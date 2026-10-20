@@ -36,7 +36,7 @@ foreach($name in @('publicFailureCodes','stageFailureCodes')){
 
 # Loading a function definition does not call it. This fixed inventory excludes
 # StartOwned/RunOwned/SCM/cleanup/main. Reject newly introduced command owners.
-$wantedFunctions=@('Check','ProjectPrimaryFailure','WriteDiagnosticSummary','ProjectSampler','ReadFailureProjection','PowerShellWorkerSource')
+$wantedFunctions=@('Check','ProjectPrimaryFailure','WriteDiagnosticSummary','ProjectSampler','ReadFailureProjection','ProjectWorkerFailure','PowerShellWorkerSource','ServicePreflightSource','ReadPreflightReceipt')
 $allowedCommands=@('Check','ConvertFrom-Json','ConvertTo-Json','New-Object','ReadOwnedBytes','ForEach-Object')
 foreach($name in $wantedFunctions){
   $defs=@($ast.FindAll({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq $name},$true))
@@ -97,8 +97,8 @@ function FailureCase([string]$Text,[string]$Origin,[string]$Status,[string]$Caus
   AssertContract ($value.status -ceq $Status -and $value.cause_code -ceq $Cause) 'prepared_failure_projection_contract'
   $encoded=$value|ConvertTo-Json -Depth 8 -Compress
   AssertContract (-not $encoded.Contains($script:privateMarker) -and -not $encoded.Contains('prepared-service-pure-')) 'prepared_failure_private_text_export'
-  AssertContract ($value.Count -eq 6 -and @($value.Keys|Where-Object {$_ -cnotin @('schema','status','origin','exception_type','hresult','cause_code')}).Count -eq 0) 'prepared_failure_output_keys'
-  if($Status -ceq 'unknown'){AssertContract ($null -eq $value.origin -and $null -eq $value.exception_type -and $null -eq $value.hresult) 'prepared_unknown_does_not_invent_fields'}
+  AssertContract ($value.Count -eq 9 -and @($value.Keys|Where-Object {$_ -cnotin @('schema','status','origin','exception_type','hresult','cause_code','operation_id','cim_native_error','cim_status_code')}).Count -eq 0) 'prepared_failure_output_keys'
+  if($Status -ceq 'unknown'){AssertContract ($null -eq $value.origin -and $null -eq $value.exception_type -and $null -eq $value.hresult -and $null -eq $value.operation_id -and $null -eq $value.cim_native_error -and $null -eq $value.cim_status_code) 'prepared_unknown_does_not_invent_fields'}
   return $value
 }
 
@@ -136,12 +136,12 @@ try{
   $value=SamplerProjection ((SamplerLine @{extra_private=$script:privateMarker})+"`n")
   AssertContract (-not (($value|ConvertTo-Json -Depth 8 -Compress).Contains($script:privateMarker))) 'prepared_sampler_extra_fields_not_exported'
 
-  $known='{"schema":"edr.ci-owned-failure.v1","origin":"powershell_worker","exception_type":"System.Management.Automation.RuntimeException","hresult":-2146233087,"cause_code":"preexisting_agent_or_service"}'
+  $known='{"schema":"edr.ci-owned-failure.v2","origin":"powershell_worker","exception_type":"System.Management.Automation.RuntimeException","hresult":-2146233087,"cause_code":"preexisting_agent_or_service","operation_id":2,"cim_native_error":null,"cim_status_code":null}'
   $value=FailureCase $known powershell_worker projected preexisting_agent_or_service
   AssertContract ($value.hresult -is [int] -and $value.hresult -eq -2146233087) 'prepared_hresult_real_int32'
   foreach($number in @('-2147483648','0','2147483647')){$null=FailureCase ($known.Replace('-2146233087',$number)) powershell_worker projected preexisting_agent_or_service}
   $null=FailureCase ($known.Replace('preexisting_agent_or_service','unknown')) powershell_worker projected unknown
-  foreach($text in @($known.Replace('preexisting_agent_or_service',$script:privateMarker),$known.Replace('preexisting_agent_or_service','PREEXISTING_AGENT_OR_SERVICE'),$known.Replace('"hresult":-2146233087','"hresult":true'),$known.Replace('"hresult":-2146233087','"hresult":2147483648'),$known.Replace('"hresult":-2146233087','"hresult":-2147483649'),$known.Replace('"hresult":-2146233087','"hresult":1.0'),$known.Replace('"hresult":-2146233087','"hresult":"0"'),$known.Replace('"hresult":-2146233087','"hresult":null'),$known.Replace('"cause_code":','"cause_code":"unknown","cause_code":'),$known.Replace('"hresult":',('"'+$script:privateMarker+'":1,"hresult":')),('['+$known+']'),($known+'{}'),$known.Replace('edr.ci-owned-failure.v1','private_schema'),$known.Replace('System.Management.Automation.RuntimeException','C:\\private path'),$known.Replace('"origin":"powershell_worker"','"origin":false'),$known.Replace('"hresult":-2146233087,',''))){
+  foreach($text in @($known.Replace('preexisting_agent_or_service',$script:privateMarker),$known.Replace('preexisting_agent_or_service','PREEXISTING_AGENT_OR_SERVICE'),$known.Replace('"hresult":-2146233087','"hresult":true'),$known.Replace('"hresult":-2146233087','"hresult":2147483648'),$known.Replace('"hresult":-2146233087','"hresult":-2147483649'),$known.Replace('"hresult":-2146233087','"hresult":1.0'),$known.Replace('"hresult":-2146233087','"hresult":"0"'),$known.Replace('"hresult":-2146233087','"hresult":null'),$known.Replace('"cause_code":','"cause_code":"unknown","cause_code":'),$known.Replace('"hresult":',('"'+$script:privateMarker+'":1,"hresult":')),('['+$known+']'),($known+'{}'),$known.Replace('edr.ci-owned-failure.v2','private_schema'),$known.Replace('System.Management.Automation.RuntimeException','C:\\private path'),$known.Replace('"origin":"powershell_worker"','"origin":false'),$known.Replace('"hresult":-2146233087,',''))){
     $null=FailureCase $text powershell_worker unknown
   }
   $null=FailureCase $known python_stage unknown
@@ -151,11 +151,62 @@ try{
   $invalid=PublicFixture ([byte[]]@(255));$bad=ReadFailureProjection $invalid powershell_worker
   AssertContract ($bad.status -ceq 'unknown' -and $bad.cause_code -ceq 'unknown') 'prepared_invalid_utf8_not_projected'
   $python='{"schema":"edr.ci-owned-failure.v1","origin":"python_stage","exception_type":"builtins.ValueError","hresult":null,"cause_code":"dependency_file_count_cap"}'
-  $value=FailureCase $python python_stage projected dependency_file_count_cap
-  AssertContract ($null -eq $value.hresult) 'prepared_python_does_not_invent_hresult'
+  $pythonValue=FailureCase $python python_stage projected dependency_file_count_cap
+  AssertContract ($null -eq $pythonValue.hresult) 'prepared_python_does_not_invent_hresult'
   $null=FailureCase ($python.Replace('"hresult":null','"hresult":0')) python_stage unknown
   $null=FailureCase ($python.Replace('dependency_file_count_cap',$script:privateMarker)) python_stage unknown
 
+  foreach($op in 0..5){$v=FailureCase ($known.Replace('"operation_id":2',('"operation_id":'+$op))) powershell_worker projected preexisting_agent_or_service;AssertContract ($v.operation_id -is [int] -and $v.operation_id -eq $op) 'prepared_closed_operation_positive'}
+  foreach($bad in @('-1','6','true','"2"','2.0','null')){$null=FailureCase ($known.Replace('"operation_id":2',('"operation_id":'+$bad))) powershell_worker unknown}
+  foreach($field in @('operation_id','cim_native_error','cim_status_code')){
+    $null=FailureCase ($known.Replace(('"'+$field+'":'),('"'+$field+'":0,"'+$field+'":'))) powershell_worker unknown
+    $null=FailureCase ([regex]::Replace($known,',"'+$field+'":(?:2|null)','')) powershell_worker unknown
+  }
+  foreach($n in @('-2147483648','0','2147483647')){$v=FailureCase ($known.Replace('"cim_native_error":null',('"cim_native_error":'+$n))) powershell_worker projected preexisting_agent_or_service;AssertContract ($v.cim_native_error -is [int]) 'prepared_cim_native_int32'}
+  foreach($n in @('0','4294967295')){$v=FailureCase ($known.Replace('"cim_status_code":null',('"cim_status_code":'+$n))) powershell_worker projected preexisting_agent_or_service;AssertContract ($v.cim_status_code -is [uint32]) 'prepared_cim_status_uint32'}
+  foreach($bad in @('-2147483649','2147483648','true','"0"','0.0')){$null=FailureCase ($known.Replace('"cim_native_error":null',('"cim_native_error":'+$bad))) powershell_worker unknown}
+  foreach($bad in @('-1','4294967296','false','"0"','0.0')){$null=FailureCase ($known.Replace('"cim_status_code":null',('"cim_status_code":'+$bad))) powershell_worker unknown}
+  $null=FailureCase ($known.Replace('edr.ci-owned-failure.v2','edr.ci-owned-failure.v1')) powershell_worker unknown
+  AssertContract ($null -eq $pythonValue.operation_id -and $null -eq $pythonValue.cim_native_error -and $null -eq $pythonValue.cim_status_code) 'prepared_python_has_no_cim_or_operation_claim'
+
+  # Exercise the actual producer helper with a real MI exception. Optional
+  # getter values use the real MI enum's numeric value / UInt32 status, never a
+  # mock, message-derived code or invented property.
+  $plain=[Exception]::new($script:privateMarker)
+  $plainRecord=[Management.Automation.ErrorRecord]::new($plain,'public',[Management.Automation.ErrorCategory]::NotSpecified,$null)
+  $plainValue=ProjectWorkerFailure $plainRecord 0 $script:publicFailureCodes
+  AssertContract ($plainValue.exception_type -ceq 'System.Exception' -and $plainValue.cause_code -ceq 'unknown' -and $plainValue.hresult -eq $plain.HResult -and $null -eq $plainValue.cim_native_error -and $null -eq $plainValue.cim_status_code) 'prepared_plain_exception_has_no_cim_dependency'
+  Add-Type -AssemblyName Microsoft.Management.Infrastructure -ErrorAction Stop
+  $realCim=[Microsoft.Management.Infrastructure.CimException]::new($script:privateMarker)
+  $cimRecord=[Management.Automation.ErrorRecord]::new($realCim,$script:privateMarker,[Management.Automation.ErrorCategory]::NotSpecified,$script:privateMarker)
+  $v=ProjectWorkerFailure $cimRecord 1 $script:publicFailureCodes
+  $expectedNative=$null;$expectedStatus=$null
+  try{$prop=$realCim.PSObject.Properties['NativeErrorCode'];if($null -ne $prop){$actualNative=$prop.Value;if($actualNative -is [Microsoft.Management.Infrastructure.NativeErrorCode]){$expectedNative=[int]$actualNative}elseif($actualNative -is [int]){$expectedNative=$actualNative}}}catch{$expectedNative=$null}
+  try{$prop=$realCim.PSObject.Properties['StatusCode'];if($null -ne $prop -and $prop.Value -is [uint32]){$expectedStatus=$prop.Value}}catch{$expectedStatus=$null}
+  AssertContract ($v.Count -eq 8 -and $v.schema -ceq 'edr.ci-owned-failure.v2' -and $v.exception_type -ceq $realCim.GetType().FullName -and $v.hresult -eq $realCim.HResult -and $v.operation_id -eq 1 -and $v.cim_native_error -eq $expectedNative -and $v.cim_status_code -eq $expectedStatus) 'prepared_real_cim_getter_types_preserved'
+  $null=FailureCase ($v|ConvertTo-Json -Compress) powershell_worker projected unknown
+  AssertContract (-not (($v|ConvertTo-Json -Compress).Contains($script:privateMarker))) 'prepared_real_cim_private_message_not_exported'
+  $nested=[InvalidOperationException]::new($script:privateMarker,$realCim)
+  $r=[Management.Automation.ErrorRecord]::new($nested,$script:privateMarker,[Management.Automation.ErrorCategory]::NotSpecified,$null)
+  $v=ProjectWorkerFailure $r 4 $script:publicFailureCodes
+  AssertContract ($v.exception_type -ceq $nested.GetType().FullName -and $v.hresult -eq $nested.HResult -and $v.cim_native_error -eq $expectedNative -and $v.cim_status_code -eq $expectedStatus) 'prepared_cim_inner_keeps_outer_hresult'
+  $deep=[Exception]::new('preexisting_agent_or_service');for($i=0;$i -lt 8;$i++){$deep=[Exception]::new($script:privateMarker,$deep)}
+  $r=[Management.Automation.ErrorRecord]::new($deep,'public',[Management.Automation.ErrorCategory]::NotSpecified,$null)
+  $v=ProjectWorkerFailure $r 0 $script:publicFailureCodes
+  AssertContract ($v.cause_code -ceq 'unknown' -and $null -eq $v.cim_native_error -and $null -eq $v.cim_status_code) 'prepared_worker_walk_stops_at_eight'
+  foreach($op in @(-1,6,'1',$true,$null)){Rejects {ProjectWorkerFailure $cimRecord $op $script:publicFailureCodes} 'worker_operation_id_invalid'}
+
+  $success='{"schema":"edr.ci-service-preflight.v1","clean_aliases":true,"machine_edr_override_count":0,"firewall_profiles_enabled":true,"operation_id":5,"ps_major":5,"ps_edition":"Desktop"}'
+  $preflight=@{stdout=(PublicText $success);stderr=(PublicText '');terminal_known=$true;exit_known=$true;exit_code=[int]0;cancelled=$false}
+  $v=ReadPreflightReceipt $preflight
+  AssertContract ($null -ne $v -and $v.Count -eq 7 -and $v.ps_major -eq 5 -and $v.ps_edition -ceq 'Desktop') 'prepared_preflight_normal_exact_receipt'
+  foreach($text in @($success.Replace('"operation_id":5','"operation_id":4'),$success.Replace('"operation_id":5','"operation_id":5.0'),$success.Replace('"ps_major":5','"ps_major":7'),$success.Replace('Desktop','Core'),$success.Replace('"clean_aliases":true','"clean_aliases":false'),$success.Replace('"machine_edr_override_count":0','"machine_edr_override_count":"0"'),$success.Replace('"schema":','"schema":"x","schema":'),$success.Replace('"schema":','"private":1,"schema":'),('['+$success+']'),$known)){
+    $preflight.stdout=PublicText $text;AssertContract ($null -eq (ReadPreflightReceipt $preflight)) 'prepared_preflight_bad_or_failure_frame_rejected'
+  }
+  $preflight.stdout=PublicText $success
+  foreach($changes in @(@{exit_code=[int]1},@{exit_code=[int]7},@{exit_code=$null},@{exit_code='0'},@{terminal_known=$false},@{exit_known=$false},@{cancelled=$true},@{stderr=(PublicText $script:privateMarker)})){
+    $bad=$preflight.Clone();foreach($key in $changes.Keys){$bad[$key]=$changes[$key]};AssertContract ($null -eq (ReadPreflightReceipt $bad)) 'prepared_preflight_nonzero_unknown_or_stderr_never_accepted'
+  }
   # Real ErrorRecords, including preparation failures before a bound intent
   # exists. Do not export their messages, target objects or invocation text.
   try{Check $false 'qa_function_inventory'}catch{$failureRecord=$_}
@@ -190,8 +241,13 @@ try{
   # its body, or its exit statement in this test process or a child process.
   $body=PowerShellWorkerSource "throw 'preexisting_agent_or_service'"
   $producerTokens=$null;$producerErrors=$null
-  $null=[Management.Automation.Language.Parser]::ParseInput($body,[ref]$producerTokens,[ref]$producerErrors)
-  AssertContract (@($producerErrors).Count -eq 0 -and $body.Contains('edr.ci-owned-failure.v1') -and -not $body.Contains('__CODES__') -and -not $body.Contains('__BODY__') -and $body -notmatch 'ScriptStackTrace|Exception\.ToString\(') 'prepared_generated_producer_parse_only'
+  $producerAst=[Management.Automation.Language.Parser]::ParseInput($body,[ref]$producerTokens,[ref]$producerErrors)
+  $embedded=@($producerAst.FindAll({param($n)$n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -ceq 'ProjectWorkerFailure'},$true))
+  AssertContract ($embedded.Count -eq 1) 'prepared_single_embedded_projector'
+  Invoke-Expression $embedded[0].Extent.Text
+  $embeddedValue=ProjectWorkerFailure $cimRecord 1 $script:publicFailureCodes
+  AssertContract ($embeddedValue.exception_type -ceq $realCim.GetType().FullName -and $embeddedValue.cim_native_error -eq $expectedNative -and $embeddedValue.cim_status_code -eq $expectedStatus) 'prepared_real_generated_projector_loaded_only'
+  AssertContract (@($producerErrors).Count -eq 0 -and $body.Contains('edr.ci-owned-failure.v2') -and -not $body.Contains('__CODES__') -and -not $body.Contains('__BODY__') -and $body -notmatch 'ScriptStackTrace|Exception\.ToString\(') 'prepared_generated_producer_parse_only'
   if((Get-FileHash -LiteralPath $sourceFile.FullName -Algorithm SHA256).Hash.ToLowerInvariant() -cne $DriverSha256){throw 'prepared_source_changed_after_contracts'}
   $finalLine='prepared_service_pure_contracts passed='+$script:passed+' source_sha256='+$DriverSha256+' top_level_executed=false product_or_service_child_executed=false'
 }finally{

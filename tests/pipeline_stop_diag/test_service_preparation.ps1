@@ -12,7 +12,9 @@ $ErrorActionPreference='Stop'
 $probeClock=[Diagnostics.Stopwatch]::StartNew();$probeRoot=$null;$probeCreated=$false;$projectLoaded=$false
 $probeOldRunnerTemp=$env:RUNNER_TEMP;$probeStatement=$null;$probeParserSelected=$false;$errors=$null
 $script:result=@{preparation_stage_id=0;intent_recorded=$false}
-$probe=[ordered]@{schema='edr.ci-service-preparation-contract.v1';status='failed_or_unknown';source_sha=$env:GITHUB_SHA;driver_sha256=$DriverSha256;qa_driver_sha256=$QADriverSha256;phase='source_validation';preparation_stage_id=0;statement_start_line=$null;statement_start_column=$null;prefix_statement_count=0;executed_statements=0;acl_contract=$null;parser_errors_is_null=$null;parser_errors_type=$null;parser_errors_safe_count=$null;primary_failure=$null;cleanup_failure=$null;elapsed_ms=0;prefix_only=$true;service_or_agent_started=$false;preflight_worker_started=$false;dummy_agent_inputs=$true;runner_temp_public_subroot=$true;public_tree_cleaned=$false}
+$script:ownedChildren=New-Object Collections.ArrayList;$script:cleanupErrors=New-Object Collections.ArrayList
+$script:cleanupMode=$false;$script:cleanupDeadline=270000;$script:lastLimitSample=-1000
+$probe=[ordered]@{schema='edr.ci-service-preparation-contract.v2';status='failed_or_unknown';source_sha=$env:GITHUB_SHA;driver_sha256=$DriverSha256;qa_driver_sha256=$QADriverSha256;phase='source_validation';preparation_stage_id=0;statement_start_line=$null;statement_start_column=$null;prefix_statement_count=0;executed_statements=0;acl_contract=$null;parser_errors_is_null=$null;parser_errors_type=$null;parser_errors_safe_count=$null;primary_failure=$null;cleanup_failure=$null;elapsed_ms=0;prefix_only=$false;service_or_agent_started=$false;preflight_worker_started=$false;preflight=$null;failed_control_receipt=$null;worker_cleanup=@();dummy_agent_inputs=$true;runner_temp_public_subroot=$true;public_tree_cleaned=$false}
 function Guard($Value,[string]$Cause){if(-not $Value){throw $Cause}}
 function ReadSource([string]$Path,[string]$Expected){
  $f=Get-Item -LiteralPath $Path -Force
@@ -52,15 +54,24 @@ try{
  }
  $probeIntent=@($probePrefix|Where-Object {$_.Extent.Text -cmatch "^SaveNew 'intent[.]json' "})
  Guard ($probeIntent.Count -eq 1) 'prefix_intent_inventory'
- $probeCodes=@($probeHarness.ast.FindAll({param($n)$n -is [Management.Automation.Language.AssignmentStatementAst] -and $n.Left -is [Management.Automation.Language.VariableExpressionAst] -and $n.Left.VariablePath.UserPath -ceq 'script:publicFailureCodes'},$true))
- Guard ($probeCodes.Count -eq 1 -and $probeCodes[0].Right.Extent.Text -cmatch "(?s)^\s*@\(\s*(?:'[a-z][a-z0-9_]{0,100}'\s*,?\s*)+\)\s*$") 'literal_failure_codes_required'
- $script:publicFailureCodes=@([regex]::Matches($probeCodes[0].Right.Extent.Text,"'([a-z][a-z0-9_]{0,100})'")|ForEach-Object {$_.Groups[1].Value})
- foreach($probeName in @('Check','Hash','RegularPath','SetDiagnosticCaseAcl','SaveNew','ProjectPrimaryFailure')){
+ foreach($codeName in @('publicFailureCodes','stageFailureCodes')){
+  $wanted='script:'+$codeName
+  $probeCodes=@($probeHarness.ast.FindAll({param($n)$n -is [Management.Automation.Language.AssignmentStatementAst] -and $n.Left -is [Management.Automation.Language.VariableExpressionAst] -and $n.Left.VariablePath.UserPath -ceq $wanted},$true))
+  Guard ($probeCodes.Count -eq 1 -and $probeCodes[0].Right.Extent.Text -cmatch "(?s)^\s*@\(\s*(?:'[a-z][a-z0-9_]{0,100}'\s*,?\s*)+\)\s*$") 'literal_failure_codes_required'
+  Set-Variable -Scope Script -Name $codeName -Value @([regex]::Matches($probeCodes[0].Right.Extent.Text,"'([a-z][a-z0-9_]{0,100})'")|ForEach-Object {$_.Groups[1].Value})
+ }
+ foreach($probeName in @('Check','Hash','RegularPath','SetDiagnosticCaseAcl','SaveNew','ProjectPrimaryFailure','WritePublic','Remaining','SampleLimits','StartOwned','WaitOwned','FinishOwned','ReadFailureProjection','RunOwned','ProjectWorkerFailure','PowerShellWorkerSource','PowerShellWorker','ServicePreflightSource','ReadPreflightReceipt','RunServicePreflight')){
   $defs=@($probeHarness.ast.FindAll({param($n)$n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -ceq $probeName},$true))
   Guard ($defs.Count -eq 1) 'prefix_helper_inventory'
   Invoke-Expression $defs[0].Extent.Text
  }
  $projectLoaded=$true
+ # The only executed worker body is the same source-owned read-only preflight.
+ # Validate it before running any selected main-prefix statement.
+ $probePreflightBody=ServicePreflightSource;$pt=$null;$pe=$null
+ $pa=[Management.Automation.Language.Parser]::ParseInput($probePreflightBody,[ref]$pt,[ref]$pe)
+ Guard ($null -eq $pe -or @($pe).Count -eq 0) 'preflight_source_parse'
+ foreach($c in @($pa.FindAll({param($n)$n -is [Management.Automation.Language.CommandAst]},$true))){Guard ($c.GetCommandName() -cin @('Get-CimInstance','Where-Object','Get-NetFirewallProfile','ConvertTo-Json')) 'readonly_preflight_commands_required'}
  $probeParent=Get-Item -LiteralPath $probeOldRunnerTemp -Force
  Guard ($probeParent.PSIsContainer -and [IO.Path]::IsPathRooted($probeParent.FullName)) 'runner_temp_shape'
  for($d=$probeParent;$null -ne $d;$d=$d.Parent){Guard (($d.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) 'runner_temp_reparse'}
@@ -109,14 +120,35 @@ try{
  $probeIntentPath=Join-Path $script:case 'intent.json';$probeIntentFile=Get-Item -LiteralPath $probeIntentPath -Force
  Guard ($probeIntentFile.Length -gt 0 -and $probeIntentFile.Length -le 131072) 'public_intent_bound'
  Guard ((Get-FileHash -LiteralPath $probeHarness.path -Algorithm SHA256).Hash.ToLowerInvariant() -ceq $DriverSha256 -and (Get-FileHash -LiteralPath $probeQA.path -Algorithm SHA256).Hash.ToLowerInvariant() -ceq $QADriverSha256) 'source_changed'
- $probe.phase='prefix_completed';$probe.status='preparation_prefix_completed'
+ $probe.phase='winps51_readonly_preflight'
+ $probe.preflight=RunServicePreflight $probePreflightBody
+ $probe.preflight_worker_started=($script:ownedChildren.Count -gt 0)
+ Guard ((Get-FileHash -LiteralPath $probeHarness.path -Algorithm SHA256).Hash.ToLowerInvariant() -ceq $DriverSha256 -and (Get-FileHash -LiteralPath $probeQA.path -Algorithm SHA256).Hash.ToLowerInvariant() -ceq $QADriverSha256) 'source_changed'
+ $probe.phase='preparation_and_preflight_completed';$probe.status='preparation_and_preflight_completed'
 }catch{
  if($projectLoaded){$probe.primary_failure=ProjectPrimaryFailure $_}else{$probe.primary_failure=@{exception_type=$_.Exception.GetType().FullName;hresult=[int]$_.Exception.HResult;native_error=$null;source_line=$null;source_column=$null;cause_code='bootstrap_source_rejected_no_message'}}
  if($projectLoaded){$probe.preparation_stage_id=$script:result.preparation_stage_id}
 }finally{
+ $probe.preflight_worker_started=($script:ownedChildren.Count -gt 0)
+ if($script:result.Contains('failed_control_receipt')){$probe.failed_control_receipt=$script:result.failed_control_receipt}
  if($probeParserSelected){$probe.parser_errors_is_null=($null -eq $errors);if($null -ne $errors){$probe.parser_errors_type=$errors.GetType().FullName};$probe.parser_errors_safe_count=if($null -eq $errors){0}else{@($errors).Count}}
  $env:RUNNER_TEMP=$probeOldRunnerTemp
- if($probeCreated){
+ # Held objects only. Never reopen an arbitrary PID or invoke full SCM cleanup.
+ # Unknown identity/exit/EOF retains the public tree and fails this test.
+ $workersClean=$true;$script:cleanupMode=$true
+ foreach($v in $script:ownedChildren){
+  try{
+   Guard ($null -ne $v.pid -and $null -ne $v.birth -and $v.process.Id -eq $v.pid -and $v.process.StartTime.ToUniversalTime().ToFileTimeUtc().ToString() -ceq $v.birth) 'public_worker_identity_unknown'
+   if(-not $v.process.HasExited){$v.cancelled=$true;$v.process.Kill();Guard ($v.process.WaitForExit(2000)) 'public_worker_cleanup_unknown'}
+   Guard ($v.process.HasExited -and $v.process.ExitCode -is [int]) 'public_worker_terminal_unknown'
+   Guard ($null -ne $v.out_task -and $null -ne $v.err_task -and $v.out_task.Wait(2000) -and $v.err_task.Wait(2000)) 'public_worker_stream_eof_unknown'
+   $v.out_file.Dispose();$v.err_file.Dispose()
+   $probe.worker_cleanup+=@{pid=$v.pid;birth_filetime=$v.birth;terminal_known=$true;exit_code=$v.process.ExitCode;cancelled=$v.cancelled;streams_closed=$true}
+   $v.process.Dispose()
+  }catch{$workersClean=$false;$probe.cleanup_failure=@{exception_type=$_.Exception.GetType().FullName;hresult=[int]$_.Exception.HResult};$probe.status='failed_or_unknown'}
+ }
+ if($script:cleanupErrors.Count){$workersClean=$false;$probe.cleanup_failure=@{exception_type='owned_worker_cleanup_reported';hresult=$null};$probe.status='failed_or_unknown'}
+ if($probeCreated -and $workersClean){
   try{
    $own=Get-Item -LiteralPath $probeRoot -Force
    Guard ($own.PSIsContainer -and ($own.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0 -and $own.Parent.FullName -ieq $probeParent.FullName) 'public_cleanup_identity'
@@ -128,4 +160,4 @@ try{
  $probe.elapsed_ms=$probeClock.ElapsedMilliseconds
 }
 [Console]::Out.WriteLine(($probe|ConvertTo-Json -Depth 8 -Compress))
-if($probe.status -ceq 'preparation_prefix_completed' -and $probe.public_tree_cleaned){exit 0}else{exit 2}
+if($probe.status -ceq 'preparation_and_preflight_completed' -and $probe.public_tree_cleaned){exit 0}else{exit 2}

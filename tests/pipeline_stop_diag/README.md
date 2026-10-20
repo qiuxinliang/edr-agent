@@ -45,17 +45,40 @@ This is an unshipped diagnostic executable with the real main, SCM, collectors
 and durable owners. It is not a candidate package or a rollback acceptance test.
 
 Before dependency builds, the manual ARM64 path runs the pure failure contracts
-and `test_service_preparation.ps1`. The latter executes only the original main
-try-prefix before its first preflight worker: directory ACLs and pinned QA
-function definitions, with public unbound Agent inputs and a fresh test-local
-temporary root. It starts no Agent or SCM service. A failure reports fixed
-types, numeric positions and a closed stage/cause; exception text is excluded.
+and `test_service_preparation.ps1`. The latter executes the original main
+try-prefix, then the same source-owned preflight in a bounded System32 Windows
+PowerShell 5.1 child: read-only service/process, machine EDR-key presence and
+active firewall-profile queries. Directory ACLs and pinned QA definitions use
+public unbound Agent inputs and a fresh test-local temporary root. It starts
+no Agent and performs no SCM mutation. The existing one-second CIM query and
+eight-second worker limits remain unchanged. Exit zero is accepted only with
+the exact success schema, original three safety conditions, operation 5 and
+observed PowerShell major 5 / Desktop edition; structured failure is nonzero.
+A failure reports fixed types, numeric positions and a closed stage/cause;
+exception text is excluded. Unknown child identity, terminal state or stream
+EOF fails cleanup and retains the public directory instead of claiming success.
 The intent file records declared inputs before preparation, not verified facts.
 The preparation test also reproduces an extra explicit public-fixture ACE left
 by incremental grants, then exercises the actual Access-only DACL replacement
 twice and checks private child inheritance and a public marker round trip.
 Only SYSTEM and Administrators receive explicit inheritable FullControl;
 the existing owner, group and SACL are preserved.
+
+PowerShell worker failures use the strict eight-field
+`edr.ci-owned-failure.v2` schema. Operation IDs are 0 (not entered), 1 (service
+query), 2 (process query and alias guard), 3 (machine environment presence),
+4 (firewall query) and 5 (done). Up to eight real exception nodes are inspected.
+For real `CimException` nodes, `cim_native_error` preserves an Int32 getter or
+the Int32-backed MI `NativeErrorCode` enum value; `cim_status_code` accepts only
+the actual UInt32 `StatusCode` getter. Missing, other-type or throwing getters
+remain null. They are separate from the outer exception's HResult. No error
+message, ErrorData, arbitrary ID or stack is exported. Python stage failures
+retain their strict v1 five-field schema; the unified v2 consumer projection
+leaves its operation/CIM fields null. Extra, duplicate and mistyped fields are
+rejected. Pure contracts use a real MI exception and only load the generated
+projection function definition, without running a worker body or its exit.
+These checks distinguish provider/host failures; they do not establish the
+historical failure's CIM status, timeout cause or Service rollback acceptance.
 
 The SCM harness requires a clean hosted runner and unique paths/service name.
 It stages and verifies the complete static/delay-import DLL closure beside the

@@ -78,6 +78,7 @@ $script:publicFailureCodes=@(
   'owned_worker_terminal_unknown',
   'pre_stop_log_binding_unknown',
   'preexisting_agent_or_service',
+  'preflight_receipt_invalid',
   'private_case_acl_not_protected',
   'private_case_acl_unexpected_principal',
   'public_worker_source_bound',
@@ -288,7 +289,7 @@ function FinishOwned($Value,[int]$Cap=16384){
   return @{pid=$Value.pid;birth_filetime=$Value.birth;terminal_known=$Value.terminal_known;exit_known=$Value.exit_known;exit_code=$Value.exit_code;cancelled=$Value.cancelled;stdout=$rows.stdout;stderr=$rows.stderr}
 }
 function ReadFailureProjection([string]$Path,[ValidateSet('powershell_worker','python_stage','unsupported')][string]$ExpectedOrigin){
-  $unknown=@{schema='edr.ci-owned-failure-projection.v1';status='unknown';origin=$null;exception_type=$null;hresult=$null;cause_code='unknown'}
+  $unknown=@{schema='edr.ci-owned-failure-projection.v2';status='unknown';origin=$null;exception_type=$null;hresult=$null;cause_code='unknown';operation_id=$null;cim_native_error=$null;cim_status_code=$null}
   if($ExpectedOrigin -ceq 'unsupported'){return $unknown}
   $document=$null
   try{
@@ -299,29 +300,42 @@ function ReadFailureProjection([string]$Path,[ValidateSet('powershell_worker','p
     $document=[Text.Json.JsonDocument]::Parse($text);$root=$document.RootElement
     if($root.ValueKind -ne [Text.Json.JsonValueKind]::Object){throw 'projection_root'}
     $expected=@('schema','origin','exception_type','hresult','cause_code')
+    $schema='edr.ci-owned-failure.v1'
+    if($ExpectedOrigin -ceq 'powershell_worker'){$expected+=@('operation_id','cim_native_error','cim_status_code');$schema='edr.ci-owned-failure.v2'}
     $keys=[Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     foreach($property in $root.EnumerateObject()){
       if(-not $keys.Add($property.Name) -or $property.Name -cnotin $expected){throw 'projection_key'}
     }
-    if($keys.Count -ne 5){throw 'projection_keys_missing'}
+    if($keys.Count -ne $expected.Count){throw 'projection_keys_missing'}
     foreach($key in @('schema','origin','exception_type','cause_code')){
       if($root.GetProperty($key).ValueKind -ne [Text.Json.JsonValueKind]::String){throw 'projection_string_type'}
     }
-    if($root.GetProperty('schema').GetString() -cne 'edr.ci-owned-failure.v1' -or $root.GetProperty('origin').GetString() -cne $ExpectedOrigin){throw 'projection_identity'}
+    if($root.GetProperty('schema').GetString() -cne $schema -or $root.GetProperty('origin').GetString() -cne $ExpectedOrigin){throw 'projection_identity'}
     $kind=$root.GetProperty('exception_type').GetString()
     if($kind -cnotmatch '^[A-Za-z_][A-Za-z0-9_.+`]{0,255}$'){throw 'projection_exception_type'}
     $code=$root.GetProperty('cause_code').GetString()
     $allowed=if($ExpectedOrigin -ceq 'python_stage'){$script:stageFailureCodes}else{$script:publicFailureCodes}
     if($code -cne 'unknown' -and $code -cnotin $allowed){throw 'projection_cause'}
-    $hresult=$null;$number=$root.GetProperty('hresult')
+    $hresult=$null;$operation=$null;$native=$null;$status=$null;$number=$root.GetProperty('hresult')
     if($ExpectedOrigin -ceq 'python_stage'){
       if($number.ValueKind -ne [Text.Json.JsonValueKind]::Null){throw 'projection_python_hresult'}
     }else{
       $integer=[int]0
       if($number.ValueKind -ne [Text.Json.JsonValueKind]::Number -or -not $number.TryGetInt32([ref]$integer)){throw 'projection_hresult'}
       $hresult=$integer
+      $number=$root.GetProperty('operation_id');$integer=[int]0
+      if($number.ValueKind -ne [Text.Json.JsonValueKind]::Number -or -not $number.TryGetInt32([ref]$integer) -or $integer -lt 0 -or $integer -gt 5){throw 'projection_operation'}
+      $operation=$integer
+      $number=$root.GetProperty('cim_native_error');$integer=[int]0
+      if($number.ValueKind -ne [Text.Json.JsonValueKind]::Null){
+        if($number.ValueKind -ne [Text.Json.JsonValueKind]::Number -or -not $number.TryGetInt32([ref]$integer)){throw 'projection_cim_native'};$native=$integer
+      }
+      $number=$root.GetProperty('cim_status_code');$unsigned=[uint32]0
+      if($number.ValueKind -ne [Text.Json.JsonValueKind]::Null){
+        if($number.ValueKind -ne [Text.Json.JsonValueKind]::Number -or -not $number.TryGetUInt32([ref]$unsigned)){throw 'projection_cim_status'};$status=$unsigned
+      }
     }
-    return @{schema='edr.ci-owned-failure-projection.v1';status='projected';origin=$ExpectedOrigin;exception_type=$kind;hresult=$hresult;cause_code=$code}
+    return @{schema='edr.ci-owned-failure-projection.v2';status='projected';origin=$ExpectedOrigin;exception_type=$kind;hresult=$hresult;cause_code=$code;operation_id=$operation;cim_native_error=$native;cim_status_code=$status}
   }catch{return $unknown}
   finally{if($null -ne $document){$document.Dispose()}}
 }
@@ -330,36 +344,104 @@ function RunOwned([string]$Label,[string]$Exe,[string[]]$Arguments,[int]$Millise
   $v=StartOwned $Label $Exe $Arguments
   Check (WaitOwned $v $Milliseconds) 'bounded_worker_timed_out_no_retry'
   $receipt=FinishOwned $v $Cap
+  $v.receipt=$receipt
   if($receipt.exit_code -ne 0 -and -not $script:result.Contains('failed_control_receipt')){
     $origin=if($Label -ceq 'stage-runtime'){'python_stage'}elseif($Exe -ieq $script:winPS){'powershell_worker'}else{'unsupported'}
     $script:result.failed_control_receipt=@{label=$Label;receipt=$receipt;failure=(ReadFailureProjection $v.stdout $origin)}
   }
   Check ($receipt.exit_code -eq 0) 'bounded_worker_nonzero_no_retry';return $v
 }
+function ProjectWorkerFailure {
+  param([Management.Automation.ErrorRecord]$Record,$OperationId,[string[]]$Codes)
+  if($OperationId -isnot [int] -or $OperationId -lt 0 -or $OperationId -gt 5){throw 'worker_operation_id_invalid'}
+  $cause='unknown';$native=$null;$status=$null;$e=$Record.Exception
+  $cimType='Microsoft.Management.Infrastructure.CimException' -as [type]
+  for($depth=0;$null -ne $e -and $depth -lt 8;$depth++){
+    if($cause -ceq 'unknown' -and $e.Message -cin $Codes){$cause=$e.Message}
+    if($null -ne $cimType -and $cimType.IsInstanceOfType($e)){
+      # Normalize only the real MI enum's Int32 backing value; never infer a
+      # code from HResult, messages, ErrorData or arbitrary ErrorRecord IDs.
+      if($null -eq $native){try{
+        $p=$e.PSObject.Properties['NativeErrorCode'];if($null -ne $p){
+          $v=$p.Value
+          if($v -is [int]){$native=$v}
+          elseif($null -ne $v -and $v.GetType().FullName -ceq 'Microsoft.Management.Infrastructure.NativeErrorCode' -and $v.GetType().IsEnum -and [Enum]::GetUnderlyingType($v.GetType()) -eq [int]){$native=[Convert]::ToInt32($v,[Globalization.CultureInfo]::InvariantCulture)}
+        }
+      }catch{$native=$null}}
+      if($null -eq $status){try{$p=$e.PSObject.Properties['StatusCode'];if($null -ne $p){$v=$p.Value;if($v -is [uint32]){$status=$v}}}catch{$status=$null}}
+    }
+    $e=$e.InnerException
+  }
+  $kind=$Record.Exception.GetType().FullName
+  if($kind -cnotmatch '^[A-Za-z_][A-Za-z0-9_.+`]{0,255}$'){$kind='unknown'}
+  return @{schema='edr.ci-owned-failure.v2';origin='powershell_worker';exception_type=$kind;hresult=[int]$Record.Exception.HResult;cause_code=$cause;operation_id=$OperationId;cim_native_error=$native;cim_status_code=$status}
+}
 function PowerShellWorkerSource([string]$Body){
   $template=@'
 Set-StrictMode -Version Latest;$ErrorActionPreference='Stop'
 $publicFailureCodes=@(__CODES__)
+$operationId=0
+function ProjectWorkerFailure {
+__PROJECT__
+}
 try {
 __BODY__
 }catch{
-  $cause='unknown';$e=$_.Exception
-  for($depth=0;$null -ne $e -and $depth -lt 8;$depth++){
-    if($cause -ceq 'unknown' -and $e.Message -cin $publicFailureCodes){$cause=$e.Message};$e=$e.InnerException
-  }
-  $kind=$_.Exception.GetType().FullName
-  if($kind -cnotmatch '^[A-Za-z_][A-Za-z0-9_.+`]{0,255}$'){$kind='unknown'}
-  $projection=@{schema='edr.ci-owned-failure.v1';origin='powershell_worker';exception_type=$kind;hresult=[int]$_.Exception.HResult;cause_code=$cause}
+  $projection=ProjectWorkerFailure $_ $operationId $publicFailureCodes
   [Console]::Out.WriteLine(($projection|ConvertTo-Json -Compress));[Console]::Out.Flush()
   exit 1
 }
 '@
   $literals=($script:publicFailureCodes|ForEach-Object {"'"+$_+"'"}) -join ','
-  return $template.Replace('__CODES__',$literals).Replace('__BODY__',$Body)
+  return $template.Replace('__CODES__',$literals).Replace('__PROJECT__',${function:ProjectWorkerFailure}.ToString()).Replace('__BODY__',$Body)
 }
 function PowerShellWorker([string]$Label,[string]$Body,[int]$Milliseconds=5000,[int]$Cap=16384){
   $path=WritePublic ($Label+'.ps1') (PowerShellWorkerSource $Body)
   RunOwned $Label $script:winPS @('-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',$path) $Milliseconds $Cap
+}
+function ServicePreflightSource {
+  # One read-only query owner, shared with the early WinPS5.1 contract.
+  return @'
+$operationId=1
+$s=@(Get-CimInstance Win32_Service -OperationTimeoutSec 1 -ErrorAction Stop|Where-Object {$_.Name -in @('FDSecurityAgent','EdrAgent','FDSecurityAgentCISmoke','__SERVICE__') -or $_.PathName -match '(?i)(FDSensor|edr_agent)\.exe'})
+$operationId=2
+$p=@(Get-CimInstance Win32_Process -Property Name -OperationTimeoutSec 1 -ErrorAction Stop|Where-Object {$_.Name -in @('FDSensor.exe','edr_agent.exe')})
+if($s.Count -or $p.Count){throw 'preexisting_agent_or_service'}
+$operationId=3
+$m=[Environment]::GetEnvironmentVariables([EnvironmentVariableTarget]::Machine);$keys=@($m.Keys|Where-Object {[string]$_ -like 'EDR_*'})
+if($keys.Count){throw 'machine_edr_override_present'}
+$operationId=4
+if(@(Get-NetFirewallProfile -PolicyStore ActiveStore -ErrorAction Stop|Where-Object {-not $_.Enabled}).Count){throw 'firewall_profile_disabled'}
+$operationId=5
+[Console]::Out.WriteLine((@{schema='edr.ci-service-preflight.v1';clean_aliases=$true;machine_edr_override_count=0;firewall_profiles_enabled=$true;operation_id=$operationId;ps_major=$PSVersionTable.PSVersion.Major;ps_edition=$PSVersionTable.PSEdition}|ConvertTo-Json -Compress));exit 0
+'@
+}
+function ReadPreflightReceipt($Value){
+  $document=$null
+  try{
+    if($Value.terminal_known -isnot [bool] -or -not $Value.terminal_known -or $Value.exit_known -isnot [bool] -or -not $Value.exit_known -or $Value.exit_code -isnot [int] -or $Value.exit_code -ne 0 -or $Value.cancelled -isnot [bool] -or $Value.cancelled){return $null}
+    $err=ReadOwnedBytes $Value.stderr 4096;if($err.bytes.Length -ne 0){return $null}
+    $raw=ReadOwnedBytes $Value.stdout 4096
+    $document=[Text.Json.JsonDocument]::Parse([Text.UTF8Encoding]::new($false,$true).GetString($raw.bytes));$root=$document.RootElement
+    if($root.ValueKind -ne [Text.Json.JsonValueKind]::Object){return $null}
+    $expected=@('schema','clean_aliases','machine_edr_override_count','firewall_profiles_enabled','operation_id','ps_major','ps_edition')
+    $keys=[Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach($p in $root.EnumerateObject()){if(-not $keys.Add($p.Name) -or $p.Name -cnotin $expected){return $null}}
+    if($keys.Count -ne 7){return $null}
+    foreach($key in @('schema','ps_edition')){if($root.GetProperty($key).ValueKind -ne [Text.Json.JsonValueKind]::String){return $null}}
+    if($root.GetProperty('schema').GetString() -cne 'edr.ci-service-preflight.v1' -or $root.GetProperty('ps_edition').GetString() -cne 'Desktop'){return $null}
+    foreach($key in @('clean_aliases','firewall_profiles_enabled')){if($root.GetProperty($key).ValueKind -ne [Text.Json.JsonValueKind]::True){return $null}}
+    foreach($pair in @(@('machine_edr_override_count',0),@('operation_id',5),@('ps_major',5))){
+      $v=[int]0;$p=$root.GetProperty($pair[0]);if($p.ValueKind -ne [Text.Json.JsonValueKind]::Number -or -not $p.TryGetInt32([ref]$v) -or $v -ne $pair[1]){return $null}
+    }
+    return @{schema='edr.ci-service-preflight.v1';clean_aliases=$true;machine_edr_override_count=0;firewall_profiles_enabled=$true;operation_id=5;ps_major=5;ps_edition='Desktop'}
+  }catch{return $null}
+  finally{if($null -ne $document){$document.Dispose()}}
+}
+function RunServicePreflight([string]$Body){
+  $v=PowerShellWorker 'preflight' ($Body.Replace('__SERVICE__',$script:serviceName)) 8000 4096
+  $accepted=ReadPreflightReceipt $v;Check ($null -ne $accepted) 'preflight_receipt_invalid'
+  return @{worker=$v.receipt;preflight=$accepted}
 }
 function Snapshot([string]$Label,[switch]$AllowAbsent){
   $body=@'
@@ -448,16 +530,8 @@ public static class CiServiceBoundedPump {
   foreach($name in $imports){$defs=@($ast.FindAll({param($n)$n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -ceq $name},$true));Check ($defs.Count -eq 1) 'qa_function_inventory';if($name -ceq 'ReadStopLogSlice'){Invoke-Expression ($defs[0].Extent.Text.Replace('function ReadStopLogSlice(', 'function OriginalReadStopLogSlice('))}else{Invoke-Expression $defs[0].Extent.Text}}
   function ReadStopLogSlice($Context,[long]$ElapsedMs){SampleLimits;OriginalReadStopLogSlice $Context $ElapsedMs;SampleLimits}
   $script:result.preparation_stage_id=8
-  $preflight=@'
-$s=@(Get-CimInstance Win32_Service -OperationTimeoutSec 1 -ErrorAction Stop|Where-Object {$_.Name -in @('FDSecurityAgent','EdrAgent','FDSecurityAgentCISmoke','__SERVICE__') -or $_.PathName -match '(?i)(FDSensor|edr_agent)\.exe'})
-$p=@(Get-CimInstance Win32_Process -Property Name -OperationTimeoutSec 1 -ErrorAction Stop|Where-Object {$_.Name -in @('FDSensor.exe','edr_agent.exe')})
-if($s.Count -or $p.Count){throw 'preexisting_agent_or_service'}
-$m=[Environment]::GetEnvironmentVariables([EnvironmentVariableTarget]::Machine);$keys=@($m.Keys|Where-Object {[string]$_ -like 'EDR_*'})
-if($keys.Count){throw 'machine_edr_override_present'}
-if(@(Get-NetFirewallProfile -PolicyStore ActiveStore -ErrorAction Stop|Where-Object {-not $_.Enabled}).Count){throw 'firewall_profile_disabled'}
-[Console]::Out.WriteLine('{"clean_aliases":true,"machine_edr_override_count":0,"firewall_profiles_enabled":true}');exit 0
-'@
-  $null=PowerShellWorker 'preflight' ($preflight.Replace('__SERVICE__',$script:serviceName)) 8000 4096
+  $preflight=ServicePreflightSource
+  $script:result.preflight=RunServicePreflight $preflight
   $script:install=Join-Path $script:case 'runtime';$script:agent=Join-Path $script:install 'FDSensor.exe';$script:configPath=Join-Path $script:install 'agent.toml'
   $stage=RegularPath (Join-Path $PSScriptRoot 'stage_ci_agent.py') 262144
   Check ((Hash $stage) -ceq $StageAdapterSha256) 'stage_adapter_hash_mismatch'
