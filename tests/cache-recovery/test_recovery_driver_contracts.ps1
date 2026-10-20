@@ -573,25 +573,29 @@ Start-Sleep -Milliseconds 300
     Checked ($ctx.diagnostic.matches.Count -eq 1 -and $ctx.diagnostic.matches[0].kind -ceq 'preprocess_worker_join') 'join_partial_numeric_line_completed_once';CloseStopLogContext $ctx
     # Fixed histogram from the original join window; no names or event fields.
     $joinSamplePhases=@('0')*13;$joinSamplePhases[3]='3'
-    $joinSampleSites=@('0')*80;$joinSampleSites[17]='1';$joinSampleSites[79]='2'
-    $joinSampleLine='[preprocess] worker join samples version=1 interval_ms=10 samples=3 capped=0 phase_hits='+($joinSamplePhases -join ',')+' callsite_hits='+($joinSampleSites -join ',')
+    $joinSampleSites=@('0')*128;$joinSampleSites[17]='1';$joinSampleSites[79]='1';$joinSampleSites[80]='1'
+    $joinSampleLine='[preprocess] worker join samples version=2 interval_ms=10 samples=3 capped=0 phase_hits='+($joinSamplePhases -join ',')+' callsite_hits='+($joinSampleSites -join ',')
     ResetPublicLog;$ctx=PublicLogContext;PublicAppend ($joinSampleLine+[char]10);ReadStopLogSlice $ctx 1
     $joinSampleProjected=$ctx.diagnostic.matches[0]
-    Checked ($ctx.diagnostic.matches.Count -eq 1 -and $joinSampleProjected.kind -ceq 'preprocess_worker_join_samples' -and $joinSampleProjected.samples -eq 3 -and -not $joinSampleProjected.capped -and $joinSampleProjected.phase_hits.Count -eq 13 -and $joinSampleProjected.phase_hits[3] -eq 3 -and $joinSampleProjected.callsite_hits.Count -eq 80 -and $joinSampleProjected.callsite_hits[17] -eq 1 -and $joinSampleProjected.callsite_hits[79] -eq 2) 'join_samples_closed_histogram_projection';CloseStopLogContext $ctx
+    Checked ($ctx.diagnostic.matches.Count -eq 1 -and $joinSampleProjected.kind -ceq 'preprocess_worker_join_samples' -and $joinSampleProjected.version -eq 2 -and $joinSampleProjected.samples -eq 3 -and -not $joinSampleProjected.capped -and $joinSampleProjected.phase_hits.Count -eq 13 -and $joinSampleProjected.phase_hits[3] -eq 3 -and $joinSampleProjected.callsite_hits.Count -eq 128 -and $joinSampleProjected.callsite_hits[17] -eq 1 -and $joinSampleProjected.callsite_hits[79] -eq 1 -and $joinSampleProjected.callsite_hits[80] -eq 1) 'join_samples_closed_histogram_projection';CloseStopLogContext $ctx
     $joinSampleMaxPhases=@('0')*13;$joinSampleMaxPhases[12]='6001'
-    $joinSampleMaxSites=@('0')*80;$joinSampleMaxSites[79]='6001'
-    $joinSampleMaxLine='[preprocess] worker join samples version=1 interval_ms=10 samples=6001 capped=1 phase_hits='+($joinSampleMaxPhases -join ',')+' callsite_hits='+($joinSampleMaxSites -join ',')
+    $joinSampleMaxSites=@('0')*128;$joinSampleMaxSites[127]='6001'
+    $joinSampleMaxLine='[preprocess] worker join samples version=2 interval_ms=10 samples=6001 capped=1 phase_hits='+($joinSampleMaxPhases -join ',')+' callsite_hits='+($joinSampleMaxSites -join ',')
     ResetPublicLog;$ctx=PublicLogContext;PublicAppend ($joinSampleMaxLine+[char]10);ReadStopLogSlice $ctx 2
-    Checked ($ctx.diagnostic.matches[0].capped -and $ctx.diagnostic.matches[0].samples -eq 6001 -and $ctx.diagnostic.matches[0].callsite_hits[79] -eq 6001) 'join_samples_cap_boundary';CloseStopLogContext $ctx
-    $joinSampleZeroLine='[preprocess] worker join samples version=1 interval_ms=10 samples=0 capped=0 phase_hits='+((@('0')*13) -join ',')+' callsite_hits='+((@('0')*80) -join ',')
+    Checked ($ctx.diagnostic.matches[0].capped -and $ctx.diagnostic.matches[0].samples -eq 6001 -and $ctx.diagnostic.matches[0].callsite_hits[127] -eq 6001) 'join_samples_cap_boundary';CloseStopLogContext $ctx
+    $joinSampleZeroLine='[preprocess] worker join samples version=2 interval_ms=10 samples=0 capped=0 phase_hits='+((@('0')*13) -join ',')+' callsite_hits='+((@('0')*128) -join ',')
     ResetPublicLog;$ctx=PublicLogContext;PublicAppend ($joinSampleZeroLine+[char]10);ReadStopLogSlice $ctx 2
     Checked ($ctx.diagnostic.matches[0].samples -eq 0 -and -not $ctx.diagnostic.matches[0].capped) 'join_samples_zero_is_not_unknown_or_failure';CloseStopLogContext $ctx
-    $joinSampleBad=@($joinSampleLine.Replace('version=1','version=2'),$joinSampleLine.Replace('interval_ms=10','interval_ms=9'),$joinSampleLine.Replace('samples=3','samples=6002'),$joinSampleLine.Replace('capped=0','capped=2'),$joinSampleLine.Replace('capped=0','capped=1'),$joinSampleLine.Replace('samples=3','samples=2'))
-    $joinSampleBad+=@('[preprocess] worker join samples version=1 interval_ms=10 samples=3 capped=0 phase_hits='+((@('0')*12) -join ',')+' callsite_hits='+($joinSampleSites -join ','))
-    foreach($joinSampleSiteCount in @(79,81)){$joinSampleBad+=,('[preprocess] worker join samples version=1 interval_ms=10 samples=0 capped=0 phase_hits='+((@('0')*13) -join ',')+' callsite_hits='+((@('0')*$joinSampleSiteCount) -join ','))}
+    # The sole supported producer is v2; reject historical unshipped v1 rather
+    # than interpreting its 80 bins in the expanded namespace.
+    $joinSampleBad=@($joinSampleLine.Replace('version=2','version=1'),$joinSampleLine.Replace('version=2','version=3'),$joinSampleLine.Replace('interval_ms=10','interval_ms=9'),$joinSampleLine.Replace('samples=3','samples=6002'),$joinSampleLine.Replace('capped=0','capped=2'),$joinSampleLine.Replace('capped=0','capped=1'),$joinSampleLine.Replace('samples=3','samples=2'),$joinSampleLine.Replace('callsite_hits=0,','callsite_hits=1,'))
+    $joinSampleBad+=,('[preprocess] worker join samples version=1 interval_ms=10 samples=0 capped=0 phase_hits='+((@('0')*13) -join ',')+' callsite_hits='+((@('0')*80) -join ','))
+    foreach($joinSamplePhaseCount in @(12,14)){$joinSampleBad+=,('[preprocess] worker join samples version=2 interval_ms=10 samples=3 capped=0 phase_hits='+((@('0')*$joinSamplePhaseCount) -join ',')+' callsite_hits='+($joinSampleSites -join ','))}
+    foreach($joinSampleSiteCount in @(80,127,129)){$joinSampleBad+=,('[preprocess] worker join samples version=2 interval_ms=10 samples=0 capped=0 phase_hits='+((@('0')*13) -join ',')+' callsite_hits='+((@('0')*$joinSampleSiteCount) -join ','))}
     $joinSampleBad+=$joinSampleMaxLine.Replace('6001','6002')
     $joinSampleBad+=$joinSampleMaxLine.Replace('phase_hits=0,','phase_hits=,')
     $joinSampleBad+=$joinSampleMaxLine.Replace('phase_hits=0,','phase_hits=4294967296,')
+    $joinSampleBad+=$joinSampleMaxLine.Replace('callsite_hits=0,','callsite_hits=4294967296,')
     foreach($joinSampleInvalid in $joinSampleBad){ResetPublicLog;$ctx=PublicLogContext;PublicAppend ($joinSampleInvalid+[char]10);Fails {ReadStopLogSlice $ctx 3} 'stop_log_numeric_shape';CloseStopLogContext $ctx}
     ResetPublicLog;$ctx=PublicLogContext;PublicAppend (($joinSampleLine+[char]10)*2);Fails {ReadStopLogSlice $ctx 4} 'stop_log_join_samples_duplicate';CloseStopLogContext $ctx
     ResetPublicLog;$ctx=PublicLogContext

@@ -49,7 +49,7 @@ static void preprocess_substage_worker_exit(void) {
   atomic_store_explicit(&s_worker_probe_thread_id, 0u, memory_order_relaxed);
 }
 #endif
-static uint64_t preprocess_substage_enter(unsigned substage, unsigned callsite) {
+uint64_t preprocess_substage_enter(unsigned substage, unsigned callsite) {
   uint64_t previous;
   if (!preprocess_substage_is_worker()) return UINT64_MAX;
   previous = ((uint64_t)atomic_load_explicit(&s_worker_substage, memory_order_relaxed) << 32) |
@@ -58,7 +58,7 @@ static uint64_t preprocess_substage_enter(unsigned substage, unsigned callsite) 
   atomic_store_explicit(&s_worker_callsite, callsite, memory_order_relaxed);
   return previous;
 }
-static void preprocess_substage_leave(uint64_t previous) {
+void preprocess_substage_leave(uint64_t previous) {
   if (previous == UINT64_MAX || !preprocess_substage_is_worker()) return;
   atomic_store_explicit(&s_worker_substage, (unsigned)(previous >> 32), memory_order_relaxed);
   atomic_store_explicit(&s_worker_callsite, (unsigned)previous, memory_order_relaxed);
@@ -75,7 +75,7 @@ static int preprocess_substage_int_leave(uint64_t previous, int result) {
 #ifdef _WIN32
 #define PREPROCESS_JOIN_SAMPLE_CAP 6001u
 #define PREPROCESS_JOIN_PHASE_BINS 13u
-#define PREPROCESS_JOIN_CALLSITE_BINS 80u
+#define PREPROCESS_JOIN_CALLSITE_BINS 128u
 typedef struct {
   unsigned samples, capped;
   unsigned phase_hits[PREPROCESS_JOIN_PHASE_BINS];
@@ -118,7 +118,7 @@ static void preprocess_join_samples_print(const PreprocessJoinSamples *samples) 
   size_t used;
   int n, saved_errno = errno;
   DWORD saved_error = GetLastError();
-  n = snprintf(line, sizeof(line), "[preprocess] worker join samples version=1 interval_ms=10 samples=%u capped=%u phase_hits=",
+  n = snprintf(line, sizeof(line), "[preprocess] worker join samples version=2 interval_ms=10 samples=%u capped=%u phase_hits=",
                samples->samples, samples->capped);
   if (n < 0 || (size_t)n >= sizeof(line)) goto done;
   used = (size_t)n;

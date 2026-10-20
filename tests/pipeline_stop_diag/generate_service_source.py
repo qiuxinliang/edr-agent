@@ -1,4 +1,4 @@
-"""Generate an opt-in real-Service pipeline diagnostic; never edit product source.
+"""Generate an opt-in real-Service pipeline/cache diagnostic; never edit product source.
 
 Use: generate_service_source.py AGENT_SOURCE_ROOT OUTPUT_DIRECTORY
 The source is read once as raw UTF-8 and every output is written as bytes, so
@@ -60,7 +60,7 @@ for name,(stage,kind) in mapping.items():
   c={'start':m.start(),'end':i,'old':old,'previous':prior,'stage':stage,'kind':kind,'owner':owner['name'],'line':s.count('\n',0,m.start())+1}
   owner['calls'].append(c);changes.append(c)
 changes.sort(key=lambda c:c['start']);assert all(a['end']<=c['start'] for a,c in zip(changes,changes[1:]))
-assert len(changes) == 79, 'review fixed 80-bin callsite inventory before changing probes'
+assert len(changes) == 79, 'review fixed pipeline IDs 1..79 before changing probes'
 for callsite_id,c in enumerate(changes,1):
  c['callsite_id']=callsite_id
  c['new']=f"PREPROCESS_SUBSTAGE_{c['kind']}({c['stage']}u, {callsite_id}u, {c['previous']}, {c['old']})"
@@ -123,7 +123,7 @@ target.write_bytes(encoded)
 actual = target.read_bytes()
 assert actual == encoded
 manifest = {
-    'schema': 'edr.test.service-substage-source.v1',
+    'schema': 'edr.test.service-substage-source.v2',
     'source': str(source), 'output': str(target),
     'source_sha256': hashlib.sha256(raw).hexdigest(),
     'generated_sha256': hashlib.sha256(actual).hexdigest(),
@@ -134,11 +134,11 @@ manifest = {
     'closed_set': {'0':'unknown','1':'decode','2':'generation','3':'token',
                    '4':'cache','5':'evidence','6':'P0','7':'correlation','8':'record'},
     'callsite_inventory': {'unknown':0,'count':79,'order':'ascending raw decoded source offset',
-                          'phase_bins':13,'callsite_bins':80},
-    'join_sampling': {'version':1,'interval_ms':10,'sample_cap':6001,'absolute_deadline_ns':60000000000,
+                          'phase_bins':13,'callsite_bins':128},
+    'join_sampling': {'version':2,'interval_ms':10,'sample_cap':6001,'absolute_deadline_ns':60000000000,
                       'clock_owner':'stop observer only','new_threads':0,
                       'deadline_boundary':'post-wait now >= deadline returns WAIT_TIMEOUT; WAIT_FAILED preserves original error',
-                      'line_prefix':'[preprocess] worker join samples version=1',
+                      'line_prefix':'[preprocess] worker join samples version=2',
                       'writer_gate':'preprocess_main registered Windows thread ID'},
     'changes': [c for c in changes if not c.get('declaration')],
     'local_previous_arrays': [{'owner': f['name'], 'size':len(f['calls'])}
@@ -160,7 +160,126 @@ manifest = {
                     'observer scheduling after the deadline can conservatively reject an earlier worker exit',
                     'unwrapped external calls retain their nearest wrapped caller ID',
                     'non-Windows generated code does not publish Windows callsite frontiers']}
-(output/'SERVICE-SOURCE-TRANSFORM-v1.json').write_bytes((json.dumps(manifest, indent=2)+'\n').encode('utf-8'))
-print(json.dumps({'source_count':1,'call_transforms':len(manifest['changes']),
-                  'inverse_raw_exact':manifest['inverse_raw_exact'],
-                  'generated_sha256':manifest['generated_sha256']}))
+# The second owner is generated independently. Only this public void body is
+# renamed; the original ABI wrapper restores every return/goto through one scope.
+cache_source = root/'src/storage/local_evidence_cache.c'
+cache_raw = cache_source.read_bytes()
+cache_text = cache_raw.decode('utf-8')
+assert '\r' not in cache_text.replace('\r\n', ''), 'unsupported cache bare CR'
+assert not ('\r\n' in cache_text and cache_text.count('\n') != cache_text.count('\r\n')), 'unsupported mixed cache line endings'
+cache_masked = mask_c(cache_text)
+cache_old_header = 'void edr_local_evidence_cache_record_behavior(const EdrBehaviorRecord *r) {'
+cache_new_header = 'static void service_diag_record_behavior_impl(const EdrBehaviorRecord *r) {'
+assert cache_text.count(cache_old_header) == 1
+cache_start = cache_text.index(cache_old_header)
+cache_open = cache_start + len(cache_old_header) - 1
+cache_depth, cache_end = 1, cache_open + 1
+while cache_depth:
+ cache_depth += (cache_masked[cache_end] == '{') - (cache_masked[cache_end] == '}');cache_end += 1
+cache_mapping = {}
+def cache_add(kind, semantic, names):
+ for name in names.split():
+  assert name not in cache_mapping
+  cache_mapping[name] = (kind, semantic)
+cache_add('VOID', 'lock_acquire', 'evidence_cache_lock')
+cache_add('VOID', 'lock_release', 'evidence_cache_unlock')
+cache_add('INT', 'value_classify', 'evidence_should_store_record evidence_is_low_value_file_noise candidate_dedupe_reuse evidence_cache_pressure_active')
+cache_add('U32', 'context_match', 'context_window_matches context_before_count')
+cache_add('INT', 'ordinary_coalesce', 'ordinary_aggregate_should_coalesce')
+cache_add('VOID', 'hot_ring_copy', 'context_ring_capture ring_record')
+cache_add('VOID', 'metric_or_failure_may_flush_sql', 'record_metric_drop record_persistence_failure')
+cache_add('INT', 'candidate_lookup_or_budget_may_maintain', 'sqlite_candidate_exists sqlite_size_budget_allow_mode')
+cache_add('INT', 'candidate_transaction', 'sqlite_record_candidate')
+cache_add('VOID', 'candidate_post_commit', 'promote_context_before_window mark_context_window candidate_dedupe_admit')
+cache_add('INT', 'context_prepare_budget_transaction', 'sqlite_record_budgeted_context_artifacts')
+cache_changes = []
+for name, (kind, semantic) in cache_mapping.items():
+ for m in re.finditer(r'\b'+name+r'\s*\(', cache_masked):
+  if not cache_open < m.start() < cache_end: continue
+  depth, end = 1, m.end()
+  while depth:
+   depth += (cache_masked[end] == '(') - (cache_masked[end] == ')');end += 1
+  cache_changes.append({'start':m.start(), 'end':end, 'old':cache_text[m.start():end],
+                        'kind':kind, 'semantic':semantic, 'owner':'edr_local_evidence_cache_record_behavior',
+                        'line':cache_text.count('\n', 0, m.start())+1})
+cache_changes.sort(key=lambda c:c['start'])
+assert len(cache_changes) == 44, 'review the fixed direct-call cache inventory'
+assert all(a['end'] <= c['start'] for a,c in zip(cache_changes, cache_changes[1:]))
+for index,c in enumerate(cache_changes):
+ site = 81 + index
+ assert site < 128, 'fixed namespace exhausted; stop instead of growing it'
+ c.update(callsite_id=site, stage=8, previous=f'cache_previous[{index}]')
+ c['new'] = f"SERVICE_CACHE_{c['kind']}({site}u, {c['previous']}, {c['old']})"
+cache_declaration = '\n  uint64_t cache_previous[44];'
+cache_bridge = '''/* Test-only cross-TU bridge: the pipeline owns the sole frontier state. */
+extern uint64_t preprocess_substage_enter(unsigned substage, unsigned callsite);
+extern void preprocess_substage_leave(uint64_t previous);
+static int service_cache_int_leave(uint64_t previous, int result) {
+  preprocess_substage_leave(previous); return result;
+}
+static uint32_t service_cache_u32_leave(uint64_t previous, uint32_t result) {
+  preprocess_substage_leave(previous); return result;
+}
+#define SERVICE_CACHE_VOID(site, previous, call) \\
+  ((previous) = preprocess_substage_enter(8u, site), (call), preprocess_substage_leave(previous))
+#define SERVICE_CACHE_INT(site, previous, call) \\
+  ((previous) = preprocess_substage_enter(8u, site), service_cache_int_leave((previous), (call)))
+#define SERVICE_CACHE_U32(site, previous, call) \\
+  ((previous) = preprocess_substage_enter(8u, site), service_cache_u32_leave((previous), (call)))
+'''
+cache_wrapper = '''
+/* One envelope covers NULL/early returns and every original goto-done path. */
+void edr_local_evidence_cache_record_behavior(const EdrBehaviorRecord *r) {
+  const uint64_t previous = preprocess_substage_enter(8u, 80u);
+  service_diag_record_behavior_impl(r);
+  preprocess_substage_leave(previous);
+}
+'''
+cache_changed = cache_text
+cache_edits = cache_changes + [
+ {'start':cache_open+1,'end':cache_open+1,'old':'','new':cache_declaration},
+ {'start':cache_start,'end':cache_start+len(cache_old_header),'old':cache_old_header,'new':cache_bridge+cache_new_header},
+ {'start':cache_end,'end':cache_end,'old':'','new':cache_wrapper}]
+for c in sorted(cache_edits, key=lambda c:c['start'], reverse=True):
+ cache_changed = cache_changed[:c['start']] + c['new'] + cache_changed[c['end']:]
+cache_restored = cache_changed.replace(cache_wrapper, '', 1).replace(cache_bridge+cache_new_header, cache_old_header, 1).replace(cache_declaration, '', 1)
+for c in reversed(cache_changes):
+ assert cache_restored.count(c['new']) == 1
+ cache_restored = cache_restored.replace(c['new'], c['old'], 1)
+assert cache_restored.encode('utf-8') == cache_raw
+assert cache_source.read_bytes() == cache_raw, 'cache source changed during generation'
+cache_target = output/'cache.service.instrumented.c'
+cache_target.write_bytes(cache_changed.encode('utf-8'))
+assert cache_target.read_bytes() == cache_changed.encode('utf-8')
+namespace = {'phase_bins':13, 'callsite_bins':128, 'unknown':0,
+             'pipeline_range':[1,79], 'cache_envelope':80, 'cache_direct_range':[81,124],
+             'max_assigned_id':124, 'unassigned_range':[125,127],
+             'single_frontier_owner':'generated pipeline registered preprocess worker',
+             'sampling_version':2}
+manifest['namespace'] = namespace
+cache_manifest = {
+ 'schema':'edr.test.service-cache-source.v2', 'source':str(cache_source), 'output':str(cache_target),
+ 'source_sha256':hashlib.sha256(cache_raw).hexdigest(),
+ 'generated_sha256':hashlib.sha256(cache_target.read_bytes()).hexdigest(),
+ 'reversed_sha256':hashlib.sha256(cache_restored.encode('utf-8')).hexdigest(),
+ 'inverse_raw_exact':True, 'generator_sha256':manifest['generator_sha256'],
+ 'template_sha256':manifest['template_sha256'], 'namespace':namespace,
+ 'changes':cache_changes,
+ 'raw_reversal':{'remove_wrapper':cache_wrapper, 'generated_header':cache_bridge+cache_new_header,
+                 'original_header':cache_old_header, 'remove_local_declaration':cache_declaration},
+ 'offset_unit':manifest['offset_unit'],
+ 'limitations':['unshipped diagnostic only; production cache source and API unchanged',
+                'same pipeline thread gate and state; non-owner calls publish nothing',
+                'envelope80 means cache-internal work not covered by a direct-call probe',
+                'site54 also covers work after record_behavior, including should_emit',
+                'metric/failure helpers may flush SQL; budget may run maintenance',
+                'context helper includes reads/budget/transaction and exact replay may not write',
+                'lock-acquire probe includes existing production lock timing work',
+                'nominal samples are not exact time, SQL attribution or additive nested costs']}
+for filename, proof in [('SERVICE-SOURCE-TRANSFORM-v2.json',manifest),
+                        ('SERVICE-CACHE-SOURCE-TRANSFORM-v2.json',cache_manifest)]:
+ (output/filename).write_bytes((json.dumps(proof, indent=2)+'\n').encode('utf-8'))
+print(json.dumps({'source_count':2,'pipeline_call_transforms':79,'cache_call_transforms':44,
+                  'inverse_raw_exact':True, 'max_assigned_id':124, 'callsite_bins':128,
+                  'generated_sha256':manifest['generated_sha256'],
+                  'cache_generated_sha256':cache_manifest['generated_sha256']}))

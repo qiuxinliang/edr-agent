@@ -436,7 +436,8 @@ jobs:
           retention-days: 7
           path: |
             ${{ runner.temp }}/service-stop-qa-${{ steps.service-stop.outputs.token }}/*.json
-            contract-build/tests/service-stop-generated/SERVICE-SOURCE-TRANSFORM-v1.json
+            contract-build/tests/service-stop-generated/SERVICE-SOURCE-TRANSFORM-v2.json
+            contract-build/tests/service-stop-generated/SERVICE-CACHE-SOURCE-TRANSFORM-v2.json
             contract-build/tests/service-stop-source-closure-*.txt
       - name: Run native critical reserve load profiles
         id: critical-load

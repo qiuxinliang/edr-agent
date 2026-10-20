@@ -479,11 +479,11 @@ function ReadStopLogSlice($Context,[long]$ElapsedMs) {
       Need ([uint64]$Matches[1] -le [uint32]::MaxValue) 'stop_log_numeric_shape';$match=@{kind='scm_status_publication_failed';stage=$null;error=[uint32]$Matches[1]}
     }elseif($line -cmatch '^\[preprocess\] worker join samples version=([0-9]{1,10}) interval_ms=([0-9]{1,10}) samples=([0-9]{1,10}) capped=([0-9]{1,10}) phase_hits=([0-9,]{1,256}) callsite_hits=([0-9,]{1,1024})$'){
       $sampleFields=@();for($field=1;$field -le 6;$field++){$sampleFields+=,[string]$Matches[$field]}
-      Need ([uint64]$sampleFields[0] -eq 1 -and [uint64]$sampleFields[1] -eq 10 -and [uint64]$sampleFields[2] -le 6001 -and [uint64]$sampleFields[3] -le 1) 'stop_log_numeric_shape'
+      Need ([uint64]$sampleFields[0] -eq 2 -and [uint64]$sampleFields[1] -eq 10 -and [uint64]$sampleFields[2] -le 6001 -and [uint64]$sampleFields[3] -le 1) 'stop_log_numeric_shape'
       $sampleCount=[int]$sampleFields[2];$sampleCapped=([int]$sampleFields[3] -eq 1)
       Need (-not $sampleCapped -or $sampleCount -eq 6001) 'stop_log_numeric_shape'
       $samplePhaseTokens=$sampleFields[4].Split([char]44);$sampleCallsiteTokens=$sampleFields[5].Split([char]44)
-      Need ($samplePhaseTokens.Count -eq 13 -and $sampleCallsiteTokens.Count -eq 80) 'stop_log_numeric_shape'
+      Need ($samplePhaseTokens.Count -eq 13 -and $sampleCallsiteTokens.Count -eq 128) 'stop_log_numeric_shape'
       $samplePhaseHits=@();$sampleCallsiteHits=@();$samplePhaseSum=[long]0;$sampleCallsiteSum=[long]0
       foreach($token in $samplePhaseTokens){$value=[uint32]0;Need ([uint32]::TryParse($token,[ref]$value) -and $value -le 6001) 'stop_log_numeric_shape';$samplePhaseHits+=,$value;$samplePhaseSum+=$value}
       foreach($token in $sampleCallsiteTokens){$value=[uint32]0;Need ([uint32]::TryParse($token,[ref]$value) -and $value -le 6001) 'stop_log_numeric_shape';$sampleCallsiteHits+=,$value;$sampleCallsiteSum+=$value}
@@ -491,7 +491,7 @@ function ReadStopLogSlice($Context,[long]$ElapsedMs) {
       Need (@($Context.diagnostic.matches|Where-Object {$_.kind -ceq 'preprocess_worker_join_samples'}).Count -eq 0) 'stop_log_join_samples_duplicate'
       # Nominal sampling cadence is not precise duration; these are independent
       # phase/callsite populations, not a joint or atomic stack observation.
-      $match=@{kind='preprocess_worker_join_samples';version=1;interval_ms=10;samples=$sampleCount;capped=$sampleCapped;phase_hits=$samplePhaseHits;callsite_hits=$sampleCallsiteHits}
+      $match=@{kind='preprocess_worker_join_samples';version=2;interval_ms=10;samples=$sampleCount;capped=$sampleCapped;phase_hits=$samplePhaseHits;callsite_hits=$sampleCallsiteHits}
     }elseif($line -cmatch '^\[preprocess\] worker substage diagnostic version=([0-9]{1,10}) substage_before=([0-9]{1,10}) substage_after=([0-9]{1,10})$'){
       Need ([uint64]$Matches[1] -eq 1 -and [uint64]$Matches[2] -le 8 -and [uint64]$Matches[3] -le 8) 'stop_log_numeric_shape'
       # Closed diagnostic vocabulary; independent loads are not a causal trace.
