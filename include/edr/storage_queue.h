@@ -109,6 +109,23 @@ EdrError edr_storage_queue_p0_source_only_commit_local_typed_handoff(
     int compressed, int recovery_audit, const EdrStorageQueueLocalEvidenceOwner *owner,
     EdrStorageQueueP0SourceOnlyLatch *successor);
 
+/* Stop-drain consumer only: at most the existing eight RAM retry owners.
+ * All entries must be typed, non-recovery local diagnostics. One FULL
+ * transaction checks every frozen owner and ordinary-lane charge, then clears
+ * the exact prepared latch (or hands off to actual remaining RAM owners).
+ * Failure acknowledges none of the entries; the caller retains them. */
+#define EDR_STORAGE_QUEUE_LOCAL_GROUP_MAX 8u
+typedef struct {
+  const char *event_id, *batch_id;
+  const uint8_t *payload;
+  size_t payload_len;
+  EdrStorageQueueLocalEvidenceOwner owner;
+} EdrStorageQueueLocalEntry;
+EdrError edr_storage_queue_p0_source_only_commit_local_group(
+    const EdrStorageQueueP0SourceOnlyLatch *expected,
+    const EdrStorageQueueLocalEntry *entries, unsigned count,
+    EdrStorageQueueP0SourceOnlyLatch *successor);
+
 /* Internal storage reader for the existing authorized cached-RTQ consumer.
  * It grants no authority and never returns raw wire to the remote caller.
  * The consumer must verify decoded scope/identity and project only fields
@@ -455,6 +472,8 @@ void edr_storage_queue_test_fail_next_enqueue_commits(unsigned count);
 /* Aborts the next queue_meta FULL commits, exercising the same SQLite
  * durable-failure boundary used by P0 source-only recovery. */
 void edr_storage_queue_test_fail_next_p0_latch_commits(unsigned count);
+/* A successful group FULL commit whose result is lost to the caller. */
+void edr_storage_queue_test_fail_next_local_group_results(unsigned count);
 /* Aborts the next deferred-match FULL commits, including atomic handoff. */
 void edr_storage_queue_test_fail_next_p0_deferred_commits(unsigned count);
 void edr_storage_queue_test_fail_next_local_retention_commits(unsigned count);

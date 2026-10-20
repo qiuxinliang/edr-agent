@@ -60,6 +60,14 @@ int edr_p0_rule_emit_ruleset_evaluation_gate(const EdrBehaviorRecord *record,
  * its own capability gate was actually accepted by SQLite. */
 int edr_p0_rule_poll_source_only_durable_retry(EdrBehaviorRecord *committed_out);
 
+/* Preprocess shutdown only, on its owning thread. While the IR is unavailable,
+ * typed pre-evaluation/ruleset diagnostics may occupy the existing eight retry
+ * slots until full or explicitly flushed. No alert/action/collector completion
+ * is batched. A failed flush retains RAM and requires a failed shutdown. */
+void edr_p0_rule_source_only_set_stop_group(int enabled);
+int edr_p0_rule_source_only_flush_stop_group(void);
+int edr_p0_rule_source_only_stop_group_failed(void);
+
 /* One due, healthy-family deferred match per call; invoked by the existing
  * preprocess loop. Snapshot and atomic queue handoff survive process restart. */
 int edr_p0_rule_poll_deferred_match(void);

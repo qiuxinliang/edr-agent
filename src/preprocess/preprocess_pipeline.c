@@ -62,6 +62,7 @@ static pthread_t s_thread;
 static int s_preprocess_active;
 static atomic_int s_stop_preprocess;
 static atomic_int s_preprocess_exited = 1;
+static atomic_int s_stop_source_unconfirmed;
 static int s_preprocess_joined;
 
 /* Diagnostic owner only: independent relaxed loads describe a coarse frontier,
@@ -1638,6 +1639,7 @@ static void process_ready_record(EdrBehaviorRecord br, const EdrEventSlot *slot,
 }
 
 static void poll_pending_process_evidence(void) {
+  if(edr_p0_rule_source_only_stop_group_failed()) return;
 #ifdef _WIN32
   EdrBehaviorRecord record;
   EdrEventSlot slot;
@@ -1647,30 +1649,37 @@ static void poll_pending_process_evidence(void) {
       atomic_load(&s_stop_preprocess), &record, &slot, &has_slot, &evidence)) {
     apply_process_evidence_result(&record, &evidence);
     process_enriched_record(record, has_slot ? &slot : NULL);
+    if(edr_p0_rule_source_only_stop_group_failed()) return;
   }
 #endif
 }
 
 static void process_pending_process_creates(void) {
+  if(edr_p0_rule_source_only_stop_group_failed()) return;
 #ifdef _WIN32
   EdrBehaviorRecord ready;
   while (edr_process_coalescer_poll(edr_monotonic_ns(), &ready)) {
     /* Deadline represents one candidate generation; this is the sole
      * NOT_EVALUABLE path when Security 4688 never arrives. */
     process_one_record(ready, NULL);
+    if(edr_p0_rule_source_only_stop_group_failed()) return;
   }
 #endif
 }
 
 static void drain_stopping_process_creates(void) {
+  if(edr_p0_rule_source_only_stop_group_failed()) return;
 #ifdef _WIN32
   EdrBehaviorRecord ready;
-  while (edr_process_coalescer_drain_stopping(&ready))
+  while (edr_process_coalescer_drain_stopping(&ready)) {
     process_one_record(ready, NULL);
+    if(edr_p0_rule_source_only_stop_group_failed()) return;
+  }
 #endif
 }
 
 static void poll_p0_source_only_durable_retry(void) {
+  if(edr_p0_rule_source_only_stop_group_failed()) return;
   EdrBehaviorRecord committed;
   /* Startup may see the queue before the authenticated IR becomes ready; run
    * the idempotent lifecycle recovery on each preprocess turn so it can emit
@@ -1700,11 +1709,6 @@ static void poll_p0_source_only_durable_retry(void) {
 
 static void process_one_slot(const EdrEventSlot *slot) {
   EdrBehaviorRecord br;
-#ifdef _WIN32
-  /* Expiry is checked before an arriving record can observe a prior slot, so
-   * a delayed 4688/PID reuse event can never join an expired generation. */
-  process_pending_process_creates();
-#endif
   edr_behavior_from_slot(slot, &br);
   edr_validation_trace_event(&br, "normalized", "decoded");
   if (br.collector_evidence_gate[0]) {
@@ -1830,16 +1834,30 @@ static void *preprocess_main(void *arg) {
 #endif
   (void)arg;
   for (;;) {
+    if(atomic_load(&s_stop_preprocess)) {
+      /* The busy try_pop/continue path is also the shutdown drain. Do not
+       * defer ownership on healthy-IR evaluation or change action semantics. */
+      if(edr_p0_rule_ir_is_ready()) {
+        if(!edr_p0_rule_source_only_flush_stop_group()) goto source_unconfirmed;
+        edr_p0_rule_source_only_set_stop_group(0);
+      } else edr_p0_rule_source_only_set_stop_group(1);
+    }
     edr_health_beat(EDR_HEALTH_PREPROCESS);
     atomic_store_explicit(&s_worker_phase, PREPROCESS_PHASE_PENDING_EVIDENCE, memory_order_relaxed);
     poll_pending_process_evidence();
     atomic_store_explicit(&s_worker_phase, PREPROCESS_PHASE_PMFE_RECOVERY, memory_order_relaxed);
     poll_pmfe_followup_recovery();
+    if(edr_p0_rule_source_only_stop_group_failed()) goto source_unconfirmed;
+    /* Expire old process generations before taking the arriving bus owner.
+     * If expiry cannot commit, that next slot must remain on the bus. */
+    process_pending_process_creates();
+    if(edr_p0_rule_source_only_stop_group_failed()) goto source_unconfirmed;
     EdrEventSlot slot;
     if (edr_event_bus_try_pop(s_bus, &slot)) {
       atomic_store_explicit(&s_worker_phase, PREPROCESS_PHASE_SLOT, memory_order_relaxed);
       process_one_slot(&slot);
       atomic_fetch_add_explicit(&s_worker_completed_slots, 1u, memory_order_relaxed);
+      if(edr_p0_rule_source_only_stop_group_failed()) goto source_unconfirmed;
       atomic_store_explicit(&s_worker_phase, PREPROCESS_PHASE_PENDING_CREATE, memory_order_relaxed);
       process_pending_process_creates();
       atomic_store_explicit(&s_worker_phase, PREPROCESS_PHASE_P0_RETRY, memory_order_relaxed);
@@ -1852,9 +1870,13 @@ static void *preprocess_main(void *arg) {
       edr_correlation_poll_maintenance(0); /* 内部节流；同预处理线程，满足契约 */
       atomic_store_explicit(&s_worker_phase, PREPROCESS_PHASE_SUMMARY, memory_order_relaxed);
       poll_summary_flush();
+      if(edr_p0_rule_source_only_stop_group_failed()) goto source_unconfirmed;
       atomic_fetch_add_explicit(&s_worker_completed_loops, 1u, memory_order_relaxed);
       continue;
     }
+    /* A partial tail has no next slot that could fill its group. */
+    if(atomic_load(&s_stop_preprocess) &&
+        !edr_p0_rule_source_only_flush_stop_group()) goto source_unconfirmed;
     atomic_store_explicit(&s_worker_phase, PREPROCESS_PHASE_BATCH, memory_order_relaxed);
     edr_event_batch_poll_timeout();
     atomic_store_explicit(&s_worker_phase, PREPROCESS_PHASE_PENDING_CREATE, memory_order_relaxed);
@@ -1871,10 +1893,15 @@ static void *preprocess_main(void *arg) {
 #ifdef _WIN32
     if (s_stop_preprocess) {
       atomic_store_explicit(&s_worker_phase, PREPROCESS_PHASE_STOP_DRAIN, memory_order_relaxed);
-      while (edr_event_bus_try_pop(s_bus, &slot)) {
+      for (;;) {
+        process_pending_process_creates();
+        if(edr_p0_rule_source_only_stop_group_failed()) goto source_unconfirmed;
+        if(!edr_event_bus_try_pop(s_bus,&slot)) break;
         process_one_slot(&slot);
         atomic_fetch_add_explicit(&s_worker_completed_slots, 1u, memory_order_relaxed);
+        if(edr_p0_rule_source_only_stop_group_failed()) goto source_unconfirmed;
       }
+      if(!edr_p0_rule_source_only_flush_stop_group()) goto source_unconfirmed;
       atomic_store_explicit(&s_worker_phase, PREPROCESS_PHASE_P0_RETRY, memory_order_relaxed);
       poll_p0_source_only_durable_retry();
       atomic_store_explicit(&s_worker_phase, PREPROCESS_PHASE_CACHE, memory_order_relaxed);
@@ -1886,10 +1913,15 @@ static void *preprocess_main(void *arg) {
 #else
     if (s_stop_preprocess) {
       atomic_store_explicit(&s_worker_phase, PREPROCESS_PHASE_STOP_DRAIN, memory_order_relaxed);
-      while (edr_event_bus_try_pop(s_bus, &slot)) {
+      for (;;) {
+        process_pending_process_creates();
+        if(edr_p0_rule_source_only_stop_group_failed()) goto source_unconfirmed;
+        if(!edr_event_bus_try_pop(s_bus,&slot)) break;
         process_one_slot(&slot);
         atomic_fetch_add_explicit(&s_worker_completed_slots, 1u, memory_order_relaxed);
+        if(edr_p0_rule_source_only_stop_group_failed()) goto source_unconfirmed;
       }
+      if(!edr_p0_rule_source_only_flush_stop_group()) goto source_unconfirmed;
       atomic_store_explicit(&s_worker_phase, PREPROCESS_PHASE_P0_RETRY, memory_order_relaxed);
       poll_p0_source_only_durable_retry();
       atomic_store_explicit(&s_worker_phase, PREPROCESS_PHASE_CACHE, memory_order_relaxed);
@@ -1905,8 +1937,14 @@ static void *preprocess_main(void *arg) {
   drain_stopping_process_creates();
   atomic_store_explicit(&s_worker_phase, PREPROCESS_PHASE_PENDING_EVIDENCE, memory_order_relaxed);
   poll_pending_process_evidence();
+  if(!edr_p0_rule_source_only_flush_stop_group()) goto source_unconfirmed;
+  edr_p0_rule_source_only_set_stop_group(0);
   atomic_store_explicit(&s_worker_phase, PREPROCESS_PHASE_P0_RETRY, memory_order_relaxed);
   poll_p0_source_only_durable_retry();
+  EdrP0EmitMetrics source_state={0};
+  edr_p0_rule_get_emit_metrics(&source_state);
+  if(source_state.source_only_retry_pending || edr_event_bus_used_approx(s_bus) ||
+      edr_p0_rule_source_only_stop_group_failed()) goto source_unconfirmed;
 #ifdef _WIN32
   atomic_store_explicit(&s_worker_phase, PREPROCESS_PHASE_WORKER_EXIT, memory_order_relaxed);
   atomic_store(&s_preprocess_exited, 1);
@@ -1914,6 +1952,16 @@ static void *preprocess_main(void *arg) {
 #else
   atomic_store_explicit(&s_worker_phase, PREPROCESS_PHASE_WORKER_EXIT, memory_order_relaxed);
   atomic_store(&s_preprocess_exited, 1);
+  return NULL;
+#endif
+source_unconfirmed:
+  atomic_store(&s_stop_source_unconfirmed,1);
+  fprintf(stderr,"[preprocess] shutdown failed: local source commit unconfirmed; retaining worker dependencies\n");
+  atomic_store_explicit(&s_worker_phase,PREPROCESS_PHASE_WORKER_EXIT,memory_order_relaxed);
+  atomic_store(&s_preprocess_exited,1);
+#ifdef _WIN32
+  return 1;
+#else
   return NULL;
 #endif
 }
@@ -1962,6 +2010,7 @@ EdrError edr_preprocess_start(EdrEventBus *bus, const EdrConfig *cfg) {
   atomic_store_explicit(&s_worker_completed_loops, 0u, memory_order_relaxed);
   atomic_store_explicit(&s_worker_completed_slots, 0u, memory_order_relaxed);
   atomic_store(&s_preprocess_exited, 0);
+  atomic_store(&s_stop_source_unconfirmed, 0);
 #ifdef _WIN32
   s_stop_preprocess = 0;
   s_thread = CreateThread(NULL, 0, preprocess_main, NULL, 0, NULL);
@@ -2075,6 +2124,7 @@ int edr_preprocess_stop(void) {
 #endif
     s_preprocess_joined = 1;
   }
+  if(atomic_load(&s_stop_source_unconfirmed)) return 0;
   if (AVE_DrainBehaviorMonitor(30000u) != AVE_OK) {
     fprintf(stderr, "[preprocess] shutdown timed out: AVE still owns the batch sink\n");
     return 0;

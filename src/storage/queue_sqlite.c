@@ -73,6 +73,7 @@ static int s_test_terminal_commit_active;
 static unsigned s_test_enqueue_commit_failures;
 static int s_test_enqueue_commit_active;
 static unsigned s_test_p0_latch_commit_failures;
+static unsigned s_test_local_group_result_failures;
 static int s_test_p0_latch_commit_active;
 static unsigned s_test_p0_deferred_commit_failures;
 static int s_test_p0_deferred_commit_active;
@@ -2849,6 +2850,11 @@ void edr_storage_queue_test_fail_next_p0_latch_commits(unsigned count) {
   s_test_p0_latch_commit_failures = count;
   queue_state_unlock();
 }
+void edr_storage_queue_test_fail_next_local_group_results(unsigned count) {
+  queue_state_lock();
+  s_test_local_group_result_failures=count;
+  queue_state_unlock();
+}
 
 void edr_storage_queue_test_fail_next_p0_deferred_commits(unsigned count) {
   queue_state_lock();
@@ -5233,6 +5239,68 @@ static int source_only_frozen_exists_locked(const char *batch_id,const uint8_t *
   sqlite3_finalize(st);return matches?1:-2;
 }
 
+/* Caller owns the write transaction; ledger triggers charge each insertion. */
+static EdrError source_only_insert_locked(const char *event_id, const char *batch_id,
+    const uint8_t *payload, size_t payload_len, int compressed, int local_owner,
+    int canonical_audit, const EdrStorageQueueLocalEvidenceOwner *owner,
+    const char *payload_sha, const char *owner_sha) {
+  sqlite3_stmt *st=NULL;
+  int rc;
+  /* Local-v3 owns retained investigation facts, not a remote delivery
+   * obligation. Its severity and durable latch semantics stay unchanged,
+   * but it cannot consume either delivery reservation. Check under the
+   * same write transaction as the payload and latch transition. Legacy
+   * inventory remains charged and protected; a lower ceiling never
+   * authorizes deleting an existing owner or inventing an ACK. */
+  if (!queue_capacity_admit_locked(
+          queue_add_bytes(queue_event_live_cost(batch_id,payload_len),owner?local_owner_cost(event_id,owner):0u),
+          canonical_audit ? QUEUE_CAPACITY_LOCAL_RECOVERY_AUDIT :
+          local_owner ? QUEUE_CAPACITY_ORDINARY : QUEUE_CAPACITY_P0_SOURCE_ONLY)) {
+    return EDR_ERR_QUEUE_FULL;
+  }
+  if (sqlite3_prepare_v2(
+          s_db,
+          "INSERT INTO event_queue(batch_id,payload,created_at,compressed,severity,status,terminal_reason,"
+          "retention_class,retention_policy_version,local_source_event_id,local_reason,local_endpoint_id,local_tenant_id,"
+          "local_event_time_ns,local_event_type,local_pid,local_parent_pid,local_start_key,local_birth,"
+          "local_parent_start_key,local_parent_birth,local_payload_sha256,local_owner_sha256) "
+          "VALUES(?,?,?,?,2,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?);",
+          -1, &st, NULL) != SQLITE_OK) {
+    return EDR_ERR_SQLITE_WRITE;
+  }
+  sqlite3_bind_text(st, 1, batch_id, -1, SQLITE_TRANSIENT);
+  sqlite3_bind_blob(st, 2, payload, (int)payload_len, SQLITE_TRANSIENT);
+  sqlite3_bind_int64(st, 3, owner?delivery_time():(sqlite3_int64)time(NULL));
+  sqlite3_bind_int(st, 4, compressed ? 1 : 0);
+  sqlite3_bind_text(st, 5, local_owner ? "local_evidence" : "pending", -1, SQLITE_STATIC);
+  sqlite3_bind_text(st, 6, canonical_audit ? "source_only_local_recovery_v3" : local_owner ? "source_only_local_v3" : "", -1, SQLITE_STATIC);
+  sqlite3_bind_int(st, 7, local_owner ? 1 : 2);
+  sqlite3_bind_int(st,8,owner?2:1);
+  sqlite3_bind_text(st,9,owner?event_id:"",-1,SQLITE_TRANSIENT);
+  sqlite3_bind_text(st,10,owner?owner->diagnostic_reason:"",-1,SQLITE_TRANSIENT);
+  sqlite3_bind_text(st,11,owner?owner->endpoint_id:"",-1,SQLITE_TRANSIENT);
+  sqlite3_bind_text(st,12,owner?owner->tenant_id:"",-1,SQLITE_TRANSIENT);
+  sqlite3_bind_int64(st,13,owner?owner->event_time_ns:0);
+  sqlite3_bind_int64(st,14,owner?owner->event_type:0);
+  sqlite3_bind_int64(st,15,owner?owner->pid:0);
+  sqlite3_bind_int64(st,16,owner?owner->parent_pid:0);
+  for(int field=0;field<4;++field) {
+    char text[21]="";
+    if(owner) local_u64_decimal(field==0?owner->process_start_key:field==1?owner->process_creation_filetime_100ns:
+        field==2?owner->parent_process_start_key:owner->parent_process_creation_filetime_100ns,text);
+    sqlite3_bind_text(st,17+field,text,-1,SQLITE_TRANSIENT);
+  }
+  sqlite3_bind_text(st,21,payload_sha,-1,SQLITE_TRANSIENT);
+  sqlite3_bind_text(st,22,owner_sha,-1,SQLITE_TRANSIENT);
+  rc = sqlite3_step(st);
+  sqlite3_finalize(st);
+  st = NULL;
+  if (rc != SQLITE_DONE) {
+    return EDR_ERR_SQLITE_WRITE;
+  }
+  return EDR_OK;
+}
+
 /* The remote-v2 and local-v3 insert paths share immutable storage, but their
  * ownership resolution is explicit and distinct. FULL commit makes evidence
  * retention and its own latch transition atomic without inventing a remote ACK. */
@@ -5252,7 +5320,6 @@ static EdrError source_only_enqueue(
   int existing = 0;
   int add_pending = 0;
   int should_bind = 0;
-  int rc;
   EdrError result = EDR_ERR_SQLITE_WRITE;
   char payload_sha[65]="",owner_sha[65]="";
   if (!expected || expected->owner_version != (local_owner ? 3u : 2u) ||
@@ -5326,63 +5393,10 @@ static EdrError source_only_enqueue(
   if(existing && source_only_frozen_exists_locked(batch_id,payload,payload_len,compressed,local_owner,
       owner?owner_sha:NULL)!=1) goto replay_missing;
   if (add_pending) {
-    /* Local-v3 owns retained investigation facts, not a remote delivery
-     * obligation. Its severity and durable latch semantics stay unchanged,
-     * but it cannot consume either delivery reservation. Check under the
-     * same write transaction as the payload and latch transition. Legacy
-     * inventory remains charged and protected; a lower ceiling never
-     * authorizes deleting an existing owner or inventing an ACK. */
-    if (!queue_capacity_admit_locked(
-            queue_add_bytes(queue_event_live_cost(batch_id,payload_len),owner?local_owner_cost(event_id,owner):0u),
-            canonical_audit ? QUEUE_CAPACITY_LOCAL_RECOVERY_AUDIT :
-            local_owner ? QUEUE_CAPACITY_ORDINARY : QUEUE_CAPACITY_P0_SOURCE_ONLY)) {
-      (void)queue_p0_latch_end_durable_locked(0);
-      queue_state_unlock();
-      return EDR_ERR_QUEUE_FULL;
-    }
-    if (sqlite3_prepare_v2(
-            s_db,
-            "INSERT INTO event_queue(batch_id,payload,created_at,compressed,severity,status,terminal_reason,"
-            "retention_class,retention_policy_version,local_source_event_id,local_reason,local_endpoint_id,local_tenant_id,"
-            "local_event_time_ns,local_event_type,local_pid,local_parent_pid,local_start_key,local_birth,"
-            "local_parent_start_key,local_parent_birth,local_payload_sha256,local_owner_sha256) "
-            "VALUES(?,?,?,?,2,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?);",
-            -1, &st, NULL) != SQLITE_OK) {
-      (void)queue_p0_latch_end_durable_locked(0);
-      queue_state_unlock();
-      return EDR_ERR_SQLITE_WRITE;
-    }
-    sqlite3_bind_text(st, 1, batch_id, -1, SQLITE_TRANSIENT);
-    sqlite3_bind_blob(st, 2, payload, (int)payload_len, SQLITE_TRANSIENT);
-    sqlite3_bind_int64(st, 3, owner?delivery_time():(sqlite3_int64)time(NULL));
-    sqlite3_bind_int(st, 4, compressed ? 1 : 0);
-    sqlite3_bind_text(st, 5, local_owner ? "local_evidence" : "pending", -1, SQLITE_STATIC);
-    sqlite3_bind_text(st, 6, canonical_audit ? "source_only_local_recovery_v3" : local_owner ? "source_only_local_v3" : "", -1, SQLITE_STATIC);
-    sqlite3_bind_int(st, 7, local_owner ? 1 : 2);
-    sqlite3_bind_int(st,8,owner?2:1);
-    sqlite3_bind_text(st,9,owner?event_id:"",-1,SQLITE_TRANSIENT);
-    sqlite3_bind_text(st,10,owner?owner->diagnostic_reason:"",-1,SQLITE_TRANSIENT);
-    sqlite3_bind_text(st,11,owner?owner->endpoint_id:"",-1,SQLITE_TRANSIENT);
-    sqlite3_bind_text(st,12,owner?owner->tenant_id:"",-1,SQLITE_TRANSIENT);
-    sqlite3_bind_int64(st,13,owner?owner->event_time_ns:0);
-    sqlite3_bind_int64(st,14,owner?owner->event_type:0);
-    sqlite3_bind_int64(st,15,owner?owner->pid:0);
-    sqlite3_bind_int64(st,16,owner?owner->parent_pid:0);
-    for(int field=0;field<4;++field) {
-      char text[21]="";
-      if(owner) local_u64_decimal(field==0?owner->process_start_key:field==1?owner->process_creation_filetime_100ns:
-          field==2?owner->parent_process_start_key:owner->parent_process_creation_filetime_100ns,text);
-      sqlite3_bind_text(st,17+field,text,-1,SQLITE_TRANSIENT);
-    }
-    sqlite3_bind_text(st,21,payload_sha,-1,SQLITE_TRANSIENT);
-    sqlite3_bind_text(st,22,owner_sha,-1,SQLITE_TRANSIENT);
-    rc = sqlite3_step(st);
-    sqlite3_finalize(st);
-    st = NULL;
-    if (rc != SQLITE_DONE) {
-      (void)queue_p0_latch_end_durable_locked(0);
-      queue_state_unlock();
-      return EDR_ERR_SQLITE_WRITE;
+    result=source_only_insert_locked(event_id,batch_id,payload,payload_len,compressed,
+        local_owner,canonical_audit,owner,payload_sha,owner_sha);
+    if(result!=EDR_OK) {
+      (void)queue_p0_latch_end_durable_locked(0);queue_state_unlock();return result;
     }
   }
   if (local_owner && should_bind) {
@@ -5441,6 +5455,91 @@ EdrError edr_storage_queue_p0_source_only_commit_local_typed_handoff(
     int compressed,int recovery_audit,const EdrStorageQueueLocalEvidenceOwner *owner,
     EdrStorageQueueP0SourceOnlyLatch *successor) {
   return source_only_enqueue(expected,event_id,batch_id,payload,payload_len,compressed,recovery_audit,1,owner,successor);
+}
+
+EdrError edr_storage_queue_p0_source_only_commit_local_group(
+    const EdrStorageQueueP0SourceOnlyLatch *expected,
+    const EdrStorageQueueLocalEntry *entries, unsigned count,
+    EdrStorageQueueP0SourceOnlyLatch *successor) {
+  EdrStorageQueueP0SourceOnlyLatch input;
+  QueueMetaRow row;
+  char payload_sha[EDR_STORAGE_QUEUE_LOCAL_GROUP_MAX][65];
+  char owner_sha[EDR_STORAGE_QUEUE_LOCAL_GROUP_MAX][65];
+  int existed[EDR_STORAGE_QUEUE_LOCAL_GROUP_MAX];
+  uint64_t bytes=0,missing_bytes=0;
+  EdrError result=EDR_ERR_SQLITE_WRITE;
+  if(expected) {input=*expected;expected=&input;}
+  if(successor) memset(successor,0,sizeof(*successor));
+  if(!expected || !expected->latched || expected->recovery_required ||
+      expected->owner_version!=EDR_STORAGE_QUEUE_P0_SOURCE_ONLY_OWNER_LOCAL_V3 ||
+      !entries || !count || count>EDR_STORAGE_QUEUE_LOCAL_GROUP_MAX)
+    return EDR_ERR_INVALID_ARG;
+  for(unsigned i=0;i<count;++i) {
+    const EdrStorageQueueLocalEntry *e=&entries[i];
+    if(!e->event_id || !e->batch_id || !e->batch_id[0] ||
+        strlen(e->batch_id)>=EDR_STORAGE_QUEUE_P0_SOURCE_ONLY_BATCH_ID_MAX ||
+        !e->payload || !e->payload_len || e->payload_len>EDR_EGRESS_BATCH_MAX ||
+        !local_owner_valid(e->event_id,&e->owner) ||
+        !strcmp(e->owner.diagnostic_reason,"pending_assertion_lost_on_restart") ||
+        edr_sha256_hex(e->payload,e->payload_len,payload_sha[i])!=0)
+      return EDR_ERR_INVALID_ARG;
+    for(unsigned j=0;j<i;++j)
+      if(!strcmp(e->batch_id,entries[j].batch_id)) return EDR_ERR_INVALID_ARG;
+    local_owner_hash(e->event_id,&e->owner,payload_sha[i],owner_sha[i]);
+    bytes=queue_add_bytes(bytes,queue_add_bytes(queue_event_live_cost(e->batch_id,e->payload_len),
+        local_owner_cost(e->event_id,&e->owner)));
+  }
+  queue_state_lock();
+  if(!s_db || queue_meta_read_locked(&row)!=0 ||
+      !queue_meta_matches_latch(&row,expected) ||
+      strcmp(row.latch_state,EDR_QUEUE_META_STATE_PREPARED)) goto done;
+  for(unsigned i=0;i<count;++i) {
+    const EdrStorageQueueLocalEntry *e=&entries[i];
+    existed[i]=source_only_frozen_exists_locked(e->batch_id,e->payload,e->payload_len,0,1,owner_sha[i]);
+    if(existed[i]<0) {result=existed[i]==-2?EDR_ERR_INVALID_ARG:EDR_ERR_SQLITE_WRITE;goto done;}
+    if(!existed[i]) missing_bytes=queue_add_bytes(missing_bytes,
+        queue_add_bytes(queue_event_live_cost(e->batch_id,e->payload_len),
+            local_owner_cost(e->event_id,&e->owner)));
+  }
+  if(missing_bytes) queue_local_retention_pressure_locked(missing_bytes);
+  /* Reserve the entire group's possible page/index/WAL growth, not eight
+   * independent estimates against the same free-space observation. */
+  if(!queue_write_pages_admit_rows_locked(bytes,count,0) ||
+      queue_p0_latch_begin_durable_locked(0)!=0) goto done;
+  if(queue_meta_read_locked(&row)!=0 || !queue_meta_matches_latch(&row,expected) ||
+      strcmp(row.latch_state,EDR_QUEUE_META_STATE_PREPARED)) goto rollback;
+  for(unsigned i=0;i<count;++i) {
+    const EdrStorageQueueLocalEntry *e=&entries[i];
+    int exists=source_only_frozen_exists_locked(e->batch_id,e->payload,e->payload_len,0,1,owner_sha[i]);
+    if(existed[i] && exists!=1) {result=EDR_ERR_SQLITE_WRITE;goto rollback;}
+    if(exists<0) {result=exists==-2?EDR_ERR_INVALID_ARG:EDR_ERR_SQLITE_WRITE;goto rollback;}
+    if(!exists) {
+      result=source_only_insert_locked(e->event_id,e->batch_id,e->payload,e->payload_len,
+          0,1,0,&e->owner,payload_sha[i],owner_sha[i]);
+      if(result!=EDR_OK) goto rollback;
+    }
+  }
+  result=EDR_ERR_SQLITE_WRITE;
+  queue_meta_clear_latch_locked(&row);
+  if(successor && queue_meta_begin_new_latch_locked(&row,0,"")!=0) goto rollback;
+  if(queue_meta_write_locked(&row)!=0 || queue_p0_latch_end_durable_locked(1)!=0)
+    goto rollback;
+#ifdef EDR_STORAGE_QUEUE_TESTING
+  /* Real FULL commit, deliberately unconfirmed return; caller must retain
+   * RAM without assuming rollback or preparing a false loss assertion. */
+  if(s_test_local_group_result_failures) {
+    s_test_local_group_result_failures--;
+    goto done;
+  }
+#endif
+  if(successor) queue_meta_export_latch(&row,successor);
+  result=EDR_OK;
+  goto done;
+rollback:
+  (void)queue_p0_latch_end_durable_locked(0);
+done:
+  queue_state_unlock();
+  return result;
 }
 
 static int terminal_text_valid(const char *value) { return queue_text_valid(value); }
@@ -7487,6 +7586,15 @@ EdrError edr_storage_queue_p0_source_only_commit_local_typed_handoff(
   if(successor) memset(successor,0,sizeof(*successor));return EDR_ERR_SQLITE_OPEN;
 }
 
+EdrError edr_storage_queue_p0_source_only_commit_local_group(
+    const EdrStorageQueueP0SourceOnlyLatch *expected,
+    const EdrStorageQueueLocalEntry *entries,unsigned count,
+    EdrStorageQueueP0SourceOnlyLatch *successor) {
+  (void)expected;(void)entries;(void)count;
+  if(successor) memset(successor,0,sizeof(*successor));
+  return EDR_ERR_SQLITE_OPEN;
+}
+
 int edr_storage_queue_query_local_snapshot(const EdrStorageQueueLocalQuery *query,
     EdrStorageQueueLocalQueryVisit visit,EdrStorageQueueLocalQueryCancel cancel,
     void *user,EdrStorageQueueLocalQueryStats *stats) {
@@ -7511,6 +7619,7 @@ EdrError edr_storage_queue_p0_source_only_commit_local(
 #ifdef EDR_STORAGE_QUEUE_TESTING
 void edr_storage_queue_test_fail_next_enqueue_commits(unsigned count) { (void)count; }
 void edr_storage_queue_test_fail_next_p0_latch_commits(unsigned count) { (void)count; }
+void edr_storage_queue_test_fail_next_local_group_results(unsigned count) { (void)count; }
 void edr_storage_queue_test_fail_next_p0_deferred_commits(unsigned count) { (void)count; }
 void edr_storage_queue_test_before_source_replay_transaction(void (*callback)(void *),void *user) { (void)callback;(void)user; }
 void edr_storage_queue_test_fail_next_capacity_calibration_commits(unsigned count) { (void)count; }

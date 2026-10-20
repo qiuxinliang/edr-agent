@@ -36,6 +36,23 @@ recovery. Passing it is diagnostic evidence, not Service rollback acceptance.
 No external action or network transport is initialized. Remove these probes
 when the slow boundary is resolved and its focused regression owns coverage.
 
+The shutdown path groups at most the existing eight RAM retry owners when the
+IR is unavailable. Only typed pre-evaluation/ruleset local diagnostics qualify;
+the first owner still prepares a durable latch and each wire is frozen when
+accepted. A full group or partial tail commits with FULL synchronization, exact
+owner checks, per-row capacity charges and one atomic latch transition. The
+group API is stage 39 in this diagnostic. Timings remain inclusive.
+
+`test_p0_source_only_capacity_recovery` exercises real producer/codec/SQLite
+behavior, including mixed producers, frozen command bytes, failed and
+unconfirmed commits, busy/full storage, and process exit before/after commit.
+`test_queue_recovery` checks whole-group rollback, replay without retirement,
+and rejection of legacy/recovery owners. The command resolver in the former
+test is an explicit adapter. Neither test proves Windows Service timing.
+Accepted RAM owners survive a failed flush; preprocessing reports failed
+shutdown before cleaning dependencies. No new queue, budget, upload permission
+or stop timeout is introduced.
+
 The comparison workflow also has a manual `diagnose_service_stop` input, false
 by default. Only its ARM64 job runs this second diagnosis. It builds
 `test_service_stop_agent` explicitly from the production Agent source list and

@@ -5,7 +5,7 @@ base=Path(sys.argv[2]).resolve() if len(sys.argv)>2 else template_base
 base.mkdir(parents=True,exist_ok=True)
 if len(sys.argv)<2:raise SystemExit('usage: generate_diagnostic_source.py SOURCE_DIR [OUTPUT_DIR]')
 root=Path(sys.argv[1]).resolve()
-stages=[('process_one_slot','VOID'),('process_pending_process_creates','VOID'),('process_one_record','VOID'),('enrich_process_integrity_context','VOID'),('apply_process_evidence','INT'),('process_enriched_record','VOID'),('edr_local_evidence_cache_observe_process','VOID'),('edr_local_evidence_cache_enrich_behavior','VOID'),('edr_local_evidence_cache_save_command_fact','INT'),('edr_p0_rule_try_emit_status','INT'),('edr_p0_rule_try_emit_with_command_facts_status','INT'),('edr_p0_rule_try_emit','INT'),('edr_correlation_evaluate','VOID'),('edr_ave_cross_engine_feed_from_record','VOID'),('edr_command_dispatch_recommended_forensics','INT'),('edr_local_evidence_cache_is_candidate','INT'),('edr_local_evidence_cache_record_behavior','VOID'),('edr_local_evidence_cache_pmfe_apply_scope','INT'),('edr_local_evidence_cache_poll_maintenance','VOID'),('poll_p0_source_only_durable_retry','VOID'),('edr_event_batch_poll_timeout','VOID'),('edr_correlation_poll_maintenance','VOID'),('poll_summary_flush','VOID'),('poll_pending_process_evidence','VOID'),('poll_pmfe_followup_recovery','VOID'),('edr_local_evidence_cache_resolve_commands','VOID'),('enrich_process_token_identity','INT'),('p0_bind_process_generation','INT'),('p0_resolve_live_parent_generation','INT'),('edr_behavior_from_slot','VOID'),('edr_local_evidence_cache_pmfe_result_pending','INT'),('process_ready_record','VOID'),('edr_process_evidence_request','INT'),('edr_storage_queue_p0_source_only_latch_prepare_local','INT'),('edr_storage_queue_p0_source_only_commit_local_typed_handoff','INT'),('edr_storage_queue_p0_source_only_commit_local','INT'),('p0_source_only_prepare_record','INT'),('p0_source_only_enqueue_record','INT')]
+stages=[('process_one_slot','VOID'),('process_pending_process_creates','VOID'),('process_one_record','VOID'),('enrich_process_integrity_context','VOID'),('apply_process_evidence','INT'),('process_enriched_record','VOID'),('edr_local_evidence_cache_observe_process','VOID'),('edr_local_evidence_cache_enrich_behavior','VOID'),('edr_local_evidence_cache_save_command_fact','INT'),('edr_p0_rule_try_emit_status','INT'),('edr_p0_rule_try_emit_with_command_facts_status','INT'),('edr_p0_rule_try_emit','INT'),('edr_correlation_evaluate','VOID'),('edr_ave_cross_engine_feed_from_record','VOID'),('edr_command_dispatch_recommended_forensics','INT'),('edr_local_evidence_cache_is_candidate','INT'),('edr_local_evidence_cache_record_behavior','VOID'),('edr_local_evidence_cache_pmfe_apply_scope','INT'),('edr_local_evidence_cache_poll_maintenance','VOID'),('poll_p0_source_only_durable_retry','VOID'),('edr_event_batch_poll_timeout','VOID'),('edr_correlation_poll_maintenance','VOID'),('poll_summary_flush','VOID'),('poll_pending_process_evidence','VOID'),('poll_pmfe_followup_recovery','VOID'),('edr_local_evidence_cache_resolve_commands','VOID'),('enrich_process_token_identity','INT'),('p0_bind_process_generation','INT'),('p0_resolve_live_parent_generation','INT'),('edr_behavior_from_slot','VOID'),('edr_local_evidence_cache_pmfe_result_pending','INT'),('process_ready_record','VOID'),('edr_process_evidence_request','INT'),('edr_storage_queue_p0_source_only_latch_prepare_local','INT'),('edr_storage_queue_p0_source_only_commit_local_typed_handoff','INT'),('edr_storage_queue_p0_source_only_commit_local','INT'),('p0_source_only_prepare_record','INT'),('p0_source_only_enqueue_record','INT'),('edr_storage_queue_p0_source_only_commit_local_group','INT')]
 api='''#ifndef EDR_PRIVATE_DIAG_API_H
 #define EDR_PRIVATE_DIAG_API_H
 void diag_enter(unsigned id);
@@ -22,14 +22,14 @@ header='''/* Private numeric diagnostics only; original calls execute exactly on
 #include "edr/time_util.h"
 #include "diag_api.h"
 typedef struct { uint64_t calls,total_ns,max_ns; } DiagMetric;
-static DiagMetric diag_metrics[39];
+static DiagMetric diag_metrics[40];
 static struct { unsigned stage; uint64_t start; } diag_stack[128];
 static unsigned diag_depth,diag_enabled,diag_current_incoming_slot_type;
 void diag_enter(unsigned id) { int prior_errno=errno;
 #ifdef _WIN32
 DWORD prior_error=GetLastError();
 #endif
-if(diag_enabled){assert(id>0 && id<39 && diag_depth<128);diag_stack[diag_depth].stage=id;diag_stack[diag_depth++].start=edr_monotonic_ns();}
+if(diag_enabled){assert(id>0 && id<40 && diag_depth<128);diag_stack[diag_depth].stage=id;diag_stack[diag_depth++].start=edr_monotonic_ns();}
 #ifdef _WIN32
 SetLastError(prior_error);
 #endif

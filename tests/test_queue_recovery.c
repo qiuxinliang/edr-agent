@@ -1011,6 +1011,48 @@ static void local_replay_retired_before_write(void *arg) {
     "UPDATE event_queue SET local_retention_state='retired' WHERE batch_id='race-original';"
     "DELETE FROM event_queue WHERE batch_id='race-original';COMMIT;");
 }
+static void local_group_capacity_replay_and_owner(void) {
+  char path[512],ids[8][32];test_path(path,sizeof(path),"local-group",0);remove(path);
+  edr_storage_queue_configure(1u,1u);edr_storage_queue_test_set_delivery_time(100000);
+  edr_storage_queue_test_set_local_retention_elapsed(0u);
+  assert(edr_storage_queue_open(path)==EDR_OK);
+  uint8_t *wire=calloc(1,128u*1024u);assert(wire);
+  EdrStorageQueueLocalEntry entries[8]={0};
+  for(unsigned i=0;i<8u;++i) {
+    snprintf(ids[i],sizeof(ids[i]),"group-owner-%u",i);
+    entries[i].event_id=entries[i].batch_id=ids[i];
+    entries[i].payload=wire;entries[i].payload_len=128u*1024u;
+    entries[i].owner.version=1u;entries[i].owner.diagnostic_reason="missing_cmdline";
+    entries[i].owner.endpoint_id="synthetic-endpoint";entries[i].owner.tenant_id="synthetic-tenant";
+    entries[i].owner.event_type=EDR_EVENT_PROCESS_CREATE;
+    entries[i].owner.event_time_ns=INT64_C(100000000000000);
+  }
+  EdrStorageQueueP0SourceOnlyLatch latch,after;
+  assert(edr_storage_queue_p0_source_only_latch_prepare_local(&latch)==EDR_OK);
+  assert(edr_storage_queue_p0_source_only_commit_local_group(&latch,entries,8u,NULL)==EDR_ERR_QUEUE_FULL);
+  assert(sql_number(path,"SELECT COUNT(*) FROM event_queue;")==0u);
+  assert(sql_number(path,"SELECT SUM(logical_bytes) FROM queue_capacity_ledger_v1;")==0u);
+  assert(edr_storage_queue_p0_source_only_latch_get(&after)==EDR_OK && after.latched &&
+      after.latch_counter==latch.latch_counter && !after.recovery_required);
+  EdrStorageQueueP0SourceOnlyLatch legacy=latch;legacy.owner_version=2u;
+  assert(edr_storage_queue_p0_source_only_commit_local_group(&legacy,entries,1u,NULL)==EDR_ERR_INVALID_ARG);
+  assert(edr_storage_queue_p0_source_only_commit_local_group(&latch,entries,0u,NULL)==EDR_ERR_INVALID_ARG);
+  assert(edr_storage_queue_p0_source_only_commit_local_group(&latch,entries,9u,NULL)==EDR_ERR_INVALID_ARG);
+  assert(edr_storage_queue_p0_source_only_commit_local_group(&latch,entries,3u,NULL)==EDR_OK);
+  for(unsigned i=0;i<3u;++i) original_equal(path,ids[i],wire,128u*1024u);
+  /* A pure replay needs no extra ordinary allocation, even after TTL. */
+  edr_storage_queue_test_set_local_retention_elapsed(7200u);
+  assert(edr_storage_queue_p0_source_only_latch_prepare_local(&latch)==EDR_OK);
+  assert(edr_storage_queue_p0_source_only_commit_local_group(&latch,entries,3u,NULL)==EDR_OK);
+  assert(sql_number(path,"SELECT COUNT(*) FROM event_queue;")==3u);
+  for(unsigned i=0;i<3u;++i) original_equal(path,ids[i],wire,128u*1024u);
+  assert(edr_storage_queue_p0_source_only_latch_prepare_local(&latch)==EDR_OK);
+  assert(edr_storage_queue_p0_source_only_latch_prepare_local(&latch)==EDR_OK && latch.recovery_required);
+  assert(edr_storage_queue_p0_source_only_commit_local_group(&latch,entries,1u,NULL)==EDR_ERR_INVALID_ARG);
+  assert(edr_storage_queue_p0_source_only_latch_get(&after)==EDR_OK && after.recovery_required);
+  edr_storage_queue_close();assert(remove(path)==0);free(wire);
+  puts("local group: per-row budget rolls back whole batch; pure replay preserves expired bytes; legacy/loss owner rejected");
+}
 static void local_recovery_audit_capacity_and_handoff(void) {
   char path[512],id[48],batch[80],other_id[48],other_batch[80];uint8_t wire[1040],other[1040];
   test_path(path,sizeof(path),"local-audit-capacity",0);remove(path);
@@ -1452,6 +1494,7 @@ int main(int argc,char **argv) {
   assert(_putenv_s("EDR_QUEUE_DRAIN_INTERVAL_MS","0")==0);
 #endif
   local_recovery_audit_capacity_and_handoff();
+  local_group_capacity_replay_and_owner();
   terminal_typed_source_lifecycle();
   typed_local_real_codec(0);typed_local_real_codec(1);
   terminal_hold_and_independent_retry();

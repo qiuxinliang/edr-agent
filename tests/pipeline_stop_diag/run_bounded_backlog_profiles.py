@@ -16,7 +16,7 @@ PARENT_SECONDS = 90
 FINALIZE_RESERVE_SECONDS = 5
 PRODUCER_PINS = {
     'tests/pipeline_stop_diag/fixture-main.inc':
-        ('564dbb937a86ba7d113b2a040c340ee6a750a4b00b901a241752c8c1014c6d0d', 'c36d8d1b4a11bf8fc441a47773b968932f7bb82ea6cc926c773d32e34efbf3ed'),
+        ('69b3ebc9191c814b27c50bfe2d51c3fedb5e8b197c57b82492cab97113e12ea1', 'a5d0be60967997b33de8575299765e07b70bd093d7133a1c1638f29f4c2d4c33'),
     'tests/pipeline_stop_diag/windows_parent.inc':
         ('d174c6ead743b6896321509f32b7437885db45b42abd858ea5ccdbf0f532cc20', '9d3937817ba684c021d8b545c1796a57dbef77a5d2950fc14bf89a0b176b35a6'),
 }
@@ -185,7 +185,7 @@ def validate_worker(records, slots, profile, require_resolved=True):
          drain.get('timings_inclusive') is True and
          drain.get('win_actor_branch_compiled') is True, 'worker_isolated_coverage')
     stages = [row for row in records if row.get('kind') == 'pipeline_diag_stage']
-    need([row.get('stage') for row in stages] == list(range(1, 39)), 'stage_inventory')
+    need([row.get('stage') for row in stages] == list(range(1, 40)), 'stage_inventory')
     need(all(all(exact_int(row.get(key)) for key in ('calls', 'inclusive_total_ns', 'max_ns')) and
              row['max_ns'] <= row['inclusive_total_ns'] for row in stages), 'stage_numeric_contract')
     for index in (7, 8, 27, 28):

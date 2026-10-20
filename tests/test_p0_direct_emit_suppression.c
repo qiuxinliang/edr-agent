@@ -494,6 +494,18 @@ EdrError edr_storage_queue_p0_source_only_commit_local(
   }
   return EDR_OK;
 }
+/* These capture tests never enable shutdown grouping. Its atomic storage
+ * contract is exercised by test_p0_source_only_capacity_recovery with SQLite. */
+EdrError edr_storage_queue_p0_source_only_commit_local_group(
+    const EdrStorageQueueP0SourceOnlyLatch *expected,
+    const EdrStorageQueueLocalEntry *entries,unsigned count,
+    EdrStorageQueueP0SourceOnlyLatch *successor) {
+  (void)expected;(void)entries;(void)count;
+  if(successor) memset(successor,0,sizeof(*successor));
+  assert(!"shutdown group reached a persistence capture stub");
+  return EDR_ERR_SQLITE_WRITE;
+}
+
 EdrError edr_storage_queue_p0_source_only_commit_local_typed_handoff(
     const EdrStorageQueueP0SourceOnlyLatch *expected,const char *event_id,
     const char *batch_id,const uint8_t *wire,size_t wire_len,int compressed,

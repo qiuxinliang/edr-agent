@@ -18,6 +18,8 @@
 #include <string.h>
 #include <time.h>
 #include <sqlite3.h>
+#include "retention_benchmark_support.h"
+void edr_storage_queue_test_set_physical_available(uint64_t bytes);
 #ifdef _WIN32
 #include <windows.h>
 #include <process.h>
@@ -72,7 +74,8 @@ static int wire_entered,release_wire,source_started;
 #include "../src/preprocess/p0_rule_ir_stub.c"
 #undef edr_p0_rule_ir_is_ready
 #undef edr_p0_rule_ir_artifact_healthy
-int edr_p0_rule_ir_is_ready(void) { return 1; }
+static int fixture_ir_ready=1;
+int edr_p0_rule_ir_is_ready(void) { return fixture_ir_ready; }
 int edr_p0_rule_ir_artifact_healthy(char *reason,size_t cap) {
   if(reason && cap) reason[0]=0;
   return 1;
@@ -85,6 +88,7 @@ void edr_adaptive_collection_raise(int severity,const char *rule,uint32_t pid,
 void edr_local_evidence_cache_record_behavior(const EdrBehaviorRecord *r) { (void)r; }
 bool edr_resource_preprocess_throttle_active(void) { return false; }
 static unsigned sends;
+static int changed_command_fact;
 int edr_ingest_http_configured(void) { return 1; }
 int edr_ingest_http_circuit_open(void) { return 0; }
 int edr_ingest_http_telemetry_deferred(void) { return 0; }
@@ -105,13 +109,20 @@ uint8_t *edr_behavior_record_alloc_durable_wire_facts(const EdrBehaviorRecord *r
     while(!release_wire) barrier_wait();
   }
   barrier_unlock();
+  /* Test adapter for a mutable command resolver; protobuf framing remains
+   * real. The stop owner must retain the bytes resolved at admission. */
+  EdrBehaviorRecord *changed=NULL;
+  if(changed_command_fact) {
+    changed=malloc(sizeof(*changed));assert(changed);*changed=*r;
+    strcpy(changed->cmdline,"synthetic later command fact");r=changed;
+  }
   uint8_t *wire=malloc(256u*1024u); assert(wire && !alert);
   size_t n=edr_behavior_record_encode_protobuf_full_facts(r,NULL,NULL,NULL,
       wire+16u,256u*1024u-16u); assert(n);
   uint32_t words[]={UINT32_C(0x31544142),1u,(uint32_t)n+4u,(uint32_t)n};
   for(unsigned i=0;i<4u;++i) for(unsigned j=0;j<4u;++j)
     wire[i*4u+j]=(uint8_t)(words[i]>>(j*8u));
-  *length=n+16u; return wire;
+  free(changed);*length=n+16u; return wire;
 }
 uint8_t *edr_behavior_record_alloc_durable_wire(const EdrBehaviorRecord *r,
     const AVEBehaviorAlert *alert,size_t *length) {
@@ -546,12 +557,222 @@ static void maximum_canonical_audit(void) {
   printf("maximum canonical audit: tenant=%zu endpoint=%zu JSON=%zu RAW-BAT1=%zu bytes\n",strlen(tenant),strlen(endpoint),strlen(record_out->detection_context),length);
   free(wire);free(record_out);
 }
+
+static uint64_t stop_group_case(int grouped,int fault) {
+  char path[256];snprintf(path,sizeof(path),"p0_stop_group_%ld_%d_%d.db",(long)TEST_PID,grouped,fault);
+  int64_t now=(int64_t)time(NULL);
+  fixture_ir_ready=1;open_synthetic(path,now);fixture_ir_ready=0;
+  EdrBehaviorRecord *records=calloc(19u,sizeof(*records)),*out=calloc(1,sizeof(*out));
+  assert(records && out);
+  sqlite3 *db=NULL;assert(sqlite3_open(path,&db)==SQLITE_OK);
+  edr_p0_rule_source_only_set_stop_group(grouped);
+  uint64_t sync0=retention_bench_syncs;
+  RetentionBenchMetrics start=retention_bench_metrics();
+  /* Empty scopes leave no prepared successor and no fictitious crash loss. */
+  assert(edr_p0_rule_source_only_flush_stop_group());
+  assert(!edr_storage_queue_p0_source_only_latch_is_set());
+  for(unsigned i=0;i<19u;++i) {
+    record(&records[i],900u+i,now);
+    if(i==7u && fault==1)
+      edr_storage_queue_test_fail_next_p0_latch_commits(1u);
+    if(i==7u && fault==2)
+      sql_exec(db,"CREATE TRIGGER stop_group_fail BEFORE INSERT ON event_queue "
+          "WHEN NEW.local_source_event_id='capacity-source-903' "
+          "BEGIN SELECT RAISE(ABORT,'synthetic batch middle failure');END;");
+    if(i==7u && fault==3) edr_storage_queue_test_set_physical_available(0);
+    if(i==7u && fault==4) edr_storage_queue_test_fail_next_local_group_results(1u);
+    if(i==7u && fault==5) sql_exec(db,"BEGIN IMMEDIATE;");
+    assert(edr_p0_rule_emit_pre_evaluation_gate(&records[i],"evidence_enrichment_timeout")==
+        (grouped?2:1));
+    if(fault && i==7u) {
+      if(fault==3) edr_storage_queue_test_set_physical_available(UINT64_MAX);
+      if(fault==5) sql_exec(db,"ROLLBACK;");
+      assert(edr_p0_rule_source_only_stop_group_failed());
+      assert(!edr_p0_rule_source_only_flush_stop_group()); /* no implicit retry */
+      EdrP0EmitMetrics m;edr_p0_rule_get_emit_metrics(&m);
+      assert(m.source_only_retry_pending==8u && !m.source_only_loss_detected);
+      assert(scalar(db,"SELECT COUNT(*) FROM event_queue")== (fault==4?8:0));
+      assert(edr_storage_queue_p0_source_only_latch_is_set()== (fault!=4));
+      if(fault==2) sql_exec(db,"DROP TRIGGER stop_group_fail;");
+      /* The unchanged single-owner retry can still recover the retained RAM.
+       * This is a separate explicit test step, not a successful stop result. */
+      edr_p0_rule_source_only_set_stop_group(0);
+      edr_p0_rule_test_set_monotonic_ms(1300u);
+      for(unsigned j=0;j<8u;++j) assert(edr_p0_rule_poll_source_only_durable_retry(out)==1);
+      for(unsigned j=0;j<8u;++j) assert_exact_source(db,&records[j]);
+      assert(!edr_storage_queue_p0_source_only_latch_is_set());
+      break;
+    }
+    assert(!edr_p0_rule_source_only_stop_group_failed());
+    if(grouped) assert(scalar(db,"SELECT COUNT(*) FROM event_queue")==((i+1u)/8u)*8u);
+  }
+  if(!fault) {
+    assert(edr_p0_rule_source_only_flush_stop_group());
+    assert(!edr_storage_queue_p0_source_only_latch_is_set());
+    assert(scalar(db,"SELECT COUNT(*) FROM event_queue")==19);
+    for(unsigned i=0;i<19u;++i) assert_exact_source(db,&records[i]);
+    EdrP0EmitMetrics m;edr_p0_rule_get_emit_metrics(&m);
+    assert(!m.source_only_retry_pending && !m.source_only_loss_detected &&
+        !m.source_only_retry_capacity_exhausted && !m.source_only_backpressure_failed);
+  }
+  uint64_t syncs=retention_bench_syncs-sync0;
+  RetentionBenchMetrics end=retention_bench_metrics();
+  EdrStorageQueueCapacityMetrics capacity;edr_storage_queue_get_capacity_metrics(&capacity);
+  assert(capacity.used_bytes==(uint64_t)scalar(db,"SELECT SUM(logical_bytes) FROM queue_capacity_ledger_v1"));
+  assert_local_only(db);assert(sqlite3_close(db)==SQLITE_OK);
+  edr_storage_queue_close();assert(edr_storage_queue_open(path)==EDR_OK);
+  assert(!edr_storage_queue_p0_source_only_latch_is_set());
+  edr_storage_queue_close();assert(remove(path)==0);
+  printf("stop group=%d fault=%d syncs=%llu elapsed=%.6f exact_wire_owner_ledger_no_ACK=passed\n",
+      grouped,fault,(unsigned long long)syncs,end.wall_seconds-start.wall_seconds);
+  free(records);free(out);fixture_ir_ready=1;
+  return syncs;
+}
+
+static void stop_group_contract(void) {
+  retention_bench_vfs_parent=sqlite3_vfs_find(NULL);assert(retention_bench_vfs_parent);
+  sqlite3_vfs vfs=*retention_bench_vfs_parent;
+  vfs.zName="source-stop-group-test";vfs.szOsFile+=(int)sizeof(RetentionBenchFile);
+  vfs.xOpen=retention_bench_open;assert(sqlite3_vfs_register(&vfs,1)==SQLITE_OK);
+  uint64_t single=stop_group_case(0,0),group=stop_group_case(1,0);
+  assert(group<single);
+  stop_group_case(1,1);stop_group_case(1,2);stop_group_case(1,3);
+  stop_group_case(1,4);stop_group_case(1,5);
+  assert(sqlite3_vfs_register(retention_bench_vfs_parent,1)==SQLITE_OK);
+  assert(sqlite3_vfs_unregister(&vfs)==SQLITE_OK);
+}
+
+static void stop_group_mixed_and_frozen(void) {
+  char path[256];snprintf(path,sizeof(path),"p0_stop_mixed_%ld.db",(long)TEST_PID);
+  int64_t now=(int64_t)time(NULL);fixture_ir_ready=1;open_synthetic(path,now);fixture_ir_ready=0;
+  EdrBehaviorRecord *r=calloc(9u,sizeof(*r)),*out=calloc(1,sizeof(*out));assert(r&&out);
+  edr_p0_rule_source_only_set_stop_group(1);
+  for(unsigned i=0;i<7u;++i) {
+    record(&r[i],1000u+i,now);
+    assert(edr_p0_rule_emit_pre_evaluation_gate(&r[i],"evidence_enrichment_timeout")==2);
+  }
+  record(&r[7],1007u,now);
+  /* A normal producer on another thread fills the last shared retry slot. */
+  ProducerCall call={&r[7],0,0};TestThread thread=start_thread(producer_thread,&call);
+  join_thread(thread);assert(call.result==2);
+  sqlite3 *db=NULL;assert(sqlite3_open(path,&db)==SQLITE_OK);
+  assert(scalar(db,"SELECT COUNT(*) FROM event_queue")==7);
+  EdrStorageQueueP0SourceOnlyLatch latch;
+  assert(edr_storage_queue_p0_source_only_latch_get(&latch)==EDR_OK && latch.latched && !latch.recovery_required);
+  /* The ninth event can use the released slots; its own frozen bytes survive
+   * a later change to the resolver's result before tail flush. */
+  record(&r[8],1008u,now);
+  assert(edr_p0_rule_emit_pre_evaluation_gate(&r[8],"evidence_enrichment_timeout")==2);
+  changed_command_fact=1;assert(edr_p0_rule_source_only_flush_stop_group());changed_command_fact=0;
+  assert(scalar(db,"SELECT COUNT(*) FROM event_queue")==8);
+  edr_p0_rule_test_set_monotonic_ms(1300u);
+  assert(edr_p0_rule_poll_source_only_durable_retry(out)==1 && !strcmp(out->event_id,r[7].event_id));
+  for(unsigned i=0;i<9u;++i) assert_exact_source(db,&r[i]);
+  EdrP0EmitMetrics m;edr_p0_rule_get_emit_metrics(&m);
+  assert(!m.source_only_retry_pending && !m.source_only_retry_capacity_exhausted && !m.source_only_loss_detected);
+  assert(!edr_storage_queue_p0_source_only_latch_is_set());assert_local_only(db);
+  assert(sqlite3_close(db)==SQLITE_OK);edr_storage_queue_close();assert(remove(path)==0);
+  free(r);free(out);fixture_ir_ready=1;
+  puts("stop mixed: concurrent eighth normal owner, exact frozen command, real successor and ninth admission passed");
+}
+
+static void stop_group_first_prepare_failure(void) {
+  char path[256];snprintf(path,sizeof(path),"p0_stop_prepare_%ld.db",(long)TEST_PID);
+  int64_t now=(int64_t)time(NULL);fixture_ir_ready=1;open_synthetic(path,now);fixture_ir_ready=0;
+  EdrBehaviorRecord *r=calloc(1,sizeof(*r)),*out=calloc(1,sizeof(*out));assert(r&&out);
+  record(r,1100u,now);edr_p0_rule_source_only_set_stop_group(1);
+  edr_storage_queue_test_fail_next_p0_latch_commits(1u);
+  assert(edr_p0_rule_emit_pre_evaluation_gate(r,"evidence_enrichment_timeout")==2);
+  assert(edr_p0_rule_source_only_stop_group_failed() && !edr_p0_rule_source_only_flush_stop_group());
+  assert(!edr_storage_queue_p0_source_only_latch_is_set());
+  EdrP0EmitMetrics m;edr_p0_rule_get_emit_metrics(&m);
+  assert(m.source_only_retry_pending==1 && !m.source_only_loss_detected);
+  edr_p0_rule_source_only_set_stop_group(0);edr_p0_rule_test_set_monotonic_ms(1300u);
+  changed_command_fact=1;
+  assert(edr_p0_rule_poll_source_only_durable_retry(out)==1);
+  changed_command_fact=0;
+  sqlite3 *db=NULL;assert(sqlite3_open(path,&db)==SQLITE_OK);
+  assert_exact_source(db,r);assert_local_only(db);assert(sqlite3_close(db)==SQLITE_OK);
+  edr_storage_queue_close();assert(remove(path)==0);free(r);free(out);fixture_ir_ready=1;
+  puts("stop first prepare failure: no second prepare, no false loss, exact RAM owner retained");
+}
+
+static void stop_group_crash_child(const char *path,int after_commit) {
+  int64_t now=(int64_t)time(NULL);fixture_ir_ready=1;open_synthetic(path,now);fixture_ir_ready=0;
+  EdrBehaviorRecord *r=calloc(1,sizeof(*r));assert(r);
+  char receipt[300];snprintf(receipt,sizeof(receipt),"%s.now",path);
+  FILE *f=fopen(receipt,"wb");assert(f && fwrite(&now,sizeof(now),1,f)==1 && !fclose(f));
+  edr_p0_rule_source_only_set_stop_group(1);
+  for(unsigned i=0;i<(after_commit?8u:1u);++i) {
+    record(r,1200u+i,now);
+    if(i==7u) edr_storage_queue_test_fail_next_local_group_results(1u);
+    assert(edr_p0_rule_emit_pre_evaluation_gate(r,"evidence_enrichment_timeout")==2);
+  }
+  assert(after_commit ? edr_p0_rule_source_only_stop_group_failed() :
+      edr_storage_queue_p0_source_only_latch_is_set());
+  _Exit(95); /* No clean close and no RAM retirement. */
+}
+static void stop_group_crash_restart(int after_commit) {
+  char path[256],receipt[300];snprintf(path,sizeof(path),"p0_stop_crash_%ld_%d.db",(long)TEST_PID,after_commit);
+  assert(!fopen(path,"rb"));snprintf(receipt,sizeof(receipt),"%s.now",path);
+#ifdef _WIN32
+  char executable[MAX_PATH],command[1600];DWORD n=GetModuleFileNameA(NULL,executable,sizeof(executable));
+  assert(n && n<sizeof(executable));
+  int length=snprintf(command,sizeof(command),"\"%s\" --stop-crash-child \"%s\" %d",executable,path,after_commit);
+  assert(length>0 && (size_t)length<sizeof(command));STARTUPINFOA start={0};PROCESS_INFORMATION child={0};start.cb=sizeof(start);
+  assert(CreateProcessA(executable,command,NULL,NULL,FALSE,0,NULL,NULL,&start,&child));
+  DWORD waited=WaitForSingleObject(child.hProcess,30000);if(waited!=WAIT_OBJECT_0) assert(TerminateProcess(child.hProcess,96));
+  assert(waited==WAIT_OBJECT_0);DWORD status=0;assert(GetExitCodeProcess(child.hProcess,&status) && status==95);
+  assert(CloseHandle(child.hThread) && CloseHandle(child.hProcess));
+#else
+  pid_t child=fork();assert(child>=0);if(!child) {alarm(30);stop_group_crash_child(path,after_commit);}
+  int status=0;assert(waitpid(child,&status,0)==child && WIFEXITED(status) && WEXITSTATUS(status)==95);
+#endif
+  int64_t now;FILE *f=fopen(receipt,"rb");assert(f && fread(&now,sizeof(now),1,f)==1 && !fclose(f));
+  sqlite3 *before=NULL;assert(sqlite3_open_v2(path,&before,SQLITE_OPEN_READONLY,NULL)==SQLITE_OK);
+  int64_t prior_counter=scalar(before,"SELECT source_latch_counter FROM queue_meta");
+  assert(scalar(before,"SELECT source_latch_epoch=0 FROM queue_meta")==after_commit);
+  assert(scalar(before,"SELECT COUNT(*) FROM event_queue WHERE " ORDINARY_ROW)==(after_commit?8:0));
+  assert(sqlite3_close(before)==SQLITE_OK);
+  fixture_ir_ready=1;edr_p0_rule_test_reset_dedup();edr_p0_rule_test_force_source_only_startup();
+  edr_p0_rule_test_set_monotonic_ms(2000u);
+  edr_p0_rule_source_only_set_runtime_identity("synthetic-tenant","synthetic-endpoint");
+  edr_storage_queue_configure(1,1);edr_storage_queue_test_set_local_retention_elapsed(0u);
+  assert(edr_storage_queue_open(path)==EDR_OK);
+  assert(edr_storage_queue_p0_source_only_latch_is_set());
+  /* Existing queue-open safety treats an unclean session as potentially
+   * losing pre-latch RAM too. This audit is distinct from the completed
+   * group's owner; do not weaken that conservative startup boundary. */
+  if(after_commit) {
+    assert(sqlite3_open(path,&before)==SQLITE_OK);
+    assert(scalar(before,"SELECT source_latch_counter FROM queue_meta")==prior_counter+1);
+    assert(scalar(before,"SELECT last_error='unclean_queue_session' FROM queue_meta")==1);
+    assert(sqlite3_close(before)==SQLITE_OK);
+  }
+  (void)edr_p0_rule_source_only_recover_after_queue_open();
+  assert(edr_p0_rule_source_only_recover_after_queue_open()==1);
+  sqlite3 *db=NULL;assert(sqlite3_open(path,&db)==SQLITE_OK);
+  assert(scalar(db,"SELECT COUNT(*) FROM event_queue WHERE " AUDIT_ROW)==1);
+  assert(scalar(db,"SELECT COUNT(*) FROM event_queue WHERE " ORDINARY_ROW)==(after_commit?8:0));
+  if(after_commit) {
+    EdrBehaviorRecord *r=calloc(1,sizeof(*r));assert(r);
+    for(unsigned i=0;i<8u;++i) {record(r,1200u+i,now);assert_exact_source(db,r);}
+    free(r);
+  }
+  assert_local_only(db);assert(sqlite3_close(db)==SQLITE_OK);edr_storage_queue_close();
+  assert(!remove(path) && !remove(receipt));
+  printf("stop crash after_commit=%d: real process exit, exact restart ownership and no fabricated ACK passed\n",after_commit);
+}
 int main(int argc,char **argv) {
   if(argc==3 && !strcmp(argv[1],"--crash-child")) {crash_after_audit(argv[2]);return 96;}
+  if(argc==4 && !strcmp(argv[1],"--stop-crash-child")) {stop_group_crash_child(argv[2],atoi(argv[3]));return 96;}
   assert(argc==1);
   run_case(0,0);run_case(1,0);run_case(0,1);
   clean_close_with_pending();abrupt_restart_with_pending();recreated_queue_with_pending();
   legacy_remote_owner_remains_protected();maximum_canonical_audit();
+  stop_group_contract();
+  stop_group_mixed_and_frozen();stop_group_first_prepare_failure();
+  stop_group_crash_restart(0);stop_group_crash_restart(1);
   puts("source-only capacity: exact retries, in-flight handoff and bounded loss-audit recovery converge without ACK/upload");
   return 0;
 }

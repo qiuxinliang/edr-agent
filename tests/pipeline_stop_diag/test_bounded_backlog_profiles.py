@@ -42,7 +42,7 @@ def worker_rows(n=128, profile='ready'):
         deferred_retry_degraded=0, necessary_source_owners_seeded=1,
         necessary_source_bytes_unchanged=True, all_input_dispositions_verified=False,
         required_owner_unresolved=False)
-    stages = [dict(kind='pipeline_diag_stage', stage=i, calls=1, inclusive_total_ns=100, max_ns=50) for i in range(1,39)]
+    stages = [dict(kind='pipeline_diag_stage', stage=i, calls=1, inclusive_total_ns=100, max_ns=50) for i in range(1,40)]
     return [offered, cost, drain] + stages + [state,
         dict(kind='pipeline_diag_evidence_stop', shutdown_timeouts=0,
              terminal_unhealthy=0, slots_used=0),

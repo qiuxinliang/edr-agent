@@ -28,6 +28,7 @@
 #include "edr/enrich_parent_info.h"
 #include "edr/collector.h"
 
+#include <stdatomic.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -61,7 +62,7 @@ static void p0_source_io_unlock(void) { pthread_mutex_unlock(&s_p0_source_io_loc
  * collide on all three.  EDR_P0_DEDUP_SEC=0 retains its test/compatibility
  * meaning of disabling the in-memory replay guard. */
 #define P0_DEDUP_SLOTS 64u
-#define P0_SOURCE_ONLY_RETRY_SLOTS 8u
+#define P0_SOURCE_ONLY_RETRY_SLOTS EDR_STORAGE_QUEUE_LOCAL_GROUP_MAX
 #define P0_SOURCE_ONLY_COMMITTED_SLOTS 64u
 #define P0_SOURCE_ONLY_RETRY_MS 250u
 struct p0_dedup_slot {
@@ -101,6 +102,10 @@ typedef struct p0_source_only_retry_slot {
   uint64_t next_retry_ms;
   uint8_t pending;
   uint8_t latch_valid;
+  uint8_t stop_group;
+  uint8_t *stop_wire;
+  size_t stop_wire_len;
+  char stop_batch_id[EDR_STORAGE_QUEUE_P0_SOURCE_ONLY_BATCH_ID_MAX];
 } p0_source_only_retry_slot;
 typedef struct p0_source_only_committed_slot {
   char source_event_id[EDR_BR_ID_LEN];
@@ -108,6 +113,13 @@ typedef struct p0_source_only_committed_slot {
   uint8_t valid;
 } p0_source_only_committed_slot;
 static p0_source_only_retry_slot s_p0_source_only_retry[P0_SOURCE_ONLY_RETRY_SLOTS];
+#ifdef _WIN32
+static __declspec(thread) int s_stop_group_mode;
+#else
+static _Thread_local int s_stop_group_mode;
+#endif
+
+static atomic_int s_stop_group_failed;
 static p0_source_only_committed_slot
     s_p0_source_only_committed[P0_SOURCE_ONLY_COMMITTED_SLOTS];
 static uint32_t s_p0_source_only_retry_next;
@@ -157,8 +169,10 @@ void edr_p0_rule_test_close_file_read_gate_after(unsigned checks) {
   s_p0_test_file_read_close_after = checks;
 }
 void edr_p0_rule_test_reset_dedup(void) {
+  s_stop_group_mode=s_stop_group_failed=0;
   p0_state_lock();
   memset(s_p0_dedup, 0, sizeof(s_p0_dedup));
+  for(unsigned i=0;i<P0_SOURCE_ONLY_RETRY_SLOTS;++i) free(s_p0_source_only_retry[i].stop_wire);
   memset(s_p0_source_only_retry, 0, sizeof(s_p0_source_only_retry));
   memset(s_p0_source_only_committed, 0, sizeof(s_p0_source_only_committed));
   s_p0_dedup_next = 0u;
@@ -199,7 +213,9 @@ void edr_p0_rule_test_reset_dedup(void) {
   p0_state_unlock();
 }
 void edr_p0_rule_test_force_source_only_startup(void) {
+  s_stop_group_mode=s_stop_group_failed=0;
   p0_state_lock();
+  for(unsigned i=0;i<P0_SOURCE_ONLY_RETRY_SLOTS;++i) free(s_p0_source_only_retry[i].stop_wire);
   memset(s_p0_source_only_retry, 0, sizeof(s_p0_source_only_retry));
   s_p0_source_only_terminal_unhealthy = 1;
   s_p0_source_only_unrecoverable = 0;
@@ -1353,6 +1369,50 @@ static int p0_source_only_prepare_record(const EdrBehaviorRecord *record,
          p0_source_semantic_sha256(durable, semantic_sha256, 65u);
 }
 
+static int p0_source_only_record_owner(const EdrBehaviorRecord *record,
+    EdrStorageQueueLocalEvidenceOwner *owner) {
+  /* Classification is supplied by the validated producer, never inferred
+   * from local_evidence status. The owner binds to these exact frozen bytes. */
+  cJSON *context = edr_p0_source_only_validate_record(record)
+                       ? cJSON_Parse(record->detection_context) : NULL;
+  const cJSON *reason = cJSON_GetObjectItemCaseSensitive(context, "reason");
+  const EdrP0SourceOnlyReason *contract = cJSON_IsString(reason)
+      ? edr_p0_source_only_reason_find(reason->valuestring) : NULL;
+  int typed = contract && contract->stage != EDR_P0_SOURCE_ONLY_STAGE_DIRECT &&
+      record->endpoint_id[0] && record->tenant_id[0] && record->event_time_ns >= 0;
+  memset(owner,0,sizeof(*owner));
+  if (typed) {
+    owner->version = 1u;
+    owner->diagnostic_reason = contract->reason;
+    owner->endpoint_id = record->endpoint_id;
+    owner->tenant_id = record->tenant_id;
+    owner->event_time_ns = record->event_time_ns;
+    owner->event_type = record->type;
+    owner->pid = record->pid;
+    owner->parent_pid = record->ppid;
+    owner->process_start_key = record->process_start_key;
+    owner->process_creation_filetime_100ns = record->process_creation_filetime_100ns;
+    owner->parent_process_start_key = record->parent_process_start_key;
+    owner->parent_process_creation_filetime_100ns = record->parent_process_creation_filetime_100ns;
+  }
+  cJSON_Delete(context);
+  return typed;
+}
+
+static int p0_source_only_enqueue_frozen(const EdrBehaviorRecord *record,
+    const EdrStorageQueueP0SourceOnlyLatch *latch, int recovery_audit,
+    EdrStorageQueueP0SourceOnlyLatch *successor, const uint8_t *wire,
+    size_t wire_len, const char *batch_id) {
+  EdrStorageQueueLocalEvidenceOwner owner;
+  int typed=p0_source_only_record_owner(record,&owner);
+  return (typed || successor ?
+      edr_storage_queue_p0_source_only_commit_local_typed_handoff(
+          latch,record->event_id,batch_id,wire,wire_len,0,recovery_audit,
+          typed?&owner:NULL,successor) :
+      edr_storage_queue_p0_source_only_commit_local(
+          latch,record->event_id,batch_id,wire,wire_len,0,recovery_audit))==EDR_OK;
+}
+
 static int p0_source_only_enqueue_record(const EdrBehaviorRecord *record,
                                          const EdrStorageQueueP0SourceOnlyLatch *latch,
                                          int recovery_audit,
@@ -1368,35 +1428,7 @@ static int p0_source_only_enqueue_record(const EdrBehaviorRecord *record,
     free(wire);
     return 0;
   }
-  /* Classification is supplied by the validated producer, never inferred
-   * from local_evidence status. The owner binds to these exact frozen bytes. */
-  EdrStorageQueueLocalEvidenceOwner owner = {0};
-  cJSON *context = edr_p0_source_only_validate_record(record)
-                       ? cJSON_Parse(record->detection_context) : NULL;
-  const cJSON *reason = cJSON_GetObjectItemCaseSensitive(context, "reason");
-  const EdrP0SourceOnlyReason *contract = cJSON_IsString(reason)
-      ? edr_p0_source_only_reason_find(reason->valuestring) : NULL;
-  int typed = contract && contract->stage != EDR_P0_SOURCE_ONLY_STAGE_DIRECT &&
-      record->endpoint_id[0] && record->tenant_id[0] && record->event_time_ns >= 0;
-  if (typed) {
-    owner.version = 1u;
-    owner.diagnostic_reason = contract->reason;
-    owner.endpoint_id = record->endpoint_id;
-    owner.tenant_id = record->tenant_id;
-    owner.event_time_ns = record->event_time_ns;
-    owner.event_type = record->type;
-    owner.pid = record->pid;
-    owner.parent_pid = record->ppid;
-    owner.process_start_key = record->process_start_key;
-    owner.process_creation_filetime_100ns = record->process_creation_filetime_100ns;
-    owner.parent_process_start_key = record->parent_process_start_key;
-    owner.parent_process_creation_filetime_100ns = record->parent_process_creation_filetime_100ns;
-  }
-  int ok = (typed || successor ? edr_storage_queue_p0_source_only_commit_local_typed_handoff(
-             latch, record->event_id, batch_id, wire, wire_len, 0, recovery_audit, typed?&owner:NULL,successor)
-           : edr_storage_queue_p0_source_only_commit_local(
-             latch, record->event_id, batch_id, wire, wire_len, 0, recovery_audit)) == EDR_OK;
-  cJSON_Delete(context);
+  int ok=p0_source_only_enqueue_frozen(record,latch,recovery_audit,successor,wire,wire_len,batch_id);
   free(wire);
   return ok;
 }
@@ -1410,15 +1442,34 @@ static int p0_source_only_latch_equal(const EdrStorageQueueP0SourceOnlyLatch *le
          memcmp(left->queue_nonce, right->queue_nonce, sizeof(left->queue_nonce)) == 0;
 }
 
+static int p0_source_only_flush_stop_group_io_owned(void);
+
 static int p0_source_only_store_retry(const EdrBehaviorRecord *record,
                                       const char *semantic_sha256,
                                       const EdrStorageQueueP0SourceOnlyLatch *latch,
-                                      int latch_valid) {
+                                      int latch_valid, int stop_group) {
+  p0_state_lock();
+  int already_pending=p0_source_only_exact_pending_locked(record->event_id,semantic_sha256);
+  p0_state_unlock();
+  if(already_pending) return P0_SOURCE_ONLY_DURABLE_PENDING;
+  uint8_t *frozen=NULL;
+  size_t frozen_len=0;
+  char frozen_batch[EDR_STORAGE_QUEUE_P0_SOURCE_ONLY_BATCH_ID_MAX]="";
+  if(stop_group) {
+    frozen=edr_behavior_record_alloc_durable_wire(record,NULL,&frozen_len);
+    if(!frozen || !frozen_len || !edr_behavior_durable_wire_batch_id("p0-source",
+        frozen,frozen_len,frozen_batch,sizeof(frozen_batch))) {
+      free(frozen);frozen=NULL;frozen_len=0;
+      s_stop_group_failed=1;
+      stop_group=0; /* Retain the record for explicit failure recovery. */
+    }
+  }
   uint64_t now = p0_monotonic_ms();
   uint32_t free_index = P0_SOURCE_ONLY_RETRY_SLOTS;
   p0_state_lock();
   if (p0_source_only_exact_pending_locked(record->event_id, semantic_sha256)) {
     p0_state_unlock();
+    free(frozen);
     return P0_SOURCE_ONLY_DURABLE_PENDING;
   }
   for (uint32_t offset = 0u; offset < P0_SOURCE_ONLY_RETRY_SLOTS; ++offset) {
@@ -1434,6 +1485,7 @@ static int p0_source_only_store_retry(const EdrBehaviorRecord *record,
     p0_source_only_mark_unhealthy_for_event_locked(
         "source_only_retry_capacity_exhausted", 1, record->type);
     p0_state_unlock();
+    free(frozen);
     p0_source_only_sync_persistent_latch_io_owned();
     return P0_SOURCE_ONLY_DURABLE_UNHEALTHY;
   }
@@ -1449,13 +1501,103 @@ static int p0_source_only_store_retry(const EdrBehaviorRecord *record,
     slot->generation = ++s_p0_source_only_retry_generation;
     slot->next_retry_ms = now == 0u ? 0u : now + P0_SOURCE_ONLY_RETRY_MS;
     slot->pending = 1u;
+    slot->stop_group = stop_group ? 1u : 0u;
+    slot->stop_wire=frozen;
+    slot->stop_wire_len=frozen_len;
+    snprintf(slot->stop_batch_id,sizeof(slot->stop_batch_id),"%s",frozen_batch);
     s_p0_source_only_retry_next = (free_index + 1u) % P0_SOURCE_ONLY_RETRY_SLOTS;
   }
   p0_source_only_mark_unhealthy_for_event_locked(
-      "source_only_durable_unavailable", 0, record->type);
+      stop_group ? "source_only_local_commit_pending" : "source_only_durable_unavailable",
+      0, record->type);
+  unsigned used=0,grouped=0;
+  for(unsigned i=0;i<P0_SOURCE_ONLY_RETRY_SLOTS;++i) {
+    if(s_p0_source_only_retry[i].pending) {
+      used++;
+      if(s_p0_source_only_retry[i].stop_group) grouped++;
+    }
+  }
   p0_state_unlock();
+  /* A concurrent normal producer can fill the eighth slot too. Flush the
+   * actual tagged owners before a ninth input, preserving its successor. */
+  if(used==P0_SOURCE_ONLY_RETRY_SLOTS && grouped)
+    (void)p0_source_only_flush_stop_group_io_owned();
   return P0_SOURCE_ONLY_DURABLE_PENDING;
 }
+
+/* Only the stopping preprocess thread opts in. The eight existing retry
+ * slots remain the RAM owners; collectors, actions and recovery audits keep
+ * their existing immediate/retry path and completion notifications. */
+static int p0_source_only_flush_stop_group_io_owned(void) {
+  EdrStorageQueueLocalEntry entries[P0_SOURCE_ONLY_RETRY_SLOTS]={0};
+  unsigned selected[P0_SOURCE_ONLY_RETRY_SLOTS],count=0,other=0;
+  EdrStorageQueueP0SourceOnlyLatch latch={0},successor={0};
+  int ok=0;
+  if(s_stop_group_failed) return 0;
+  p0_state_lock();
+  int unresolved=s_p0_source_only_latch_sync_required ||
+      (s_p0_source_only_unrecoverable && !s_p0_source_only_loss_audit_durable);
+  for(unsigned i=0;i<P0_SOURCE_ONLY_RETRY_SLOTS;++i) {
+    if(!s_p0_source_only_retry[i].pending) continue;
+    if(s_p0_source_only_retry[i].stop_group) selected[count++]=i;
+    else other++;
+  }
+  p0_state_unlock();
+  if(!count) return 1; /* Never prepare an empty hypothetical next owner. */
+  if(unresolved) goto done;
+  if(edr_storage_queue_p0_source_only_latch_get(&latch)!=EDR_OK ||
+      !latch.latched || latch.recovery_required ||
+      latch.owner_version!=EDR_STORAGE_QUEUE_P0_SOURCE_ONLY_OWNER_LOCAL_V3)
+    goto done;
+  for(unsigned i=0;i<count;++i) {
+    const p0_source_only_retry_slot *slot=&s_p0_source_only_retry[selected[i]];
+    const EdrBehaviorRecord *r=&slot->record;
+    if(!slot->latch_valid || !p0_source_only_latch_equal(&slot->latch,&latch) ||
+        !p0_source_only_record_owner(r,&entries[i].owner)) goto done;
+    entries[i].event_id=r->event_id;
+    entries[i].batch_id=slot->stop_batch_id;
+    entries[i].payload=slot->stop_wire;
+    entries[i].payload_len=slot->stop_wire_len;
+    if(!entries[i].payload || !entries[i].payload_len || !entries[i].batch_id[0]) goto done;
+  }
+  if(edr_storage_queue_p0_source_only_commit_local_group(&latch,entries,count,
+      other?&successor:NULL)!=EDR_OK) goto done;
+  p0_state_lock();
+  for(unsigned i=0;i<count;++i) {
+    p0_source_only_retry_slot *slot=&s_p0_source_only_retry[selected[i]];
+    p0_source_only_remember_committed_locked(slot->source_event_id,slot->source_semantic_sha256);
+    free(slot->stop_wire);
+    memset(slot,0,sizeof(*slot));
+  }
+  p0_source_only_note_commit_latch_locked(&latch,&successor);
+  s_p0_source_only_retry_committed+=count;
+  s_p0_emit_source_only_backpressure_emitted+=count;
+  p0_state_unlock();
+  ok=1;
+done:
+  if(!ok) {
+    /* COMMIT failure is unconfirmed, not proof of rollback or of loss.
+     * Preserve all exact RAM records and stop the drain before another pop.
+     * In particular do not prepare a replacement tuple on this path. */
+    s_stop_group_failed=1;
+    p0_state_lock();
+    s_p0_emit_source_only_backpressure_failed++;
+    p0_source_only_mark_unhealthy_locked("source_only_stop_commit_unconfirmed",0);
+    p0_state_unlock();
+  }
+  return ok;
+}
+
+void edr_p0_rule_source_only_set_stop_group(int enabled) {
+  s_stop_group_mode=!!enabled;
+}
+int edr_p0_rule_source_only_flush_stop_group(void) {
+  p0_source_io_lock();
+  int result=p0_source_only_flush_stop_group_io_owned();
+  p0_source_io_unlock();
+  return result;
+}
+int edr_p0_rule_source_only_stop_group_failed(void) { return s_stop_group_failed; }
 
 static int p0_source_only_submit_record_io_owned(const EdrBehaviorRecord *record) {
   EdrBehaviorRecord durable;
@@ -1479,11 +1621,41 @@ static int p0_source_only_submit_record_io_owned(const EdrBehaviorRecord *record
   int pending = p0_source_only_retry_has_pending_locked();
   p0_state_unlock();
 
+  if(s_stop_group_mode && !s_stop_group_failed && !edr_p0_rule_ir_is_ready()) {
+    EdrStorageQueueLocalEvidenceOwner owner;
+    const EdrP0SourceOnlyReason *reason=p0_source_only_record_owner(&durable,&owner)
+        ? edr_p0_source_only_reason_find(owner.diagnostic_reason) : NULL;
+    if(reason && (reason->stage==EDR_P0_SOURCE_ONLY_STAGE_PRE_EVALUATION ||
+                  reason->stage==EDR_P0_SOURCE_ONLY_STAGE_RULESET_EVALUATION)) {
+      EdrError status=pending ? edr_storage_queue_p0_source_only_latch_get(&latch) :
+          edr_storage_queue_p0_source_only_latch_prepare_local(&latch);
+      if(status==EDR_OK && latch.latched && !latch.recovery_required &&
+          latch.owner_version==EDR_STORAGE_QUEUE_P0_SOURCE_ONLY_OWNER_LOCAL_V3 &&
+          !latch.recovery_batch_id[0]) {
+        p0_state_lock();
+        p0_source_only_set_latch_locked(&latch);
+        p0_state_unlock();
+        int result=p0_source_only_store_retry(&durable,semantic_sha256,&latch,1,1);
+        if(result==P0_SOURCE_ONLY_DURABLE_UNHEALTHY) s_stop_group_failed=1;
+        return result; /* PENDING never authorizes a collector callback. */
+      }
+      /* The first prepare may have committed despite a failed return. A
+       * second prepare would turn this known RAM owner into a false loss.
+       * Retain the record and report the stop as unconfirmed instead. */
+      s_stop_group_failed=1;
+      p0_state_lock();
+      s_p0_emit_source_only_backpressure_failed++;
+      p0_state_unlock();
+      return p0_source_only_store_retry(&durable,semantic_sha256,
+          status==EDR_OK?&latch:NULL,status==EDR_OK,1);
+    }
+  }
+
   /* A known failed assertion still owns the prepared tuple. A new prepare
    * would turn it into an unknown-loss boundary and prohibit TTL reclamation
    * needed by that exact retry. Retain later sources without touching it. */
   if (pending) {
-    return p0_source_only_store_retry(&durable, semantic_sha256, NULL, 0);
+    return p0_source_only_store_retry(&durable, semantic_sha256, NULL, 0, 0);
   }
 
   memset(&latch, 0, sizeof(latch));
@@ -1510,7 +1682,7 @@ static int p0_source_only_submit_record_io_owned(const EdrBehaviorRecord *record
     p0_source_only_mark_unhealthy_for_event_locked(
         "source_only_durable_unavailable", 0, durable.type);
     p0_state_unlock();
-    return p0_source_only_store_retry(&durable, semantic_sha256, &latch, 1);
+    return p0_source_only_store_retry(&durable, semantic_sha256, &latch, 1, 0);
   }
 
   p0_state_lock();
@@ -1518,7 +1690,7 @@ static int p0_source_only_submit_record_io_owned(const EdrBehaviorRecord *record
   p0_source_only_mark_unhealthy_for_event_locked(
       "source_only_latch_prepare_failed", 0, durable.type);
   p0_state_unlock();
-  return p0_source_only_store_retry(&durable, semantic_sha256, NULL, 0);
+  return p0_source_only_store_retry(&durable, semantic_sha256, NULL, 0, 0);
 }
 
 static int p0_source_only_submit_record(const EdrBehaviorRecord *record) {
@@ -1553,7 +1725,7 @@ static int p0_source_only_poll_durable_retry_io_owned(EdrBehaviorRecord *committ
     uint32_t candidate = (s_p0_source_only_retry_next + offset) %
                          P0_SOURCE_ONLY_RETRY_SLOTS;
     p0_source_only_retry_slot *slot = &s_p0_source_only_retry[candidate];
-    if (!slot->pending || (slot->next_retry_ms != 0u && now != 0u &&
+    if (!slot->pending || (s_stop_group_mode && slot->stop_group) || (slot->next_retry_ms != 0u && now != 0u &&
                            now < slot->next_retry_ms)) {
       continue;
     }
@@ -1616,7 +1788,12 @@ static int p0_source_only_poll_durable_retry_io_owned(EdrBehaviorRecord *committ
     if(i!=selected && s_p0_source_only_retry[i].pending) other_pending=1;
   p0_state_unlock();
   EdrStorageQueueP0SourceOnlyLatch successor={0};
-  if (!p0_source_only_enqueue_record(&record, &latch,0,other_pending?&successor:NULL)) {
+  const p0_source_only_retry_slot *selected_slot=&s_p0_source_only_retry[selected];
+  int committed=selected_slot->stop_wire ? p0_source_only_enqueue_frozen(&record,&latch,0,
+      other_pending?&successor:NULL,selected_slot->stop_wire,selected_slot->stop_wire_len,
+      selected_slot->stop_batch_id) :
+      p0_source_only_enqueue_record(&record,&latch,0,other_pending?&successor:NULL);
+  if (!committed) {
     EdrStorageQueueP0SourceOnlyLatch current;
     /* A queue lifecycle or external recovery can replace this tuple despite
      * producer serialization. Keep the source and require explicit recovery
@@ -1655,6 +1832,7 @@ static int p0_source_only_poll_durable_retry_io_owned(EdrBehaviorRecord *committ
   p0_source_only_remember_committed_locked(
       s_p0_source_only_retry[selected].source_event_id,
       s_p0_source_only_retry[selected].source_semantic_sha256);
+  free(s_p0_source_only_retry[selected].stop_wire);
   memset(&s_p0_source_only_retry[selected], 0, sizeof(s_p0_source_only_retry[selected]));
   p0_source_only_note_commit_latch_locked(&latch,&successor);
   s_p0_source_only_retry_committed++;
