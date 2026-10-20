@@ -7,8 +7,9 @@
 #include <string.h>
 
 static int fail(EdrContextStore *s, const char *operation) {
+  s->sqlite_error_code = sqlite3_extended_errcode(s->db);
   snprintf(s->error, sizeof(s->error), "%s: sqlite=%d %s", operation,
-           sqlite3_extended_errcode(s->db), sqlite3_errmsg(s->db));
+           s->sqlite_error_code, sqlite3_errmsg(s->db));
   return -1;
 }
 
@@ -213,6 +214,7 @@ int edr_context_store_install_retention_guards(EdrContextStore *s) {
 }
 
 int edr_context_store_begin_upgrade(EdrContextStore *s) {
+  s->sqlite_error_code = SQLITE_OK;
   if (s->format) return 0;
   if (sql(s, "BEGIN IMMEDIATE;") != 0) return -1;
   if (sql(s, compact_schema) != 0) goto rollback;
@@ -250,14 +252,14 @@ static int decode_source(const char *artifact, size_t *prefix, unsigned char out
 sqlite3_stmt *edr_context_store_prepare_lookup(EdrContextStore *s) {
   sqlite3_stmt *st = NULL;
   const char *query = s->format ?
-      "SELECT c.candidate_id,f.fact_id,r.created_ns FROM compact_context_refs r "
+      "SELECT c.candidate_id,f.fact_id,r.created_ns,1 FROM compact_context_refs r "
       "JOIN context_candidates c ON c.id=r.candidate_key JOIN context_fact_keys f ON f.id=r.fact_key "
       "WHERE r.candidate_key=(SELECT id FROM context_candidates WHERE candidate_id=?1) AND r.source_identity=?2 "
-      "UNION ALL SELECT c.candidate_id,f.fact_id,r.created_ns FROM compact_context_refs r "
+      "UNION ALL SELECT c.candidate_id,f.fact_id,r.created_ns,1 FROM compact_context_refs r "
       "JOIN context_candidates c ON c.id=r.candidate_key JOIN context_fact_keys f ON f.id=r.fact_key "
       "WHERE r.artifact_override=?3 "
-      "UNION ALL SELECT candidate_id,fact_id,created_ns FROM candidate_context_refs WHERE artifact_id=?3;"
-      : "SELECT candidate_id,fact_id,created_ns FROM candidate_context_refs WHERE artifact_id=?3;";
+      "UNION ALL SELECT candidate_id,fact_id,created_ns,0 FROM candidate_context_refs WHERE artifact_id=?3;"
+      : "SELECT candidate_id,fact_id,created_ns,0 FROM candidate_context_refs WHERE artifact_id=?3;";
   if (prepare(s, &st, query) != 0) return NULL;
   return st;
 }
@@ -279,23 +281,32 @@ void edr_context_writer_close(EdrContextWriter *w) {
   sqlite3_finalize(w->fact_find); sqlite3_finalize(w->fact_number);
   sqlite3_finalize(w->ref_insert); sqlite3_finalize(w->old_delete);
   sqlite3_finalize(w->lookup);
+  sqlite3_finalize(w->legacy_insert);
   memset(w, 0, sizeof(*w));
 }
 
-int edr_context_writer_open(EdrContextStore *s, EdrContextWriter *w) {
+static const char legacy_ref_upsert[] =
+    "INSERT INTO candidate_context_refs(artifact_id,candidate_id,fact_id,candidate_id_json,created_ns,upload_status,minio_key) "
+    "VALUES(?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(artifact_id) DO UPDATE SET "
+    "candidate_id=excluded.candidate_id,fact_id=excluded.fact_id,candidate_id_json=excluded.candidate_id_json,"
+    "created_ns=excluded.created_ns,upload_status=excluded.upload_status,minio_key=excluded.minio_key;";
+
+int edr_context_writer_open(EdrContextStore *s, EdrContextWriter *w,
+                            int migrate_existing) {
   memset(w, 0, sizeof(*w)); w->store = s;
+  if (migrate_existing != 0 && migrate_existing != 1) {
+    snprintf(s->error, sizeof(s->error), "context writer migration mode invalid"); return -1;
+  }
+  w->migrate_existing = migrate_existing;
   if (!s->format) {
-    return prepare(s, &w->ref_insert,
-      "INSERT INTO candidate_context_refs(artifact_id,candidate_id,fact_id,candidate_id_json,created_ns,upload_status,minio_key) "
-      "VALUES(?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(artifact_id) DO UPDATE SET "
-      "candidate_id=excluded.candidate_id,fact_id=excluded.fact_id,candidate_id_json=excluded.candidate_id_json,"
-      "created_ns=excluded.created_ns,upload_status=excluded.upload_status,minio_key=excluded.minio_key;");
+    return prepare(s, &w->ref_insert, legacy_ref_upsert);
   }
   if (prepare(s, &w->candidate_find, "SELECT id,candidate_id_json FROM context_candidates WHERE candidate_id=?") ||
       prepare(s, &w->candidate_insert, "INSERT INTO context_candidates(candidate_id,candidate_id_json) VALUES(?,?)") ||
       prepare(s, &w->fact_find, "SELECT id FROM context_fact_keys WHERE fact_id=?") ||
       prepare(s, &w->fact_number, "INSERT INTO context_fact_keys(fact_id) VALUES(?)") ||
-      prepare(s, &w->old_delete, "DELETE FROM candidate_context_refs WHERE artifact_id=?") ||
+      (migrate_existing && prepare(s, &w->old_delete, "DELETE FROM candidate_context_refs WHERE artifact_id=?")) ||
+      (!migrate_existing && prepare(s, &w->legacy_insert, legacy_ref_upsert)) ||
       prepare(s, &w->ref_insert,
         "INSERT INTO compact_context_refs(candidate_key,fact_key,source_identity,artifact_override,candidate_json_override,"
         "created_ns,upload_status,minio_key) VALUES(?1,?2,?3,?4,?5,?6,?7,?8) "
@@ -313,30 +324,41 @@ int edr_context_writer_put(EdrContextWriter *w, const char *artifact, const char
                            const char *fact, const char *candidate_json, sqlite3_int64 created, int created_null,
                            const char *upload, const char *key) {
   EdrContextStore *s = w->store;
-  if (!sqlite3_get_autocommit(s->db) && artifact && candidate && fact && candidate_json) {
-    if (!s->format) {
-      sqlite3_stmt *st = w->ref_insert; reset(st);
-      if (text(st, 1, artifact) != SQLITE_OK || text(st, 2, candidate) != SQLITE_OK ||
-          text(st, 3, fact) != SQLITE_OK || text(st, 4, candidate_json) != SQLITE_OK ||
-          (created_null ? sqlite3_bind_null(st, 5) : sqlite3_bind_int64(st, 5, created)) != SQLITE_OK ||
-          text(st, 6, upload) != SQLITE_OK || text(st, 7, key) != SQLITE_OK)
-        return fail(s, "bind legacy context reference failed");
-      if (sqlite3_step(st) == SQLITE_DONE) return 0;
-      return fail(s, "write legacy context reference failed");
-    }
-  } else { snprintf(s->error, sizeof(s->error), "context reference requires valid input and transaction"); return -1; }
-  sqlite3_stmt *st = w->lookup;
-  if (edr_context_store_bind_lookup(s, st, artifact) != 0) return -1;
-  int rc = sqlite3_step(st);
-  if (rc == SQLITE_ROW) {
-    const char *owner = (const char *)sqlite3_column_text(st, 0);
-    if (!owner || strcmp(owner, candidate)) {
-      snprintf(s->error, sizeof(s->error), "context artifact candidate conflict"); reset(st); return -1;
-    }
-    rc = sqlite3_step(st);
+  sqlite3_stmt *legacy = !s->format ? w->ref_insert : NULL;
+  if (sqlite3_get_autocommit(s->db) || !artifact || !candidate || !fact || !candidate_json) {
+    snprintf(s->error, sizeof(s->error), "context reference requires valid input and transaction"); return -1;
   }
-  if (rc != SQLITE_DONE) { fail(s, "ambiguous context artifact identity"); reset(st); return -1; }
-  reset(st);
+  if (s->format) {
+    sqlite3_stmt *lookup = w->lookup;
+    if (edr_context_store_bind_lookup(s, lookup, artifact) != 0) return -1;
+    int rc = sqlite3_step(lookup);
+    if (rc == SQLITE_ROW) {
+      const char *owner = (const char *)sqlite3_column_text(lookup, 0);
+      if (!owner || strcmp(owner, candidate)) {
+        snprintf(s->error, sizeof(s->error), "context artifact candidate conflict"); reset(lookup); return -1;
+      }
+      if (sqlite3_column_type(lookup, 3) != SQLITE_INTEGER ||
+          (sqlite3_column_int(lookup, 3) != 0 && sqlite3_column_int(lookup, 3) != 1)) {
+        snprintf(s->error, sizeof(s->error), "context reference layout invalid"); reset(lookup); return -1;
+      }
+      if (!w->migrate_existing && sqlite3_column_int(lookup, 3) == 0) legacy = w->legacy_insert;
+      rc = sqlite3_step(lookup);
+    }
+    if (rc != SQLITE_DONE) { fail(s, "ambiguous context artifact identity"); reset(lookup); return -1; }
+    reset(lookup);
+  }
+  if (legacy) {
+    sqlite3_stmt *st = legacy; reset(st);
+    if (text(st, 1, artifact) != SQLITE_OK || text(st, 2, candidate) != SQLITE_OK ||
+        text(st, 3, fact) != SQLITE_OK || text(st, 4, candidate_json) != SQLITE_OK ||
+        (created_null ? sqlite3_bind_null(st, 5) : sqlite3_bind_int64(st, 5, created)) != SQLITE_OK ||
+        text(st, 6, upload) != SQLITE_OK || text(st, 7, key) != SQLITE_OK)
+      return fail(s, "bind legacy context reference failed");
+    if (sqlite3_step(st) == SQLITE_DONE) return 0;
+    return fail(s, "write legacy context reference failed");
+  }
+  sqlite3_stmt *st;
+  int rc;
   sqlite3_int64 candidate_key, fact_key;
   const char *override = NULL;
   st = w->candidate_find; reset(st);
@@ -379,10 +401,12 @@ int edr_context_writer_put(EdrContextWriter *w, const char *artifact, const char
       text(st, 7, upload) != SQLITE_OK || text(st, 8, key) != SQLITE_OK)
     return fail(s, "bind compact context reference failed");
   if (sqlite3_step(st) != SQLITE_DONE) return fail(s, "write compact context reference failed");
-  /* Moving an enriched legacy row is part of the same caller-owned transaction. */
-  st = w->old_delete; reset(st);
-  if (text(st, 1, artifact) != SQLITE_OK) return fail(s, "bind moved legacy reference failed");
-  if (sqlite3_step(st) != SQLITE_DONE) return fail(s, "remove moved legacy reference failed");
+  /* Only explicit migration moves an existing legacy row. */
+  if (w->migrate_existing) {
+    st = w->old_delete; reset(st);
+    if (text(st, 1, artifact) != SQLITE_OK) return fail(s, "bind moved legacy reference failed");
+    if (sqlite3_step(st) != SQLITE_DONE) return fail(s, "remove moved legacy reference failed");
+  }
   return 0;
 }
 
@@ -395,7 +419,7 @@ int edr_context_store_migrate_batch(EdrContextStore *s, unsigned limit,
     snprintf(s->error, sizeof(s->error), "context migration requires format 1/2 and 1..64 rows"); return -1;
   }
   if (sql(s, "BEGIN IMMEDIATE;") != 0) return -1;
-  if (edr_context_writer_open(s, &writer) != 0) goto rollback;
+  if (edr_context_writer_open(s, &writer, 1) != 0) goto rollback;
   /* Follow the existing artifact primary-key index. Rowid order can scatter
    * each small batch across the wide artifact/candidate indexes, exhausting
    * the migration reserve and repeating work after rollback. Identity order

@@ -1,5 +1,45 @@
 # Cache reliability remediation
 
+## 2026-10-20 context transaction layout follow-up
+
+常规告警与本地详细证据使用不同的投影。本改动只减少本地上下文引用的重复字符串和索引写入，不增加常规上传、命令权限或调查字段范围，也不把 ACK 当成本地证据的回收许可。
+
+固定源码 `06dd6ba3a8944aa25fa54dc00d6dc53d0f7423cb` 的 [ARM64 隔离 Service 诊断](https://github.com/qiuxinliang/edr-agent/actions/runs/39407930657) 仍未通过原 45 秒停机门槛。3774 个名义采样中，2757 个位于 `sqlite_record_context_artifacts` 事务包络（73.052%）；准备与容量包络分别只有 12、1 个。这证明主要采样边界，不能当成某条 SQL 的精确耗时或死锁证明。
+
+受控本机 6000 次、20 候选 fanout 布局对照中，关键上下文耗时由 19.660 秒降至 13.623 秒，VFS 请求写字节由 5,300,523,488 降至 3,607,229,064；事实、引用、物化投影、候选四个完整行集摘要一致。普通负载维持 40 条事实、800 条引用和 5960 次明确额度拒绝，耗时由 6.928 秒略增至 7.014 秒。该实验使用真实 SQLite、测试 P0 stub；这些数据解释布局选择，不证明本次产品补丁已通过 Windows 停机或回滚。
+
+### 布局与正常写入
+
+`local_evidence_cache.c` 通过既有 `evidence_context_store` 管理上下文事实及引用：
+
+| `storage_format` | 含义 |
+| --- | --- |
+| 0 | legacy 引用，或容量不足时暂缓启用紧凑写入 |
+| 1 | 混合布局；新身份使用紧凑引用，旧引用仍可读取 |
+| 2 | 显式迁移工具已完成该次紧凑迁移 |
+
+本次新增的启动步骤对格式 0 做一次有界、事务内的旁路 schema/header 升级。这一步不调用逐行迁移，不重新编码既有事实或冻结负载；既有开库检查、legacy artifact normalization 和维护仍是独立流程。正常写入更新已有 legacy 身份时仍在原表更新；只有显式迁移 owner 可以搬动该引用。新事实仍先校验内容身份，再在同一事务内校验保留 owner、写入事实及全部候选引用；失败不能留下任意前缀的关联。
+
+已有身份收到更完整证据时，正常的原位更新语义仍保留。因此，不能把“没有自动搬行”解释为所有可更新元数据永远逐字节不变。冻结负载、内容 hash、候选身份和恢复所有权各自的原保护规则继续生效。
+
+### 容量与故障
+
+不改变现有预算配置。`offline.max_queue_size_mb` 的 512 MiB 默认值仍是队列预算，不是 Agent 目录物理硬上限；`offline.evidence_cache_max_size_mb` 独立控制证据库，配置代码默认 128 MiB，Windows 生产示例为 512 MiB。调用方已有的预算、SQLite 页增长上限、DB/WAL 准入及卷空闲保护继续适用。
+
+达到原页数或 DB/WAL 容量上限、明确的物理空间拒绝，会保持 legacy 并设置有界状态 `compact_startup_deferred=1`。DDL 返回 `SQLITE_FULL` 时，只有事务已结束、格式读回为 0、没有残留紧凑对象且旧布局验证成功，才允许同样降级。不能确认事务、schema 或持久化结果时，开库失败并报告原因；不提高预算，不删除旧数据换取启用空间。
+
+本次 schema 提交若使 DB/WAL 超过原预算，在全部启动写入后新增一次已有物理保护的 TRUNCATE checkpoint 并复核；失败退出仍走原有关闭收尾，因此不承诺整次 open/close 只有一次 checkpoint。它不回收证据行；若长读事务、空间保护或 SQLite 错误使其不能完成，开库失败并保留已提交的格式 1，不能冒充仍处于 legacy 降级。
+
+SQLite `NORMAL` 同步方式、原 1000 页被保护的 checkpoint 节奏、每个源事件的事务边界和本地保留策略不变。紧凑布局不能保证任意负载都在固定时间内停止，也不能保证无法合法回收的旧库恢复可用空间。
+
+### 验证和启用
+
+`local_evidence_cache_context_layout` 检查默认新布局、旧行保全、原位更新、显式迁移区分、容量降级及故障恢复。它属于 Agent runtime、Windows release 和 telemetry 合同门禁。测试专用 legacy setter 只用于明确的旧布局 fixture，产品没有该开关。
+
+`--public-context6000-critical` 与 `--public-context6000-ordinary` 是独立合成负载入口。VFS 请求字节数不是设备实际 I/O；固定输入耗时包含测试入口的固定开销。本机布局对照和语义行集一致，不能替代 Windows 原生测试、45 秒 SCM 停机或真实 Headless 安装器回滚验收。
+
+首次启用会改变数据库 schema 和 header。真实库启用前应完成容量与旧数据分类、受控副本及回滚验证，并取得对应变更授权。旧缓存无法分类时保持其保护规则；本任务的合成测试和源码补丁不代表已经迁移活跃终端缓存。回滚基线 692 的源码支持格式 0/1/2，固定发行 EXE 的实际读写、健康与回滚结果仍需独立验证。
+
 ## 2026-10-17 pressure continuation follow-up
 
 Two synthetic counterfactuals use the unchanged production cache from

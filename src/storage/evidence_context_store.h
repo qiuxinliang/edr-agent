@@ -9,6 +9,7 @@
 typedef struct {
   sqlite3 *db;
   int format;
+  int sqlite_error_code; /* Original SQLite failure; rollback does not overwrite it. */
   char error[192];
 } EdrContextStore;
 
@@ -18,6 +19,8 @@ typedef struct {
   sqlite3_stmt *fact_find, *fact_number;
   sqlite3_stmt *ref_insert, *old_delete;
   sqlite3_stmt *lookup;
+  sqlite3_stmt *legacy_insert;
+  int migrate_existing;
 } EdrContextWriter;
 
 /* Read-only guard, called before normal startup can change schema or pragmas. */
@@ -39,7 +42,10 @@ int edr_context_store_migrate_batch(EdrContextStore *store, unsigned limit,
 sqlite3_stmt *edr_context_store_prepare_lookup(EdrContextStore *store);
 int edr_context_store_bind_lookup(EdrContextStore *store, sqlite3_stmt *stmt,
                                   const char *artifact_id);
-int edr_context_writer_open(EdrContextStore *store, EdrContextWriter *writer);
+/* Normal writes keep an existing legacy identity in place. Only the explicit
+ * migration owner may replace it with a compact reference in its transaction. */
+int edr_context_writer_open(EdrContextStore *store, EdrContextWriter *writer,
+                            int migrate_existing);
 int edr_context_writer_put(EdrContextWriter *writer, const char *artifact_id,
                            const char *candidate_id, const char *fact_id,
                            const char *candidate_json, sqlite3_int64 created_ns, int created_null,

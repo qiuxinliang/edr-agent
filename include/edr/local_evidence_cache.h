@@ -36,7 +36,8 @@ typedef enum {
 
 typedef struct {
   int db_open;
-  uint32_t storage_format; /* 0 legacy, 1 migrating, 2 compact */
+  uint32_t storage_format; /* 0 legacy, 1 mixed compact writes, 2 fully compact */
+  uint32_t compact_startup_deferred; /* 0/1: this open retained legacy for capacity. */
   uint64_t records_written;
   uint64_t records_dropped;
   uint64_t records_skipped;
@@ -399,6 +400,8 @@ int edr_local_evidence_cache_accounting_json(const EdrEvidenceCacheStatus *statu
                                             char *out, size_t cap);
 
 #ifdef EDR_LOCAL_EVIDENCE_CACHE_TESTING
+/* Explicit legacy-layout fixtures only; default zero exercises normal startup. */
+void edr_local_evidence_cache_test_set_legacy_context_writes(int enabled);
 /* Test-only wall clock for historical replay and retention checks. Survives
  * cache close/open; pass zero to restore the real clock after the scenario. */
 void edr_local_evidence_cache_test_set_now_unix_ns(int64_t now_ns);

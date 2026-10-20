@@ -169,6 +169,7 @@ static const char *const metric_names[METRIC_COUNT] = {
 static EdrEvidenceFailureReason s_persistence_failure = EDR_EVIDENCE_FAILURE_UNCLASSIFIED;
 #ifdef EDR_LOCAL_EVIDENCE_CACHE_TESTING
 static unsigned s_test_manifest_allocation_failures;
+static int s_test_legacy_context_writes;
 static EdrEvidenceCacheQueryCost s_test_pmfe_query_cost[2];
 #endif
 
@@ -668,6 +669,12 @@ static int identity_quality_rank(const char *q) {
 static int64_t s_test_now_unix_ns;
 static int64_t s_test_retention_monotonic_ms = -1;
 static int64_t s_test_retention_after_commit_ms = -1;
+
+void edr_local_evidence_cache_test_set_legacy_context_writes(int enabled) {
+  evidence_cache_lock();
+  s_test_legacy_context_writes = enabled != 0;
+  evidence_cache_unlock();
+}
 
 void edr_local_evidence_cache_test_set_now_unix_ns(int64_t now_ns) {
   evidence_cache_lock();
@@ -4825,7 +4832,7 @@ static int sqlite_record_context_artifacts(const EdrBehaviorRecord *r,
     sqlite3_finalize(st);
   }
   EdrContextWriter writer;
-  if (edr_context_writer_open(&s_context_store, &writer) != 0) {
+  if (edr_context_writer_open(&s_context_store, &writer, 0) != 0) {
     set_error(s_context_store.error);
     sqlite_rollback_silent();
     return -1;
@@ -4992,7 +4999,7 @@ static int sqlite_migrate_legacy_context_artifacts(void) {
       sqlite3_prepare_v2(s_db, normalize_sql, -1, &normalize_st, NULL) != SQLITE_OK ||
       sqlite3_prepare_v2(s_db, fact_sql, -1, &fact_st, NULL) != SQLITE_OK ||
       sqlite3_prepare_v2(s_db, fact_lookup_sql, -1, &fact_lookup_st, NULL) != SQLITE_OK ||
-      edr_context_writer_open(&s_context_store, &writer) != 0) {
+      edr_context_writer_open(&s_context_store, &writer, 0) != 0) {
     set_error("prepare legacy context normalization failed");
     goto done;
   }
@@ -5247,7 +5254,7 @@ static int sqlite_record_alert_parent_context(const EdrBehaviorRecord *r,
   }
   candidate_json = context_candidate_id_json(candidate_id);
   EdrContextWriter writer;
-  if (!candidate_json || edr_context_writer_open(&s_context_store, &writer) != 0) goto done;
+  if (!candidate_json || edr_context_writer_open(&s_context_store, &writer, 0) != 0) goto done;
   result = edr_context_writer_put(&writer, artifact_id, candidate_id, fact_id,
       candidate_json, written, 0, "local_manifest", "");
   edr_context_writer_close(&writer);
@@ -7359,6 +7366,118 @@ static int sqlite_ensure_incremental_vacuum(void) {
   if (sqlite_maintenance_checkpoint(SQLITE_CHECKPOINT_TRUNCATE) != 0) return -1;
   return 0;
 }
+
+static int sqlite_compact_namespace_empty(void) {
+  sqlite3_stmt *st = NULL;
+  int empty = -1;
+  if (sqlite3_prepare_v2(s_db,
+      "SELECT COUNT(*) FROM sqlite_master WHERE name COLLATE NOCASE IN ("
+      "'context_fact_keys','context_candidates','compact_context_refs',"
+      "'idx_compact_context_candidate_time','idx_compact_context_fact','idx_compact_context_time',"
+      "'context_compact_ref_retention_delete','context_fact_key_retention_delete','context_candidate_key_retention_delete');",
+      -1, &st, NULL) == SQLITE_OK && sqlite3_step(st) == SQLITE_ROW &&
+      sqlite3_column_type(st, 0) == SQLITE_INTEGER) {
+    empty = sqlite3_column_int64(st, 0) == 0;
+    if (sqlite3_step(st) != SQLITE_DONE) empty = -1;
+  }
+  sqlite3_finalize(st);
+  return empty;
+}
+
+/* A typed FULL can defer only after the original transaction is gone and
+ * actual header, namespace and bounded legacy reads prove the old path. */
+static int sqlite_compact_capacity_rollback_valid(void) {
+  EdrContextStore legacy;
+  static const char *const queries[] = {
+    "SELECT fact_id FROM context_facts LIMIT 1;",
+    "SELECT artifact_id,candidate_id,fact_id FROM candidate_context_refs LIMIT 1;",
+    "SELECT artifact_id,candidate_id,fact_id FROM context_reference_projection LIMIT 1;",
+    "SELECT artifact_id,candidate_id FROM materialized_artifacts LIMIT 1;"
+  };
+  if (!sqlite3_get_autocommit(s_db) ||
+      edr_context_store_check_format(&legacy, s_db) != 0 || legacy.format != 0 ||
+      sqlite_compact_namespace_empty() != 1) return 0;
+  for (unsigned i = 0u; i < sizeof(queries) / sizeof(queries[0]); ++i) {
+    sqlite3_stmt *st = NULL;
+    int rc = sqlite3_prepare_v2(s_db, queries[i], -1, &st, NULL);
+    if (rc == SQLITE_OK) rc = sqlite3_step(st);
+    const int read_ok = rc == SQLITE_ROW || rc == SQLITE_DONE;
+    const int close_ok = sqlite3_finalize(st) == SQLITE_OK;
+    if (!read_ok || !close_ok) return 0;
+  }
+  return sqlite3_get_autocommit(s_db) != 0;
+}
+
+/* Add only the mixed-layout schema. Historical rows are not migrated here;
+ * normal writers keep existing legacy identities in their original layout. */
+static int sqlite_enable_compact_context_writes(void) {
+  sqlite3_stmt *st = NULL;
+  uint64_t logical = 0u, page_size = 0u, ceiling = 0u;
+  const uint64_t limit = (uint64_t)s_status.max_db_mb * UINT64_C(1048576);
+  if (s_context_store.format != 0) return 0;
+#ifdef EDR_LOCAL_EVIDENCE_CACHE_TESTING
+  if (s_test_legacy_context_writes) return 0;
+#endif
+  if (!sqlite3_get_autocommit(s_db)) {
+    set_error("compact context startup requires a completed owner transaction"); return -1;
+  }
+  /* Never hide an ambiguous format-0 namespace under capacity deferral. */
+  if (sqlite_compact_namespace_empty() != 1) {
+    set_error("compact context startup namespace unavailable or inconsistent"); return -1;
+  }
+  if (!sqlite_database_page_bytes(&logical, &page_size) ||
+      sqlite_startup_max_pages(0u, &ceiling) != 0) return -1;
+  refresh_db_size_status();
+  if (logical >= limit || logical / page_size >= ceiling ||
+      s_status.wal_bytes > limit || s_status.db_bytes > limit - s_status.wal_bytes) {
+    s_status.compact_startup_deferred = 1u;
+    set_error("compact context startup deferred at existing capacity limit");
+    fprintf(stderr, "[evidence-cache] compact startup deferred cause=1 format=0\n");
+    return 0;
+  }
+  const uint64_t refusals = s_status.physical_refusals;
+  const uint64_t failures = s_status.physical_guard_failures;
+  if (!sqlite_database_write_allow(EDR_EVIDENCE_MANIFEST_MAX_BYTES)) {
+    if (s_status.physical_refusals > refusals && s_status.physical_guard_failures == failures) {
+      s_status.compact_startup_deferred = 1u;
+      fprintf(stderr, "[evidence-cache] compact startup deferred cause=2 format=0\n");
+      return 0;
+    }
+    return -1;
+  }
+  if (edr_context_store_begin_upgrade(&s_context_store) != 0) {
+    const int original_code = s_context_store.sqlite_error_code;
+    if ((original_code & 0xff) == SQLITE_FULL) {
+      if (!sqlite_compact_capacity_rollback_valid()) {
+        set_error("compact context startup capacity rollback validation failed"); return -1;
+      }
+      s_status.compact_startup_deferred = 1u;
+      s_context_store.format = 0;
+      s_status.storage_format = 0u;
+      set_error("compact context startup deferred after verified capacity rollback");
+      fprintf(stderr, "[evidence-cache] compact startup deferred cause=3 format=0\n");
+      return 0;
+    }
+    set_error(s_context_store.error); return -1;
+  }
+  if (!sqlite3_get_autocommit(s_db) ||
+      edr_context_store_open(&s_context_store, s_db) != 0 ||
+      s_context_store.format != 1 || !sqlite3_get_autocommit(s_db)) {
+    set_error("compact context startup committed format validation failed"); return -1;
+  }
+  st = NULL;
+  if (sqlite3_prepare_v2(s_db,
+      "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND name IN ("
+      "'context_compact_ref_retention_delete','context_fact_key_retention_delete','context_candidate_key_retention_delete');",
+      -1, &st, NULL) != SQLITE_OK || sqlite3_step(st) != SQLITE_ROW ||
+      sqlite3_column_int64(st, 0) != 3 || sqlite3_step(st) != SQLITE_DONE) {
+    sqlite3_finalize(st);
+    set_error("compact context startup retention guards unavailable"); return -1;
+  }
+  sqlite3_finalize(st);
+  s_status.storage_format = (uint32_t)s_context_store.format;
+  return 0;
+}
 #endif
 
 int edr_local_evidence_cache_open(const char *path, uint32_t max_db_mb,
@@ -7548,6 +7667,9 @@ int edr_local_evidence_cache_open_with_policy(const char *path, uint32_t max_db_
       sqlite_migrate_legacy_context_artifacts() != 0) {
     goto startup_failed;
   }
+  const int was_legacy_context = s_context_store.format == 0;
+  if (sqlite_enable_compact_context_writes() != 0) goto startup_failed;
+  const int enabled_compact_context = was_legacy_context && s_context_store.format == 1;
   sqlite_maintenance(0);
   if (!sqlite_database_write_allow(EDR_EVIDENCE_MANIFEST_MAX_BYTES) ||
       exec_sql("UPDATE artifacts SET upload_status='scheduled' WHERE artifact_type='pmfe_followup_local_v1' AND upload_status='running';") != 0) {
@@ -7559,6 +7681,15 @@ int edr_local_evidence_cache_open_with_policy(const char *path, uint32_t max_db_
         restored!=startup_previous_max_pages) {
       set_error("evidence cache startup page-growth limit could not be restored");
       goto startup_failed;
+    }
+  }
+  /* Maintenance can copy the new schema into the DB while retaining WAL
+   * allocation. Finish this activation after all startup writes, through the
+   * existing physical guard; normal format-1/2 opens and cadence are unchanged. */
+  if (enabled_compact_context && db_size_over_limit()) {
+    if (sqlite_maintenance_checkpoint(SQLITE_CHECKPOINT_TRUNCATE) != 0) goto startup_failed;
+    if (db_size_over_limit()) {
+      set_error("compact context startup remains above DB/WAL budget"); goto startup_failed;
     }
   }
   evidence_cache_unlock();
@@ -10399,7 +10530,7 @@ void edr_local_evidence_cache_status_json(char *out, size_t cap) {
     snprintf(context_ref_sources, sizeof(context_ref_sources), "{}");
   }
   int written = snprintf(out, cap,
-           "\"evidence_cache\":{\"db_open\":%s,\"storage_format\":%u,\"path\":%s,\"max_db_mb\":%u,"
+           "\"evidence_cache\":{\"db_open\":%s,\"storage_format\":%u,\"compact_startup_deferred\":%u,\"path\":%s,\"max_db_mb\":%u,"
            "\"retention_hours\":%u,\"db_bytes\":%llu,\"wal_bytes\":%llu,"
            "\"records_written\":%llu,\"records_dropped\":%llu,"
            "\"records_skipped\":%llu,\"hot_ring_ingested\":%llu,"
@@ -10426,7 +10557,7 @@ void edr_local_evidence_cache_status_json(char *out, size_t cap) {
            "\"drop_counters\":{\"file\":%llu,\"registry\":%llu,\"network\":%llu,\"other\":%llu},"
            "\"accounting\":%s,"
            "\"shm_bytes\":%llu,\"physical_bytes\":%llu}",
-           st.db_open ? "true" : "false", st.storage_format, path, st.max_db_mb, st.retention_hours,
+           st.db_open ? "true" : "false", st.storage_format, st.compact_startup_deferred, path, st.max_db_mb, st.retention_hours,
            (unsigned long long)st.db_bytes, (unsigned long long)st.wal_bytes,
            (unsigned long long)st.records_written, (unsigned long long)st.records_dropped,
            (unsigned long long)st.records_skipped, (unsigned long long)st.hot_ring_ingested,

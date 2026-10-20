@@ -51,6 +51,15 @@ static void test_unsetenv(const char *name) { assert(unsetenv(name) == 0); }
 #if defined(EDR_HAVE_SQLITE)
 #include <sqlite3.h>
 #include "../src/storage/evidence_context_store.h"
+
+/* Explicit old-layout fixtures keep exercising the supported legacy writer.
+ * The seam is restored immediately; all other opens use production defaults. */
+static int test_open_legacy_context(const char *path, uint32_t mb, uint32_t hours) {
+  edr_local_evidence_cache_test_set_legacy_context_writes(1);
+  int rc = edr_local_evidence_cache_open(path, mb, hours);
+  edr_local_evidence_cache_test_set_legacy_context_writes(0);
+  return rc;
+}
 #endif
 
 static bool s_test_pressure;
@@ -1021,7 +1030,7 @@ static void test_legacy_post_context_normalizes_without_losing_variants(void) {
   (void)remove("local_evidence_cache_legacy_context.sqlite-shm");
   sqlite_exec_create_legacy_context_artifacts(db, 0);
 
-  assert(edr_local_evidence_cache_open(db, 8u, 24u) == 0);
+  assert(test_open_legacy_context(db, 8u, 24u) == 0);
   /* Legacy rows remain available to an older binary; the materialized view
    * suppresses their normalized duplicates. */
   assert(sqlite_table_count(db, "artifacts") == 3u);
@@ -1066,7 +1075,7 @@ static void test_legacy_post_context_normalizes_without_losing_variants(void) {
 
   /* Reopen is idempotent for prior rows and imports the downgrade row.
    * The superseded legacy fact has no current retirement owner and survives. */
-  assert(edr_local_evidence_cache_open(db, 8u, 24u) == 0);
+  assert(test_open_legacy_context(db, 8u, 24u) == 0);
   assert(sqlite_table_count(db, "context_facts") == 3u);
   assert(sqlite_scalar_integer(db,"SELECT COUNT(*) FROM context_facts f WHERE NOT EXISTS(SELECT 1 FROM candidate_context_refs r WHERE r.fact_id=f.fact_id);")==1);
   assert(sqlite_table_count(db, "candidate_context_refs") == 4u);
@@ -1093,7 +1102,7 @@ static void test_legacy_context_corrupt_fact_blocks_reference(void) {
       "DELETE FROM candidate_context_refs WHERE candidate_id='legacy-b';";
   cleanup_test_sqlite_path(db);
   sqlite_exec_create_legacy_context_artifacts(db, 0);
-  assert(edr_local_evidence_cache_open(db, 8u, 24u) == 0);
+  assert(test_open_legacy_context(db, 8u, 24u) == 0);
   edr_local_evidence_cache_close();
 
   assert(sqlite3_open(db, &raw) == SQLITE_OK);
@@ -1101,7 +1110,7 @@ static void test_legacy_context_corrupt_fact_blocks_reference(void) {
   sqlite3_free(error);
   assert(sqlite3_close(raw) == SQLITE_OK);
 
-  assert(edr_local_evidence_cache_open(db, 8u, 24u) == -1);
+  assert(test_open_legacy_context(db, 8u, 24u) == -1);
   assert(sqlite_table_count(db, "context_facts") == 2u);
   assert(sqlite_table_count(db, "candidate_context_refs") == 2u);
   cleanup_test_sqlite_path(db);
@@ -1131,7 +1140,7 @@ static void test_malformed_legacy_context_manifests_are_rejected(void) {
     sqlite_exec_create_legacy_context_artifacts(cases[i].path, 0);
     sqlite_set_legacy_context_manifest(cases[i].path, "legacy-b",
                                        cases[i].manifest, cases[i].length);
-    assert(edr_local_evidence_cache_open(cases[i].path, 8u, 24u) == -1);
+    assert(test_open_legacy_context(cases[i].path, 8u, 24u) == -1);
     assert(sqlite_table_count(cases[i].path, "context_facts") == 0u);
     assert(sqlite_table_count(cases[i].path, "candidate_context_refs") == 0u);
     cleanup_test_sqlite_path(cases[i].path);
@@ -1145,7 +1154,7 @@ static void test_invalid_legacy_post_context_rolls_back_normalization(void) {
   (void)remove("local_evidence_cache_invalid_legacy_context.sqlite-shm");
   sqlite_exec_create_legacy_context_artifacts(db, 1);
 
-  assert(edr_local_evidence_cache_open(db, 8u, 24u) == -1);
+  assert(test_open_legacy_context(db, 8u, 24u) == -1);
   /* Schema creation is additive, but all data movement rolls back together:
    * valid rows processed before the malformed row remain in legacy storage. */
   assert(sqlite_table_count(db, "artifacts") == 4u);
@@ -1456,7 +1465,7 @@ static void test_critical_context_high_fanout_is_atomically_bounded(void) {
   }
   edr_local_evidence_cache_get_status(&baseline);
   baseline_facts = sqlite_table_count(db, "context_facts");
-  baseline_refs = sqlite_table_count(db, "candidate_context_refs");
+  baseline_refs = sqlite_table_count(db, "context_reference_projection");
   baseline_materialized = sqlite_table_count(
       db, EDR_LOCAL_EVIDENCE_MATERIALIZED_ARTIFACTS_VIEW);
 
@@ -1491,7 +1500,7 @@ static void test_critical_context_high_fanout_is_atomically_bounded(void) {
   assert(strstr(ref_sources_json, "\"1\":80") != NULL);
   assert(after_quota.artifacts_written == baseline.artifacts_written + 80u);
   assert(sqlite_table_count(db, "context_facts") == baseline_facts + 4u);
-  assert(sqlite_table_count(db, "candidate_context_refs") == baseline_refs + 80u);
+  assert(sqlite_table_count(db, "context_reference_projection") == baseline_refs + 80u);
   assert(sqlite_table_count(db,
                             EDR_LOCAL_EVIDENCE_MATERIALIZED_ARTIFACTS_VIEW) ==
          baseline_materialized + 80u);
@@ -1523,7 +1532,7 @@ static void test_critical_context_high_fanout_is_atomically_bounded(void) {
   assert(after_failure.context_facts_written == before_failure.context_facts_written);
   assert(after_failure.context_refs_written == before_failure.context_refs_written);
   assert(sqlite_table_count(db, "context_facts") == baseline_facts + 4u);
-  assert(sqlite_table_count(db, "candidate_context_refs") == baseline_refs + 80u);
+  assert(sqlite_table_count(db, "context_reference_projection") == baseline_refs + 80u);
   for (unsigned i = 0u; i < 20u; ++i) {
     assert(sqlite_post_artifact_count(db, candidate_ids[i],
                                       "fanout-context-commit-failure") == 0u);
@@ -1541,13 +1550,15 @@ static void test_critical_context_high_fanout_is_atomically_bounded(void) {
    * a statement must not leave a partial fact/ref transaction or a stale bind. */
   sqlite3 *raw = NULL;
   assert(sqlite3_open(db, &raw) == SQLITE_OK);
-  uint64_t refs_before = sqlite_table_count(db, "candidate_context_refs");
+  uint64_t refs_before = sqlite_table_count(db, "context_reference_projection");
   uint64_t facts_before = sqlite_table_count(db, "context_facts");
+  const char *ref_table = sqlite_scalar_integer(db, "PRAGMA user_version")
+      ? "compact_context_refs" : "candidate_context_refs";
   char *fault = sqlite3_mprintf(
-      "CREATE TRIGGER fail_second_ref BEFORE INSERT ON candidate_context_refs "
-      "WHEN (SELECT COUNT(*) FROM candidate_context_refs) > %lld "
+      "CREATE TRIGGER fail_second_ref BEFORE INSERT ON %s "
+      "WHEN (SELECT COUNT(*) FROM %s) > %lld "
       "BEGIN SELECT RAISE(ABORT,'second reference fault'); END;",
-      (sqlite3_int64)refs_before);
+      ref_table, ref_table, (sqlite3_int64)refs_before);
   assert(fault != NULL);
   assert(sqlite3_exec(raw, fault, NULL, NULL, NULL) == SQLITE_OK);
   sqlite3_free(fault);
@@ -1555,11 +1566,11 @@ static void test_critical_context_high_fanout_is_atomically_bounded(void) {
   snprintf(context.event_id, sizeof(context.event_id), "fanout-context-step-failure");
   edr_local_evidence_cache_record_behavior(&context);
   assert(sqlite_table_count(db, "context_facts") == facts_before);
-  assert(sqlite_table_count(db, "candidate_context_refs") == refs_before);
+  assert(sqlite_table_count(db, "context_reference_projection") == refs_before);
   assert(sqlite3_exec(raw, "DROP TRIGGER fail_second_ref;", NULL, NULL, NULL) == SQLITE_OK);
   edr_local_evidence_cache_record_behavior(&context);
   assert(sqlite_table_count(db, "context_facts") == facts_before + 1u);
-  assert(sqlite_table_count(db, "candidate_context_refs") == refs_before + 20u);
+  assert(sqlite_table_count(db, "context_reference_projection") == refs_before + 20u);
   edr_local_evidence_cache_close();
   assert(sqlite3_exec(raw, "PRAGMA auto_vacuum=NONE; VACUUM;", NULL, NULL, NULL) == SQLITE_OK);
   assert(sqlite3_close(raw) == SQLITE_OK);
@@ -1569,7 +1580,7 @@ static void test_critical_context_high_fanout_is_atomically_bounded(void) {
     assert(sqlite_scalar_integer(db, "PRAGMA auto_vacuum;") == 2);
     assert(sqlite_table_count(db, "p0_candidates") == 20u);
     assert(sqlite_table_count(db, "context_facts") == facts_before + 1u);
-    assert(sqlite_table_count(db, "candidate_context_refs") == refs_before + 20u);
+    assert(sqlite_table_count(db, "context_reference_projection") == refs_before + 20u);
     for (unsigned i = 0; i < 20u; ++i) {
       assert(sqlite_post_artifact_count(db, candidate_ids[i],
                                         "fanout-context-step-failure") == 1u);
@@ -1784,7 +1795,7 @@ static void test_critical_context_distinct_events_exceed_legacy_fixed_limit(void
                                        sizeof(candidate_id));
   edr_local_evidence_cache_get_status(&baseline);
   baseline_facts = sqlite_table_count(db, "context_facts");
-  baseline_refs = sqlite_table_count(db, "candidate_context_refs");
+  baseline_refs = sqlite_table_count(db, "context_reference_projection");
 
   context = candidate;
   context.priority = 1u;
@@ -1809,7 +1820,7 @@ static void test_critical_context_distinct_events_exceed_legacy_fixed_limit(void
   assert(after_distinct.context_refs_written == baseline.context_refs_written + 161u);
   assert(after_distinct.artifacts_written == baseline.artifacts_written + 161u);
   assert(sqlite_table_count(db, "context_facts") == baseline_facts + 161u);
-  assert(sqlite_table_count(db, "candidate_context_refs") == baseline_refs + 161u);
+  assert(sqlite_table_count(db, "context_reference_projection") == baseline_refs + 161u);
   assert(sqlite_post_artifact_count(db, candidate_id, "distinct-critical-0") == 1u);
   assert(sqlite_post_artifact_count(db, candidate_id, "distinct-critical-159") == 1u);
   assert(sqlite_post_artifact_count(db, candidate_id, "distinct-critical-160") == 1u);
@@ -1856,7 +1867,7 @@ static void test_critical_context_still_honors_database_capacity(void) {
   candidate.net_dport = 445u;
   edr_local_evidence_cache_record_behavior(&candidate);
   baseline_facts = sqlite_table_count(db, "context_facts");
-  baseline_refs = sqlite_table_count(db, "candidate_context_refs");
+  baseline_refs = sqlite_table_count(db, "context_reference_projection");
 
   /* Model a legacy over-budget database directly. The production command
    * entry point now rejects this oversize copy before it can create pressure. */
@@ -1889,7 +1900,7 @@ static void test_critical_context_still_honors_database_capacity(void) {
   assert(after.write_budget_critical_context_dropped == 0u);
   assert(strstr(after.last_error, "evidence cache size budget exceeded") != NULL);
   assert(sqlite_table_count(db, "context_facts") == baseline_facts);
-  assert(sqlite_table_count(db, "candidate_context_refs") == baseline_refs);
+  assert(sqlite_table_count(db, "context_reference_projection") == baseline_refs);
 
   /* A cleanup that cannot recover admission is damped; continuous arrivals
    * must not repeatedly scan the same full cache. */
@@ -1904,7 +1915,7 @@ static void test_critical_context_still_honors_database_capacity(void) {
   assert(after.maintenance_runs == before.maintenance_runs + 1u);
   assert(after.db_budget_dropped == before.db_budget_dropped + 2u);
   assert(sqlite_table_count(db, "context_facts") == baseline_facts);
-  assert(sqlite_table_count(db, "candidate_context_refs") == baseline_refs);
+  assert(sqlite_table_count(db, "context_reference_projection") == baseline_refs);
   s_test_monotonic_ns = 1000000000ull;
 
   edr_local_evidence_cache_close();
@@ -1948,8 +1959,17 @@ static void test_command_result_copy_budget(void) {
   EdrEvidenceCacheStatus before, after;
   assert(make_test_sqlite_path(db, sizeof(db)) == 0);
   assert(edr_local_evidence_cache_open(db, 1u, 24u) == 0);
-  assert(edr_local_evidence_cache_record_command_result("keep", "test", "ok", 1, 0,
-      "original UTF-8 \xe8\xaf\x81\xe6\x8d\xae", "[]") == EDR_EVIDENCE_COMMAND_RESULT_STORED);
+  int first_result = edr_local_evidence_cache_record_command_result("keep", "test", "ok", 1, 0,
+      "original UTF-8 \xe8\xaf\x81\xe6\x8d\xae", "[]");
+  if (first_result != EDR_EVIDENCE_COMMAND_RESULT_STORED) {
+    EdrEvidenceCacheStatus failed; edr_local_evidence_cache_get_status(&failed);
+    fprintf(stderr, "command_copy_first rc=%d format=%u db=%llu wal=%llu physical=%llu capacity_rejected=%llu storage_failed=%llu\n",
+        first_result, failed.storage_format, (unsigned long long)failed.db_bytes,
+        (unsigned long long)failed.wal_bytes, (unsigned long long)failed.physical_bytes,
+        (unsigned long long)failed.command_results_capacity_rejected,
+        (unsigned long long)failed.command_results_failed); fflush(stderr);
+  }
+  assert(first_result == EDR_EVIDENCE_COMMAND_RESULT_STORED);
   assert(sqlite3_open(db, &raw) == SQLITE_OK);
   assert(sqlite3_exec(raw, "BEGIN IMMEDIATE;", NULL, NULL, NULL) == SQLITE_OK);
   assert(edr_local_evidence_cache_record_command_result("busy", "test", "ok", 1, 0,
@@ -2368,16 +2388,16 @@ static void test_capacity_preserves_unclassified_refs_and_reports_refusal(void) 
   assert(sqlite3_exec(raw, fixture, NULL, NULL, &error) == SQLITE_OK);
   sqlite3_free(error);
   assert(sqlite3_close(raw) == SQLITE_OK);
-  assert(sqlite_table_count(db, "candidate_context_refs") == 4601u);
+  assert(sqlite_table_count(db, "context_reference_projection") == 4601u);
 
   assert(edr_local_evidence_cache_open(db, 1u, 24u) == 0);
   edr_local_evidence_cache_get_status(&status);
   assert(status.db_capacity_evicted == 0u);
   assert(sqlite_table_count(db, "p0_candidates") == 1u);
-  assert(sqlite_table_count(db, "candidate_context_refs") == 4601u);
+  assert(sqlite_table_count(db, "context_reference_projection") == 4601u);
   assert(sqlite_table_count(db, "context_facts") == 2u);
   assert(sqlite_table_count(db, EDR_LOCAL_EVIDENCE_MATERIALIZED_ARTIFACTS_VIEW) ==
-         sqlite_table_count(db, "candidate_context_refs"));
+         sqlite_table_count(db, "context_reference_projection"));
   assert(sqlite3_open_v2(db, &raw, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK);
   assert(sqlite3_prepare_v2(raw,
       "SELECT manifest_json FROM materialized_artifacts WHERE artifact_id='live-ref';",
@@ -2407,7 +2427,7 @@ static void test_capacity_preserves_unclassified_refs_and_reports_refusal(void) 
   assert(edr_local_evidence_cache_save_command_fact(&identity, command) != 0);
   edr_local_evidence_cache_get_status(&status);
   assert(status.last_error[0] != '\0');
-  assert(sqlite_table_count(db, "candidate_context_refs") == 4601u);
+  assert(sqlite_table_count(db, "context_reference_projection") == 4601u);
   edr_local_evidence_cache_close();
   /* A deliberately larger synthetic budget is only for testing retained
    * command readback; maintenance did not clear unknown evidence to fit it. */
@@ -2419,9 +2439,9 @@ static void test_capacity_preserves_unclassified_refs_and_reports_refusal(void) 
   edr_local_evidence_cache_close();
 
   /* Normal capacity retains standalone refs and the full command artifact. */
-  remaining_refs = sqlite_table_count(db, "candidate_context_refs");
+  remaining_refs = sqlite_table_count(db, "context_reference_projection");
   assert(edr_local_evidence_cache_open(db, 8u, 24u) == 0);
-  assert(sqlite_table_count(db, "candidate_context_refs") == remaining_refs);
+  assert(sqlite_table_count(db, "context_reference_projection") == remaining_refs);
   readback = edr_local_evidence_cache_read_command_fact(&identity);
   assert(readback && strlen(readback) == 32768u && memcmp(readback, command, 32769u) == 0);
   free(readback);
@@ -2772,7 +2792,7 @@ static void test_capacity_reserves_wal_room_below_live_limit(void) {
   assert(after.db_bytes == 960u * 1024u && after.wal_bytes == 0u);
   uint64_t retained_groups=sqlite_table_count(db,"p0_candidates");
   assert(retained_groups>=1u && retained_groups<(uint64_t)rows+1u);
-  assert(sqlite_table_count(db,"candidate_context_refs")==retained_groups);
+  assert(sqlite_table_count(db,"context_reference_projection")==retained_groups);
   assert(sqlite_scalar_integer(db,"SELECT COUNT(*) FROM p0_candidates WHERE candidate_id='keep';")==1);
   assert(sqlite_table_count(db, "context_facts") == 1u);
   assert(timespec_get(&ts, TIME_UTC) == TIME_UTC);
@@ -3059,7 +3079,7 @@ static void test_runtime_pressure_preserves_unclassified_shared_context(void) {
       "CREATE TEMP TABLE expected_refs AS SELECT * FROM candidate_context_refs;",
       NULL, NULL, NULL) == SQLITE_OK);
   assert(sqlite_table_count(db, "context_facts") == 2u);
-  assert(sqlite_table_count(db, "candidate_context_refs") == 1000u);
+  assert(sqlite_table_count(db, "context_reference_projection") == 1000u);
 
   edr_local_evidence_cache_get_status(&before);
   assert(sqlite_post_artifact_count(db, second_id, context.event_id) == 0u);
@@ -3081,7 +3101,7 @@ static void test_runtime_pressure_preserves_unclassified_shared_context(void) {
   sqlite3_finalize(st);
   assert(sqlite3_close(raw) == SQLITE_OK);
   assert(sqlite_post_artifact_count(db, second_id, context.event_id) == 0u);
-  assert(sqlite_table_count(db, "candidate_context_refs") == 1000u);
+  assert(sqlite_table_count(db, "context_reference_projection") == 1000u);
   edr_local_evidence_cache_close();
   test_unsetenv("EDR_EVIDENCE_CONTEXT_WINDOW_S");
   cleanup_test_sqlite_path(db);
@@ -3127,7 +3147,7 @@ static void test_critical_context_still_honors_retention(void) {
   snprintf(context.cmdline, sizeof(context.cmdline), "parent-helper.exe --benign");
   edr_local_evidence_cache_record_behavior(&context);
   assert(sqlite_table_count(db, "context_facts") == 1u);
-  assert(sqlite_table_count(db, "candidate_context_refs") == 1u);
+  assert(sqlite_table_count(db, "context_reference_projection") == 1u);
   edr_local_evidence_cache_close();
 
   assert(sqlite3_open(db, &raw) == SQLITE_OK);
@@ -3139,7 +3159,7 @@ static void test_critical_context_still_honors_retention(void) {
   assert(edr_local_evidence_cache_open(db, 8u, 1u) == 0);
   edr_local_evidence_cache_get_status(&status);
   assert(status.db_retention_evicted == 0u);
-  assert(sqlite_table_count(db, "candidate_context_refs") == 1u);
+  assert(sqlite_table_count(db, "context_reference_projection") == 1u);
   assert(sqlite_table_count(db, "context_facts") == 1u);
   assert(sqlite_table_count(db, "p0_candidates") == 1u);
   /* The low-severity context has the candidate's lifecycle, not its own TTL. */
@@ -3147,7 +3167,7 @@ static void test_critical_context_still_honors_retention(void) {
   s_test_monotonic_ns += UINT64_C(121000000000);
   edr_local_evidence_cache_poll_maintenance();
   assert(sqlite_table_count(db, "p0_candidates") == 0u);
-  assert(sqlite_table_count(db, "candidate_context_refs") == 0u);
+  assert(sqlite_table_count(db, "context_reference_projection") == 0u);
   assert(sqlite_table_count(db, "context_facts") == 0u);
   edr_local_evidence_cache_test_set_now_unix_ns(0);
   edr_local_evidence_cache_close();
@@ -7180,11 +7200,11 @@ static void test_legacy_command_quality_is_unknown_until_observed(void) {
   r->pid = 10084u; set_record_generation(r, 12u);
   strcpy(r->endpoint_id, "ep-legacy-command"); strcpy(r->tenant_id, "tenant-legacy");
   for (unsigned i = 0u; i < 2u; i++) {
-    assert(edr_local_evidence_cache_open(db, 8u, 24u) == 0);
+    assert(test_open_legacy_context(db, 8u, 24u) == 0);
     assert_cached_command(db, r, "legacy-preview", "unknown");
     edr_local_evidence_cache_close();
   }
-  assert(edr_local_evidence_cache_open(db, 8u, 24u) == 0);
+  assert(test_open_legacy_context(db, 8u, 24u) == 0);
   assert(timespec_get(&ts, TIME_UTC) == TIME_UTC);
   r->event_time_ns = (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
   strcpy(r->detection_context, "{\"severity\":\"P1\"}");
@@ -7206,7 +7226,7 @@ static void test_legacy_command_quality_is_unknown_until_observed(void) {
   edr_local_evidence_cache_record_behavior(r);
   assert_cached_command(db, r, "complete-replacement", "complete");
   edr_local_evidence_cache_close();
-  assert(edr_local_evidence_cache_open(db, 8u, 24u) == 0);
+  assert(test_open_legacy_context(db, 8u, 24u) == 0);
   assert_cached_command(db, r, "complete-replacement", "complete");
   edr_local_evidence_cache_close(); cleanup_test_sqlite_path(db); free(r);
 }
@@ -7967,7 +7987,7 @@ static void test_candidate_group_shared_facts_and_legacy_protection(void) {
     char path[512]; sqlite3 *db = NULL;
     assert(make_test_sqlite_path(path, sizeof(path)) == 0);
     edr_local_evidence_cache_test_set_now_unix_ns(now);
-    assert(edr_local_evidence_cache_open(path, 16, 1) == 0);
+    assert(test_open_legacy_context(path, 16, 1) == 0);
     edr_local_evidence_cache_close();
     assert(sqlite3_open(path, &db) == SQLITE_OK);
     retention_group_fixture(db, "expired", 1, old, old, old + 1);
@@ -7994,7 +8014,7 @@ static void test_candidate_group_shared_facts_and_legacy_protection(void) {
     compact_exec(db, "CREATE TABLE retention_expected AS SELECT * FROM materialized_artifacts WHERE candidate_id<>'expired';"
                      "CREATE TABLE retention_expected_candidates AS SELECT * FROM p0_candidates WHERE candidate_id<>'expired';");
     assert(sqlite3_close(db) == SQLITE_OK);
-    assert(edr_local_evidence_cache_open(path, 16, 1) == 0);
+    assert(test_open_legacy_context(path, 16, 1) == 0);
     assert(sqlite3_open(path, &db) == SQLITE_OK);
     assert(compact_scalar(db, "SELECT COUNT(*) FROM p0_candidates WHERE candidate_id='expired'") == 0);
     assert(compact_scalar(db, "SELECT COUNT(*) FROM context_reference_projection WHERE candidate_id='expired'") == 0);
@@ -8022,7 +8042,7 @@ static void test_candidate_group_delete_and_commit_rollback(void) {
       char path[512]; sqlite3 *db = NULL; EdrEvidenceCacheStatus before, after;
       assert(make_test_sqlite_path(path, sizeof(path)) == 0);
       edr_local_evidence_cache_test_set_now_unix_ns(now);
-      assert(edr_local_evidence_cache_open(path, 16, 1) == 0);
+      assert(test_open_legacy_context(path, 16, 1) == 0);
       assert(sqlite3_open(path, &db) == SQLITE_OK);
       retention_group_fixture(db, "atomic", 1, old, old, old + 1);
       compact_exec(db, "INSERT INTO context_facts(fact_id,endpoint_id,tenant_id,manifest_template_json,created_ns,updated_ns) "
@@ -8037,7 +8057,7 @@ static void test_candidate_group_delete_and_commit_rollback(void) {
                                      "BEGIN SELECT RAISE(ABORT,'injected whole-group retirement failure'); END;");
       /* Start with the fixture younger than the cutoff, then age after open. */
       compact_exec(db, "UPDATE p0_candidates SET event_time_ns=9000000000000000000;");
-      assert(edr_local_evidence_cache_open(path, 16, 1) == 0);
+      assert(test_open_legacy_context(path, 16, 1) == 0);
       retention_poll(); /* Finish the future-only scan before aging this fixture. */
       compact_exec(db, "UPDATE p0_candidates SET event_time_ns=1700000000000000000;"
                        "CREATE TABLE retention_expected AS SELECT * FROM materialized_artifacts;"
@@ -8117,7 +8137,7 @@ static void test_candidate_group_oversize_and_active_window(void) {
   strcpy(late.process_name,"benign-helper.exe"); strcpy(late.cmdline,"benign-helper.exe --local-context");
   assert(!edr_local_evidence_cache_is_candidate(&late));
   edr_local_evidence_cache_record_behavior(&late);
-  assert(sqlite_table_count(path,"candidate_context_refs")==0);
+  assert(sqlite_table_count(path,"context_reference_projection")==0);
   assert(sqlite_table_count(path,"context_facts")==0);
   edr_local_evidence_cache_close(); cleanup_test_sqlite_path(path);
   test_unsetenv("EDR_EVIDENCE_CONTEXT_WINDOW_S");
@@ -8157,7 +8177,7 @@ static void test_context_prepared_before_pressure_cannot_resurrect_retired_group
   edr_local_evidence_cache_get_status(&after);
   assert(after.maintenance_runs>before.maintenance_runs);
   assert(sqlite_table_count(path,"p0_candidates")==0);
-  assert(sqlite_table_count(path,"candidate_context_refs")==0);
+  assert(sqlite_table_count(path,"context_reference_projection")==0);
   assert(sqlite_table_count(path,"context_facts")==0);
   assert(after.context_refs_written==before.context_refs_written);
   assert(after.records_dropped>before.records_dropped);
@@ -8247,7 +8267,7 @@ static void compact_assert_projection(sqlite3 *db) {
 
 static void migration_fixture(const char *path) {
   sqlite_exec_create_legacy_context_artifacts(path, 0);
-  assert(edr_local_evidence_cache_open(path, 16, 24) == 0);
+  assert(test_open_legacy_context(path, 16, 24) == 0);
   edr_local_evidence_cache_close();
   sqlite3 *db = NULL; assert(sqlite3_open(path, &db) == SQLITE_OK);
   compact_exec(db, "CREATE TABLE migration_expected AS SELECT * FROM materialized_artifacts");
@@ -8551,7 +8571,7 @@ static void test_compact_format_resume_and_projection(void) {
   char path[512];
   assert(make_test_sqlite_path(path, sizeof(path)) == 0);
   sqlite_exec_create_legacy_context_artifacts(path, 0);
-  assert(edr_local_evidence_cache_open(path, 16, 24) == 0);
+  assert(test_open_legacy_context(path, 16, 24) == 0);
   edr_local_evidence_cache_close();
   sqlite3 *db = NULL;
   assert(sqlite3_open(path, &db) == SQLITE_OK);
@@ -8576,7 +8596,7 @@ static void test_compact_format_resume_and_projection(void) {
   compact_assert_projection(db);
   assert(sqlite3_close(db) == SQLITE_OK);
   /* Normal runtime opens and preserves a partly migrated cache. */
-  assert(edr_local_evidence_cache_open(path, 16, 24) == 0);
+  assert(test_open_legacy_context(path, 16, 24) == 0);
   edr_local_evidence_cache_close();
   assert(sqlite3_open(path, &db) == SQLITE_OK);
   compact_assert_projection(db);
@@ -8589,7 +8609,7 @@ static void test_compact_format_resume_and_projection(void) {
   assert(edr_local_evidence_cache_migrate(path, 16, 10000, NULL, NULL, &result) == 0);
   assert(result.complete && result.format == 2 && result.moved_refs == 3);
   assert(result.peak_physical_bytes <= UINT64_C(16) * 1024 * 1024);
-  assert(edr_local_evidence_cache_open(path, 16, 24) == 0);
+  assert(test_open_legacy_context(path, 16, 24) == 0);
   edr_local_evidence_cache_close();
   assert(sqlite3_open(path, &db) == SQLITE_OK);
   compact_assert_projection(db);
@@ -8608,7 +8628,7 @@ static void test_compact_format_resume_and_projection(void) {
 }
 
 static void reclaim_fixture(const char *path, int format) {
-  assert(edr_local_evidence_cache_open(path, 16, 24) == 0);
+  assert(test_open_legacy_context(path, 16, 24) == 0);
   edr_local_evidence_cache_close();
   sqlite3 *db = NULL; EdrContextStore store;
   assert(sqlite3_open(path, &db) == SQLITE_OK);
@@ -8953,7 +8973,7 @@ static void test_sliced_reclaim_yields_preserves_projection_and_backoff(void) {
     EdrEvidenceCacheStatus before, after;
     assert(make_test_sqlite_path(path, sizeof(path)) == 0);
     reclaim_fixture(path, format);
-    assert(edr_local_evidence_cache_open(path, 1, 24) == 0);
+    assert(test_open_legacy_context(path, 1, 24) == 0);
     assert(sqlite3_open(path, &db) == SQLITE_OK);
     sliced_reclaim_padding(db);
     sqlite3_int64 initial = compact_scalar(db, "PRAGMA freelist_count");
@@ -8986,7 +9006,7 @@ static void test_sliced_reclaim_yields_preserves_projection_and_backoff(void) {
      * unchanged BUSY/reader assertions their own fresh reclaim fixture. */
     assert(sqlite3_close(db)==SQLITE_OK);edr_local_evidence_cache_close();cleanup_test_sqlite_path(path);
     assert(make_test_sqlite_path(path,sizeof(path))==0);reclaim_fixture(path,format);
-    assert(edr_local_evidence_cache_open(path,1,24)==0 && sqlite3_open(path,&db)==SQLITE_OK);
+    assert(test_open_legacy_context(path,1,24)==0 && sqlite3_open(path,&db)==SQLITE_OK);
     sliced_reclaim_padding(db);
     s_test_monotonic_ns += UINT64_C(120000000000);
     edr_local_evidence_cache_poll_maintenance(); /* Schedule this fresh physical cycle. */
@@ -9099,7 +9119,7 @@ static void test_sliced_reclaim_yields_preserves_projection_and_backoff(void) {
     assert(compact_scalar(db, "PRAGMA freelist_count") == initial);
     assert(sqlite3_close(db) == SQLITE_OK);
     edr_local_evidence_cache_close();
-    assert(edr_local_evidence_cache_open(path, 1, 24) == 0);
+    assert(test_open_legacy_context(path, 1, 24) == 0);
     edr_local_evidence_cache_get_status(&after);
     for(unsigned i=0;i<64 && after.db_bytes+after.wal_bytes>1048576;++i) {
       edr_local_evidence_cache_poll_maintenance(); edr_local_evidence_cache_get_status(&after);
@@ -9134,7 +9154,7 @@ static void test_sliced_reclaim_process_restart(void) {
       compact_assert_projection(db);
       assert(compact_scalar(db, "SELECT COUNT(*) FROM pragma_foreign_key_check") == 0);
       assert(sqlite3_close(db) == SQLITE_OK);
-      assert(edr_local_evidence_cache_open(path, 1, 24) == 0);
+      assert(test_open_legacy_context(path, 1, 24) == 0);
       EdrEvidenceCacheStatus status; edr_local_evidence_cache_get_status(&status);
       for(unsigned i=0;i<64 && status.db_bytes+status.wal_bytes>1048576;++i) {
         edr_local_evidence_cache_poll_maintenance(); edr_local_evidence_cache_get_status(&status);
@@ -9153,7 +9173,7 @@ static void test_context_fact_collection_preserves_references(void) {
   for (int format = 0; format <= 2; ++format) {
     char path[512];
     assert(make_test_sqlite_path(path, sizeof(path)) == 0);
-    assert(edr_local_evidence_cache_open(path, 16, 24) == 0);
+    assert(test_open_legacy_context(path, 16, 24) == 0);
     edr_local_evidence_cache_close();
     sqlite3 *db = NULL;
     assert(sqlite3_open(path, &db) == SQLITE_OK);
@@ -9237,7 +9257,7 @@ static void test_legacy_payload_retention_protection_and_projection(void) {
     EdrEvidenceCacheStatus before, after;
     assert(make_test_sqlite_path(path, sizeof(path)) == 0);
     edr_local_evidence_cache_test_set_now_unix_ns(now);
-    assert(edr_local_evidence_cache_open(path, 128, 24) == 0);
+    assert(test_open_legacy_context(path, 128, 24) == 0);
     edr_local_evidence_cache_close();
     assert(sqlite3_open(path, &db) == SQLITE_OK);
     assert(edr_context_store_open(&store, db) == 0);
@@ -9280,7 +9300,7 @@ static void test_legacy_payload_retention_protection_and_projection(void) {
         "CREATE TABLE expected_facts AS SELECT * FROM context_facts;");
     assert(sqlite3_close(db) == SQLITE_OK);
     /* Open executes the same production maintenance owner as periodic poll. */
-    assert(edr_local_evidence_cache_open(path, 128, 24) == 0);
+    assert(test_open_legacy_context(path, 128, 24) == 0);
     edr_local_evidence_cache_get_status(&before);
     assert(before.db_retention_evicted == 0u);
     assert(before.db_capacity_evicted == 0u && before.last_error[0] == '\0');
@@ -9304,7 +9324,7 @@ static void test_legacy_payload_retention_protection_and_projection(void) {
         assert(after.db_retention_evicted == before.db_retention_evicted);
       } else if (pass == 1) {
         edr_local_evidence_cache_close();
-        assert(edr_local_evidence_cache_open(path, 128, 24) == 0);
+        assert(test_open_legacy_context(path, 128, 24) == 0);
         edr_local_evidence_cache_get_status(&after);
         assert(after.db_retention_evicted == 0u && after.last_error[0] == '\0');
       }
@@ -9323,7 +9343,7 @@ static void test_compact_runtime_replay_enrichment_and_failure(void) {
   struct timespec ts; assert(timespec_get(&ts, TIME_UTC) == TIME_UTC);
   int64_t base = (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
   test_setenv("EDR_EVIDENCE_CACHE_WRITE_BUDGET_PER_MIN", "0");
-  assert(edr_local_evidence_cache_open(path, 16, 24) == 0);
+  assert(test_open_legacy_context(path, 16, 24) == 0);
   init_record(&candidate, EDR_EVENT_NET_CONNECT);
   candidate.priority = 3; candidate.pid = 74001; candidate.event_time_ns = base;
   set_record_generation(&candidate, 74001);
@@ -9344,7 +9364,7 @@ static void test_compact_runtime_replay_enrichment_and_failure(void) {
   edr_local_evidence_cache_close();
   EdrEvidenceMigrationResult migration;
   assert(edr_local_evidence_cache_migrate(path, 16, 10000, NULL, NULL, &migration) == 0);
-  assert(edr_local_evidence_cache_open(path, 16, 24) == 0);
+  assert(test_open_legacy_context(path, 16, 24) == 0);
   /* Historical windows are deliberately not rearmed by a replay after restart.
    * A fresh candidate in the same generation opens a real new window, consumes
    * the retained fact, and then exercises exact replay/enrichment in format 2. */
@@ -9377,7 +9397,7 @@ static void test_compact_runtime_replay_enrichment_and_failure(void) {
   edr_local_evidence_cache_record_behavior(&context);
   assert(sqlite_post_artifact_count(path, id, context.event_id) == 1);
   edr_local_evidence_cache_close();
-  assert(edr_local_evidence_cache_open(path, 16, 24) == 0);
+  assert(test_open_legacy_context(path, 16, 24) == 0);
   assert(sqlite_post_artifact_count(path, id, context.event_id) == 1);
   edr_local_evidence_cache_close();
   test_unsetenv("EDR_EVIDENCE_CACHE_WRITE_BUDGET_PER_MIN");
@@ -10408,11 +10428,11 @@ static void test_normal_alert_parent_context_retention(void) {
       assert(make_test_sqlite_path(path, sizeof(path)) == 0);
       cleanup_test_sqlite_path(path);
       edr_local_evidence_cache_test_set_retention_monotonic_ms(1000);
-      assert(edr_local_evidence_cache_open(path, 16u, 24u) == 0);
+      assert(test_open_legacy_context(path, 16u, 24u) == 0);
       edr_local_evidence_cache_close();
       sqlite3 *db = NULL; assert(sqlite3_open(path, &db) == SQLITE_OK);
       retention_upgrade_refs(db, format); sqlite3_close(db);
-      assert(edr_local_evidence_cache_open(path, 16u, 24u) == 0);
+      assert(test_open_legacy_context(path, 16u, 24u) == 0);
       edr_pt_cache_init();
       assert(edr_pt_cache_put_generation(701u, 4u, "retained-parent.exe", command,
           parent_path, NULL, parent_time, UINT64_C(18446744073709551613),
@@ -10459,7 +10479,7 @@ static void test_normal_alert_parent_context_retention(void) {
       edr_pt_cache_init();
       assert(edr_pt_cache_put_generation(701u, 0u, "replacement.exe", "replacement-only",
           "C:/replacement.exe", NULL, (uint64_t)now, 9u, test_unix_ns_to_filetime((uint64_t)now)) == 0);
-      assert(edr_local_evidence_cache_open(path, 16u, 24u) == 0);
+      assert(test_open_legacy_context(path, 16u, 24u) == 0);
       EdrParentContextQuery query = {first->tenant_id, first->endpoint_id, first->event_id,
           first->pid, first->process_start_key, first->process_creation_filetime_100ns,
           first->event_time_ns - INT64_C(1000000000), first->event_time_ns + INT64_C(1000000000),
@@ -10519,7 +10539,7 @@ static void test_normal_alert_parent_context_retention(void) {
       assert(compact_scalar(db, "SELECT COUNT(*) FROM artifacts WHERE artifact_type='process_command_line'") == 3);
       if (!format) retention_upgrade_refs(db, 2);
       sqlite3_close(db);
-      assert(edr_local_evidence_cache_open(path, 16u, 24u) == 0);
+      assert(test_open_legacy_context(path, 16u, 24u) == 0);
       query.child_pid = second->pid; query.child_process_start_key = second->process_start_key;
       query.child_creation_filetime_100ns = second->process_creation_filetime_100ns;
       query.source_event_id = second->event_id; query.until_ns += INT64_C(1000000000);
@@ -12746,6 +12766,363 @@ done:
 }
 #endif
 
+/* Fixed public-data cache-helper workload. SQLite/context owners are real;
+ * P0 IR and resource getters retain this fixture's documented test boundaries. */
+#if defined(EDR_HAVE_SQLITE)
+static void context6000_owner_hash(sqlite3 *db, char hash[65]) {
+  sqlite3_stmt *st=NULL; EdrSha256Ctx digest; uint8_t raw[32]; unsigned rows=0u;
+  static const char sql[]=
+    "SELECT json_array(p.candidate_id,p.endpoint_id,p.tenant_id,p.pid,p.ppid,p.event_time_ns,"
+    "p.process_start_key,p.process_creation_filetime_100ns,p.subject_command_fact_id,"
+    "p.parent_command_fact_id,p.alert_context_protect_until_active_ms,p.context_post_until_ns,"
+    "p.local_retention_state,r.artifact_id,r.fact_id,f.manifest_template_json,"
+    "b.artifact_id,b.artifact_type,b.manifest_json,b.created_ns,b.upload_status,b.minio_key,"
+    "sc.artifact_id,sc.sha256,sc.manifest_json,sc.upload_status,sc.command_retention_policy,"
+    "sc.command_owner_pid,sc.command_owner_start_key,sc.command_owner_creation,"
+    "pc.artifact_id,pc.sha256,pc.manifest_json,pc.upload_status,pc.command_retention_policy,"
+    "pc.command_owner_pid,pc.command_owner_start_key,pc.command_owner_creation) "
+    "FROM p0_candidates p JOIN context_reference_projection r "
+    "ON r.artifact_id=p.candidate_id||':alert_parent_context' "
+    "JOIN context_facts f ON f.fact_id=r.fact_id JOIN artifacts b "
+    "ON b.artifact_id=p.candidate_id||':p0_context_bundle:candidate' "
+    "JOIN artifacts sc ON sc.artifact_id=p.subject_command_fact_id "
+    "JOIN artifacts pc ON pc.artifact_id=p.parent_command_fact_id "
+    "WHERE p.endpoint_id='ctx6000' AND p.tenant_id='public-tenant' ORDER BY p.candidate_id";
+  assert(sqlite3_prepare_v2(db,sql,-1,&st,NULL)==SQLITE_OK);edr_sha256_init(&digest);
+  int rc;while((rc=sqlite3_step(st))==SQLITE_ROW){const uint8_t *v=sqlite3_column_text(st,0);int n=sqlite3_column_bytes(st,0);assert(v&&n>0);uint8_t len[8];uint64_t size=(uint64_t)n;for(unsigned i=0;i<8u;i++)len[7u-i]=(uint8_t)(size>>(8u*i));edr_sha256_update(&digest,len,sizeof(len));edr_sha256_update(&digest,v,(size_t)n);rows++;}
+  assert(rc==SQLITE_DONE&&rows==20u);sqlite3_finalize(st);edr_sha256_final(&digest,raw);for(unsigned i=0;i<32u;i++)snprintf(hash+2u*i,3u,"%02x",raw[i]);
+}
+static uint64_t context6000_files(void) {
+  return parent_soak_file_bytes("fixture.sqlite")+parent_soak_file_bytes("fixture.sqlite-wal")+parent_soak_file_bytes("fixture.sqlite-shm");
+}
+static int context6000_workload(int ordinary) {
+  edr_local_evidence_cache_test_set_legacy_context_writes(0);
+  enum { INPUTS=6000, FANOUT=20, BUDGET_MB=512 };
+  const uint64_t file_cap=UINT64_C(512)*1024u*1024u;
+  const int64_t now=INT64_C(1700000000000000000);
+  const uint64_t parent_birth=(uint64_t)now-UINT64_C(10000000000),child_birth=(uint64_t)now-UINT64_C(5000000000);
+  const uint64_t parent_key=UINT64_C(0x6000000001),child_key=UINT64_C(0x6000000002);
+  char owner_before[65],owner_after[65],input_hash[65];uint8_t input_raw[32];EdrSha256Ctx offered;
+  EdrBehaviorRecord *candidate=calloc(1,sizeof(*candidate)),*context=calloc(1,sizeof(*context)),*first=calloc(1,sizeof(*first));assert(candidate&&context&&first);
+  assert(parent_soak_file_bytes("fixture.sqlite")==0u);
+  test_setenv("EDR_EVIDENCE_CONTEXT_WINDOW_S","120");test_setenv("EDR_EVIDENCE_CACHE_WRITE_BUDGET_PER_MIN","80");test_unsetenv("EDR_EVIDENCE_CACHE_ORDINARY_CONTEXT_WRITE_BUDGET_PER_MIN");
+  s_test_monotonic_ns=UINT64_C(1000000000);edr_local_evidence_cache_test_set_now_unix_ns(now);edr_local_evidence_cache_test_set_retention_monotonic_ms(1000);
+  retention_bench_vfs_parent=sqlite3_vfs_find(NULL);assert(retention_bench_vfs_parent);sqlite3_vfs vfs=*retention_bench_vfs_parent;vfs.zName="public-context6000";vfs.pNext=NULL;vfs.szOsFile+=(int)sizeof(RetentionBenchFile);vfs.xOpen=retention_bench_open;assert(sqlite3_vfs_register(&vfs,1)==SQLITE_OK);
+  assert(edr_local_evidence_cache_open("fixture.sqlite",BUDGET_MB,24u)==0);edr_pt_cache_init();
+  assert(edr_pt_cache_put_generation(96000u,4u,"public-parent.exe","public-parent.exe --synthetic","C:/Data/public-parent.exe",NULL,(uint64_t)now,parent_key,test_unix_ns_to_filetime(parent_birth))==0);
+  assert(edr_pt_cache_mark_alive_generation(96000u,parent_key,test_unix_ns_to_filetime(parent_birth),(uint64_t)now+UINT64_C(1000000000))==0);
+  assert(edr_pt_cache_put_generation(96001u,96000u,"public-child.exe","public-child.exe --synthetic","C:/Data/public-child.exe","public-parent.exe",(uint64_t)now,child_key,test_unix_ns_to_filetime(child_birth))==0);
+  init_record(candidate,EDR_EVENT_NET_CONNECT);candidate->pid=96001u;candidate->ppid=96000u;candidate->parent_pid_state=EDR_PARENT_PID_KNOWN;candidate->process_start_key=child_key;candidate->process_creation_filetime_100ns=test_unix_ns_to_filetime(child_birth);candidate->parent_process_start_key=parent_key;candidate->parent_process_creation_filetime_100ns=test_unix_ns_to_filetime(parent_birth);candidate->net_dport=445u;
+  strcpy(candidate->endpoint_id,"ctx6000");strcpy(candidate->tenant_id,"public-tenant");strcpy(candidate->process_name,"public-child.exe");strcpy(candidate->exe_path,"C:/Data/public-child.exe");strcpy(candidate->cmdline,"public-child.exe --synthetic");strcpy(candidate->parent_name,"public-parent.exe");strcpy(candidate->parent_path,"C:/Data/public-parent.exe");strcpy(candidate->parent_cmdline,"public-parent.exe --synthetic");strcpy(candidate->parent_resolution_source,"live_parent_generation");strcpy(candidate->parent_resolution_status,"RESOLVED");strcpy(candidate->source_completeness,"COMPLETE");edr_behavior_bind_parent_context(candidate);
+  EdrCommandFacts facts={candidate->cmdline,candidate->parent_cmdline};
+  for(unsigned i=0;i<FANOUT;i++){candidate->event_time_ns=now+(int64_t)i*1000;snprintf(candidate->event_id,sizeof(candidate->event_id),"ctx6000-candidate-%04u",i);snprintf(candidate->net_dst,sizeof(candidate->net_dst),"192.0.2.%u",i+1u);assert(edr_local_evidence_cache_is_candidate(candidate));edr_local_evidence_cache_record_behavior(candidate);assert(edr_local_evidence_cache_record_alert_context(candidate,&facts)==0);if(i==0u)*first=*candidate;}
+  sqlite3 *db=NULL;assert(sqlite3_open("fixture.sqlite",&db)==SQLITE_OK);context6000_owner_hash(db,owner_before);
+  assert(compact_scalar(db,"PRAGMA user_version")==1);assert(compact_scalar(db,"PRAGMA page_size")==4096);assert(compact_scalar(db,"SELECT MAX(length(manifest_template_json)) FROM context_facts")<=4096);
+  assert(compact_scalar(db,"SELECT COUNT(*) FROM p0_candidates WHERE local_retention_state='retained'")==20);assert(context6000_files()<8u*1024u*1024u);assert(sqlite3_close(db)==SQLITE_OK);
+  EdrEvidenceCacheStatus before,after;edr_local_evidence_cache_get_status(&before);assert(before.storage_format==1u);assert(before.candidate_admitted==20u&&before.candidate_rejected==0u);assert(before.write_budget_base_limit==80u&&before.write_budget_ordinary_context_limit==40u);
+  *context=*candidate;context->type=ordinary?EDR_EVENT_FILE_READ:EDR_EVENT_FILE_WRITE;context->priority=1u;context->net_dst[0]=0;context->net_dport=0;context->file_actor_generation_validated=1u;strcpy(context->file_path,"C:/Data/public-context.txt");assert(!edr_local_evidence_cache_is_candidate(context));
+  const uint64_t reads0=retention_bench_reads,writes0=retention_bench_writes,syncs0=retention_bench_syncs;uint64_t peak=context6000_files();ParentSoakProcess cpu0=parent_soak_process();uint64_t started=soak_monotonic_ns();edr_sha256_init(&offered);
+  for(unsigned i=0;i<INPUTS;i++){context->event_time_ns=now+INT64_C(1000000)+(int64_t)i;snprintf(context->event_id,sizeof(context->event_id),"ctx6000-context-%04u",i);edr_sha256_update(&offered,(const uint8_t*)context,sizeof(*context));edr_local_evidence_cache_record_behavior(context);if((i+1u)%1000u==0u){uint64_t bytes=context6000_files();if(bytes>peak)peak=bytes;assert(bytes<=file_cap&&soak_monotonic_ns()-started<UINT64_C(180000000000));printf("{\"kind\":\"context6000_progress\",\"ordinary\":%d,\"offered\":%u,\"file_bytes\":%llu}\n",ordinary,i+1u,(unsigned long long)bytes);assert(!fflush(stdout));}}
+  uint64_t elapsed=soak_monotonic_ns()-started,reads=retention_bench_reads-reads0,writes=retention_bench_writes-writes0,syncs=retention_bench_syncs-syncs0;ParentSoakProcess cpu1=parent_soak_process();edr_sha256_final(&offered,input_raw);for(unsigned i=0;i<32u;i++)snprintf(input_hash+2u*i,3u,"%02x",input_raw[i]);edr_local_evidence_cache_get_status(&after);
+  uint64_t accepted=ordinary?40u:6000u,refused=INPUTS-accepted;assert(after.candidate_admitted==before.candidate_admitted&&after.candidate_rejected==before.candidate_rejected);assert(after.context_facts_written-before.context_facts_written==accepted);assert(after.context_refs_written-before.context_refs_written==accepted*FANOUT);assert(after.context_failure_reasons[EDR_EVIDENCE_FAILURE_WRITE_BUDGET]-before.context_failure_reasons[EDR_EVIDENCE_FAILURE_WRITE_BUDGET]==refused);assert(after.write_budget_ordinary_context_dropped-before.write_budget_ordinary_context_dropped==refused);assert(after.write_budget_critical_context_dropped==0u&&after.write_budget_critical_context_used==0u);assert(after.write_budget_ordinary_context_used==(ordinary?40u:0u));assert(after.db_budget_dropped==before.db_budget_dropped&&after.retention_groups_retired==before.retention_groups_retired);assert(!after.last_error[0]||ordinary);
+  assert(sqlite3_open("fixture.sqlite",&db)==SQLITE_OK);context6000_owner_hash(db,owner_after);assert(!strcmp(owner_before,owner_after));
+  assert((uint64_t)compact_scalar(db,"SELECT COUNT(*) FROM context_facts WHERE json_extract(manifest_template_json,'$.source_event_id') LIKE 'ctx6000-context-%'")==accepted);
+  assert(compact_scalar(db,"SELECT COUNT(*) FROM (SELECT f.fact_id,COUNT(r.artifact_id) n FROM context_facts f LEFT JOIN context_reference_projection r ON r.fact_id=f.fact_id WHERE json_extract(f.manifest_template_json,'$.source_event_id') LIKE 'ctx6000-context-%' GROUP BY f.fact_id HAVING n!=20)")==0);
+  assert(compact_scalar(db,"SELECT COUNT(*) FROM context_reference_projection r LEFT JOIN context_facts f ON f.fact_id=r.fact_id LEFT JOIN p0_candidates p ON p.candidate_id=r.candidate_id WHERE f.fact_id IS NULL OR p.candidate_id IS NULL OR f.endpoint_id!=p.endpoint_id OR f.tenant_id!=p.tenant_id")==0);
+  assert(compact_scalar(db,"SELECT MAX(length(manifest_template_json)) FROM context_facts")<=4096);assert(compact_scalar(db,"SELECT COUNT(*) FROM (SELECT candidate_id,fact_id,COUNT(*) n FROM context_reference_projection GROUP BY candidate_id,fact_id HAVING n!=1)")==0);assert(sqlite3_close(db)==SQLITE_OK);
+  char answer[2048];EdrParentContextQuery query={first->tenant_id,first->endpoint_id,first->event_id,first->pid,first->process_start_key,first->process_creation_filetime_100ns,first->event_time_ns-1,first->event_time_ns+1,now/1000000+60000,EDR_PARENT_CONTEXT_FIELD_NAME};assert(edr_local_evidence_cache_query_parent_context_json(&query,answer,sizeof(answer))==0);cJSON *a=cJSON_Parse(answer),*parent=cJSON_GetObjectItemCaseSensitive(a,"parent");assert(cJSON_IsObject(parent));assert(!strcmp(cJSON_GetObjectItemCaseSensitive(parent,"name")->valuestring,"public-parent.exe"));cJSON_Delete(a);
+  edr_local_evidence_cache_close();edr_pt_cache_shutdown();assert(sqlite3_open_v2("fixture.sqlite",&db,SQLITE_OPEN_READONLY,NULL)==SQLITE_OK);context6000_owner_hash(db,owner_after);assert(!strcmp(owner_before,owner_after));assert(sqlite3_close(db)==SQLITE_OK);uint64_t final_bytes=context6000_files();if(final_bytes>peak)peak=final_bytes;assert(peak<=file_cap);
+  printf("{\"kind\":\"context6000_result\",\"ordinary\":%d,\"inputs\":6000,\"fanout\":20,\"accepted_sources\":%llu,\"quota_refused\":%llu,\"fact_delta\":%llu,\"ref_delta\":%llu,\"owner_count\":20,\"owner_unchanged\":true,\"parent_query_ok\":true,\"no_dangling_refs\":true,\"all_fanout_complete\":true,\"input_sha256\":\"%s\",\"owner_sha256\":\"%s\",\"elapsed_ns\":%llu,\"cpu_user_s\":%.6f,\"cpu_system_s\":%.6f,\"process_io_available\":%d,\"process_read_bytes\":%llu,\"process_write_bytes\":%llu,\"vfs_read_bytes\":%llu,\"vfs_write_bytes\":%llu,\"vfs_syncs\":%llu,\"sampled_file_peak_bytes\":%llu,\"final_file_bytes\":%llu,\"db_budget_mb\":512,\"window_s\":120,\"write_base\":80,\"ordinary_limit\":40,\"wall_fixed\":true,\"real_sqlite\":true,\"p0_ir_stub\":true,\"service_verified\":false}\n",ordinary,(unsigned long long)accepted,(unsigned long long)refused,(unsigned long long)(after.context_facts_written-before.context_facts_written),(unsigned long long)(after.context_refs_written-before.context_refs_written),input_hash,owner_before,(unsigned long long)elapsed,cpu1.user-cpu0.user,cpu1.kernel-cpu0.kernel,cpu1.io_available,(unsigned long long)(cpu1.read_bytes-cpu0.read_bytes),(unsigned long long)(cpu1.write_bytes-cpu0.write_bytes),(unsigned long long)reads,(unsigned long long)writes,(unsigned long long)syncs,(unsigned long long)peak,(unsigned long long)final_bytes);assert(!fflush(stdout));
+  assert(sqlite3_vfs_register(retention_bench_vfs_parent,1)==SQLITE_OK);assert(sqlite3_vfs_unregister(&vfs)==SQLITE_OK);free(candidate);free(context);free(first);return 0;
+}
+#endif
+
+#if defined(EDR_HAVE_SQLITE)
+static void compact_startup_rowset_hash(sqlite3 *db, const char *sql, char out[65]) {
+  sqlite3_stmt *st = NULL; EdrSha256Ctx digest; uint8_t raw[32];
+  assert(sqlite3_prepare_v2(db, sql, -1, &st, NULL) == SQLITE_OK);
+  edr_sha256_init(&digest);
+  int rc;
+  while ((rc = sqlite3_step(st)) == SQLITE_ROW) {
+    unsigned columns = (unsigned)sqlite3_column_count(st);
+    uint8_t count[4];
+    for (unsigned i = 0; i < 4u; ++i) count[3u-i] = (uint8_t)(columns >> (8u*i));
+    edr_sha256_update(&digest, count, sizeof(count));
+    for (unsigned c = 0; c < columns; ++c) {
+      uint8_t type = (uint8_t)sqlite3_column_type(st, (int)c), length[8];
+      const uint8_t *v = sqlite3_column_blob(st, (int)c);
+      uint64_t bytes = (uint64_t)sqlite3_column_bytes(st, (int)c);
+      assert(v || !bytes);
+      for (unsigned i = 0; i < 8u; ++i) length[7u-i] = (uint8_t)(bytes >> (8u*i));
+      edr_sha256_update(&digest, &type, 1u);
+      edr_sha256_update(&digest, length, sizeof(length));
+      if (bytes) edr_sha256_update(&digest, v, (size_t)bytes);
+    }
+  }
+  assert(rc == SQLITE_DONE && sqlite3_finalize(st) == SQLITE_OK);
+  edr_sha256_final(&digest, raw);
+  for (unsigned i = 0; i < 32u; ++i) snprintf(out + 2u*i, 3u, "%02x", raw[i]);
+}
+
+static void compact_startup_seed_legacy(const char *path, EdrBehaviorRecord *r, int64_t now) {
+  assert(test_open_legacy_context(path, 16u, 24u) == 0);
+  init_floor_parent(r, now);
+  EdrCommandFacts facts = {r->cmdline, r->parent_cmdline};
+  assert(edr_local_evidence_cache_record_alert_context(r, &facts) == 0);
+  edr_local_evidence_cache_close();
+}
+
+static void compact_startup_unchanged(sqlite3 *db, const char *refs, const char *projection) {
+  char after[65];
+  compact_startup_rowset_hash(db, "SELECT * FROM candidate_context_refs ORDER BY artifact_id", after);
+  assert(!strcmp(refs, after));
+  compact_startup_rowset_hash(db, "SELECT * FROM materialized_artifacts ORDER BY artifact_id", after);
+  assert(!strcmp(projection, after));
+}
+
+static void test_compact_startup_near_cap(void) {
+  const int64_t now = INT64_C(1700000000000000000);
+  char path[512], refs[65], projection[65]; sqlite3 *db = NULL;
+  EdrBehaviorRecord *r = calloc(1u, sizeof(*r)); assert(r);
+  edr_local_evidence_cache_test_set_legacy_context_writes(0);
+  edr_local_evidence_cache_test_set_now_unix_ns(now);
+  edr_local_evidence_cache_test_set_retention_monotonic_ms(1000);
+  assert(make_test_sqlite_path(path, sizeof(path)) == 0);
+  compact_startup_seed_legacy(path, r, now);
+  assert(sqlite3_open(path, &db) == SQLITE_OK);
+  startup_fill_pages(db, 255);
+  compact_startup_rowset_hash(db, "SELECT * FROM candidate_context_refs ORDER BY artifact_id", refs);
+  compact_startup_rowset_hash(db, "SELECT * FROM materialized_artifacts ORDER BY artifact_id", projection);
+  assert(compact_scalar(db, "PRAGMA freelist_count") == 0);
+  int rc = edr_local_evidence_cache_open(path, 1u, 24u);
+  EdrEvidenceCacheStatus status; edr_local_evidence_cache_get_status(&status);
+  compact_startup_unchanged(db, refs, projection);
+  fprintf(stderr, "compact_near_cap before_pages=255 budget_pages=256 after_pages=%lld open_rc=%d db_open=%d format=%u deferred=%u legacy_columns_unchanged=1\n",
+      (long long)compact_scalar(db, "PRAGMA page_count"), rc, status.db_open,
+      status.storage_format, status.compact_startup_deferred); fflush(stderr);
+  assert(rc == 0 && status.db_open && status.storage_format == 0u && status.compact_startup_deferred == 1u);
+  assert(compact_scalar(db, "PRAGMA user_version") == 0);
+  assert(compact_scalar(db, "SELECT COUNT(*) FROM sqlite_schema WHERE name IN('context_fact_keys','context_candidates','compact_context_refs')") == 0);
+  EdrParentContextQuery query = floor_query(r, now);
+  parent_pressure_query(&query, "compact_near_cap_deferred", 1);
+  edr_local_evidence_cache_close();
+  assert(edr_local_evidence_cache_open(path, 16u, 24u) == 0);
+  edr_local_evidence_cache_get_status(&status); assert(status.storage_format == 1u && !status.compact_startup_deferred);
+  compact_startup_unchanged(db, refs, projection); edr_local_evidence_cache_close();
+  assert(sqlite3_close(db) == SQLITE_OK); cleanup_test_sqlite_path(path); free(r);
+  edr_local_evidence_cache_test_set_now_unix_ns(0);
+  edr_local_evidence_cache_test_set_retention_monotonic_ms(-1);
+}
+
+static void test_compact_startup_checkpoint_refusal(int physical) {
+  const int64_t now = INT64_C(1700000000000000000);
+  char path[512], refs[65], projection[65]; sqlite3 *db = NULL, *reader = NULL;
+  EdrBehaviorRecord *r = calloc(1u, sizeof(*r)); assert(r);
+  edr_local_evidence_cache_test_set_now_unix_ns(now);
+  edr_local_evidence_cache_test_set_retention_monotonic_ms(1000);
+  assert(make_test_sqlite_path(path, sizeof(path)) == 0);
+  compact_startup_seed_legacy(path, r, now);
+  assert(sqlite3_open(path, &db) == SQLITE_OK);
+  /* Fourteen remaining pages fit the empty schema, but its committed WAL
+   * cannot also fit beside the existing main file under the same 1MiB cap. */
+  startup_fill_pages(db, 242);
+  compact_startup_rowset_hash(db, "SELECT * FROM candidate_context_refs ORDER BY artifact_id", refs);
+  compact_startup_rowset_hash(db, "SELECT * FROM materialized_artifacts ORDER BY artifact_id", projection);
+  retention_bench_vfs_parent = sqlite3_vfs_find(NULL); assert(retention_bench_vfs_parent);
+  sqlite3_vfs vfs = *retention_bench_vfs_parent;
+  vfs.zName = "compact-startup-checkpoint-refusal"; vfs.pNext = NULL;
+  vfs.szOsFile += (int)sizeof(RetentionBenchFile); vfs.xOpen = retention_bench_open;
+  assert(sqlite3_vfs_register(&vfs, 1) == SQLITE_OK);
+  if (physical) retention_raise_floor_on_write = 1;
+  else {
+    assert(sqlite3_open(path, &reader) == SQLITE_OK);
+    compact_exec(reader, "BEGIN;SELECT COUNT(*) FROM context_facts;");
+  }
+  int rc = edr_local_evidence_cache_open(path, 1u, 24u);
+  EdrEvidenceCacheStatus status; edr_local_evidence_cache_get_status(&status);
+  fprintf(stderr, "compact_checkpoint_refusal physical=%d rc=%d db_open=%d format=%u deferred=%u db=%llu wal=%llu physical_refusals=%llu\n",
+      physical, rc, status.db_open, status.storage_format, status.compact_startup_deferred,
+      (unsigned long long)status.db_bytes, (unsigned long long)status.wal_bytes,
+      (unsigned long long)status.physical_refusals); fflush(stderr);
+  assert(rc < 0 && !status.db_open && status.storage_format == 1u && !status.compact_startup_deferred);
+  if (physical) {
+    assert(retention_raise_floor_on_write == 0 && status.physical_refusals);
+    test_unsetenv("EDR_STORAGE_MIN_FREE_MB");
+  } else {
+    assert(compact_scalar(reader, "PRAGMA user_version") == 0);
+    compact_exec(reader, "ROLLBACK;"); assert(sqlite3_close(reader) == SQLITE_OK);
+  }
+  assert(compact_scalar(db, "PRAGMA user_version") == 1);
+  assert(compact_scalar(db, "SELECT COUNT(*) FROM compact_context_refs") == 0);
+  compact_startup_unchanged(db, refs, projection);
+  assert(sqlite3_vfs_register(retention_bench_vfs_parent, 1) == SQLITE_OK);
+  assert(sqlite3_vfs_unregister(&vfs) == SQLITE_OK);
+  assert(edr_local_evidence_cache_open(path, 1u, 24u) == 0);
+  edr_local_evidence_cache_get_status(&status); assert(status.db_open && status.storage_format == 1u);
+  EdrParentContextQuery query = floor_query(r, now);
+  parent_pressure_query(&query, "compact_checkpoint_refusal_reopen", 1);
+  compact_startup_unchanged(db, refs, projection); edr_local_evidence_cache_close();
+  assert(sqlite3_close(db) == SQLITE_OK); cleanup_test_sqlite_path(path); free(r);
+  edr_local_evidence_cache_test_set_now_unix_ns(0);
+  edr_local_evidence_cache_test_set_retention_monotonic_ms(-1);
+}
+
+static int compact_startup_deny_create(void *unused, int action, const char *name,
+                                       const char *two, const char *schema, const char *trigger) {
+  (void)unused; (void)two; (void)schema; (void)trigger;
+  return action == SQLITE_CREATE_TABLE && name && !strcmp(name, "context_fact_keys")
+      ? SQLITE_DENY : SQLITE_OK;
+}
+
+static void test_compact_startup_contract(void) {
+  const int64_t now = INT64_C(1700000000000000000);
+  char path[512], refs[65], projection[65], owner[65], after[65];
+  char candidates[65], artifacts[65];
+  EdrBehaviorRecord *r = calloc(1u, sizeof(*r)); assert(r);
+  EdrEvidenceCacheStatus status; sqlite3 *db = NULL, *peer = NULL;
+  edr_local_evidence_cache_test_set_legacy_context_writes(0);
+  edr_local_evidence_cache_test_set_now_unix_ns(now);
+  edr_local_evidence_cache_test_set_retention_monotonic_ms(1000);
+  s_test_monotonic_ns = UINT64_C(1000000000);
+
+  /* Even the supported minimum budget must admit a tiny result after startup
+   * DDL: committed but resettable WAL cannot strand a fresh empty store. */
+  assert(make_test_sqlite_path(path, sizeof(path)) == 0);
+  assert(edr_local_evidence_cache_open(path, 1u, 24u) == 0);
+  edr_local_evidence_cache_get_status(&status);
+  assert(status.storage_format == 1u && !status.compact_startup_deferred);
+  assert(edr_local_evidence_cache_record_command_result("fresh-result", "test", "ok",
+      1, 0, "small public result", "[]") == EDR_EVIDENCE_COMMAND_RESULT_STORED);
+  edr_local_evidence_cache_get_status(&status);
+  assert(status.db_bytes + status.wal_bytes <= UINT64_C(1048576));
+  edr_local_evidence_cache_close();
+  assert(sqlite3_open(path, &db) == SQLITE_OK);
+  assert(compact_scalar(db, "PRAGMA user_version") == 1);
+  assert(compact_scalar(db, "SELECT COUNT(*) FROM compact_context_refs") == 0);
+  assert(sqlite3_close(db) == SQLITE_OK); cleanup_test_sqlite_path(path);
+
+  /* An additive startup preserves every selected old ref/projected column. */
+  assert(make_test_sqlite_path(path, sizeof(path)) == 0);
+  compact_startup_seed_legacy(path, r, now);
+  assert(sqlite3_open(path, &db) == SQLITE_OK);
+  assert(compact_scalar(db, "PRAGMA user_version") == 0);
+  assert(compact_scalar(db, "SELECT COUNT(*) FROM candidate_context_refs") == 1);
+  compact_startup_rowset_hash(db, "SELECT * FROM candidate_context_refs ORDER BY artifact_id", refs);
+  compact_startup_rowset_hash(db, "SELECT * FROM materialized_artifacts ORDER BY artifact_id", projection);
+  parent_fixture_owner_hash(db, r->pid, owner);
+  compact_startup_rowset_hash(db, "SELECT * FROM p0_candidates ORDER BY candidate_id", candidates);
+  compact_startup_rowset_hash(db, "SELECT * FROM artifacts ORDER BY artifact_id", artifacts);
+  assert(edr_local_evidence_cache_open(path, 16u, 24u) == 0);
+  edr_local_evidence_cache_get_status(&status);
+  assert(status.storage_format == 1u && !status.compact_startup_deferred);
+  compact_startup_unchanged(db, refs, projection);
+  parent_fixture_owner_hash(db, r->pid, after); assert(!strcmp(owner, after));
+  compact_startup_rowset_hash(db, "SELECT * FROM p0_candidates ORDER BY candidate_id", after);
+  assert(!strcmp(candidates, after));
+  compact_startup_rowset_hash(db, "SELECT * FROM artifacts ORDER BY artifact_id", after);
+  assert(!strcmp(artifacts, after));
+  assert(compact_scalar(db, "SELECT COUNT(*) FROM compact_context_refs") == 0);
+  EdrParentContextQuery query = floor_query(r, now);
+  parent_pressure_query(&query, "compact_additive_startup", 1);
+  edr_local_evidence_cache_close();
+
+  /* Normal mixed-format enrichment keeps an existing legacy identity in place;
+   * a new canonical identity uses compact. Explicit migration remains separate. */
+  EdrContextStore store; EdrContextWriter writer;
+  assert(edr_context_store_open(&store, db) == 0 && store.format == 1);
+  sqlite3_stmt *row = NULL; char candidate[160], artifact[384], fact[65];
+  assert(sqlite3_prepare_v2(db, "SELECT candidate_id,artifact_id,fact_id FROM candidate_context_refs", -1, &row, NULL) == SQLITE_OK);
+  assert(sqlite3_step(row) == SQLITE_ROW);
+  snprintf(candidate, sizeof(candidate), "%s", sqlite3_column_text(row, 0));
+  snprintf(artifact, sizeof(artifact), "%s", sqlite3_column_text(row, 1));
+  snprintf(fact, sizeof(fact), "%s", sqlite3_column_text(row, 2));
+  assert(sqlite3_step(row) == SQLITE_DONE && sqlite3_finalize(row) == SQLITE_OK);
+  char *candidate_json = sqlite3_mprintf("\"%q\"", candidate); assert(candidate_json);
+  compact_exec(db, "BEGIN IMMEDIATE;");
+  assert(edr_context_writer_open(&store, &writer, 0) == 0);
+  assert(edr_context_writer_put(&writer, artifact, candidate, fact, candidate_json,
+      now, 0, "local_manifest", "") == 0);
+  char new_artifact[384];
+  snprintf(new_artifact, sizeof(new_artifact), "%s:post_context:%064x", candidate, 7);
+  char new_fact[65]; memset(new_fact, '7', 64u); new_fact[64] = 0;
+  char *new_fact_sql = sqlite3_mprintf(
+      "INSERT INTO context_facts SELECT %Q,endpoint_id,tenant_id,"
+      "json_set(manifest_template_json,'$.source_event_id','new-mixed-context'),created_ns,updated_ns "
+      "FROM context_facts WHERE fact_id=%Q;", new_fact, fact);
+  assert(new_fact_sql); compact_exec(db, new_fact_sql); sqlite3_free(new_fact_sql);
+  assert(edr_context_writer_put(&writer, new_artifact, candidate, new_fact, candidate_json,
+      now, 0, "local_manifest", "") == 0);
+  edr_context_writer_close(&writer); compact_exec(db, "COMMIT;"); sqlite3_free(candidate_json);
+  assert(compact_scalar(db, "SELECT COUNT(*) FROM candidate_context_refs") == 1);
+  assert(compact_scalar(db, "SELECT COUNT(*) FROM compact_context_refs") == 1);
+  assert(compact_scalar(db, "SELECT COUNT(*) FROM context_reference_projection") == 2);
+  assert(compact_scalar(db, "SELECT COUNT(*) FROM pragma_foreign_key_check") == 0);
+  assert(sqlite3_close(db) == SQLITE_OK);
+  assert(edr_local_evidence_cache_open(path, 16u, 24u) == 0); edr_local_evidence_cache_close();
+  assert(sqlite3_open(path, &db) == SQLITE_OK);
+  assert(compact_scalar(db, "SELECT COUNT(*) FROM candidate_context_refs") == 1);
+  assert(compact_scalar(db, "SELECT COUNT(*) FROM compact_context_refs") == 1);
+  assert(sqlite3_close(db) == SQLITE_OK); cleanup_test_sqlite_path(path);
+
+  /* A known over-budget legacy file stays queryable and explicitly deferred. */
+  assert(make_test_sqlite_path(path, sizeof(path)) == 0);
+  compact_startup_seed_legacy(path, r, now);
+  assert(sqlite3_open(path, &db) == SQLITE_OK);
+  compact_exec(db, "CREATE TABLE compact_startup_padding(x);INSERT INTO compact_startup_padding VALUES(zeroblob(2097152));PRAGMA wal_checkpoint(TRUNCATE);");
+  compact_startup_rowset_hash(db, "SELECT * FROM candidate_context_refs ORDER BY artifact_id", refs);
+  compact_startup_rowset_hash(db, "SELECT * FROM materialized_artifacts ORDER BY artifact_id", projection);
+  assert(edr_local_evidence_cache_open(path, 1u, 24u) == 0);
+  edr_local_evidence_cache_get_status(&status);
+  assert(status.storage_format == 0u && status.compact_startup_deferred == 1u);
+  assert(status.last_error[0]); compact_startup_unchanged(db, refs, projection);
+  parent_pressure_query(&query, "compact_startup_over_budget_deferred", 1);
+  edr_local_evidence_cache_close();
+  assert(edr_local_evidence_cache_open(path, 16u, 24u) == 0);
+  edr_local_evidence_cache_get_status(&status); assert(status.storage_format == 1u && !status.compact_startup_deferred);
+  compact_startup_unchanged(db, refs, projection); edr_local_evidence_cache_close();
+  assert(sqlite3_close(db) == SQLITE_OK); cleanup_test_sqlite_path(path);
+
+  /* Existing startup physical admission refuses before optional layout DDL. */
+  assert(make_test_sqlite_path(path, sizeof(path)) == 0);
+  compact_startup_seed_legacy(path, r, now);
+  assert(sqlite3_open(path, &db) == SQLITE_OK);
+  compact_startup_rowset_hash(db, "SELECT * FROM candidate_context_refs ORDER BY artifact_id", refs);
+  compact_startup_rowset_hash(db, "SELECT * FROM materialized_artifacts ORDER BY artifact_id", projection);
+  test_setenv("EDR_STORAGE_MIN_FREE_MB", "1073741824");
+  assert(edr_local_evidence_cache_open(path, 16u, 24u) < 0);
+  edr_local_evidence_cache_get_status(&status);
+  assert(!status.db_open && status.physical_refusals && status.last_error[0]);
+  assert(compact_scalar(db, "PRAGMA user_version") == 0); compact_startup_unchanged(db, refs, projection);
+  test_unsetenv("EDR_STORAGE_MIN_FREE_MB");
+
+  /* Busy/schema errors remain failures, never a success-shaped deferred mode. */
+  assert(sqlite3_open(path, &peer) == SQLITE_OK); compact_exec(peer, "BEGIN IMMEDIATE;");
+  assert(edr_local_evidence_cache_open(path, 16u, 24u) < 0);
+  edr_local_evidence_cache_get_status(&status); assert(!status.db_open && status.last_error[0]);
+  assert(compact_scalar(db, "PRAGMA user_version") == 0); compact_startup_unchanged(db, refs, projection);
+  compact_exec(peer, "ROLLBACK;"); assert(sqlite3_close(peer) == SQLITE_OK);
+  assert(edr_context_store_open(&store, db) == 0 && store.format == 0);
+  assert(sqlite3_set_authorizer(db, compact_startup_deny_create, NULL) == SQLITE_OK);
+  assert(edr_context_store_begin_upgrade(&store) < 0);
+  assert(sqlite3_get_autocommit(db) && compact_scalar(db, "PRAGMA user_version") == 0);
+  assert(compact_scalar(db, "SELECT COUNT(*) FROM sqlite_schema WHERE name='context_fact_keys'") == 0);
+  assert(sqlite3_set_authorizer(db, NULL, NULL) == SQLITE_OK);
+  compact_startup_unchanged(db, refs, projection);
+  compact_exec(db, "CREATE TABLE context_fact_keys(invalid_schema);");
+  assert(edr_local_evidence_cache_open(path, 16u, 24u) < 0);
+  edr_local_evidence_cache_get_status(&status); assert(!status.db_open && !status.compact_startup_deferred && status.last_error[0]);
+  assert(compact_scalar(db, "PRAGMA user_version") == 0); compact_startup_unchanged(db, refs, projection);
+  compact_exec(db, "DROP TABLE context_fact_keys;");
+  assert(edr_local_evidence_cache_open(path, 16u, 24u) == 0);
+  edr_local_evidence_cache_get_status(&status); assert(status.storage_format == 1u);
+  compact_startup_unchanged(db, refs, projection); edr_local_evidence_cache_close();
+  assert(sqlite3_close(db) == SQLITE_OK); cleanup_test_sqlite_path(path);
+  edr_local_evidence_cache_test_set_now_unix_ns(0);
+  edr_local_evidence_cache_test_set_retention_monotonic_ms(-1); free(r);
+  puts("compact_startup_contract fresh_default=1 legacy_columns_preserved=1 no_startup_move=1 mixed_writer_preserves_old_identity=1 capacity_deferred=1 physical_refusal=1 busy_and_DDL_fail_closed=1 reopen_consistent=1");
+}
+#endif
+
 int main(int argc, char **argv) {
   if (argc >= 2 && strcmp(argv[1], "--normal-open-work-copy") == 0) {
 #if defined(_WIN32) && defined(EDR_HAVE_SQLITE) && defined(EDR_LOCAL_EVIDENCE_CACHE_TESTING)
@@ -12754,6 +13131,25 @@ int main(int argc, char **argv) {
     fprintf(stderr, "work-copy rehearsal requires native Windows SQLite test build, token and approved manifest SHA\n");
     return 2;
   }
+#if defined(EDR_HAVE_SQLITE)
+  if (argc == 2 && strcmp(argv[1], "--compact-startup-near-cap") == 0) {
+    test_compact_startup_near_cap(); return 0;
+  }
+  if (argc == 2 && strcmp(argv[1], "--compact-startup-contract") == 0) {
+    test_compact_startup_contract();
+    test_compact_startup_near_cap();
+    test_compact_startup_checkpoint_refusal(0);
+    test_compact_startup_checkpoint_refusal(1);
+    test_post_context_exact_replay_charges_only_durable_changes();
+    test_critical_context_high_fanout_is_atomically_bounded();
+    test_candidate_commit_failure_leaves_no_dedupe_or_context_state();
+    return 0;
+  }
+  if (argc == 2 && strcmp(argv[1], "--public-context6000-critical") == 0)
+    return context6000_workload(0);
+  if (argc == 2 && strcmp(argv[1], "--public-context6000-ordinary") == 0)
+    return context6000_workload(1);
+#endif
 #if !defined(_WIN32)
   s_test_executable = argv[0];
 #endif
