@@ -122,10 +122,13 @@ try {
         Invoke-Preflight 'owner-lock-busy' @('--config', $config) 7
         $lock.Unlock(0, 1)
     } finally { $lock.Dispose() }
+    $releasedOwner = Get-OwnerSnapshot
+    Assert-Preflight ((Invoke-Preflight 'owner-lock-released' @('--config', $config)) -eq 64MB) 'released owner inventory did not recover'
+    Assert-Preflight ((Get-OwnerSnapshot) -eq $releasedOwner) 'released inventory changed owner bytes, timestamps, or ACL'
     [IO.File]::WriteAllText($config, "[offline`n", $utf8)
     Invoke-Preflight 'corrupt-config' @('--config', $config) 3
     Invoke-Preflight 'ambiguous-config' @('--config', $config, '--defaults') 2
-    Assert-Preflight ($cases.Count -eq 13) 'not all native preflight cases completed'
+    Assert-Preflight ($cases.Count -eq 14) 'not all native preflight cases completed'
     [ordered]@{test='native_storage_space_preflight';cases=$cases.Count;owner_hash_timestamps_acl_unchanged=$true;unsafe_acl_and_reparse_rejected=$true;missing_parent_not_created=$true;lock_busy_rejected=$true;agent_started=$false} | ConvertTo-Json -Compress
 } finally {
     foreach ($key in $savedEnv.Keys) { [Environment]::SetEnvironmentVariable($key, $savedEnv[$key], 'Process') }

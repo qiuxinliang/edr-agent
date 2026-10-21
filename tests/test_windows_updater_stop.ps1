@@ -1,6 +1,6 @@
 #Requires -Version 5.1
-# Execute only the pinned production stop function. SCM and process enumeration
-# are isolated below; this is not a real Agent/installer rollback acceptance.
+# Execute pinned production updater branches with external I/O isolated below.
+# This is not a real Agent/installer rollback acceptance.
 [CmdletBinding()]
 param(
   [Parameter(Mandatory=$true)][string]$UpdaterPath,
@@ -167,4 +167,108 @@ foreach($name in @('pending','denied','process_query_failed')){
   }
   [void]$rollbackResults.Add(@{case=$name;mirrors=$script:mirrors;starts=$script:starts;status=$report.status;rollback=$report.rollback})
 }
-@{schema='edr.updater-stop-tests.v1';status='passed';checks=$script:checks;updater_sha256=$UpdaterSha256;function_extraction_only=$true;scm_stub=$true;process_query_stub=$true;rollback_external_io_stub=$true;updater_main_executed=$false;cases=$results.ToArray();rollback_cases=$rollbackResults.ToArray()} | ConvertTo-Json -Depth 5 -Compress
+# Execute the production full-installer and interrupted-stage bodies. Only I/O
+# is replaced: a live synthetic owner refuses inventory until runtime stop.
+$install=@($ast.FindAll({param($n)
+  $n -is [Management.Automation.Language.IfStatementAst] -and
+  $n.Clauses[0].Item1.Extent.Text -ceq '$UpgradeClass -eq ''installer_required''' -and
+  $n.Clauses[0].Item2.Extent.Text -like '*full_installer_backup*'
+},$true))
+$resume=@($ast.FindAll({param($n)
+  $n -is [Management.Automation.Language.IfStatementAst] -and
+  $n.Clauses[0].Item1.Extent.Text -ceq '$interruptedFullInstaller'
+},$true))
+Check ($install.Count -eq 1 -and $resume.Count -eq 1) 'unique_installer_and_recovery_bodies'
+$body=$install[0].Clauses[0].Item2.Extent.Text
+$installBody=[scriptblock]::Create($body.Substring(1,$body.Length-2))
+$body=$resume[0].Clauses[0].Item2.Extent.Text
+$resumeBody=[scriptblock]::Create($body.Substring(1,$body.Length-2))
+function Get-SetupInstallerFromPackage {param($PackagePath,$DestinationDirectory,$ExpectedAgentSha256,$ExpectedVersion);return @{SetupPath='C:\public\setup.exe';RuntimeIdentitySha256='public-identity'}}
+function Assert-AuthenticodePublisher {param($Path,$Thumbprint,$Subject)}
+function Assert-InstalledRuntimeIdentity {param($InstallDirectory,$ExpectedIdentitySha256)}
+function Write-AtomicJson {param($Path,$Value)}
+function Remove-Item { [CmdletBinding()]param($LiteralPath,[switch]$Force)}
+function Test-Path { [CmdletBinding()]param($LiteralPath,$PathType);return $true }
+function Get-Sha256 {param($Path);if($script:flowCase -eq 'interrupted'){return 'old-hash'};return 'target-hash'}
+function Copy-Item { [CmdletBinding()]param($LiteralPath,$Destination,[switch]$Force);$script:configCopies++ }
+function Set-UpdateStage {param($Stage,$Status);$script:lastStage=$Stage;$report['stage']=$Stage}
+function Invoke-FullInstallerRuntimeMirror {
+  param($Source,$Destination,$Stage)
+  if($Stage -eq 'backup'){
+    if($script:flowCase -eq 'backup_failure'){throw 'fixture_backup_failed'}
+    $script:backupReady=$true
+  }else{$script:restores++}
+}
+function Stop-AgentRuntime {
+  param($Mode,$TaskName,$TaskPath,$WindowsServiceName,$ExecutablePath)
+  Check ($Mode -ceq $resolvedDeploymentMode -and $ExecutablePath -ceq $currentPath) 'stop_expected_runtime'
+  $script:installStops++
+  if($script:flowCase -eq 'stop_failure'){throw 'fixture_stop_failed'}
+  if($script:installStops -eq 1 -and $script:flowCase -ne 'interrupted'){
+    Check ($script:backupReady -and $script:configCopies -eq 2 -and
+      $script:lastStage -ceq 'full_installer_upgrade' -and $fullInstallerStarted) 'recovery_ready_before_quiesce'
+  }
+  $script:ownerBusy=$false
+}
+function Invoke-FullInstallerUpgrade {
+  param($SetupPath,$Mode,$RuntimeBackupPath)
+  $script:installerCalls++
+  if($script:ownerBusy){throw 'fixture_owner_lock_timeout'}
+  if($script:flowCase -eq 'inventory_failure'){throw 'fixture_inventory_unavailable'}
+  return @{ExitCode=0;Evidence=@{Sha256='public-log';Size=1;OriginalSize=1;Status='ready';Path='C:\public\setup.log'};EvidenceId='public-id';StorageKey='public-key';BaselineMode='upgrade_existing'}
+}
+function Wait-FullInstallerProcess {param($SetupPath);$script:recoveryWaits++}
+$RuntimeManifest='C:\public\package.zip';$stagedPath='C:\public\FDSensor.exe';$expectedHash='target-hash'
+$TargetVersion='3.2.704';$TrustedPublisherThumbprint='';$TrustedPublisherSubject=''
+$UpgradeClass='installer_required';$verifiedStatus='verified';$journalPath='C:\public\journal.json'
+$installerResults=New-Object 'System.Collections.Generic.List[object]'
+foreach($mode in @('scheduled_task','service')){
+  foreach($flowCase in @('success','backup_failure','stop_failure','inventory_failure','interrupted')){
+    $script:flowCase=$flowCase;$resolvedDeploymentMode=$mode
+    $script:ownerBusy=$true;$script:backupReady=$false;$script:configCopies=0
+    $script:installStops=0;$script:installerCalls=0;$script:restores=0;$script:starts=0;$script:healthChecks=0;$script:recoveryWaits=0
+    $fullInstallerStarted=$false;$fullInstallerExpectedRuntimeIdentity='public-identity'
+    $report=@{status='running'};$journal=@{resolved_deployment_mode=$mode};$failure=$null
+    try{
+      if($flowCase -eq 'interrupted'){
+        # Simulate death immediately after stop, before invoking the installer.
+        $script:ownerBusy=$false;$script:backupReady=$true;$script:configCopies=2
+        & $resumeBody
+      }else{& $installBody}
+    }catch{
+      $failure=$_.Exception.Message;$failureMessage=$failure;$report.status='failed';$report['error']=$failure
+      if($flowCase -in @('stop_failure','inventory_failure','interrupted')){& $rollbackBody}
+    }
+    switch($flowCase){
+      'success'{Check ($null -eq $failure -and $report.status -ceq 'succeeded' -and $script:installStops -eq 1 -and $script:installerCalls -eq 1 -and $script:healthChecks -eq 1 -and $script:restores -eq 0) 'quiesce_then_inventory_then_health'}
+      'backup_failure'{Check ($failure -ceq 'fixture_backup_failed' -and $script:installStops -eq 0 -and $script:installerCalls -eq 0 -and $script:restores -eq 0) 'backup_failure_keeps_owner_running'}
+      'stop_failure'{Check ($failure -ceq 'fixture_stop_failed' -and $script:installerCalls -eq 0 -and $script:restores -eq 0 -and $script:starts -eq 0 -and $report.rollback -ceq 'failed') 'stop_failure_never_installs_or_restores'}
+      'inventory_failure'{Check ($failure -ceq 'fixture_inventory_unavailable' -and $script:installerCalls -eq 1 -and $report.rollback -ceq 'succeeded' -and $script:restores -eq 1 -and $script:starts -eq 1 -and $script:healthChecks -eq 1) 'inventory_failure_restores_original_runtime'}
+      'interrupted'{Check ($failure -ceq 'recovered full installer did not complete the task-pinned Agent replacement' -and $script:recoveryWaits -eq 1 -and $script:installerCalls -eq 0 -and $report.rollback -ceq 'succeeded' -and $script:restores -eq 1 -and $script:starts -eq 1 -and $script:healthChecks -eq 1) 'interrupted_quiesce_uses_existing_recovery'}
+    }
+    [void]$installerResults.Add(@{mode=$mode;case=$flowCase;status=$report.status;installer_calls=$script:installerCalls;restores=$script:restores;starts=$script:starts;failure=$failure})
+  }
+}
+
+# Exercise the real exception projection: PrepareToInstall also reports storage
+# failures and must not by itself imply an unsupported installation baseline.
+$invoke=@($ast.FindAll({param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -ceq 'Invoke-FullInstallerUpgrade'},$true))
+Check ($invoke.Count -eq 1) 'unique_installer_invoke'
+Invoke-Expression $invoke[0].Extent.Text
+function Get-InstallerLogPath {param($TaskId,$CommandId);return 'C:\public\setup.log'}
+function Get-InstallerLogEvidence {param($Path);return @{Status='ready';Sha256='public-log';Size=1;Summary=$script:summary}}
+function Start-Process {param($FilePath,$ArgumentList,[switch]$Wait,[switch]$PassThru);return @{ExitCode=7}}
+$InstallDir='C:\public';$TaskId='public-task';$CommandId='public-command';$MinFreeBytes=[UInt64]64MB
+$errorResults=New-Object 'System.Collections.Generic.List[object]'
+foreach($item in @(
+  @('PrepareToInstall failed: EDR: local storage preflight failed; existing runtime was not stopped.','INSTALL_EXIT_NONZERO'),
+  @('uninstall baseline present. PrepareToInstall failed: insufficient space.','INSTALL_EXIT_NONZERO'),
+  @('PrepareToInstall failed: EDR: /EDR_UPGRADE_EXISTING requires a completed existing Setup installation.','INSTALL_BASELINE_UNSUPPORTED'),
+  @('PrepareToInstall failed: EDR: baseline repair backup is incomplete; refusing to modify the existing Agent.','INSTALL_BASELINE_UNSUPPORTED')
+)){
+  $script:summary=$item[0];$failure=$null
+  try{Invoke-FullInstallerUpgrade -SetupPath 'C:\public\setup.exe' -Mode service -RuntimeBackupPath 'C:\public\backup'}catch{$failure=$_.Exception.Message}
+  Check ($null -ne $failure -and $failure.StartsWith($item[1]+'|installer_exit_code=7|')) 'installer_failure_classification'
+  [void]$errorResults.Add(@{expected=$item[1];error=$failure})
+}
+@{schema='edr.updater-stop-tests.v1';status='passed';checks=$script:checks;updater_sha256=$UpdaterSha256;function_extraction_only=$true;scm_stub=$true;process_query_stub=$true;rollback_external_io_stub=$true;updater_main_executed=$false;cases=$results.ToArray();rollback_cases=$rollbackResults.ToArray();installer_cases=$installerResults.ToArray();installer_error_cases=$errorResults.ToArray();installer_external_io_stub=$true} | ConvertTo-Json -Depth 5 -Compress

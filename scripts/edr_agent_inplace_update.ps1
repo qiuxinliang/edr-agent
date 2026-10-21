@@ -285,7 +285,7 @@ function Invoke-FullInstallerUpgrade {
     throw "INSTALL_LOG_TOO_LARGE|installer_exit_code=$($process.ExitCode)|log_sha256=$($diagnostic.Sha256)|log_size=$($diagnostic.Size)|original_size=$($evidence.Size)"
   }
   if ($process.ExitCode -ne 0) {
-    $code = if ($process.ExitCode -eq 7 -and $evidence.Summary -match '(?i)PrepareToInstall|baseline|uninstall') { 'INSTALL_BASELINE_UNSUPPORTED' } else { 'INSTALL_EXIT_NONZERO' }
+    $code = if ($process.ExitCode -eq 7 -and $evidence.Summary -match '(?i)EDR: (?:/EDR_UPGRADE_EXISTING requires|baseline repair)') { 'INSTALL_BASELINE_UNSUPPORTED' } else { 'INSTALL_EXIT_NONZERO' }
     # Keep exception text machine-readable and deliberately free of paths/log content.
     throw "$code|installer_exit_code=$($process.ExitCode)|log_sha256=$($evidence.Sha256)|log_size=$($evidence.Size)"
   }
@@ -1452,6 +1452,12 @@ try {
     Add-UpdateEvent -Status 'installing' -Progress 50 -Detail @{ stage = 'full_installer_upgrade'; preserves_identity = $true; preserves_queue = $true; preserves_evidence = $true }
     Set-UpdateStage -Stage 'full_installer_upgrade'
     $fullInstallerStarted = $true
+    # The installer calibrates command-state commitments under the owner's
+    # exclusive lock. Quiesce the existing runtime after its recovery backup
+    # and durable stage are ready; do not race that inventory against live work.
+    # This stage already recovers a crash before the installer replaces files.
+    Stop-AgentRuntime -Mode $resolvedDeploymentMode -TaskName $ScheduledTaskName `
+      -TaskPath $ScheduledTaskPath -WindowsServiceName $ServiceName -ExecutablePath $currentPath
     $installerResult = Invoke-FullInstallerUpgrade -SetupPath $setupPath -Mode $resolvedDeploymentMode -RuntimeBackupPath $fullInstallerBackupPath
     $report['installer_exit_code'] = $installerResult.ExitCode
     $report['installer_log_sha256'] = $installerResult.Evidence.Sha256
