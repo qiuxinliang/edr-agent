@@ -137,12 +137,18 @@ function Repair-UninstallerAcls {
 function Repair-RuntimeFileAcls {
   param([string]$Path)
   if (-not (Test-Path -LiteralPath $Path)) { return }
-  foreach ($item in @(Get-ChildItem -LiteralPath $Path -File -Force -Recurse -ErrorAction SilentlyContinue)) {
-    try { & takeown.exe /F $item.FullName /A 2>$null | Out-Null } catch {}
-    & icacls.exe $item.FullName /inheritance:r /grant:r "*S-1-5-18:F" /grant:r "*S-1-5-32-544:F" /C /Q | Out-Null
-    if ($LASTEXITCODE -ne 0) {
-      throw "file ACL repair failed with exit code $LASTEXITCODE path=$($item.FullName)"
-    }
+  # The caller already took ownership and removed inheritance recursively.
+  # Match the native installer's batched direct-file grants. /grant (not
+  # /grant:r) preserves directory inheritance for files created afterwards.
+  # Older autorun versions recursed over *.json and granted Users access to
+  # outbox/evidence files. Remove those explicit grants as well as inheritance.
+  & icacls.exe $Path /remove:g "*S-1-5-32-545" /T /C /Q | Out-Null
+  if ($LASTEXITCODE -ne 0) {
+    throw "sensitive ACL removal failed with exit code $LASTEXITCODE path=$Path"
+  }
+  & icacls.exe $Path /grant "*S-1-5-18:F" "*S-1-5-32-544:F" /T /C /Q | Out-Null
+  if ($LASTEXITCODE -ne 0) {
+    throw "file ACL repair failed with exit code $LASTEXITCODE path=$Path"
   }
 }
 
@@ -177,12 +183,12 @@ function Repair-SensitiveRuntimeAcls {
       try { & takeown.exe /F $path /A /R /D Y 2>$null | Out-Null } catch {}
       & icacls.exe $path /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)F" /grant:r "*S-1-5-32-544:(OI)(CI)F" /T /C /Q | Out-Null
       $aclExit = $LASTEXITCODE
-      if ($sub -eq "queue" -and $aclExit -ne 0) {
-        throw "queue ACL repair failed with exit code $aclExit"
+      if ($aclExit -ne 0) {
+        throw "$sub ACL repair failed with exit code $aclExit"
       }
       Repair-RuntimeFileAcls -Path $path
     } catch {
-      if ($sub -eq "queue") { throw }
+      throw
     }
   }
 
@@ -198,7 +204,9 @@ function Repair-SensitiveRuntimeAcls {
 
   foreach ($pattern in @("*.exe", "*.dll", "*.ps1", "*.json", "*.enc", "*.example", "*.txt", "edr_config\*")) {
     try {
-      Get-ChildItem -Path (Join-Path $Dir $pattern) -Force -Recurse -ErrorAction SilentlyContinue |
+      # Runtime files at the install root (and edr_config's immediate files)
+      # may be public-readable. Never traverse evidence/outbox JSON or logs.
+      Get-ChildItem -Path (Join-Path $Dir $pattern) -File -Force -ErrorAction SilentlyContinue |
         ForEach-Object {
           try { & icacls.exe $_.FullName /grant:r "*S-1-5-18:F" /grant:r "*S-1-5-32-544:F" /grant:r "*S-1-5-32-545:RX" /C /Q | Out-Null } catch {}
           try { Unblock-File -LiteralPath $_.FullName -ErrorAction SilentlyContinue } catch {}
@@ -472,7 +480,16 @@ if (-not (Test-Path -LiteralPath $cfg)) {
   Write-Error "Missing $cfg (enroll or copy agent.toml.example before autorun install)"
 }
 
-Remove-ScheduledTaskIfPresent
+# Keep the existing definition until replacement registration succeeds. The
+# updater also snapshots it before invoking the installer for later rollback.
+foreach ($name in @($TaskName, $LegacyTaskName)) {
+  Stop-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue
+}
+$installWatch = [Diagnostics.Stopwatch]::StartNew()
+function Write-AutorunStage([string]$Stage) {
+  Write-Host ("autorun_stage={0} elapsed_ms={1}" -f $Stage, $installWatch.ElapsedMilliseconds)
+}
+Write-AutorunStage 'stop_process'
 Stop-AgentProcess
 Remove-StaleQueueLock -Dir $instDir
 
@@ -480,12 +497,15 @@ if ($HardenAcl) {
   Set-InstallDirAclHarden -Dir $instDir
   Set-AgentTomlAcl -Path $cfg
 }
+Write-AutorunStage 'dependency_acl'
 Repair-RuntimeDependencyAcls -Dir $instDir
+Write-AutorunStage 'sensitive_acl'
 Repair-SensitiveRuntimeAcls -Dir $instDir
 Set-AgentTomlAcl -Path $cfg
 
 # Keep autorun forensic collector settings aligned with the Windows service installer.
 # Derive adapter and Velociraptor manifest URLs from rest_base_url.
+Write-AutorunStage 'environment'
 try {
   [Environment]::SetEnvironmentVariable("EDR_FORENSIC_COLLECTOR", "1", "Machine")
   [Environment]::SetEnvironmentVariable("EDR_FORENSIC_COLLECTOR_BIN", (Join-Path $instDir "collector\forensic_collector.exe"), "Machine")
@@ -505,6 +525,7 @@ try {
 }
 Repair-ExecutableAcl -Path $exe
 
+Write-AutorunStage 'launcher'
 $launcher = Write-TaskLauncher -Exe $exe -Config $cfg -Dir $instDir
 $psExe = Join-Path $env:WINDIR "System32\WindowsPowerShell\v1.0\powershell.exe"
 if (-not (Test-Path -LiteralPath $psExe)) {
@@ -518,9 +539,12 @@ $set = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnB
   -MultipleInstances IgnoreNew -ExecutionTimeLimit ([TimeSpan]::Zero) `
   -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
 
+Write-AutorunStage 'register_task'
 Register-ScheduledTask -TaskName $TaskName -Action $sta -Trigger $trg -Principal $prc -Settings $set -Force | Out-Null
+Unregister-ScheduledTask -TaskName $LegacyTaskName -Confirm:$false -ErrorAction SilentlyContinue
 if (-not $NoStart) {
   Start-ScheduledTask -TaskName $TaskName
 }
 
+Write-AutorunStage 'complete'
 exit 0

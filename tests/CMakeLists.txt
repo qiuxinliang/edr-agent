@@ -284,6 +284,20 @@ if(WIN32)
   # Three negative cases exercise the production 30-second stop deadline.
   set_tests_properties(windows_updater_stop PROPERTIES TIMEOUT 120
     ENVIRONMENT "PSModulePath=${CMAKE_CURRENT_BINARY_DIR}/foreign-powershell-modules")
+  add_test(NAME windows_updater_task_recovery
+    COMMAND "${CMAKE_COMMAND}" -E env --unset=PSModulePath powershell.exe -NoProfile -NonInteractive -File
+      "${CMAKE_CURRENT_SOURCE_DIR}/test_windows_updater_task_recovery.ps1"
+      -UpdaterPath "${CMAKE_SOURCE_DIR}/scripts/edr_agent_inplace_update.ps1")
+  add_test(NAME windows_autorun_acl
+    COMMAND "${CMAKE_COMMAND}" -E env --unset=PSModulePath powershell.exe -NoProfile -NonInteractive -File
+      "${CMAKE_CURRENT_SOURCE_DIR}/test_windows_autorun_acl.ps1"
+      -AutorunPath "${CMAKE_SOURCE_DIR}/install/windows-inno/edr_windows_autorun.ps1"
+      -ProgressPath "${CMAKE_CURRENT_BINARY_DIR}/autorun-acl-progress.json")
+  add_test(NAME windows_autorun_task
+    COMMAND "${CMAKE_COMMAND}" -E env --unset=PSModulePath powershell.exe -NoProfile -NonInteractive -File
+      "${CMAKE_CURRENT_SOURCE_DIR}/test_windows_autorun_task.ps1"
+      -AutorunPath "${CMAKE_SOURCE_DIR}/install/windows-inno/edr_windows_autorun.ps1")
+  set_tests_properties(windows_updater_task_recovery windows_autorun_acl windows_autorun_task PROPERTIES TIMEOUT 60)
   add_test(NAME windows_installer_acl_behavior
     COMMAND "${CMAKE_COMMAND}" -E env --unset=PSModulePath powershell.exe -NoProfile -Command
       "& ([scriptblock]::Create((Get-Content -LiteralPath '${CMAKE_CURRENT_SOURCE_DIR}/test_windows_installer_acl.ps1' -Raw -Encoding UTF8))) -InstallerWorker '$<TARGET_FILE:fd_installer_worker>'")

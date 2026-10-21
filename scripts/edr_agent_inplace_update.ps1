@@ -881,6 +881,98 @@ function Stop-AgentRuntime {
   Wait-AgentProcess -ExecutablePath $ExecutablePath -Running $false -TimeoutSeconds 30
 }
 
+function Get-AgentTaskFolder {
+  param([string]$TaskPath)
+  $scheduler = New-Object -ComObject 'Schedule.Service'
+  $scheduler.Connect()
+  return $scheduler.GetFolder($TaskPath)
+}
+
+function Save-AgentTaskDefinition {
+  param([string]$TaskName, [string]$TaskPath, [string]$Path, [switch]$AllowMissing)
+  $folder = Get-AgentTaskFolder -TaskPath $TaskPath
+  try { $task = $folder.GetTask($TaskName) } catch {
+    $cause = $_.Exception
+    while ($cause.InnerException) { $cause = $cause.InnerException }
+    # A same-version repair may start with a missing owner. Record absence;
+    # query/access errors must never be mistaken for a missing Task.
+    if (-not $AllowMissing -or $cause.HResult -ne -2147024894) { throw }
+    Write-AtomicJson -Path $Path -Value @{task_name=$TaskName; task_path=$TaskPath; present=$false}
+    return Get-Sha256 -Path $Path
+  }
+  # The supported startup owner is SYSTEM with no password to recover.
+  $principal = $task.Definition.Principal
+  if ([int]$principal.LogonType -ne 5 -or
+      [string]$principal.UserId -notin @('SYSTEM','NT AUTHORITY\SYSTEM','S-1-5-18')) {
+    throw 'cannot preserve unsupported Agent Task principal'
+  }
+  $snapshot = [ordered]@{
+    task_name = $TaskName; task_path = $TaskPath; present = $true
+    xml = [string]$task.Xml; sddl = [string]$task.GetSecurityDescriptor(7)
+  }
+  if ($snapshot.xml.Length -eq 0 -or $snapshot.xml.Length -gt 262144 -or
+      $snapshot.sddl.Length -eq 0 -or $snapshot.sddl.Length -gt 65536) {
+    throw 'Agent Task definition exceeds recovery snapshot limits'
+  }
+  Write-AtomicJson -Path $Path -Value $snapshot
+  return Get-Sha256 -Path $Path
+}
+
+function Test-AgentTaskSecurityDescriptor {
+  param([string]$Expected, [string]$Actual)
+  # Task Scheduler reorders allow ACEs and marks DACL_AUTO_INHERITED. Allow
+  # grants commute; with deny/other ACEs require the original exact order.
+  # Keep SID, rights, ACE flags, owner/group and DACL protection significant.
+  $left = [Security.AccessControl.RawSecurityDescriptor]::new($Expected)
+  $right = [Security.AccessControl.RawSecurityDescriptor]::new($Actual)
+  if ($null -eq $left.DiscretionaryAcl -or $null -eq $right.DiscretionaryAcl -or
+      $left.Owner -ne $right.Owner -or $left.Group -ne $right.Group -or
+      (($left.ControlFlags -bxor $right.ControlFlags) -band [Security.AccessControl.ControlFlags]::DiscretionaryAclProtected)) {
+    return $false
+  }
+  $permissions = {
+    param($Acl)
+    $rules = New-Object 'System.Collections.Generic.List[string]'
+    $allowOnly = $true
+    foreach ($ace in $Acl) {
+      if ($ace.AceType -ne [Security.AccessControl.AceType]::AccessAllowed) { $allowOnly = $false }
+      $bytes = New-Object byte[] $ace.BinaryLength
+      $ace.GetBinaryForm($bytes, 0)
+      $rules.Add([Convert]::ToBase64String($bytes))
+    }
+    if ($allowOnly) { $rules.Sort([StringComparer]::Ordinal) }
+    return $rules -join ';'
+  }
+  return (& $permissions $left.DiscretionaryAcl) -ceq (& $permissions $right.DiscretionaryAcl)
+}
+
+function Restore-AgentTaskDefinition {
+  param([string]$TaskName, [string]$TaskPath, [string]$Path, [string]$ExpectedSha256)
+  # Old journals without a snapshot cannot prove a missing/replaced Task's
+  # original owner. Fail explicitly rather than inventing a launch definition.
+  if ($ExpectedSha256 -notmatch '^[a-f0-9]{64}$') {
+    throw 'original Agent Task recovery snapshot is unavailable'
+  }
+  $file = Get-Item -LiteralPath $Path -ErrorAction Stop
+  if ($file.Length -gt 2MB -or ($file.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or
+      (Get-Sha256 -Path $Path) -cne $ExpectedSha256) {
+    throw 'Agent Task recovery snapshot integrity check failed'
+  }
+  $snapshot = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json
+  if ([string]$snapshot.task_name -cne $TaskName -or [string]$snapshot.task_path -cne $TaskPath) {
+    throw 'Agent Task recovery snapshot identity mismatch'
+  }
+  if (-not $snapshot.present) { throw 'original Agent Task was absent; no verified startup owner to restore' }
+  $folder = Get-AgentTaskFolder -TaskPath $TaskPath
+  # CREATE_OR_UPDATE | DONT_ADD_PRINCIPAL_ACE | IGNORE_REGISTRATION_TRIGGERS:
+  # restore the original ACL and never start before explicit health observation.
+  $restored = $folder.RegisterTask($TaskName, [string]$snapshot.xml, 54,
+    'SYSTEM', $null, 5, [string]$snapshot.sddl)
+  if (-not (Test-AgentTaskSecurityDescriptor -Expected $snapshot.sddl -Actual $restored.GetSecurityDescriptor(7))) {
+    throw 'restored Agent Task permissions do not match the recovery snapshot'
+  }
+}
+
 function Start-AgentRuntime {
   param([string]$Mode, [string]$TaskName, [string]$TaskPath, [string]$WindowsServiceName,
     [string]$ExecutablePath, [int]$TimeoutSeconds)
@@ -1049,6 +1141,7 @@ $candidatePath = Join-Path $installFull ("FDSensor.exe.candidate-{0}" -f $Target
 $failedPath = Join-Path $installFull ("FDSensor.exe.failed-{0}-{1}" -f $TargetVersion, $stamp)
 $fullInstallerBackupPath = Join-Path (Split-Path -Parent $stagedPath) 'full-installer-runtime-backup'
 $fullInstallerConfigBackupPath = Join-Path (Split-Path -Parent $stagedPath) 'full-installer-agent.toml.backup'
+$fullInstallerTaskBackupPath = Join-Path (Split-Path -Parent $stagedPath) 'full-installer-task.backup.json'
 $fullInstallerStarted = $false
 $fullInstallerExpectedRuntimeIdentity = ''
 $replacementCommitted = $false
@@ -1083,6 +1176,7 @@ $journal = [ordered]@{
   runtime_files = @()
   full_installer_backup_path = if ($UpgradeClass -eq 'installer_required') { $fullInstallerBackupPath } else { $null }
   full_installer_config_backup_path = if ($UpgradeClass -eq 'installer_required') { $fullInstallerConfigBackupPath } else { $null }
+  full_installer_task_backup_sha256 = ''
   expected_runtime_identity_sha256 = $null
   installer_log_file = $null
   installer_log_sha256 = $null
@@ -1240,7 +1334,7 @@ try {
     foreach ($field in @('backup_path','failed_path','resolved_deployment_mode','previous_sha256',
         'health_observation_clock_version','health_observation_started_at_unix_ms','health_observation_deadline_unix_ms',
         'health_observation_utc_deadline_unix_ms','health_last_checked_unix_ms',
-        'expected_runtime_identity_sha256')) {
+        'expected_runtime_identity_sha256','full_installer_task_backup_sha256')) {
       if ($priorProperties -contains $field) { $journal[$field] = $prior.$field }
     }
 	if ($priorProperties -contains 'expected_runtime_identity_sha256') {
@@ -1281,8 +1375,9 @@ try {
 	  }
 	}
     $currentMatchesCandidate = $currentHash -eq $expectedHash
-	if ($UpgradeClass -eq 'installer_required' -and $currentMatchesCandidate -and
-	    [string]$prior.stage -in @('full_installer_upgrade','full_installer_recovery','health_observation','resume_after_commit')) {
+	if ($UpgradeClass -eq 'installer_required' -and
+        (($currentMatchesCandidate -and [string]$prior.stage -in @('full_installer_upgrade','full_installer_recovery','health_observation','resume_after_commit')) -or
+         [string]$prior.stage -like 'rollback_*')) {
 	  $fullInstallerStarted = $true
 	}
     $replacementMayHaveStarted = [bool]$prior.replacement_committed -or $currentMatchesCandidate -or
@@ -1449,6 +1544,10 @@ try {
     Invoke-FullInstallerRuntimeMirror -Source $installFull -Destination $fullInstallerBackupPath -Stage 'backup'
     Copy-Item -LiteralPath (Join-Path $installFull 'agent.toml') -Destination (Join-Path $fullInstallerBackupPath 'agent.toml') -Force
     Copy-Item -LiteralPath (Join-Path $installFull 'agent.toml') -Destination $fullInstallerConfigBackupPath -Force
+    if ($resolvedDeploymentMode -eq 'scheduled_task') {
+      $journal['full_installer_task_backup_sha256'] = Save-AgentTaskDefinition `
+        -TaskName $ScheduledTaskName -TaskPath $ScheduledTaskPath -Path $fullInstallerTaskBackupPath -AllowMissing:($Operation -eq 'repair')
+    }
     Add-UpdateEvent -Status 'installing' -Progress 50 -Detail @{ stage = 'full_installer_upgrade'; preserves_identity = $true; preserves_queue = $true; preserves_evidence = $true }
     Set-UpdateStage -Stage 'full_installer_upgrade'
     $fullInstallerStarted = $true
@@ -1613,6 +1712,10 @@ try {
       if (Test-Path -LiteralPath $fullInstallerConfigBackupPath -PathType Leaf) {
         Copy-Item -LiteralPath $fullInstallerConfigBackupPath -Destination (Join-Path $installFull 'agent.toml') -Force
       }
+      if ($resolvedDeploymentMode -eq 'scheduled_task') {
+        Restore-AgentTaskDefinition -TaskName $ScheduledTaskName -TaskPath $ScheduledTaskPath `
+          -Path $fullInstallerTaskBackupPath -ExpectedSha256 $journal['full_installer_task_backup_sha256']
+      }
       Start-AgentRuntime -Mode $resolvedDeploymentMode -TaskName $ScheduledTaskName -TaskPath $ScheduledTaskPath `
         -WindowsServiceName $ServiceName -ExecutablePath $currentPath -TimeoutSeconds $StartupTimeoutSeconds
       $rollbackObserveMs = [UInt64][Math]::Min([double]$HealthObserveMs, 60000.0)
@@ -1720,6 +1823,7 @@ try {
   Remove-Item -LiteralPath $candidatePath -Force -ErrorAction SilentlyContinue
   if ($report['status'] -in @('succeeded','failed_rolled_back')) {
     Remove-Item -LiteralPath $fullInstallerConfigBackupPath -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $fullInstallerTaskBackupPath -Force -ErrorAction SilentlyContinue
   }
   foreach ($item in @($runtimePlan)) {
     Remove-Item -LiteralPath $item.CandidatePath -Force -ErrorAction SilentlyContinue
