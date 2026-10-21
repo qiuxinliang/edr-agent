@@ -147,8 +147,8 @@ with tempfile.TemporaryDirectory(prefix='edr-space-preflight-') as directory:
         invoke('busy-evidence',['--config',str(config)],12)
     db.close()
     assert evidence.read_bytes()==evidence_before
-    # The installer consumes the configured TTL, while remaining read-only.
-    # These public counters have a bootstrap path at 72 h, not at 720 h.
+    # One legal expiry candidate does not prove any page can be freed. Keep
+    # refusing this full pre-clock store, even at a shorter configured TTL.
     with sqlite3.connect(evidence) as db:
         db.execute('INSERT INTO metrics VALUES(?,?,?,?)',
                    (int(time.time()//60)-96*60,'public','ordinary',1))
@@ -156,7 +156,7 @@ with tempfile.TemporaryDirectory(prefix='edr-space-preflight-') as directory:
     eligible_before=evidence.read_bytes()
     base_config=config.read_text()
     config.write_text(base_config+'evidence_cache_retention_hours=72\n')
-    assert invoke('expired-metrics-bootstrap',['--config',str(config)])==protected
+    invoke('expired-metrics-not-capacity-proof',['--config',str(config)],11)
     assert evidence.read_bytes()==eligible_before
     config.write_text(base_config+'evidence_cache_retention_hours=720\n')
     invoke('unexpired-metrics-protected',['--config',str(config)],11)

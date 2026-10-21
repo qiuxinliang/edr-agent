@@ -10,8 +10,8 @@
 #define EDR_METRICS_EXPIRY_BYTES \
   "COALESCE(length(CAST(endpoint_id AS BLOB)),0)+COALESCE(length(CAST(metric_name AS BLOB)),0)"
 
-/* Shared by the readonly installer preflight and the cache owner. The owner
- * must recheck under BEGIN IMMEDIATE before deletion. Never bootstrap an
+/* The cache owner must recheck under BEGIN IMMEDIATE before deletion. This
+ * predicate is NOT proof of capacity for installer admission. Never bootstrap an
  * unknown trigger/FK owner or an already initialized clock. Returns 0/1 or
  * a negative SQLite error; existence is not a promise of enough free pages. */
 static int evidence_metrics_bootstrap_eligible(sqlite3 *db, sqlite3_int64 cutoff) {

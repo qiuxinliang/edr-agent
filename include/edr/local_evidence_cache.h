@@ -255,12 +255,10 @@ typedef struct {
 } EdrEvidenceMigrationResult;
 
 /* Read-only, bounded installer check for the known full pre-clock schema.
- * Returns 1 when missing clock/guards have no free or budgeted growth pages
- * and no ordinary metrics eligible for the owner's bounded startup expiry,
+ * Returns 1 when missing clock/guards have no free or budgeted growth pages,
  * -1 when inspection fails, 0 otherwise (not a guarantee of full migration).
  * Missing/empty stores are fresh installs. No cleanup or capacity change. */
-int edr_local_evidence_cache_startup_preflight(const char *path, uint32_t max_db_mb,
-                                             uint32_t retention_hours);
+int edr_local_evidence_cache_startup_preflight(const char *path, uint32_t max_db_mb);
 
 /* Finite, exclusive maintenance operation for the installed updater/operator.
  * The Agent must be stopped and the selected rollback binary must support

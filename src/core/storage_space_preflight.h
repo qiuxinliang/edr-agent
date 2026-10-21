@@ -40,8 +40,7 @@ static int edr_storage_space_preflight_body(int argc, char **argv) {
     const char *path=getenv("EDR_EVIDENCE_CACHE_PATH");
     if (!path || !path[0]) path=cfg.offline.evidence_cache_path;
     if (!path || !path[0]) path="local_evidence_cache.db";
-    evidence_rc=edr_local_evidence_cache_startup_preflight(path,cfg.offline.evidence_cache_max_size_mb,
-        cfg.offline.evidence_cache_retention_hours);
+    evidence_rc=edr_local_evidence_cache_startup_preflight(path,cfg.offline.evidence_cache_max_size_mb);
   }
   edr_config_free_heap(&cfg);
   if (rc == EDR_STORAGE_POLICY_INVENTORY_LOCK_TIMEOUT) {

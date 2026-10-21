@@ -12491,7 +12491,9 @@ static void test_startup_preclock_full(int over, int expired_metrics) {
   sqlite3_finalize(st);
   if (expired_metrics) {
     compact_exec(db,"WITH RECURSIVE seq(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM seq WHERE n<512) "
-      "INSERT INTO metrics SELECT 1,'public-bootstrap',printf('expired-%04d',n),1 FROM seq;"
+      "INSERT INTO metrics SELECT 1,'public-bootstrap',printf('expired-%04d',n),1 FROM seq;");
+    if (expired_metrics==4) compact_exec(db,"DELETE FROM metrics WHERE metric_name LIKE 'expired-%' AND metric_name!='expired-0001';");
+    compact_exec(db,
       "INSERT INTO metrics VALUES(0,'','local_retention_v1_expired_rows',123);"
       "INSERT INTO metrics VALUES(0,'public-bootstrap','unknown-time',7);"
       "INSERT INTO metrics VALUES(-1,'public-bootstrap','negative-time',7);"
@@ -12506,7 +12508,7 @@ static void test_startup_preclock_full(int over, int expired_metrics) {
   snprintf(sql,sizeof(sql),"CREATE TEMP TABLE preclock_expected AS SELECT %s FROM p0_candidates",columns);
   compact_exec(db,sql);startup_fill_pages(db,over?291:256);
   sqlite3_int64 schema=compact_scalar(db,"PRAGMA schema_version");
-  assert(edr_local_evidence_cache_startup_preflight(path,1,72)==(expired_metrics==1 ? 0 : 1));
+  assert(edr_local_evidence_cache_startup_preflight(path,1)==1);
   assert(compact_scalar(db,"PRAGMA schema_version")==schema);
   assert(compact_scalar(db,"PRAGMA page_count")== (over?291:256));
   if (expired_metrics==1) {
@@ -12533,26 +12535,27 @@ static void test_startup_preclock_full(int over, int expired_metrics) {
   snprintf(sql,sizeof(sql),"SELECT COUNT(*) FROM (SELECT %s FROM p0_candidates EXCEPT SELECT * FROM preclock_expected)",columns);
   assert(compact_scalar(db,sql)==0 && compact_scalar(db,"SELECT COUNT(*) FROM p0_candidates")==1);
   assert(compact_scalar(db,"SELECT COUNT(*) FROM metrics WHERE metric_name='local_retention_v1_active_ms'")==0);
-  assert(edr_local_evidence_cache_startup_preflight(path,1,72)==1); /* Partial additive DDL is still rejected. */
+  assert(edr_local_evidence_cache_startup_preflight(path,1)==1); /* Partial additive DDL is still rejected. */
   if (expired_metrics>=2) {
-    assert(compact_scalar(db,"SELECT COUNT(*) FROM metrics WHERE metric_name LIKE 'expired-%'")==512);
+    assert(compact_scalar(db,"SELECT COUNT(*) FROM metrics WHERE metric_name LIKE 'expired-%'")==(expired_metrics==4 ? 0 : 512));
     if (expired_metrics==3) assert(compact_scalar(db,"SELECT COUNT(*) FROM public_metrics_dependent")==1);
     assert(sqlite3_close(db)==SQLITE_OK);cleanup_test_sqlite_path(path);
-    puts("startup_preclock_unknown_metrics_owner protected=1 explicit_refusal=1");return;
+    puts(expired_metrics==4 ? "startup_preclock_sparse_metrics preflight_refuses=1 native_full=1 frozen_unchanged=1" :
+      "startup_preclock_unknown_metrics_owner protected=1 explicit_refusal=1");return;
   }
   /* Only public padding is released: no old evidence is deleted or promoted. */
   for(unsigned i=0;i<32u;i++) {
     snprintf(sql,sizeof(sql),"DROP TABLE IF EXISTS startup_padding_page_%u",i);compact_exec(db,sql);
   }
   compact_exec(db,"DROP TABLE startup_padding;");
-  assert(edr_local_evidence_cache_startup_preflight(path,1,72)==0);
+  assert(edr_local_evidence_cache_startup_preflight(path,1)==0);
   assert(edr_local_evidence_cache_open_with_policy(path,1,72,72)==0);
   edr_local_evidence_cache_get_status(&status);assert(status.db_open && status.retention_clock_valid);
   snprintf(sql,sizeof(sql),"SELECT COUNT(*) FROM (SELECT %s FROM p0_candidates EXCEPT SELECT * FROM preclock_expected)",columns);
   assert(compact_scalar(db,sql)==0 && compact_scalar(db,"SELECT COUNT(*) FROM p0_candidates")==1);
   edr_local_evidence_cache_close();
   startup_fill_pages(db,over?291:256);
-  assert(edr_local_evidence_cache_startup_preflight(path,1,72)==0); /* Current full schema is compatible. */
+  assert(edr_local_evidence_cache_startup_preflight(path,1)==0); /* Current full schema is compatible. */
   assert(edr_local_evidence_cache_open_with_policy(path,1,72,72)==0);
   edr_local_evidence_cache_close();assert(sqlite3_close(db)==SQLITE_OK);cleanup_test_sqlite_path(path);
   printf("startup_preclock over=%d first_cause_sqlite_full=1 preflight_readonly_refusal=1 old_evidence_unchanged=1 same_budget_recovery=1 compatible_full_allowed=1\n",over);
@@ -12566,6 +12569,7 @@ static void test_startup_logical_budget(void) {
   test_startup_preclock_full(1,1);
   test_startup_preclock_full(0,2);
   test_startup_preclock_full(0,3);
+  test_startup_preclock_full(0,4);
   test_startup_logical_budget_legacy(1,0,1u);
   test_startup_logical_budget_legacy(1,1,1u);
   test_startup_logical_budget_legacy(0,0,1u);
@@ -13249,7 +13253,7 @@ int main(int argc, char **argv) {
   if (argc==2 && !strcmp(argv[1],"--startup-preclock")) {
     test_startup_preclock_full(0,0);test_startup_preclock_full(1,0);
     test_startup_preclock_full(0,1);test_startup_preclock_full(1,1);
-    test_startup_preclock_full(0,2);test_startup_preclock_full(0,3);return 0;
+    test_startup_preclock_full(0,2);test_startup_preclock_full(0,3);test_startup_preclock_full(0,4);return 0;
   }
 #endif
   if (argc >= 2 && strcmp(argv[1], "--normal-open-work-copy") == 0) {
