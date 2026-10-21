@@ -297,10 +297,12 @@ if(WIN32)
     COMMAND "${CMAKE_COMMAND}" -E env --unset=PSModulePath powershell.exe -NoProfile -NonInteractive -File
       "${CMAKE_CURRENT_SOURCE_DIR}/test_windows_autorun_task.ps1"
       -AutorunPath "${CMAKE_SOURCE_DIR}/install/windows-inno/edr_windows_autorun.ps1")
-  set_tests_properties(windows_updater_task_recovery windows_autorun_task PROPERTIES TIMEOUT 60)
+  set_tests_properties(windows_updater_task_recovery windows_autorun_task PROPERTIES TIMEOUT 60
+    ENVIRONMENT "PSModulePath=${CMAKE_CURRENT_BINARY_DIR}/foreign-powershell-modules")
   # Includes fixture creation, two ACL rounds and every file's byte/ACL check.
   # Each ACL round independently retains the installer's 120-second bound.
-  set_tests_properties(windows_autorun_acl PROPERTIES TIMEOUT 180)
+  set_tests_properties(windows_autorun_acl PROPERTIES TIMEOUT 180
+    ENVIRONMENT "PSModulePath=${CMAKE_CURRENT_BINARY_DIR}/foreign-powershell-modules")
   add_test(NAME windows_installer_acl_behavior
     COMMAND "${CMAKE_COMMAND}" -E env --unset=PSModulePath powershell.exe -NoProfile -Command
       "& ([scriptblock]::Create((Get-Content -LiteralPath '${CMAKE_CURRENT_SOURCE_DIR}/test_windows_installer_acl.ps1' -Raw -Encoding UTF8))) -InstallerWorker '$<TARGET_FILE:fd_installer_worker>'")

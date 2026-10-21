@@ -41,6 +41,7 @@ WINDOWS_EXPECTED = {
     "windows_isolation_mock_behavior", "windows_install_compatibility_behavior", "http_telemetry_budget",
     "windows_release_collector_pe_closure", "windows_inplace_collector_transaction",
     "windows_update_physical_guard", "windows_updater_health_clock", "windows_updater_stop", "windows_inno_evidence_space",
+    "windows_updater_task_recovery", "windows_autorun_acl", "windows_autorun_task",
     "windows_storage_space_preflight",
     "windows_installer_log_redaction",
     "windows_installer_acl_behavior", "windows_installer_health_behavior",
@@ -189,7 +190,7 @@ class WindowsReleaseGateTests(unittest.TestCase):
                     self.run_command(*wrapper, *probe, env=inherited)
                     self.assertEqual(inherited["PSModulePath"], test_env["PSModulePath"])
 
-    def test_updater_health_and_stop_use_checkout_sha_and_isolated_powershell(self):
+    def test_updater_and_autorun_use_checkout_and_isolated_powershell(self):
         production = (ROOT / "tests/CMakeLists.txt").read_text(encoding="utf-8")
         start = production.index("  # Pin the actual checkout bytes at configure time;")
         end = production.index("  add_test(NAME windows_installer_acl_behavior", start)
@@ -205,16 +206,32 @@ class WindowsReleaseGateTests(unittest.TestCase):
             self.run_command("cmake", "-S", str(source), "-B", str(build), "-G", "Ninja")
             listed = self.run_command("ctest", "--test-dir", str(build), "--show-only=json-v1")
             tests = json.loads(listed.stdout)["tests"]
-            self.assertEqual([test["name"] for test in tests],
-                             ["windows_updater_health_clock", "windows_updater_stop"])
-            for test, timeout in zip(tests, (30, 120)):
+            specs = {
+                "windows_updater_health_clock": (30, "scripts/edr_agent_inplace_update.ps1", "Updater"),
+                "windows_updater_stop": (120, "scripts/edr_agent_inplace_update.ps1", "Updater"),
+                "windows_updater_task_recovery": (60, "scripts/edr_agent_inplace_update.ps1", "Updater"),
+                "windows_autorun_acl": (180, "install/windows-inno/edr_windows_autorun.ps1", "Autorun"),
+                "windows_autorun_task": (60, "install/windows-inno/edr_windows_autorun.ps1", "Autorun"),
+            }
+            self.assertEqual([test["name"] for test in tests], list(specs))
+            for test in tests:
+                timeout, source_file, option = specs[test["name"]]
                 command = test["command"]
-                expected = hashlib.sha256((ROOT / "scripts/edr_agent_inplace_update.ps1").read_bytes()).hexdigest()
                 self.assertIn("--unset=PSModulePath", command)
                 self.assertIn("powershell.exe", command)
                 self.assertIn("-NonInteractive", command)
-                self.assertIn("-UpdaterSha256 '" + expected + "'", command[-1])
-                self.assertIn("-UpdaterPath '" + (ROOT / "scripts/edr_agent_inplace_update.ps1").as_posix() + "'", command[-1])
+                if test["name"] in ("windows_updater_health_clock", "windows_updater_stop"):
+                    expected = hashlib.sha256((ROOT / source_file).read_bytes()).hexdigest()
+                    self.assertIn("-UpdaterSha256 '" + expected + "'", command[-1])
+                    self.assertIn("-UpdaterPath '" + (ROOT / source_file).as_posix() + "'", command[-1])
+                else:
+                    self.assertEqual(command[command.index("-File") + 1],
+                                     (ROOT / "tests" / ("test_" + test["name"] + ".ps1")).as_posix())
+                    self.assertEqual(command[command.index("-" + option + "Path") + 1],
+                                     (ROOT / source_file).as_posix())
+                    if test["name"] == "windows_autorun_acl":
+                        self.assertEqual(Path(command[command.index("-ProgressPath") + 1]).resolve(),
+                                         (build / "autorun-acl-progress.json").resolve())
                 properties = {item["name"]: item["value"] for item in test["properties"]}
                 self.assertEqual(properties["TIMEOUT"], timeout)
                 environment = properties["ENVIRONMENT"]
@@ -225,8 +242,9 @@ class WindowsReleaseGateTests(unittest.TestCase):
                 self.assertTrue(selected_modules.is_absolute())
                 self.assertEqual(selected_modules.resolve(), (build / "foreign-powershell-modules").resolve())
 
-    def test_updater_health_and_stop_are_required_and_failure_blocks_windows_gate(self):
-        for name in ("windows_updater_health_clock", "windows_updater_stop"):
+    def test_updater_and_autorun_are_required_and_failure_blocks_windows_gate(self):
+        for name in ("windows_updater_health_clock", "windows_updater_stop",
+                     "windows_updater_task_recovery", "windows_autorun_acl", "windows_autorun_task"):
             with tempfile.TemporaryDirectory() as directory:
                 source, build, _ = self.fixture(directory, missing_test=name)
                 result = self.run_command("cmake", "-S", str(source), "-B", str(build), "-G", "Ninja", success=False)
