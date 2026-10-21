@@ -43,6 +43,7 @@
 #include "edr/v1/event.pb.h"
 #include <pb_decode.h>
 #include "evidence_context_store.h"
+#include "evidence_metrics_retention.h"
 #include <sys/stat.h>
 #endif
 
@@ -5734,14 +5735,19 @@ static int sqlite_maintenance_charge(EvidenceMaintenanceSlice *slice, unsigned r
  * lengths, not large payloads, then delete a bounded transaction of rowids. */
 static int sqlite_maintenance_delete(const char *table, const char *clock_column,
     const char *condition, const char *byte_expression, sqlite3_int64 cutoff,
-    EvidenceMaintenanceSlice *slice) {
+    EvidenceMaintenanceSlice *slice, int preclock_metrics) {
   sqlite3_stmt *st=NULL, *del=NULL;
   sqlite3_int64 ids[128]; unsigned count=0, removed=0;
-  char sql[2048]; int step=SQLITE_DONE, began=0;
+  char sql[2048]; int step=SQLITE_DONE, began=0, failure_rc=0;
   if (sqlite_maintenance_yield(slice)) return 0;
   if (!sqlite_database_write_allow(slice->bytes_left)) return -1;
   if (exec_sql("BEGIN IMMEDIATE;") != 0) goto failed;
   began=1;
+  if (preclock_metrics) {
+    int eligible=evidence_metrics_bootstrap_eligible(s_db,cutoff);
+    if (eligible<0) { failure_rc=-eligible; goto failed; }
+    if (!eligible) { sqlite_rollback_silent(); return 0; }
+  }
   int length=snprintf(sql,sizeof(sql),"SELECT rowid,64+(%s) FROM %s WHERE %s<?1 AND (%s) ORDER BY %s,rowid LIMIT 128;",
       byte_expression,table,clock_column,condition,clock_column);
   if(length<0 || (size_t)length>=sizeof(sql)) { set_error("maintenance statement exceeds fixed buffer"); goto failed; }
@@ -5769,10 +5775,32 @@ static int sqlite_maintenance_delete(const char *table, const char *clock_column
   s_status.db_retention_evicted+=removed;
   return 0;
 failed:
-  sqlite_maintenance_error(table,sqlite3_errcode(s_db));
+  sqlite_maintenance_error(table,failure_rc ? failure_rc : sqlite3_errcode(s_db));
   sqlite3_finalize(st); sqlite3_finalize(del);
   if(began) sqlite_rollback_silent();
   return -1;
+}
+
+/* A full pre-clock store cannot reach normal maintenance. Reuse its ordinary
+ * metrics expiry policy before installing clock guards, with the same single
+ * cooperative slice. Never retire evidence, command owners or summaries here.
+ * Partial expiry is safe across restart; insufficient space still fails with
+ * the original schema error. No extra pages, VACUUM or automatic retry. */
+static int sqlite_startup_expire_metrics(void) {
+  EvidenceMaintenanceSlice slice={evidence_cache_clock_ns()+20000000ULL,
+      4u*EDR_EVIDENCE_MANIFEST_MAX_BYTES,4096u};
+  sqlite3_int64 cutoff=now_unix_ns()/60000000000LL-(sqlite3_int64)s_status.retention_hours*60;
+  uint64_t initial=s_status.db_retention_evicted, previous;
+  int result=0;
+  do {
+    previous=s_status.db_retention_evicted;
+    if (sqlite_maintenance_delete("metrics","minute_unix",EDR_METRICS_EXPIRY_CONDITION,
+        EDR_METRICS_EXPIRY_BYTES,cutoff,&slice,1)!=0) { result=-1; break; }
+  } while (s_status.db_retention_evicted!=previous && !sqlite_maintenance_yield(&slice));
+  if (s_status.db_retention_evicted!=initial)
+    fprintf(stderr,"[evidence_cache] startup ordinary metrics expired=%llu retention_hours=%u\n",
+        (unsigned long long)(s_status.db_retention_evicted-initial),s_status.retention_hours);
+  return result;
 }
 
 static int sqlite_maintenance_checkpoint(int mode) {
@@ -6129,7 +6157,7 @@ static int sqlite_maintenance(int defer_reclaim) {
     {"registry_evidence","last_seen_ns","1","COALESCE(length(CAST(endpoint_id AS BLOB)),0)+COALESCE(length(CAST(key_path AS BLOB)),0)+COALESCE(length(CAST(value_name AS BLOB)),0)+COALESCE(length(CAST(op AS BLOB)),0)"},
     {"command_results","updated_ns","1","COALESCE(length(CAST(command_id AS BLOB)),0)+COALESCE(length(CAST(command_type AS BLOB)),0)+COALESCE(length(CAST(status AS BLOB)),0)+COALESCE(length(CAST(detail AS BLOB)),0)+COALESCE(length(CAST(artifacts AS BLOB)),0)"},
     {"artifacts","created_ns","artifact_type='pmfe_followup_local_v1' AND upload_status IN('completed','expired','conflict')","COALESCE(length(CAST(artifact_id AS BLOB)),0)+COALESCE(length(CAST(endpoint_id AS BLOB)),0)+COALESCE(length(CAST(tenant_id AS BLOB)),0)+COALESCE(length(CAST(candidate_id AS BLOB)),0)+COALESCE(length(CAST(path AS BLOB)),0)+COALESCE(length(CAST(sha256 AS BLOB)),0)+COALESCE(length(CAST(manifest_json AS BLOB)),0)+COALESCE(length(CAST(minio_key AS BLOB)),0)+64"},
-    {"metrics","minute_unix","NOT(minute_unix=0 AND endpoint_id='' AND metric_name IN('local_retention_v1_expired_groups','local_retention_v1_expired_rows','local_retention_v1_expired_work_bytes','local_retention_v1_capacity_groups','local_retention_v1_capacity_rows','local_retention_v1_capacity_work_bytes','" RETENTION_ACTIVE_CLOCK_KEY "'))","COALESCE(length(CAST(endpoint_id AS BLOB)),0)+COALESCE(length(CAST(metric_name AS BLOB)),0)"}
+    {"metrics","minute_unix",EDR_METRICS_EXPIRY_CONDITION,EDR_METRICS_EXPIRY_BYTES}
   };
   if (db_size_over_limit()) s_maintenance_pressure_pending=1;
   for (unsigned pass=0;pass<MAINTENANCE_STAGE_COUNT && !sqlite_maintenance_yield(&slice);++pass) {
@@ -6153,7 +6181,7 @@ static int sqlite_maintenance(int defer_reclaim) {
     } else {
       unsigned i=stage<6 ? stage-1 : stage-2;
       if(sqlite_maintenance_delete(ttl[i].table,ttl[i].clock,ttl[i].condition,ttl[i].bytes,
-           i==6 ? cutoff_minute : cutoff,&slice)!=0) goto failed;
+           i==6 ? cutoff_minute : cutoff,&slice,0)!=0) goto failed;
     }
   }
   if (db_size_over_limit()) s_maintenance_pressure_pending=1;
@@ -7690,7 +7718,8 @@ int edr_local_evidence_cache_open_with_policy(const char *path, uint32_t max_db_
     set_error(s_context_store.error);
     goto startup_failed;
   }
-  if (sqlite_ensure_process_cache_generation_columns() != 0 ||
+  if (sqlite_startup_expire_metrics() != 0 ||
+      sqlite_ensure_process_cache_generation_columns() != 0 ||
       sqlite_ensure_p0_candidate_columns() != 0 ||
       sqlite_retention_metadata_open() != 0 ||
       sqlite_migrate_legacy_context_artifacts() != 0) {

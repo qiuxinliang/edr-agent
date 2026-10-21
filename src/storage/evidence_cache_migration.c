@@ -4,15 +4,16 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include <time.h>
 
 #if defined(EDR_HAVE_SQLITE)
 #include "evidence_context_store.h"
+#include "evidence_metrics_retention.h"
 #include <sys/stat.h>
 #if defined(_WIN32)
 #include <windows.h>
 #else
 #include <sys/statvfs.h>
-#include <time.h>
 #endif
 
 typedef struct {
@@ -118,7 +119,8 @@ static int physical_bound(sqlite3 *db, const char *wal, uint64_t *out) {
 }
 #endif
 
-int edr_local_evidence_cache_startup_preflight(const char *path, uint32_t max_db_mb) {
+int edr_local_evidence_cache_startup_preflight(const char *path, uint32_t max_db_mb,
+                                             uint32_t retention_hours) {
 #if defined(EDR_HAVE_SQLITE)
   if (!path || !path[0]) return -1;
   uint64_t length = file_bytes(path);
@@ -153,12 +155,21 @@ int edr_local_evidence_cache_startup_preflight(const char *path, uint32_t max_db
   /* This is deliberately conservative: slack within occupied B-tree pages
    * is not proven migration capacity. Fully current full stores may reopen. */
   result = clock == 1 && guards == 7 ? 0 : 1;
+  if (result==1 && metrics && !clock) {
+    time_t now=time(NULL);
+    if (now<0) { result=-1; goto done; }
+    sqlite3_int64 cutoff=(sqlite3_int64)now/60-(sqlite3_int64)(retention_hours ? retention_hours : 24u)*60;
+    int eligible=evidence_metrics_bootstrap_eligible(db,cutoff);
+    /* The owner may legally reclaim ordinary counters before clock DDL.
+     * This read-only check neither expires them nor promises enough pages. */
+    result=eligible<0 ? -1 : eligible ? 0 : 1;
+  }
 done:
   if (interrupted(&deadline)) result=-1;
   if (db) sqlite3_close(db);
   return result;
 #else
-  (void)path; (void)max_db_mb;
+  (void)path; (void)max_db_mb; (void)retention_hours;
   return -1;
 #endif
 }
