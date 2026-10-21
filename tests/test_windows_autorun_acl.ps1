@@ -35,20 +35,25 @@ function Assert-Private([string]$Path){
   foreach($ace in $acl.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier])){
     if($ace.AccessControlType -ne 'Allow'){continue}
     $sid=$ace.IdentityReference.Value
-    if($sid -notin @('S-1-5-18','S-1-5-32-544')){throw 'sensitive_file_has_public_grant'}
+    if($sid -notin @('S-1-5-18','S-1-5-32-544')){
+      # Generated fixture metadata only; identify the first ACL boundary that
+      # differs on native runners without exposing installed endpoint paths.
+      throw ('sensitive_file_has_public_grant fixture={0} sid={1} inherited={2} rights={3} propagation={4}' -f
+        $Path.Substring($root.Length),$sid,$ace.IsInherited,[int]$ace.FileSystemRights,$ace.PropagationFlags)
+    }
     if(($ace.PropagationFlags -band [Security.AccessControl.PropagationFlags]::InheritOnly) -eq 0 -and
        ($ace.FileSystemRights -band [Security.AccessControl.FileSystemRights]::FullControl) -eq [Security.AccessControl.FileSystemRights]::FullControl){$grants[$sid]=$true}
   }
   if(-not $grants['S-1-5-18'] -or -not $grants['S-1-5-32-544']){throw 'required_direct_or_inherited_grant_missing'}
   $script:checks++
 }
-function Assert-LegacyUsersGrant([string]$Path){
+function Assert-LegacyGrant([string]$Path,[string]$Sid){
   $acl=Get-Acl -LiteralPath $Path
   $rules=@($acl.GetAccessRules($true,$false,[Security.Principal.SecurityIdentifier])|Where-Object {
-    $_.IdentityReference.Value -eq 'S-1-5-32-545' -and $_.AccessControlType -eq 'Allow' -and
+    $_.IdentityReference.Value -eq $Sid -and $_.AccessControlType -eq 'Allow' -and
     ($_.FileSystemRights -band [Security.AccessControl.FileSystemRights]::ReadData) -ne 0
   })
-  if($rules.Count -eq 0){throw 'fixture_legacy_users_grant_missing'}
+  if($rules.Count -eq 0){throw 'fixture_legacy_grant_missing'}
 }
 try{
   $sensitive=@('certs','queue','evidence','state','logs','diagnostics','upload_outbox')
@@ -75,10 +80,12 @@ try{
   }
   # A recursive explicit grant reproduces existing bad ACEs, including files
   # that native /inheritance:r plus SYSTEM/Admin grants cannot repair alone.
-  & icacls.exe $forensic /grant:r '*S-1-5-32-545:RX' /T /C /Q | Out-Null
+  & icacls.exe $forensic /grant:r '*S-1-5-32-545:RX' '*S-1-5-11:RX' /T /C /Q | Out-Null
   if($LASTEXITCODE -ne 0){throw 'fixture_forensic_grant_failed'}
-  Assert-LegacyUsersGrant $forensicCases[0].path
-  Assert-LegacyUsersGrant $forensicCases[$forensicCounts.json].path
+  foreach($sid in @('S-1-5-32-545','S-1-5-11')){
+    Assert-LegacyGrant $forensicCases[0].path $sid
+    Assert-LegacyGrant $forensicCases[$forensicCounts.json].path $sid
+  }
   if(@(Get-ChildItem -LiteralPath $forensic -File -Recurse).Count -ne 6287){throw 'fixture_forensic_file_count'}
   if(@(Get-ChildItem -LiteralPath $forensic -Directory -Recurse).Count -ne $forensicDirectories){throw 'fixture_forensic_directory_count'}
   [IO.File]::WriteAllText((Join-Path $root 'agent.toml'),'# public fixture')
@@ -111,6 +118,8 @@ try{
     if(@(Get-ChildItem -LiteralPath $forensic -File -Recurse).Count -ne (6287+$round)){throw 'forensic_fixture_population_changed'}
     $times["verify_$round"]=$watch.ElapsedMilliseconds-$start-$times["sensitive_$round"]
   }
+  $empty=Join-Path $root 'empty-private';[IO.Directory]::CreateDirectory($empty)|Out-Null
+  Repair-RuntimeFileAcls -Path $empty;Assert-Private $empty
   # Fail closed for both the batched file operation and non-queue directories.
   function icacls.exe {$global:LASTEXITCODE=5}
   $refused=$false
@@ -124,18 +133,24 @@ try{
   function takeown.exe {$global:LASTEXITCODE=0}
   function icacls.exe {
     $global:LASTEXITCODE=0
-    if($args[0] -eq $forensic -and $args -contains $script:failSwitch){
+    if($args[0] -eq (Join-Path $forensic '*') -and $args -contains '/reset'){
       $script:targetFailureSeen=$true;$global:LASTEXITCODE=5
     }
   }
-  foreach($script:failSwitch in @('/inheritance:r','/remove:g','/grant')){
-    $script:targetFailureSeen=$false;$refused=$false
-    try{Repair-SensitiveRuntimeAcls -Dir $root}catch{$refused=$true}
-    if(-not $targetFailureSeen -or -not $refused){throw 'forensic_acl_failure_silenced'}
+  $script:targetFailureSeen=$false;$refused=$false
+  try{Repair-SensitiveRuntimeAcls -Dir $root}catch{$refused=$true}
+  if(-not $targetFailureSeen -or -not $refused){throw 'forensic_reset_failure_silenced'}
+  function icacls.exe {$global:LASTEXITCODE=0}
+  function Set-Acl {
+    param($LiteralPath,$AclObject,$ErrorAction)
+    if($LiteralPath -eq $forensic){$script:targetFailureSeen=$true;throw 'fixture_parent_acl_denied'}
   }
+  $script:targetFailureSeen=$false;$refused=$false
+  try{Repair-SensitiveRuntimeAcls -Dir $root}catch{$refused=$true}
+  if(-not $targetFailureSeen -or -not $refused){throw 'forensic_parent_acl_failure_silenced'}
   $passed=$true
   Progress 'passed'
-  @{status='passed';outbox_files=$FileCount;forensic_files=6287;forensic_directories=631;forensic_file_types=$forensicCounts;permission_checks=$checks;forensic_failure_cases=3;times=$times;elapsed_ms=$watch.ElapsedMilliseconds;live_runtime_touched=$false}|ConvertTo-Json -Depth 4 -Compress
+  @{status='passed';outbox_files=$FileCount;forensic_files=6287;forensic_directories=631;forensic_file_types=$forensicCounts;permission_checks=$checks;forensic_failure_cases=2;times=$times;elapsed_ms=$watch.ElapsedMilliseconds;live_runtime_touched=$false}|ConvertTo-Json -Depth 4 -Compress
 }catch{
   [IO.File]::WriteAllText($ProgressPath,(@{stage='failed';completed=$times;error=$_.Exception.Message;line=$_.InvocationInfo.ScriptLineNumber;elapsed_ms=$watch.ElapsedMilliseconds}|ConvertTo-Json -Compress))
   throw

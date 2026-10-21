@@ -1,5 +1,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <aclapi.h>
+#include <sddl.h>
 #include <shellapi.h>
 #include <tlhelp32.h>
 #include <ctype.h>
@@ -693,6 +695,23 @@ static int run_takeown(const wchar_t *args, const wchar_t *install_dir, const wc
   return run_process_wait(exe, args, install_dir, log_path, 30000);
 }
 
+static DWORD protect_runtime_directory(const wchar_t *path) {
+  PSECURITY_DESCRIPTOR descriptor = NULL;
+  PACL dacl = NULL;
+  BOOL present = FALSE, defaulted = FALSE;
+  if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
+          L"D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)", SDDL_REVISION_1, &descriptor, NULL)) {
+    return GetLastError();
+  }
+  DWORD error = ERROR_INVALID_SECURITY_DESCR;
+  if (GetSecurityDescriptorDacl(descriptor, &present, &dacl, &defaulted) && present && dacl) {
+    error = SetNamedSecurityInfoW((LPWSTR)path, SE_FILE_OBJECT,
+        DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION, NULL, NULL, dacl, NULL);
+  }
+  LocalFree(descriptor);
+  return error;
+}
+
 static int stage_harden_acl(const wchar_t *install_dir, const wchar_t *log_path) {
   append_log_utf8(log_path, L"stage=harden-acl begin");
   ensure_runtime_dirs(install_dir, log_path);
@@ -713,25 +732,44 @@ static int stage_harden_acl(const wchar_t *install_dir, const wchar_t *log_path)
     _snwprintf(args, sizeof(args) / sizeof(args[0]), L"/F %ls /A /R /D Y", qpath);
     args[(sizeof(args) / sizeof(args[0])) - 1] = 0;
     (void)run_takeown(args, install_dir, log_path);
-    _snwprintf(args, sizeof(args) / sizeof(args[0]),
-               L"%ls /inheritance:r /grant:r \"*S-1-5-18:(OI)(CI)F\" /grant:r \"*S-1-5-32-544:(OI)(CI)F\" /T /C /Q",
-               qpath);
-    args[(sizeof(args) / sizeof(args[0])) - 1] = 0;
-    int acl_rc = run_icacls(args, install_dir, log_path);
-    if (acl_rc != 0) {
+    DWORD acl_error = protect_runtime_directory(path);
+    if (acl_error != ERROR_SUCCESS) {
       _snwprintf(args, sizeof(args) / sizeof(args[0]),
-                 L"runtime_directory_acl_repair_failed path=%ls rc=%d", path, acl_rc);
+                 L"runtime_directory_acl_repair_failed path=%ls rc=%lu", path, acl_error);
       append_log_utf8(log_path, args);
       return 52;
     }
-    /* icacls drops directory-only (OI)(CI) grants on existing files. With
-     * /inheritance:r /T that can leave an empty file DACL despite exit=0.
-     * Add direct grants without /grant:r so directories retain inheritance
-     * for future children. Never grant ordinary users access to runtime data. */
+    /* Reset only descendants of the already-private parent. This removes
+     * explicit legacy grants as well as inherited public access, and leaves
+     * the same private inheritance for future files. No per-file processes. */
+    wchar_t children[MAX_PATH * 2];
+    join_path(children, sizeof(children) / sizeof(children[0]), path, L"*");
+    WIN32_FIND_DATAW entry;
+    HANDLE found = FindFirstFileW(children, &entry);
+    if (found == INVALID_HANDLE_VALUE) {
+      if (GetLastError() == ERROR_FILE_NOT_FOUND) continue;
+      append_log_utf8(log_path, L"runtime_acl_children_query_failed");
+      return 52;
+    }
+    int has_children = 0;
+    do {
+      if (wcscmp(entry.cFileName, L".") != 0 && wcscmp(entry.cFileName, L"..") != 0) {
+        has_children = 1;
+        break;
+      }
+    } while (FindNextFileW(found, &entry));
+    DWORD find_error = has_children ? ERROR_SUCCESS : GetLastError();
+    FindClose(found);
+    if (!has_children) {
+      if (find_error == ERROR_NO_MORE_FILES) continue;
+      append_log_utf8(log_path, L"runtime_acl_children_query_failed");
+      return 52;
+    }
+    quote_arg(qpath, sizeof(qpath) / sizeof(qpath[0]), children);
     _snwprintf(args, sizeof(args) / sizeof(args[0]),
-               L"%ls /grant \"*S-1-5-18:F\" \"*S-1-5-32-544:F\" /T /C /Q", qpath);
+               L"%ls /reset /T /L /C /Q", qpath);
     args[(sizeof(args) / sizeof(args[0])) - 1] = 0;
-    acl_rc = run_icacls(args, install_dir, log_path);
+    int acl_rc = run_icacls(args, install_dir, log_path);
     if (acl_rc != 0) {
       _snwprintf(args, sizeof(args) / sizeof(args[0]),
                  L"runtime_file_acl_repair_failed path=%ls rc=%d", path, acl_rc);

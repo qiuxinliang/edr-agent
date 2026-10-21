@@ -137,18 +137,21 @@ function Repair-UninstallerAcls {
 function Repair-RuntimeFileAcls {
   param([string]$Path)
   if (-not (Test-Path -LiteralPath $Path)) { return }
-  # The caller already took ownership and removed inheritance recursively.
-  # Match the native installer's batched direct-file grants. /grant (not
-  # /grant:r) preserves directory inheritance for files created afterwards.
-  # Older autorun versions recursed over *.json/*.txt and granted Users access
-  # to evidence, including forensic output. Remove explicit grants too.
-  & icacls.exe $Path /remove:g "*S-1-5-32-545" /T /C /Q | Out-Null
-  if ($LASTEXITCODE -ne 0) {
-    throw "sensitive ACL removal failed with exit code $LASTEXITCODE path=$Path"
-  }
-  & icacls.exe $Path /grant "*S-1-5-18:F" "*S-1-5-32-544:F" /T /C /Q | Out-Null
-  if ($LASTEXITCODE -ne 0) {
-    throw "file ACL repair failed with exit code $LASTEXITCODE path=$Path"
+  # Establish the private parent before resetting descendants. Incremental
+  # grants leave explicit legacy Users, Authenticated Users or logon ACEs.
+  # One native tree operation preserves bounded process count and gives
+  # existing and future files the same SYSTEM/Administrators-only policy.
+  $acl = [Security.AccessControl.DirectorySecurity]::new()
+  $acl.SetSecurityDescriptorSddlForm('D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)',
+    [Security.AccessControl.AccessControlSections]::Access)
+  Set-Acl -LiteralPath $Path -AclObject $acl -ErrorAction Stop
+  $hasChildren = $false
+  foreach ($entry in [IO.Directory]::EnumerateFileSystemEntries($Path)) { $hasChildren = $true; break }
+  if ($hasChildren) {
+    & icacls.exe (Join-Path $Path '*') /reset /T /L /C /Q | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+      throw "file ACL repair failed with exit code $LASTEXITCODE path=$Path"
+    }
   }
 }
 
@@ -181,11 +184,6 @@ function Repair-SensitiveRuntimeAcls {
         New-Item -ItemType Directory -Path $path -Force | Out-Null
       }
       try { & takeown.exe /F $path /A /R /D Y 2>$null | Out-Null } catch {}
-      & icacls.exe $path /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)F" /grant:r "*S-1-5-32-544:(OI)(CI)F" /T /C /Q | Out-Null
-      $aclExit = $LASTEXITCODE
-      if ($aclExit -ne 0) {
-        throw "$sub ACL repair failed with exit code $aclExit"
-      }
       Repair-RuntimeFileAcls -Path $path
     } catch {
       throw

@@ -44,6 +44,10 @@ try {
   $collector = Join-Path $root 'collector/forensic_collector_builtin.exe'
   $pe = [IO.File]::ReadAllBytes($InstallerWorker)
   [IO.File]::WriteAllBytes($collector, $pe)
+  # Existing broad explicit grants survive /inheritance:r and incremental
+  # SYSTEM/Admin grants. Seed them independently of the runner's temp ACL.
+  & icacls.exe $root /grant:r '*S-1-5-32-545:RX' '*S-1-5-11:RX' /T /C /Q | Out-Null
+  if ($LASTEXITCODE -ne 0) { throw 'Failed to seed legacy public ACLs' }
   foreach ($round in 1..2) {
     $process = Start-Process -FilePath $InstallerWorker -ArgumentList @(
       '--stage', 'harden-acl', '--install-dir', ('"{0}"' -f $root),
