@@ -9,6 +9,7 @@ import subprocess
 import tempfile
 import time
 import uuid
+import sqlite3
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--client', type=Path, required=True)
@@ -87,6 +88,7 @@ with tempfile.TemporaryDirectory(prefix='edr-space-preflight-') as directory:
     config = root/'agent.toml'
     config.write_text('[offline]\ncommand_state_owner_budget_mb = 1\nstorage_min_free_mb = 0\n')
     env = dict(os.environ, EDR_COMMAND_STATE_DB=str(state),
+               EDR_EVIDENCE_CACHE_PATH=str(root/'missing-evidence.db'),
                EDR_STORAGE_MIN_FREE_MB='999999', EDR_STORAGE_OWNER_PROTECTED_BYTES='unavailable')
     def invoke(name, flags, expected=0):
         output = root/(name+'.floor')
@@ -125,6 +127,58 @@ with tempfile.TemporaryDirectory(prefix='edr-space-preflight-') as directory:
     protected = invoke('legacy-owner', ['--config', str(config)])
     assert protected > 27*1024*1024 and hashlib.sha256(state.read_bytes()).hexdigest() == before_hash
     assert permissions(state) == owner_permissions and permissions(state.parent) == parent_permissions
+    # Exercise the real installer CLI with a public, full pre-clock DB. This
+    # small schema tests the rejection contract; the C suite covers real schema
+    # migration and query ownership using the production storage owner.
+    evidence=root/'public-evidence.db'
+    with sqlite3.connect(evidence) as db:
+        db.execute('CREATE TABLE metrics(minute_unix INTEGER,endpoint_id TEXT,metric_name TEXT,value INTEGER)')
+        db.execute('CREATE TABLE padding(payload BLOB)')
+        db.execute('INSERT INTO padding VALUES(zeroblob(1100000))')
+    db.close()
+    env.pop('EDR_EVIDENCE_CACHE_PATH')
+    config.write_text('[offline]\ncommand_state_owner_budget_mb=1\nstorage_min_free_mb=0\n'
+                      'evidence_cache_max_size_mb=1\nevidence_cache_path='+json.dumps(str(evidence))+'\n')
+    evidence_before=evidence.read_bytes()
+    invoke('full-preclock-evidence',['--config',str(config)],11)
+    assert evidence.read_bytes()==evidence_before
+    with sqlite3.connect(evidence) as db:
+        db.execute('BEGIN EXCLUSIVE')
+        invoke('busy-evidence',['--config',str(config)],12)
+    db.close()
+    assert evidence.read_bytes()==evidence_before
+    with sqlite3.connect(evidence) as db:
+        db.execute("INSERT INTO metrics VALUES(0,'','local_retention_v1_active_ms','invalid')")
+    db.close()
+    invalid_clock=evidence.read_bytes()
+    invoke('invalid-clock-evidence',['--config',str(config)],12)
+    assert evidence.read_bytes()==invalid_clock
+    env['EDR_EVIDENCE_CACHE_PATH']=str(root/'override-missing.db')
+    assert invoke('evidence-path-override',['--config',str(config)])==protected
+    assert not Path(env['EDR_EVIDENCE_CACHE_PATH']).exists()
+    env['EDR_EVIDENCE_CACHE_PATH']=str(evidence)
+    evidence.write_bytes(b'public-invalid-sqlite')
+    invoke('invalid-evidence',['--config',str(config)],12)
+    assert evidence.read_bytes()==b'public-invalid-sqlite'
+    wal_evidence=root/'wal-public.db'
+    env['EDR_EVIDENCE_CACHE_PATH']=str(wal_evidence)
+    db=sqlite3.connect(wal_evidence)
+    try:
+        db.execute('PRAGMA journal_mode=WAL')
+        db.execute('PRAGMA wal_autocheckpoint=0')
+        db.execute('CREATE TABLE padding(payload BLOB)')
+        db.commit()
+        db.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+        db.execute('INSERT INTO padding VALUES(zeroblob(1100000))')
+        db.commit()
+        wal=Path(str(wal_evidence)+'-wal')
+        main_before,wal_before=wal_evidence.read_bytes(),wal.read_bytes()
+        assert len(main_before)<1048576 and len(wal_before)>1048576
+        invoke('committed-wal-full-evidence',['--config',str(config)],11)
+        assert wal_evidence.read_bytes()==main_before and wal.read_bytes()==wal_before
+    finally:
+        db.close()
+    env['EDR_EVIDENCE_CACHE_PATH']=str(root/'missing-evidence.db')
     # User-configured physical floor takes precedence without accepting inherited
     # environment values as a substitute for the selected local config.
     config.write_text('[offline]\ncommand_state_owner_budget_mb=1\nstorage_min_free_mb=64\n')
@@ -331,4 +385,4 @@ with tempfile.TemporaryDirectory(prefix='edr-space-preflight-') as directory:
     result = subprocess.run([client, '--storage-space-preflight', '--defaults', '--output', str(output)],
                             env=env, capture_output=True, timeout=10)
     assert result.returncode == 5 and output.read_bytes() == b'preserve'
-    print('storage_space_preflight: defaults/config/missing-state/legacy-owner/ACL/corruption/output cases passed; real config/parser/owner lock; JSONL and owner ACL unchanged; no Agent startup')
+    print('storage_space_preflight: defaults/config/missing-state/legacy-owner/ACL/corruption/output and evidence full/busy/invalid/invalid-clock/committed-WAL/path-override cases passed; real config/parser/owner lock and SQLite; DB/WAL/JSONL and owner ACL unchanged by preflight; no Agent startup')

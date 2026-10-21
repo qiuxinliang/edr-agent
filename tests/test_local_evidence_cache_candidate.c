@@ -12466,8 +12466,67 @@ static void test_startup_logical_budget_wal_long_reader(void) {
   edr_local_evidence_cache_test_set_now_unix_ns(0);edr_local_evidence_cache_test_set_retention_monotonic_ms(-1);
 }
 
+/* 692 already has retention ownership but no active-clock row/guards/column.
+ * Reproduce that additive boundary without importing endpoint evidence. */
+static void test_startup_preclock_full(int over) {
+  char path[512], columns[4096]="", sql[8192];
+  sqlite3 *db=NULL;sqlite3_stmt *st=NULL;EdrEvidenceCacheStatus status;
+  assert(make_test_sqlite_path(path,sizeof(path))==0);
+  assert(edr_local_evidence_cache_open_with_policy(path,1,72,72)==0);
+  edr_local_evidence_cache_close();assert(sqlite3_open(path,&db)==SQLITE_OK);
+  compact_exec(db,"DROP TRIGGER retention_active_clock_v1_insert;DROP TRIGGER retention_active_clock_v1_update;"
+    "DROP TRIGGER retention_active_clock_v1_delete;DROP TRIGGER alert_context_floor_v1_insert;"
+    "DROP TRIGGER alert_context_floor_v1_update;DROP TRIGGER alert_context_floor_v1_eligible;"
+    "DROP TRIGGER alert_context_floor_v1_delete;DELETE FROM metrics WHERE metric_name='local_retention_v1_active_ms';"
+    "ALTER TABLE p0_candidates DROP COLUMN alert_context_protect_until_active_ms;"
+    "INSERT INTO p0_candidates(candidate_id,endpoint_id,tenant_id,event_time_ns,pid,ppid,cmdline,"
+    "process_start_key,retention_policy_version,retention_value_class,created_ns,context_post_until_ns) "
+    "VALUES('preclock-public','test','test',9000000000000000100,42,21,'public command','instance-42',0,0,9000000000000000100,0);");
+  assert(sqlite3_prepare_v2(db,"PRAGMA table_info(p0_candidates)",-1,&st,NULL)==SQLITE_OK);
+  while(sqlite3_step(st)==SQLITE_ROW) {
+    const char *name=(const char *)sqlite3_column_text(st,1);
+    size_t used=strlen(columns);int n=snprintf(columns+used,sizeof(columns)-used,"%s%s",used?",":"",name);
+    assert(n>0 && (size_t)n<sizeof(columns)-used);
+  }
+  sqlite3_finalize(st);
+  snprintf(sql,sizeof(sql),"CREATE TEMP TABLE preclock_expected AS SELECT %s FROM p0_candidates",columns);
+  compact_exec(db,sql);startup_fill_pages(db,over?291:256);
+  sqlite3_int64 schema=compact_scalar(db,"PRAGMA schema_version");
+  assert(edr_local_evidence_cache_startup_preflight(path,1)==1);
+  assert(compact_scalar(db,"PRAGMA schema_version")==schema);
+  assert(compact_scalar(db,"PRAGMA page_count")== (over?291:256));
+  /* An operator bypassing the installer still gets the real, preserved cause. */
+  assert(edr_local_evidence_cache_open_with_policy(path,1,72,72)<0);
+  edr_local_evidence_cache_get_status(&status);
+  assert(!status.db_open && strstr(status.last_error,"retention clock guards sqlite=13"));
+  assert(!strstr(status.last_error,"unsupported") && !strstr(status.last_error,"rollback"));
+  assert(compact_scalar(db,"PRAGMA page_count")== (over?291:256));
+  snprintf(sql,sizeof(sql),"SELECT COUNT(*) FROM (SELECT %s FROM p0_candidates EXCEPT SELECT * FROM preclock_expected)",columns);
+  assert(compact_scalar(db,sql)==0 && compact_scalar(db,"SELECT COUNT(*) FROM p0_candidates")==1);
+  assert(compact_scalar(db,"SELECT COUNT(*) FROM metrics WHERE metric_name='local_retention_v1_active_ms'")==0);
+  assert(edr_local_evidence_cache_startup_preflight(path,1)==1); /* Partial additive DDL is still rejected. */
+  /* Only public padding is released: no old evidence is deleted or promoted. */
+  for(unsigned i=0;i<32u;i++) {
+    snprintf(sql,sizeof(sql),"DROP TABLE IF EXISTS startup_padding_page_%u",i);compact_exec(db,sql);
+  }
+  compact_exec(db,"DROP TABLE startup_padding;");
+  assert(edr_local_evidence_cache_startup_preflight(path,1)==0);
+  assert(edr_local_evidence_cache_open_with_policy(path,1,72,72)==0);
+  edr_local_evidence_cache_get_status(&status);assert(status.db_open && status.retention_clock_valid);
+  snprintf(sql,sizeof(sql),"SELECT COUNT(*) FROM (SELECT %s FROM p0_candidates EXCEPT SELECT * FROM preclock_expected)",columns);
+  assert(compact_scalar(db,sql)==0 && compact_scalar(db,"SELECT COUNT(*) FROM p0_candidates")==1);
+  edr_local_evidence_cache_close();
+  startup_fill_pages(db,over?291:256);
+  assert(edr_local_evidence_cache_startup_preflight(path,1)==0); /* Current full schema is compatible. */
+  assert(edr_local_evidence_cache_open_with_policy(path,1,72,72)==0);
+  edr_local_evidence_cache_close();assert(sqlite3_close(db)==SQLITE_OK);cleanup_test_sqlite_path(path);
+  printf("startup_preclock over=%d first_cause_sqlite_full=1 preflight_readonly_refusal=1 old_evidence_unchanged=1 same_budget_recovery=1 compatible_full_allowed=1\n",over);
+}
+
 static void test_startup_logical_budget(void) {
   s_test_pressure=false;
+  test_startup_preclock_full(0);
+  test_startup_preclock_full(1);
   test_startup_logical_budget_legacy(1,0,1u);
   test_startup_logical_budget_legacy(1,1,1u);
   test_startup_logical_budget_legacy(0,0,1u);
@@ -13147,6 +13206,11 @@ static void test_compact_startup_contract(void) {
 #endif
 
 int main(int argc, char **argv) {
+#if defined(EDR_HAVE_SQLITE)
+  if (argc==2 && !strcmp(argv[1],"--startup-preclock")) {
+    test_startup_preclock_full(0);test_startup_preclock_full(1);return 0;
+  }
+#endif
   if (argc >= 2 && strcmp(argv[1], "--normal-open-work-copy") == 0) {
 #if defined(_WIN32) && defined(EDR_HAVE_SQLITE) && defined(EDR_LOCAL_EVIDENCE_CACHE_TESTING)
     if (argc == 4) return run_normal_open_work_copy(argv[2], argv[3]);

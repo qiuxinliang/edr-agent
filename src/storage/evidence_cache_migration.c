@@ -118,6 +118,51 @@ static int physical_bound(sqlite3 *db, const char *wal, uint64_t *out) {
 }
 #endif
 
+int edr_local_evidence_cache_startup_preflight(const char *path, uint32_t max_db_mb) {
+#if defined(EDR_HAVE_SQLITE)
+  if (!path || !path[0]) return -1;
+  uint64_t length = file_bytes(path);
+  if (!length) return 0;
+  if (length == UINT64_MAX) return -1;
+  sqlite3 *db = NULL;
+  int result = -1;
+  MigrationDeadline deadline = { migration_clock_ms() + 2000u, NULL, NULL };
+  if (sqlite3_open_v2(path,&db,SQLITE_OPEN_READONLY,NULL) != SQLITE_OK) goto done;
+  sqlite3_busy_timeout(db,200);
+  sqlite3_progress_handler(db,1000,interrupted,&deadline);
+  /* One snapshot; do not use immutable=1 on a live WAL database. SQLite may
+   * maintain its SHM reader bookkeeping, but cannot change the DB or WAL. */
+  if (sqlite3_exec(db,"PRAGMA query_only=ON;BEGIN;",NULL,NULL,NULL) != SQLITE_OK) goto done;
+  EdrContextStore store = {0};
+  if (edr_context_store_check_format(&store,db) != 0) goto done;
+  sqlite3_int64 pages=0, free_pages=0, page_size=0, metrics=0, clock=0, valid_clock=0, guards=0;
+  if (scalar(db,"PRAGMA page_count",&pages) || scalar(db,"PRAGMA freelist_count",&free_pages) ||
+      scalar(db,"PRAGMA page_size",&page_size) || pages<0 || free_pages<0 || page_size<=0) goto done;
+  uint64_t budget=(uint64_t)(max_db_mb ? max_db_mb : 128u)*1048576u;
+  if (free_pages>0 || (uint64_t)pages<budget/(uint64_t)page_size) { result=0; goto done; }
+  if (scalar(db,"SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='metrics'",&metrics)) goto done;
+  if (metrics && scalar(db,"SELECT COUNT(*) FROM metrics WHERE minute_unix=0 AND endpoint_id='' "
+      "AND metric_name='local_retention_v1_active_ms'",&clock)) goto done;
+  if (clock && (scalar(db,"SELECT COUNT(*) FROM metrics WHERE minute_unix=0 AND endpoint_id='' "
+      "AND metric_name='local_retention_v1_active_ms' AND typeof(value)='integer' AND value>=0",&valid_clock) ||
+      clock!=1 || valid_clock!=1)) goto done;
+  if (scalar(db,"SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND name IN ("
+      "'retention_active_clock_v1_insert','retention_active_clock_v1_update','retention_active_clock_v1_delete',"
+      "'alert_context_floor_v1_insert','alert_context_floor_v1_update','alert_context_floor_v1_eligible',"
+      "'alert_context_floor_v1_delete')",&guards)) goto done;
+  /* This is deliberately conservative: slack within occupied B-tree pages
+   * is not proven migration capacity. Fully current full stores may reopen. */
+  result = clock == 1 && guards == 7 ? 0 : 1;
+done:
+  if (interrupted(&deadline)) result=-1;
+  if (db) sqlite3_close(db);
+  return result;
+#else
+  (void)path; (void)max_db_mb;
+  return -1;
+#endif
+}
+
 int edr_local_evidence_cache_migrate(const char *path, uint32_t max_db_mb,
                                     uint32_t timeout_ms,
                                     int (*cancelled)(void *), void *cancel_context,

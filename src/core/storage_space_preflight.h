@@ -2,6 +2,7 @@
 #define EDR_STORAGE_SPACE_PREFLIGHT_H
 
 #include "edr/storage_space_policy.h"
+#include "edr/local_evidence_cache.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -34,6 +35,13 @@ static int edr_storage_space_preflight_body(int argc, char **argv) {
     fprintf(stderr, "storage preflight: local configuration unavailable\n"); return 3;
   }
   int rc = edr_storage_policy_apply(&cfg, defaults ? EDR_STORAGE_POLICY_DEFAULTS : EDR_STORAGE_POLICY_READ_ONLY);
+  int evidence_rc=0;
+  if (!rc && !defaults) {
+    const char *path=getenv("EDR_EVIDENCE_CACHE_PATH");
+    if (!path || !path[0]) path=cfg.offline.evidence_cache_path;
+    if (!path || !path[0]) path="local_evidence_cache.db";
+    evidence_rc=edr_local_evidence_cache_startup_preflight(path,cfg.offline.evidence_cache_max_size_mb);
+  }
   edr_config_free_heap(&cfg);
   if (rc == EDR_STORAGE_POLICY_INVENTORY_LOCK_TIMEOUT) {
     fprintf(stderr, "storage preflight: owner_lock_timeout\n"); return 7;
@@ -43,6 +51,11 @@ static int edr_storage_space_preflight_body(int argc, char **argv) {
   }
   if (rc == EDR_STORAGE_POLICY_INVENTORY_DEADLINE_BEFORE_REQUEST) {
     fprintf(stderr, "storage preflight: owner_lock_deadline_before_request\n"); return 10;
+  }
+  if (evidence_rc) {
+    fprintf(stderr,"storage preflight: %s\n",evidence_rc==1
+        ? "evidence_schema_no_page_headroom" : "evidence_schema_inspection_unavailable");
+    return evidence_rc==1 ? 11 : 12;
   }
   uint64_t floor = 0;
   if (rc || edr_storage_min_free_bytes(&floor) || floor > 9007199254740991ULL) {

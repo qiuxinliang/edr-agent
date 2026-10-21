@@ -9,11 +9,12 @@ $config = Join-Path $root 'agent.toml'
 $junction = Join-Path $root 'linked-state'
 $utf8 = New-Object Text.UTF8Encoding($false)
 $savedEnv = @{}
-foreach ($key in @('EDR_COMMAND_STATE_DB','EDR_STORAGE_MIN_FREE_MB','EDR_STORAGE_OWNER_PROTECTED_BYTES')) {
+foreach ($key in @('EDR_COMMAND_STATE_DB','EDR_STORAGE_MIN_FREE_MB','EDR_STORAGE_OWNER_PROTECTED_BYTES','EDR_EVIDENCE_CACHE_PATH')) {
     $savedEnv[$key] = [Environment]::GetEnvironmentVariable($key, 'Process')
 }
 $null = New-Item -ItemType Directory -Path $root
 $env:EDR_COMMAND_STATE_DB = $state
+$env:EDR_EVIDENCE_CACHE_PATH = Join-Path $root 'missing-evidence.db'
 $env:EDR_STORAGE_MIN_FREE_MB = '999999'
 $env:EDR_STORAGE_OWNER_PROTECTED_BYTES = 'unavailable'
 $cases = @{Count = 0}

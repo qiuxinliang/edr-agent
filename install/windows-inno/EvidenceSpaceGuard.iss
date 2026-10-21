@@ -120,6 +120,8 @@ begin
     8: Result := 'deadline_unavailable';
     9: Result := 'owner_lock_granted_expired';
     10: Result := 'owner_lock_deadline_before_request';
+    11: Result := 'evidence_schema_no_page_headroom';
+    12: Result := 'evidence_schema_inspection_unavailable';
     124: Result := 'child_watchdog_timeout';
   else
     Result := 'unclassified_exit';
@@ -148,7 +150,7 @@ function EdrComputeLocalSpaceFloor(const AppDir: string; const Required: Boolean
   const PassedFloor: Int64; var FloorBytes: Int64): string;
 var
   Extracted: Integer;
-  ProbeDir, ProbeExe, OutputPath, ConfigPath, Arguments, Command: string;
+  ProbeDir, ProbeExe, OutputPath, ConfigPath, Arguments, Command, RuntimeDir: string;
   Decimal: AnsiString;
 begin
   Result := '';
@@ -188,10 +190,14 @@ begin
       Arguments := Arguments + '+'' --defaults''';
     // Bound the existing local PowerShell process launcher. It waits for only
     // this child and kills only that PID on timeout; no Agent process matching.
+    // Existing relative cache/owner paths have the installed Agent's working
+    // directory. The executable and its DLL closure still come from ProbeDir.
+    RuntimeDir := ProbeDir;
+    if Required then RuntimeDir := AppDir;
     Command := '-NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "'
       + '$ErrorActionPreference=''Stop'';$p=Start-Process -FilePath '
       + EdrSpacePsQuote(ProbeExe) + ' -ArgumentList '
-      + '(' + Arguments + ')' + ' -WorkingDirectory ' + EdrSpacePsQuote(ProbeDir)
+      + '(' + Arguments + ')' + ' -WorkingDirectory ' + EdrSpacePsQuote(RuntimeDir)
       + ' -PassThru;try{if(-not $p.WaitForExit(15000)){$p.Kill();exit 124};'
       + '$p.Refresh();exit $p.ExitCode}finally{$p.Dispose()}"';
     Result := EdrExecSpacePreflight(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),

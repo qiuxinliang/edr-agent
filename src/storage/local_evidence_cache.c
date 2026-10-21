@@ -2774,6 +2774,7 @@ static int sqlite_parent_floor_guards(void) {
 
 static int sqlite_retention_clock_open(void) {
   sqlite3_stmt *st = NULL;
+  const char *phase = "read";
   uint64_t now = retention_monotonic_ms();
   int cause = 5;
   if (!now) return retention_clock_error(3u, "retention monotonic clock unavailable at cache open");
@@ -2786,6 +2787,7 @@ static int sqlite_retention_clock_open(void) {
     base = (uint64_t)sqlite3_column_int64(st, 0);
   } else if (step == SQLITE_DONE) {
     sqlite3_finalize(st); st = NULL;
+    phase = "existing floors";
     if (sqlite3_prepare_v2(s_db, "SELECT 1 FROM p0_candidates WHERE "
         "typeof(alert_context_protect_until_active_ms)!='integer' OR alert_context_protect_until_active_ms!=0 LIMIT 1;",
         -1, &st, NULL) != SQLITE_OK) goto failed;
@@ -2793,10 +2795,12 @@ static int sqlite_retention_clock_open(void) {
     if (step == SQLITE_ROW) { cause = 1; goto failed; }
     if (step != SQLITE_DONE) goto failed;
     sqlite3_finalize(st); st = NULL;
+    phase = "initialize";
     if (exec_sql("INSERT INTO metrics(minute_unix,endpoint_id,metric_name,value) VALUES(0,'','" RETENTION_ACTIVE_CLOCK_KEY "',0);") != 0)
       goto failed;
   } else goto failed;
   sqlite3_finalize(st); st = NULL;
+  phase = "guards";
   if (sqlite_parent_floor_guards() != 0) goto failed;
   s_retention_clock.base_ms = base;
   s_retention_clock.anchor_ms = now;
@@ -2807,8 +2811,16 @@ static int sqlite_retention_clock_open(void) {
   s_status.retention_clock_cause_code = 0u;
   return 0;
 failed:
-  sqlite3_finalize(st);
-  return retention_clock_error((unsigned)cause, "retention active clock missing or invalid at cache open; existing evidence preserved");
+  {
+    char message[sizeof(s_status.last_error)];
+    if (cause == 5)
+      snprintf(message,sizeof(message),"retention clock %s sqlite=%d: %.80s; evidence preserved",
+               phase,sqlite3_extended_errcode(s_db),sqlite3_errmsg(s_db));
+    else
+      snprintf(message,sizeof(message),"retention clock invalid (cause=%d); evidence preserved",cause);
+    sqlite3_finalize(st);
+    return retention_clock_error((unsigned)cause,message);
+  }
 }
 
 static int sqlite_live_size_over_limit(uint64_t limit);
@@ -2915,7 +2927,11 @@ static int sqlite_retention_metadata_open(void) {
       "SELECT COUNT(*) FROM p0_candidates WHERE typeof(retention_policy_version)!='integer' "
       "OR retention_policy_version NOT IN (0,1) OR local_retention_state IS NULL "
       "OR local_retention_state!='retained';", -1, &st, NULL) != SQLITE_OK ||
-      sqlite3_step(st) != SQLITE_ROW || sqlite3_column_int64(st, 0) != 0) goto failed;
+      sqlite3_step(st) != SQLITE_ROW) goto query_failed;
+  if (sqlite3_column_int64(st, 0) != 0) {
+    set_error("unsupported candidate retention metadata; evidence preserved");
+    goto failed;
+  }
   sqlite3_finalize(st); st = NULL;
   if (exec_sql(
       "CREATE INDEX IF NOT EXISTS idx_candidates_retention ON p0_candidates(retention_policy_version,event_time_ns,candidate_id);"
@@ -2944,7 +2960,7 @@ static int sqlite_retention_metadata_open(void) {
       "OR (NEW.local_retention_state='retirement_eligible' AND NEW.retention_policy_version!=1) "
       "BEGIN SELECT RAISE(ABORT,'unsupported candidate retention transition'); END;") != 0) { set_error(s_context_store.error); goto failed; }
   if (sqlite3_prepare_v2(s_db, "SELECT COUNT(*) FROM p0_candidates WHERE retention_policy_version=0 OR retention_value_class=0;",
-      -1, &st, NULL) != SQLITE_OK || sqlite3_step(st) != SQLITE_ROW) goto failed;
+      -1, &st, NULL) != SQLITE_OK || sqlite3_step(st) != SQLITE_ROW) goto query_failed;
   uint64_t legacy = (uint64_t)sqlite3_column_int64(st, 0);
   sqlite3_finalize(st); st = NULL;
   if (edr_context_store_install_retention_guards(&s_context_store)!=0) { set_error(s_context_store.error); goto failed; }
@@ -2953,11 +2969,24 @@ static int sqlite_retention_metadata_open(void) {
   sqlite_retention_clock_committed();
   s_status.retention_legacy_candidates = legacy;
   return 0;
+query_failed:
+  {
+    char message[sizeof(s_status.last_error)];
+    snprintf(message,sizeof(message),"candidate metadata read sqlite=%d: %.90s",
+             sqlite3_extended_errcode(s_db),sqlite3_errmsg(s_db));
+    set_error(message);
+  }
 failed:
-  sqlite3_finalize(st);
-  (void)exec_sql("ROLLBACK;");
-  s_retention_clock.pending = 0;
-  set_error("candidate retention metadata unavailable or unsupported; evidence preserved");
+  {
+    char cause[sizeof(s_status.last_error)];
+    copy_s(cause,sizeof(cause),s_status.last_error);
+    sqlite3_finalize(st);
+    /* SQLITE_FULL may already have rolled back. Cleanup must not replace the
+     * original capacity/clock/metadata failure with a second rollback error. */
+    if (!sqlite3_get_autocommit(s_db)) (void)exec_sql("ROLLBACK;");
+    s_retention_clock.pending = 0;
+    set_error(cause);
+  }
   return -1;
 }
 

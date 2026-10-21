@@ -2315,14 +2315,25 @@ add_test(NAME storage_physical_guard COMMAND test_storage_physical_guard)
 # Installer compatibility preflight uses the exact production CLI implementation,
 # real TOML parser and real command owner calibration; it never starts an Agent.
 add_executable(storage_space_preflight_client storage_space_preflight_client.c
+  ${CMAKE_SOURCE_DIR}/src/storage/evidence_cache_migration.c
+  ${CMAKE_SOURCE_DIR}/src/storage/evidence_context_store.c
+  ${CMAKE_SOURCE_DIR}/third_party/cjson/cJSON.c
   ${CMAKE_SOURCE_DIR}/src/config/config.c
   ${CMAKE_SOURCE_DIR}/third_party/tomlc99/toml.c
   ${CMAKE_SOURCE_DIR}/src/command/command_state.c
   ${CMAKE_SOURCE_DIR}/src/command/sha256.c
   ${CMAKE_SOURCE_DIR}/src/transport/command_result_json.c)
 target_include_directories(storage_space_preflight_client PRIVATE
-  ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/third_party/tomlc99)
+  ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/third_party/tomlc99 ${CMAKE_SOURCE_DIR}/third_party/cjson)
 target_link_libraries(storage_space_preflight_client PRIVATE edr_egress_policy Threads::Threads)
+if(SQLite3_FOUND)
+  target_compile_definitions(storage_space_preflight_client PRIVATE EDR_HAVE_SQLITE=1)
+  if(TARGET SQLite3::SQLite3)
+    target_link_libraries(storage_space_preflight_client PRIVATE SQLite3::SQLite3)
+  else()
+    target_link_libraries(storage_space_preflight_client PRIVATE SQLite::SQLite3)
+  endif()
+endif()
 if(WIN32)
   target_link_libraries(storage_space_preflight_client PRIVATE advapi32)
   target_compile_definitions(storage_space_preflight_client PRIVATE EDR_COMMAND_STATE_INVENTORY_TEST=1)

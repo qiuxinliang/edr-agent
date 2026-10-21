@@ -73,6 +73,8 @@ function Invoke-SpaceFixtureProcess([string]$Path, [string[]]$Arguments, [int]$T
 $root = Join-Path $env:TEMP ('edr-inno-space-' + [guid]::NewGuid().ToString('N'))
 $null = New-Item -ItemType Directory -Path $root
 $previousStateDb = $env:EDR_COMMAND_STATE_DB
+$previousEvidenceDb = $env:EDR_EVIDENCE_CACHE_PATH
+$env:EDR_EVIDENCE_CACHE_PATH = Join-Path $root 'missing-evidence.db'
 $previousFixtureMode = $env:EDR_INNO_PREFLIGHT_FIXTURE_MODE
 $previousFixturePid = $env:EDR_INNO_PREFLIGHT_FIXTURE_PID
 $env:EDR_COMMAND_STATE_DB = Join-Path $root 'synthetic-owner\command_state.jsonl'
@@ -284,6 +286,8 @@ public static class SpacePreflightFailureFixture {
         @{Name='deadline-unavailable'; Mode='8'; Code=8; Reason='deadline_unavailable'},
         @{Name='owner-lock-granted-expired'; Mode='9'; Code=9; Reason='owner_lock_granted_expired'},
         @{Name='owner-lock-deadline-before-request'; Mode='10'; Code=10; Reason='owner_lock_deadline_before_request'},
+        @{Name='evidence-schema-full'; Mode='11'; Code=11; Reason='evidence_schema_no_page_headroom'},
+        @{Name='evidence-schema-unavailable'; Mode='12'; Code=12; Reason='evidence_schema_inspection_unavailable'},
         @{Name='child-watchdog'; Mode='watchdog'; Code=124; Reason='child_watchdog_timeout'},
         @{Name='launcher-unavailable'; Mode='7'; LaunchFailure=$true}
     )
@@ -333,6 +337,7 @@ public static class SpacePreflightFailureFixture {
     throw
 } finally {
     $env:EDR_COMMAND_STATE_DB = $previousStateDb
+    $env:EDR_EVIDENCE_CACHE_PATH = $previousEvidenceDb
     $env:EDR_INNO_PREFLIGHT_FIXTURE_MODE = $previousFixtureMode
     $env:EDR_INNO_PREFLIGHT_FIXTURE_PID = $previousFixturePid
     if (-not $retained) { Remove-Item -LiteralPath $root -Recurse -Force }
