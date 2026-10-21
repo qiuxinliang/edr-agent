@@ -140,8 +140,8 @@ function Repair-RuntimeFileAcls {
   # The caller already took ownership and removed inheritance recursively.
   # Match the native installer's batched direct-file grants. /grant (not
   # /grant:r) preserves directory inheritance for files created afterwards.
-  # Older autorun versions recursed over *.json and granted Users access to
-  # outbox/evidence files. Remove those explicit grants as well as inheritance.
+  # Older autorun versions recursed over *.json/*.txt and granted Users access
+  # to evidence, including forensic output. Remove explicit grants too.
   & icacls.exe $Path /remove:g "*S-1-5-32-545" /T /C /Q | Out-Null
   if ($LASTEXITCODE -ne 0) {
     throw "sensitive ACL removal failed with exit code $LASTEXITCODE path=$Path"
@@ -174,7 +174,7 @@ function Repair-SensitiveRuntimeAcls {
   param([string]$Dir)
   if (-not (Test-Path -LiteralPath $Dir)) { return }
 
-  foreach ($sub in @("certs", "queue", "evidence", "state", "logs", "diagnostics", "upload_outbox")) {
+  foreach ($sub in @("certs", "queue", "evidence", "state", "logs", "diagnostics", "upload_outbox", "forensic")) {
     $path = Join-Path $Dir $sub
     try {
       if (-not (Test-Path -LiteralPath $path)) {
