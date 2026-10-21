@@ -19,6 +19,7 @@ import unittest
 import uuid
 
 ROOT = Path(r"C:\EDR_RETENTION_SYNTHETIC_20261017")
+MAX_BASELINE_BYTES = 512 * 1024 * 1024 + 35 * 4096
 CONFIG = None
 
 
@@ -133,6 +134,20 @@ class SyntheticWorkCopyTests(unittest.TestCase):
         self.assertFalse(r["owner_called"])
         self.assertFalse((d / "work").exists())
 
+    def test_baseline_length_bound_is_separate_from_owner_budget(self):
+        # Public small files deliberately do not match the declared length.
+        # Reaching the identity check proves admission through the manifest,
+        # not successful migration of a large historical cache.
+        for size in (512 * 1024 * 1024, 512 * 1024 * 1024 + 1, MAX_BASELINE_BYTES):
+            with self.subTest(declared_bytes=size):
+                t, d, c = self.seed()
+                c["baseline_bytes"] = size
+                rc, r = self.invoke(t, d, c)
+                self.assertEqual(rc, 2)
+                self.assertEqual(r["cause"], "baseline_identity_size_or_sha")
+                self.assertFalse(r["owner_called"])
+                self.assertFalse((d / "work").exists())
+
     def test_pathlike_or_unbound_arguments_are_refused_before_io(self):
         for token, approval in (("../baseline.db", "0" * 64),
                                 ("UNBOUND", "0" * 64),
@@ -156,7 +171,7 @@ class SyntheticWorkCopyTests(unittest.TestCase):
                 elif kind == "wrong_exe": c["exe_sha256"] = "0" * 64
                 elif kind == "wrong_sha": c["baseline_sha256"] = "0" * 64
                 elif kind == "wrong_size": c["baseline_bytes"] += 1
-                elif kind == "oversize": c["baseline_bytes"] = 512 * 1024 * 1024 + 1
+                elif kind == "oversize": c["baseline_bytes"] = MAX_BASELINE_BYTES + 1
                 elif kind == "bool_size": c["baseline_bytes"] = True
                 elif kind == "raise_budget": c["budget_mb"] = 513
                 elif kind == "lower_hours": c["recent_hours"] = 1

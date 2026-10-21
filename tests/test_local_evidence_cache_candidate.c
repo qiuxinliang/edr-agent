@@ -12599,6 +12599,9 @@ static void test_startup_logical_budget(void) {
 
 #define WC_ROOT "C:\\EDR_RETENTION_SYNTHETIC_20261017"
 #define WC_BYTES (UINT64_C(512) * 1024u * 1024u)
+/* The preserved 707 snapshot already has 35 extra 4096-byte pages. This is
+ * only the diagnostic input limit; the real owner's budget remains 512 MiB. */
+#define WC_MAX_BASELINE_BYTES (WC_BYTES + UINT64_C(35) * 4096u)
 #define WC_CAP 4096u
 
 typedef struct {
@@ -12756,7 +12759,7 @@ static int wc_manifest(const char *raw, size_t bytes, const char *token, cJSON *
       cJSON_IsString(source) && wc_hex(source->valuestring,40u) &&
       cJSON_IsString(exe) && wc_hex(exe->valuestring,64u) &&
       cJSON_IsString(baseline) && wc_hex(baseline->valuestring,64u) &&
-      cJSON_IsNumber(n) && n->valuedouble>=512.0 && n->valuedouble<=WC_BYTES &&
+      cJSON_IsNumber(n) && n->valuedouble>=512.0 && n->valuedouble<=WC_MAX_BASELINE_BYTES &&
       n->valuedouble==(double)(uint64_t)n->valuedouble &&
       cJSON_IsNumber(budget) && budget->valuedouble==512.0 &&
       cJSON_IsNumber(recent) && recent->valuedouble==72.0 &&
