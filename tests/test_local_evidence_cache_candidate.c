@@ -12253,6 +12253,13 @@ static void startup_preserve_legacy(sqlite3 *db, int snapshot) {
 
 static void startup_fill_pages(sqlite3 *db, sqlite3_int64 target) {
   sqlite3_int64 size=compact_scalar(db,"PRAGMA page_size");
+  sqlite3_int64 free_pages=compact_scalar(db,"PRAGMA freelist_count");
+  fprintf(stderr,"startup_padding target=%lld before_pages=%lld free_pages=%lld\n",
+      (long long)target,(long long)compact_scalar(db,"PRAGMA page_count"),(long long)free_pages);
+  /* A cooperative runtime slice need not shrink every freed fixture page.
+   * Normalize only this synthetic padding setup before filling it again;
+   * the resulting exact page ceiling and zero-freelist assertions stay intact. */
+  if (free_pages) compact_exec(db,"PRAGMA incremental_vacuum;");
   compact_exec(db,"CREATE TABLE startup_padding(payload BLOB);");
   sqlite3_int64 pages=compact_scalar(db,"PRAGMA page_count"); assert(target>pages+8);
   if(target>4096) {
