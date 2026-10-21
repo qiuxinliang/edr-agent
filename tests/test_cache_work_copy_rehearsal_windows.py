@@ -179,6 +179,8 @@ class SyntheticWorkCopyTests(unittest.TestCase):
                 rc, r = self.invoke(t, d, c, raw=raw)
                 self.assertEqual(rc, 2)
                 self.assertFalse(r["owner_called"])
+                if kind == "oversize":
+                    self.assertEqual(r["cause"], "manifest_schema")
 
     def test_sidecar_refused_without_open(self):
         for suffix in ("-wal", "-shm", "-journal"):
