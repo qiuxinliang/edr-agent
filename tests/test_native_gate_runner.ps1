@@ -18,8 +18,12 @@ $lastTest = Join-Path $root 'Testing/Temporary/LastTest.log'
 $savedRelease = Join-Path $root 'native-release-LastTest.log'
 $null = New-Item -ItemType Directory -Path (Split-Path $lastTest -Parent) -Force
 $oldMarker = [Environment]::GetEnvironmentVariable('EDR_GATE_RUNNER_TEST', 'Process')
+$oldTempEnvironment = @{}
+foreach ($name in @('TMP', 'TEMP', 'RUNNER_TEMP', 'GITHUB_ACTIONS')) {
+  $oldTempEnvironment[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
+}
 
-$state = [pscustomobject]@{ Scenario = ''; BuildArguments = @(); Inventory = @(); Phases = $null; TestArguments = $null }
+$state = [pscustomobject]@{ Scenario = ''; BuildArguments = @(); Inventory = @(); Phases = $null; TestArguments = $null; ExpectedTemp = $null }
 
 function openssl { throw 'The orchestration fixture must not execute OpenSSL.' }
 function cmake {
@@ -28,6 +32,10 @@ function cmake {
 }
 function ctest {
   $arguments = @($args | ForEach-Object { $_ })
+  if ($null -ne $state.ExpectedTemp -and
+      ($env:TMP -cne $state.ExpectedTemp -or $env:TEMP -cne $state.ExpectedTemp)) {
+    throw 'Native test child did not receive the intended temporary directory.'
+  }
   if ($arguments -contains '--show-only=json-v1') {
     $global:LASTEXITCODE = 0
     return (@{ tests = $state.inventory } | ConvertTo-Json -Depth 8)
@@ -153,7 +161,43 @@ try {
     if ($env:EDR_GATE_RUNNER_TEST -cne 'must be restored') { throw "${earlyFailure}: early preflight changed the inherited environment." }
     Write-Host "PASS: native gate runner early $earlyFailure"
   }
+  $profileTemp = Join-Path $root 'profile-temp'
+  $runnerTemp = Join-Path $root 'runner-temp'
+  $null = New-Item -ItemType Directory -Path $profileTemp, $runnerTemp
+  foreach ($case in @('ci success', 'ci failure', 'ci unset directory', 'ci missing directory', 'ci file directory', 'local unchanged')) {
+    $env:TMP = $profileTemp
+    $env:TEMP = $profileTemp
+    $env:GITHUB_ACTIONS = if ($case -eq 'local unchanged') { 'false' } else { 'true' }
+    $env:RUNNER_TEMP = switch ($case) {
+      'ci unset directory' { $null }
+      'ci missing directory' { Join-Path $root 'absent' }
+      'ci file directory' { Join-Path $root 'CMakeCache.txt' }
+      'local unchanged' { $null }
+      default { $runnerTemp }
+    }
+    $state.ExpectedTemp = if ($case -eq 'local unchanged') { $profileTemp } else { $runnerTemp }
+    $state.scenario = if ($case -eq 'ci failure') { 'release failure' } else { $case }
+    $state.inventory = $validCombinedInventory
+    $state.phases.Clear()
+    $state.testArguments.Clear()
+    $caught = ''
+    try { & $invokeRunner -BuildDir $root -IncludeReleaseGate | Out-Null }
+    catch { $caught = $_.Exception.Message }
+    if ($env:TMP -cne $profileTemp -or $env:TEMP -cne $profileTemp) { throw "${case}: temporary environment was not restored." }
+    $invalidDirectory = $case -in @('ci unset directory', 'ci missing directory', 'ci file directory')
+    $expectedError = if ($invalidDirectory) { 'GitHub CI requires an existing RUNNER_TEMP directory' }
+      elseif ($case -eq 'ci failure') { 'Native Windows release gate failed' } else { '' }
+    if (($expectedError -and -not $caught.Contains($expectedError)) -or (-not $expectedError -and $caught)) {
+      throw "${case}: unexpected result '$caught'."
+    }
+    $expectedPhases = if ($invalidDirectory) { '' } elseif ($case -eq 'ci failure') { 'release' } else { 'release,telemetry' }
+    if (($state.phases -join ',') -cne $expectedPhases) { throw "${case}: unexpected native test selection." }
+    Write-Host "PASS: native gate runner temp $case"
+  }
 } finally {
+  foreach ($name in $oldTempEnvironment.Keys) {
+    [Environment]::SetEnvironmentVariable($name, $oldTempEnvironment[$name], 'Process')
+  }
   [Environment]::SetEnvironmentVariable('EDR_GATE_RUNNER_TEST', $oldMarker, 'Process')
   Remove-Item -LiteralPath $root -Recurse -Force
 }

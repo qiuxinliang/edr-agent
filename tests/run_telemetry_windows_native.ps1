@@ -60,9 +60,21 @@ function Save-NativeReleaseLog([string]$BuildPath) {
 }
 
 $oldPath = $env:PATH
+$oldTmp = $env:TMP
+$oldTemp = $env:TEMP
 $edrOverrides = @{}
 Get-ChildItem Env: | Where-Object Name -Like 'EDR_*' | ForEach-Object { $edrOverrides[$_.Name] = $_.Value }
 try {
+  # GetTempPath-based fixtures must use the CI-owned scratch directory. The
+  # user-profile volume's sync latency can consume the entire seed deadline.
+  if ($env:GITHUB_ACTIONS -eq 'true') {
+    if ([string]::IsNullOrWhiteSpace($env:RUNNER_TEMP) -or
+        !(Test-Path -LiteralPath $env:RUNNER_TEMP -PathType Container)) {
+      throw 'GitHub CI requires an existing RUNNER_TEMP directory for native synthetic tests.'
+    }
+    $env:TMP = $env:RUNNER_TEMP
+    $env:TEMP = $env:RUNNER_TEMP
+  }
   # Prevent inherited endpoint configuration from changing an isolated fixture.
   foreach ($name in $edrOverrides.Keys) { [Environment]::SetEnvironmentVariable($name, $null, 'Process') }
   if ($OpenSslBin) { $env:PATH = "$OpenSslBin;$oldPath" }
@@ -113,5 +125,7 @@ try {
   Write-Output 'PASS: native synthetic contracts and loopback mTLS. This does not certify native sensor collection or execute real queue migration.'
 } finally {
   $env:PATH = $oldPath
+  $env:TMP = $oldTmp
+  $env:TEMP = $oldTemp
   foreach ($name in $edrOverrides.Keys) { [Environment]::SetEnvironmentVariable($name, $edrOverrides[$name], 'Process') }
 }
