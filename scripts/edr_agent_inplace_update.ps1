@@ -469,12 +469,32 @@ function Assert-AuthenticodePublisher {
 
 function Write-AtomicJson {
   param([string]$Path, [object]$Value)
+  $Path = [System.IO.Path]::GetFullPath($Path)
   $directory = Split-Path -Parent $Path
   New-Item -ItemType Directory -Path $directory -Force | Out-Null
   $temporary = "$Path.tmp-$PID"
   [System.IO.File]::WriteAllText([System.IO.Path]::GetFullPath($temporary),
     ($Value | ConvertTo-Json -Depth 10), (New-Object System.Text.UTF8Encoding($false)))
-  Move-Item -LiteralPath $temporary -Destination $Path -Force
+  # Move-Item -Force can delete the old journal before a locked source fails
+  # to move. Keep the previous state until the replacement actually succeeds.
+  # File inspection can briefly deny delete sharing; retry only that error.
+  # Six attempts add at most 750ms of backoff, then preserve the temp and fail.
+  for ($attempt = 0; $attempt -lt 6; $attempt++) {
+    try {
+      if ([System.IO.File]::Exists($Path)) {
+        [System.IO.File]::Replace($temporary, $Path, [NullString]::Value)
+      } else {
+        [System.IO.File]::Move($temporary, $Path)
+      }
+      return
+    } catch {
+      $cause = $_.Exception
+      while ($cause.InnerException) { $cause = $cause.InnerException }
+      if ($cause -isnot [System.IO.IOException] -or
+          ($cause.HResult -band 0xffff) -ne 32 -or $attempt -eq 5) { throw }
+      Start-Sleep -Milliseconds ([int][Math]::Min(200, 50 * [Math]::Pow(2, $attempt)))
+    }
+  }
 }
 
 function Get-PeMachine {

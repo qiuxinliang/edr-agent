@@ -41,7 +41,7 @@ WINDOWS_EXPECTED = {
     "windows_isolation_mock_behavior", "windows_install_compatibility_behavior", "http_telemetry_budget",
     "windows_release_collector_pe_closure", "windows_inplace_collector_transaction",
     "windows_update_physical_guard", "windows_updater_health_clock", "windows_updater_stop", "windows_inno_evidence_space",
-    "windows_updater_task_recovery", "windows_autorun_acl", "windows_autorun_task",
+    "windows_updater_task_recovery", "windows_updater_atomic_json", "windows_autorun_acl", "windows_autorun_task",
     "windows_storage_space_preflight",
     "windows_installer_log_redaction",
     "windows_installer_acl_behavior", "windows_installer_health_behavior",
@@ -210,6 +210,7 @@ class WindowsReleaseGateTests(unittest.TestCase):
                 "windows_updater_health_clock": (30, "scripts/edr_agent_inplace_update.ps1", "Updater"),
                 "windows_updater_stop": (120, "scripts/edr_agent_inplace_update.ps1", "Updater"),
                 "windows_updater_task_recovery": (60, "scripts/edr_agent_inplace_update.ps1", "Updater"),
+                "windows_updater_atomic_json": (30, "scripts/edr_agent_inplace_update.ps1", "Updater"),
                 "windows_autorun_acl": (180, "install/windows-inno/edr_windows_autorun.ps1", "Autorun"),
                 "windows_autorun_task": (60, "install/windows-inno/edr_windows_autorun.ps1", "Autorun"),
             }
@@ -244,7 +245,8 @@ class WindowsReleaseGateTests(unittest.TestCase):
 
     def test_updater_and_autorun_are_required_and_failure_blocks_windows_gate(self):
         for name in ("windows_updater_health_clock", "windows_updater_stop",
-                     "windows_updater_task_recovery", "windows_autorun_acl", "windows_autorun_task"):
+                     "windows_updater_task_recovery", "windows_updater_atomic_json",
+                     "windows_autorun_acl", "windows_autorun_task"):
             with tempfile.TemporaryDirectory() as directory:
                 source, build, _ = self.fixture(directory, missing_test=name)
                 result = self.run_command("cmake", "-S", str(source), "-B", str(build), "-G", "Ninja", success=False)
