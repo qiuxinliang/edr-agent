@@ -12568,6 +12568,87 @@ static void test_startup_preclock_full(int over, int expired_metrics) {
   printf("startup_preclock over=%d first_cause_sqlite_full=1 preflight_readonly_refusal=1 old_evidence_unchanged=1 same_budget_recovery=1 compatible_full_allowed=1\n",over);
 }
 
+static void compact_startup_rowset_hash(sqlite3 *db, const char *sql, char out[65]);
+
+/* Exercise the pre-clock full-store repair with actual frozen parent facts,
+ * shared commands and two generations of one PID, not only a bare candidate.
+ * Hash the old columns byte-for-byte; the newly added floor must remain zero. */
+static void test_startup_preclock_owner_integrity(void) {
+  const int64_t now=INT64_C(1700000000000000000);
+  char path[512],columns[4096]="",sql[8192],before[7][65],after[65];
+  sqlite3 *db=NULL;sqlite3_stmt *st=NULL;
+  EdrBehaviorRecord *first=calloc(1,sizeof(*first)),*second=calloc(1,sizeof(*second));
+  char command[4096];assert(first && second);
+  edr_local_evidence_cache_test_set_now_unix_ns(now);
+  edr_local_evidence_cache_test_set_retention_monotonic_ms(1000);
+  assert(make_test_sqlite_path(path,sizeof(path))==0);
+  assert(edr_local_evidence_cache_open_with_policy(path,1u,72u,72u)==0);
+  init_floor_parent(first,now);
+  memset(command,'x',sizeof(command)-1);command[sizeof(command)-1]=0;
+  memcpy(command,first->cmdline,strlen(first->cmdline));
+  EdrCommandFacts facts={command,first->parent_cmdline};
+  assert(edr_local_evidence_cache_record_alert_context(first,&facts)==0);
+  *second=*first;strcpy(second->event_id,"preclock-reused-pid");
+  second->process_start_key++;second->process_creation_filetime_100ns+=UINT64_C(10000000);
+  second->event_time_ns+=INT64_C(1000000000);edr_behavior_bind_parent_context(second);
+  assert(edr_local_evidence_cache_record_alert_context(second,&facts)==0);
+  assert(edr_local_evidence_cache_record_command_result("preclock-result","rtq_query","done",1,0,
+      "public retained result","[]")==EDR_EVIDENCE_COMMAND_RESULT_STORED);
+  edr_local_evidence_cache_close();assert(sqlite3_open(path,&db)==SQLITE_OK);
+  compact_exec(db,"DROP TRIGGER retention_active_clock_v1_insert;DROP TRIGGER retention_active_clock_v1_update;"
+      "DROP TRIGGER retention_active_clock_v1_delete;DROP TRIGGER alert_context_floor_v1_insert;"
+      "DROP TRIGGER alert_context_floor_v1_update;DROP TRIGGER alert_context_floor_v1_eligible;"
+      "DROP TRIGGER alert_context_floor_v1_delete;DELETE FROM metrics WHERE metric_name='local_retention_v1_active_ms';"
+      "ALTER TABLE p0_candidates DROP COLUMN alert_context_protect_until_active_ms;"
+      "INSERT INTO artifacts(artifact_id,artifact_type,manifest_json,sha256,upload_status) "
+      "VALUES('public-unknown-owner','unknown-v1','{\"frozen\":\"public bytes\"}','public-hash','pending');"
+      "INSERT INTO p0_candidates(candidate_id,retention_policy_version) VALUES('public-unclassified',0);"
+      "WITH RECURSIVE n(x) AS(VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<512) "
+      "INSERT INTO metrics SELECT 1,'public-bootstrap',printf('expired-%04d',x),1 FROM n;");
+  assert(sqlite3_prepare_v2(db,"PRAGMA table_info(p0_candidates)",-1,&st,NULL)==SQLITE_OK);
+  while(sqlite3_step(st)==SQLITE_ROW) {
+    size_t used=strlen(columns);int n=snprintf(columns+used,sizeof(columns)-used,"%s%s",
+        used?",":"",sqlite3_column_text(st,1));assert(n>0 && (size_t)n<sizeof(columns)-used);
+  }
+  sqlite3_finalize(st);
+  snprintf(sql,sizeof(sql),"CREATE TEMP VIEW preclock_old_candidates AS SELECT %s FROM main.p0_candidates",columns);
+  compact_exec(db,sql);
+  const char *queries[]={
+      "SELECT * FROM preclock_old_candidates ORDER BY candidate_id",
+      "SELECT * FROM artifacts ORDER BY artifact_id",
+      "SELECT * FROM context_facts ORDER BY fact_id",
+      "SELECT * FROM context_reference_projection ORDER BY artifact_id",
+      "SELECT * FROM materialized_artifacts ORDER BY artifact_id",
+      "SELECT * FROM process_cache ORDER BY endpoint_id,pid",
+      "SELECT * FROM command_results ORDER BY command_id"};
+  for(unsigned i=0;i<7;i++)compact_startup_rowset_hash(db,queries[i],before[i]);
+  startup_fill_pages(db,291); /* Same 35-page excess as the historical store. */
+  for(unsigned turn=0;turn<2;turn++) {
+    assert(edr_local_evidence_cache_open_with_policy(path,1u,72u,72u)==0);
+    EdrEvidenceCacheStatus status;edr_local_evidence_cache_get_status(&status);
+    assert(status.db_open && status.retention_clock_valid && !status.retention_groups_retired);
+    for(unsigned i=0;i<7;i++) {
+      compact_startup_rowset_hash(db,queries[i],after);assert(!strcmp(before[i],after));
+    }
+    assert(compact_scalar(db,"SELECT COUNT(*) FROM p0_candidates WHERE alert_context_protect_until_active_ms!=0")==0);
+    assert(compact_scalar(db,"SELECT COUNT(*) FROM metrics WHERE metric_name LIKE 'expired-%'")<512);
+    assert(compact_scalar(db,"PRAGMA page_count")<=291);
+    EdrParentContextQuery q=floor_query(first,now);
+    parent_pressure_query(&q,"preclock_first_generation",1);
+    q=floor_query(second,now);parent_pressure_query(&q,"preclock_reused_pid",1);
+    q=floor_query(first,now);q.child_process_start_key=second->process_start_key;
+    char output[4096];assert(edr_local_evidence_cache_query_parent_context_json(&q,output,sizeof(output))==0);
+    cJSON *answer=cJSON_Parse(output);assert(answer && cJSON_IsNull(cJSON_GetObjectItemCaseSensitive(answer,"parent")));
+    cJSON_Delete(answer);
+    char *loaded=edr_local_evidence_cache_read_command_fact(first);assert(loaded && !strcmp(loaded,command));free(loaded);
+    loaded=edr_local_evidence_cache_read_command_fact(second);assert(loaded && !strcmp(loaded,command));free(loaded);
+    edr_local_evidence_cache_close();
+  }
+  assert(sqlite3_close(db)==SQLITE_OK);cleanup_test_sqlite_path(path);free(first);free(second);
+  edr_local_evidence_cache_test_set_now_unix_ns(0);edr_local_evidence_cache_test_set_retention_monotonic_ms(-1);
+  puts("startup_preclock_integrity frozen_rows_and_refs_unchanged=1 pending_owner_unchanged=1 full_commands=1 pid_reuse_isolated=1 reopen=1");
+}
+
 static void test_startup_logical_budget(void) {
   s_test_pressure=false;
   test_startup_preclock_full(0,0);
@@ -12577,6 +12658,7 @@ static void test_startup_logical_budget(void) {
   test_startup_preclock_full(0,2);
   test_startup_preclock_full(0,3);
   test_startup_preclock_full(0,4);
+  test_startup_preclock_owner_integrity();
   test_startup_logical_budget_legacy(1,0,1u);
   test_startup_logical_budget_legacy(1,1,1u);
   test_startup_logical_budget_legacy(0,0,1u);

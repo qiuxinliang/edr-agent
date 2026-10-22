@@ -18,6 +18,11 @@ on:
         type: boolean
         required: false
         default: false
+      diagnose_pressure_temp:
+        description: 'Compare the unchanged AMD64 pressure contract on profile and runner temp volumes; no gate override'
+        type: boolean
+        required: false
+        default: false
   push:
     paths:
       - tests/evidence_retention_comparison.c
@@ -48,6 +53,7 @@ on:
       - tests/test_p0_source_only_durable_contract.c
       - tests/test_p0_observation_semantics.c
       - tests/run_telemetry_windows_native.ps1
+      - tests/diagnose_windows_pressure_temp.py
       - tests/test_native_gate_runner.ps1
       - tests/CMakeLists.txt
       - tests/pipeline_stop_diag/**
@@ -192,6 +198,15 @@ jobs:
           $opensslTools = Join-Path $prefix 'tools/openssl'
           & .\tests\run_telemetry_windows_native.ps1 -BuildDir contract-build -Configuration Release -OpenSslBin $opensslTools -IncludeReleaseGate
           if ($LASTEXITCODE -ne 0) { throw 'Actual native release and telemetry contracts failed before comparison' }
+      # Temporary diagnosis for the observed C: xSync timeout. Keep a failed
+      # normal gate failed; this A/B measurement cannot grant release status.
+      - name: Diagnose AMD64 pressure temporary-volume boundary
+        if: ${{ always() && github.event_name == 'workflow_dispatch' && inputs.diagnose_pressure_temp && matrix.arch == 'amd64' }}
+        timeout-minutes: 6
+        shell: pwsh
+        run: |
+          python -B tests/diagnose_windows_pressure_temp.py --build-dir contract-build --output "$env:RUNNER_TEMP/pressure-temp-diagnosis"
+          if ($LASTEXITCODE -ne 0) { throw 'Pressure temporary-volume diagnosis unavailable or incomplete' }
       - name: Repeat the native bounded-reclaim contracts
         id: sliced
         timeout-minutes: 5
@@ -618,3 +633,5 @@ jobs:
             ${{ runner.temp }}/retention-sliced-contract/*.log
             ${{ runner.temp }}/queue-critical-load/*.log
             ${{ runner.temp }}/queue-critical-load/*.json
+            ${{ runner.temp }}/pressure-temp-diagnosis/*.json
+            ${{ runner.temp }}/pressure-temp-diagnosis/*.log
