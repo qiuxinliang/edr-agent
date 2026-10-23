@@ -9,6 +9,7 @@
 #include "edr/v1/event.pb.h"
 #include <pb_decode.h>
 #include "edr/egress_batch_policy.h"
+#include "edr/egress_request_policy.h"
 #include "edr/p0_rule_match.h"
 #include "edr/process_tree_cache.h"
 #include "edr/sha256.h"
@@ -2352,6 +2353,8 @@ static void test_capacity_reclaims_free_pages_before_evicting_candidates(void) {
 /* Reproduce a cache dominated by refs whose candidates have already gone.
  * The shared fact and the surviving candidate remain readable after pressure
  * cleanup; a later no-pressure reopen preserves independent refs. */
+static void assert_capacity_diagnostics(const EdrEvidenceCacheStatus *status);
+
 static void test_capacity_preserves_unclassified_refs_and_reports_refusal(void) {
   char db[512];
   char command[32769];
@@ -2428,6 +2431,16 @@ static void test_capacity_preserves_unclassified_refs_and_reports_refusal(void) 
   edr_local_evidence_cache_get_status(&status);
   assert(status.last_error[0] != '\0');
   assert(sqlite_table_count(db, "context_reference_projection") == 4601u);
+  identity.type=EDR_EVENT_NET_CONNECT; identity.priority=3u;
+  strcpy(identity.event_id,"unclassified-full-candidate");
+  strcpy(identity.net_dst,"192.0.2.11"); identity.net_dport=445u;
+  edr_local_evidence_cache_record_behavior(&identity);
+  edr_local_evidence_cache_get_status(&status);
+  assert(status.candidate_capacity_causes[EDR_EVIDENCE_CAPACITY_DB_WAL_LIMIT]==1u);
+  assert(status.capacity_last_sqlite_rc==0u);
+  assert_capacity_diagnostics(&status);
+  assert(sqlite_table_count(db,"context_reference_projection")==4601u);
+  assert(sqlite_table_count(db,"p0_candidates")==1u);
   edr_local_evidence_cache_close();
   /* A deliberately larger synthetic budget is only for testing retained
    * command readback; maintenance did not clear unknown evidence to fit it. */
@@ -2595,6 +2608,35 @@ static void sqlite_fill_exact_capacity_target(const char *db, uint64_t target) {
 /* Existing owners still consume capacity when enrichment/replay rewrites WAL.
  * A real reader prevents reset; refusal must preserve the owner and its
  * evidence, then recover after the reader releases its snapshot. */
+static void assert_capacity_diagnostics(const EdrEvidenceCacheStatus *status) {
+  uint64_t candidate = 0u, context = 0u;
+  for (unsigned i = 0; i < EDR_EVIDENCE_CAPACITY_CAUSE_COUNT; ++i) {
+    candidate += status->candidate_capacity_causes[i];
+    context += status->context_capacity_causes[i];
+  }
+  assert(candidate == status->candidate_failure_reasons[EDR_EVIDENCE_FAILURE_CAPACITY]);
+  assert(context == status->context_failure_reasons[EDR_EVIDENCE_FAILURE_CAPACITY]);
+  char accounting[EDR_EVIDENCE_ACCOUNTING_JSON_BYTES], body[8192], reason[128];
+  assert(edr_local_evidence_cache_accounting_json(status, accounting, sizeof(accounting)) == 0);
+  snprintf(body, sizeof(body), "{\"endpoint_id\":\"ep\",\"agent_version\":\"test\",\"policy_version\":\"p\","
+      "\"engine_health\":{\"p0_acceptance\":{\"evidence_cache\":{\"accounting\":%s}}}}", accounting);
+  char *wire = edr_egress_health_project(body, reason, sizeof(reason)); assert(wire);
+  assert(edr_egress_request_validate("POST", "ingest/engine-health", "application/json",
+      wire, strlen(wire), reason, sizeof(reason)) == 0);
+  cJSON *raw = cJSON_Parse(accounting), *projected = cJSON_Parse(wire); assert(raw && projected);
+  cJSON *a = cJSON_GetObjectItemCaseSensitive(projected, "engine_health");
+  a = cJSON_GetObjectItemCaseSensitive(a, "p0_acceptance");
+  a = cJSON_GetObjectItemCaseSensitive(a, "evidence_cache");
+  a = cJSON_GetObjectItemCaseSensitive(a, "accounting");
+  assert(cJSON_Compare(cJSON_GetObjectItemCaseSensitive(raw, "capacity_failures"),
+                      cJSON_GetObjectItemCaseSensitive(a, "capacity_failures"), 1));
+  assert(cJSON_GetObjectItemCaseSensitive(cJSON_GetObjectItemCaseSensitive(a, "candidate_failures"),
+      "candidate_capacity_refused")->valuedouble == (double)candidate);
+  assert(cJSON_GetObjectItemCaseSensitive(cJSON_GetObjectItemCaseSensitive(a, "context_failures"),
+      "context_capacity_refused")->valuedouble == (double)context);
+  cJSON_Delete(raw); cJSON_Delete(projected); free(wire);
+}
+
 static void test_existing_candidate_update_honors_capacity(void) {
   char db[512], candidate_id[160];
   sqlite3 *raw = NULL, *reader = NULL;
@@ -2676,8 +2718,20 @@ static void test_existing_candidate_update_honors_capacity(void) {
     assert(after.retention_groups_retired == initial.retention_groups_retired);
     assert(after.db_bytes == before.db_bytes && after.wal_bytes == before.wal_bytes);
     assert(strstr(after.last_error, "WAL reset blocked") != NULL);
+    assert(after.candidate_capacity_causes[EDR_EVIDENCE_CAPACITY_WAL_BUSY] == refusal + 1u);
+    assert(after.capacity_last_cause == EDR_EVIDENCE_CAPACITY_WAL_BUSY);
+    assert(after.capacity_last_sqlite_rc == SQLITE_BUSY && after.capacity_last_owner == 1u);
+    assert_capacity_diagnostics(&after);
     before = after;
   }
+  EdrBehaviorRecord blocked_context = context;
+  strcpy(blocked_context.event_id, "blocked-context-different-source");
+  edr_local_evidence_cache_record_behavior(&blocked_context);
+  edr_local_evidence_cache_get_status(&after);
+  assert(after.context_capacity_causes[EDR_EVIDENCE_CAPACITY_WAL_BUSY] == 1u);
+  assert(after.capacity_last_sqlite_rc == SQLITE_BUSY && after.capacity_last_owner == 2u);
+  assert_capacity_diagnostics(&after);
+  before = after;
   const char *unchanged[] = {
       "SELECT * FROM before_owner EXCEPT SELECT * FROM p0_candidates;",
       "SELECT * FROM before_facts EXCEPT SELECT * FROM context_facts;",
@@ -2710,7 +2764,15 @@ static void test_existing_candidate_update_honors_capacity(void) {
     assert(sqlite_post_artifact_count(db, candidate_id, context.event_id) == 1u);
     assert(sqlite_scalar_integer(db, "SELECT COUNT(*) FROM candidate_context_refs r LEFT JOIN p0_candidates p ON p.candidate_id=r.candidate_id LEFT JOIN context_facts f ON f.fact_id=r.fact_id WHERE p.candidate_id IS NULL OR f.fact_id IS NULL;") == 0);
     edr_local_evidence_cache_close();
-    if (!reopen) assert(edr_local_evidence_cache_open(db, 1u, 24u) == 0);
+    assert(sqlite_scalar_integer(db, "SELECT SUM(value) FROM metrics WHERE metric_name='candidate_capacity_wal_busy';") == 2);
+    assert(sqlite_scalar_integer(db, "SELECT SUM(value) FROM metrics WHERE metric_name='context_capacity_wal_busy';") == 1);
+    if (!reopen) {
+      assert(edr_local_evidence_cache_open(db, 1u, 24u) == 0);
+      edr_local_evidence_cache_get_status(&after);
+      assert(after.capacity_last_owner == 0u);
+      assert(after.candidate_capacity_causes[EDR_EVIDENCE_CAPACITY_WAL_BUSY] == 0u);
+      assert(after.context_capacity_causes[EDR_EVIDENCE_CAPACITY_WAL_BUSY] == 0u);
+    }
   }
   cleanup_test_sqlite_path(db);
 }
@@ -7531,6 +7593,20 @@ static void test_physical_floor_rejects_evidence_copy(void) {
   assert(after.command_results_capacity_rejected==before.command_results_capacity_rejected+1);
   assert(strstr(after.last_error,"volume_free_space_exhausted"));
   assert(after.physical_refusals==before.physical_refusals+1 && after.physical_cause_code==1);
+  /* A command query copy is a different owner: it must not contaminate the
+   * candidate/context cause counters. Exercise the real candidate gate too. */
+  assert_capacity_diagnostics(&after);
+  EdrBehaviorRecord candidate; init_record(&candidate, EDR_EVENT_NET_CONNECT);
+  candidate.priority=3u; candidate.pid=74600u;
+  candidate.event_time_ns=(int64_t)time(NULL)*INT64_C(1000000000);
+  strcpy(candidate.event_id,"physical-candidate");
+  strcpy(candidate.net_dst,"192.0.2.20"); candidate.net_dport=445u;
+  assert(edr_local_evidence_cache_is_candidate(&candidate));
+  edr_local_evidence_cache_record_behavior(&candidate);
+  edr_local_evidence_cache_get_status(&after);
+  assert(after.candidate_capacity_causes[EDR_EVIDENCE_CAPACITY_PHYSICAL_GUARD]==1u);
+  assert(after.capacity_last_sqlite_rc==0u);
+  assert_capacity_diagnostics(&after);
   test_unsetenv("EDR_STORAGE_MIN_FREE_MB");
   edr_local_evidence_cache_close(); cleanup_test_sqlite_path(path);
 }
@@ -8186,16 +8262,27 @@ static void test_context_prepared_before_pressure_cannot_resurrect_retired_group
 }
 
 static void test_retention_accounting_maximum_width_is_bounded(void) {
-  EdrEvidenceCacheStatus status={0}; char json[2048];
+  EdrEvidenceCacheStatus status={0}; char json[EDR_EVIDENCE_ACCOUNTING_JSON_BYTES];
   for(unsigned i=0;i<EDR_EVIDENCE_ORDINARY_REASON_COUNT;++i) status.ordinary_reasons[i]=UINT64_MAX;
   for(unsigned i=0;i<EDR_EVIDENCE_FAILURE_REASON_COUNT;++i)
     status.candidate_failure_reasons[i]=status.context_failure_reasons[i]=UINT64_MAX;
+  for(unsigned i=0;i<EDR_EVIDENCE_CAPACITY_CAUSE_COUNT;++i)
+    status.candidate_capacity_causes[i]=status.context_capacity_causes[i]=UINT64_MAX;
+  status.capacity_last_cause=status.capacity_last_sqlite_rc=status.capacity_last_owner=UINT32_MAX;
   status.pmfe_scheduled=status.pmfe_running=status.pmfe_result_bound=status.pmfe_result_acked=UINT32_MAX;
   status.pmfe_active=status.pmfe_expired=status.pmfe_cause_code=UINT32_MAX; status.pmfe_failures=UINT64_MAX;
   status.retention_groups_retired=status.retention_groups_held=status.retention_failures=status.retention_legacy_candidates=UINT64_MAX;
+  status.physical_refusals=status.physical_guard_failures=status.query_pin_exhausted=UINT64_MAX;
+  status.physical_cause_code=status.retention_hours=status.selected_retention_hours=UINT32_MAX;
+  status.retention_active_ms=status.retention_clock_failures=UINT64_MAX;
+  status.retention_clock_valid=status.retention_clock_cause_code=UINT32_MAX;
+  status.retention_parent_protections=status.retention_floor_held=UINT64_MAX;
   assert(edr_local_evidence_cache_accounting_json(&status,json,sizeof(json))==0);
   cJSON *root=cJSON_Parse(json); assert(root);
   assert(cJSON_IsObject(cJSON_GetObjectItemCaseSensitive(root,"local_retention")));
+  cJSON *causes=cJSON_GetObjectItemCaseSensitive(root,"capacity_failures"); assert(causes);
+  assert(cJSON_GetArraySize(cJSON_GetObjectItemCaseSensitive(causes,"candidate"))==EDR_EVIDENCE_CAPACITY_CAUSE_COUNT);
+  assert(cJSON_GetArraySize(cJSON_GetObjectItemCaseSensitive(causes,"context"))==EDR_EVIDENCE_CAPACITY_CAUSE_COUNT);
   printf("retention_accounting_maximum_bytes=%zu capacity=%zu\n",strlen(json),sizeof(json));
   cJSON_Delete(root);
 }
@@ -10003,7 +10090,7 @@ static void test_pmfe_recovery_retry_capacity_and_inconclusive(void) {
   pmfe_fixture_original(r,64u); size_t n=edr_behavior_record_encode_protobuf(r,frame,EDR_EGRESS_FRAME_MAX); assert(n);
   assert(edr_local_evidence_cache_pmfe_prepare(r,"sc-local-64",frame,n,0u,0u,&task)<0);
   assert(pmfe_artifact_count(path,"scheduled")==64);
-  EdrEvidenceCacheStatus health; char accounting[2048];
+  EdrEvidenceCacheStatus health; char accounting[EDR_EVIDENCE_ACCOUNTING_JSON_BYTES];
   edr_local_evidence_cache_get_status(&health);
   assert(health.pmfe_active==64u && health.pmfe_scheduled==64u && health.pmfe_cause_code==3u && health.pmfe_failures>0u);
   assert(!edr_local_evidence_cache_accounting_json(&health,accounting,sizeof(accounting)));
@@ -11189,6 +11276,9 @@ static void test_synchronous_reclaim_failure_preserves_owner_and_backoff(void) {
     assert(failed.db_budget_dropped == before.db_budget_dropped + 1u);
     assert(strstr(failed.last_error, reader ? "maintenance checkpoint" : "maintenance incremental vacuum"));
     assert(strstr(failed.last_error, "sqlite=5/5"));
+    assert(failed.capacity_last_cause == EDR_EVIDENCE_CAPACITY_MAINTENANCE_FAILED);
+    assert(failed.capacity_last_sqlite_rc == SQLITE_BUSY);
+    assert_capacity_diagnostics(&failed);
     compact_exec(db, "ROLLBACK;");
     compact_assert_projection(db); sliced_live_owner_hash(db, current_hash);
     assert(!strcmp(original_hash, current_hash));
@@ -11199,6 +11289,17 @@ static void test_synchronous_reclaim_failure_preserves_owner_and_backoff(void) {
     assert(after.maintenance_runs == failed.maintenance_runs);
     assert(!strcmp(after.last_error, failed.last_error));
     assert(compact_scalar(db, "PRAGMA freelist_count") == initial);
+    /* The admission retry window can open before maintenance's error backoff.
+     * This is a new deferred refusal, not a stale SQLITE_BUSY result. */
+    s_test_monotonic_ns += UINT64_C(11000000000);
+    edr_local_evidence_cache_record_behavior(&candidate);
+    edr_local_evidence_cache_get_status(&after);
+    assert(after.candidate_capacity_causes[EDR_EVIDENCE_CAPACITY_MAINTENANCE_DEFERRED] ==
+        failed.candidate_capacity_causes[EDR_EVIDENCE_CAPACITY_MAINTENANCE_DEFERRED] + 1u);
+    assert(after.capacity_last_sqlite_rc == 0u);
+    assert(after.maintenance_runs == failed.maintenance_runs);
+    assert_capacity_diagnostics(&after);
+    failed = after;
     s_test_monotonic_ns += UINT64_C(60000000000);
     edr_local_evidence_cache_poll_maintenance();
     edr_local_evidence_cache_get_status(&after);
@@ -11607,6 +11708,9 @@ static void test_pressure_continuation_postwrite_refusal(int fail_rollback) {
   assert(refused.candidate_transaction_failures == before.candidate_transaction_failures+1u);
   unsigned reason = fail_rollback ? EDR_EVIDENCE_FAILURE_STORAGE : EDR_EVIDENCE_FAILURE_CAPACITY;
   assert(refused.candidate_failure_reasons[reason] == before.candidate_failure_reasons[reason]+1u);
+  assert(refused.candidate_capacity_causes[EDR_EVIDENCE_CAPACITY_POSTWRITE_PAGE_LIMIT] ==
+      before.candidate_capacity_causes[EDR_EVIDENCE_CAPACITY_POSTWRITE_PAGE_LIMIT] + (fail_rollback ? 0u : 1u));
+  assert_capacity_diagnostics(&refused);
   assert(refused.candidate_admitted == before.candidate_admitted);
   assert(refused.maintenance_runs == before.maintenance_runs);
   assert(compact_scalar(db,"SELECT COUNT(*) FROM p0_candidates") == 2);

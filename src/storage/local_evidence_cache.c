@@ -157,17 +157,37 @@ typedef struct {
 #define METRIC_ORDINARY_BASE 4u
 #define METRIC_CANDIDATE_BASE (METRIC_ORDINARY_BASE + EDR_EVIDENCE_ORDINARY_REASON_COUNT)
 #define METRIC_CONTEXT_BASE (METRIC_CANDIDATE_BASE + EDR_EVIDENCE_FAILURE_REASON_COUNT)
-#define METRIC_COUNT (METRIC_CONTEXT_BASE + EDR_EVIDENCE_FAILURE_REASON_COUNT)
+#define METRIC_CANDIDATE_CAPACITY_BASE (METRIC_CONTEXT_BASE + EDR_EVIDENCE_FAILURE_REASON_COUNT)
+#define METRIC_CONTEXT_CAPACITY_BASE (METRIC_CANDIDATE_CAPACITY_BASE + EDR_EVIDENCE_CAPACITY_CAUSE_COUNT)
+#define METRIC_COUNT (METRIC_CONTEXT_CAPACITY_BASE + EDR_EVIDENCE_CAPACITY_CAUSE_COUNT)
+#define CAPACITY_METRIC_NAMES(prefix) \
+  prefix "unknown", prefix "db_wal_limit", prefix "wal_busy", prefix "wal_error", \
+  prefix "physical_guard", prefix "maintenance_deferred", prefix "maintenance_failed", \
+  prefix "postwrite_page_limit"
+static const char *const capacity_cause_names[EDR_EVIDENCE_CAPACITY_CAUSE_COUNT] = {
+  CAPACITY_METRIC_NAMES("")
+};
 static const char *const metric_names[METRIC_COUNT] = {
   "file_drops", "registry_drops", "network_drops", "other_drops",
   "ordinary_policy_filtered", "ordinary_pressure_skipped", "ordinary_coalesced", "ordinary_hot_ring_only",
   "candidate_no_database", "candidate_capacity_refused", "candidate_write_budget_refused",
   "candidate_resource_failed", "candidate_invalid", "candidate_storage_failed", "candidate_unclassified_failure",
   "context_no_database", "context_capacity_refused", "context_write_budget_refused",
-  "context_resource_failed", "context_invalid", "context_storage_failed", "context_unclassified_failure"
+  "context_resource_failed", "context_invalid", "context_storage_failed", "context_unclassified_failure",
+  CAPACITY_METRIC_NAMES("candidate_capacity_"), CAPACITY_METRIC_NAMES("context_capacity_")
 };
+#undef CAPACITY_METRIC_NAMES
 /* Protected by the cache owner mutex; reset for each persistence operation. */
 static EdrEvidenceFailureReason s_persistence_failure = EDR_EVIDENCE_FAILURE_UNCLASSIFIED;
+static EdrEvidenceCapacityCause s_capacity_cause = EDR_EVIDENCE_CAPACITY_UNKNOWN;
+static int s_capacity_sqlite_rc;
+
+#if defined(EDR_HAVE_SQLITE)
+static void set_capacity_cause(EdrEvidenceCapacityCause cause, int sqlite_rc) {
+  s_capacity_cause = cause;
+  s_capacity_sqlite_rc = sqlite_rc;
+}
+#endif
 #ifdef EDR_LOCAL_EVIDENCE_CACHE_TESTING
 static unsigned s_test_manifest_allocation_failures;
 static int s_test_legacy_context_writes;
@@ -1758,12 +1778,25 @@ static void record_metric_drop(const EdrBehaviorRecord *r, int64_t event_time_ns
 
 static void record_persistence_failure(const EdrBehaviorRecord *r, int64_t ts,
                                         int candidate, EdrEvidenceFailureReason reason) {
+  /* Slot replacement may flush metrics and run physical preflight. Capture
+   * the failed operation's cause before that independent diagnostic write. */
+  EdrEvidenceCapacityCause cause = s_capacity_cause;
+  int sqlite_rc = s_capacity_sqlite_rc;
   MetricSlot *m = metric_slot_for(r, ts);
   size_t index = (candidate ? METRIC_CANDIDATE_BASE : METRIC_CONTEXT_BASE) + (size_t)reason;
   if (m) m->reasons[index - METRIC_ORDINARY_BASE]++;
   edr_validation_trace_event(r, "local_retention", metric_names[index]);
   if (candidate) s_status.candidate_failure_reasons[reason]++;
   else s_status.context_failure_reasons[reason]++;
+  if (reason == EDR_EVIDENCE_FAILURE_CAPACITY) {
+    size_t detail = (candidate ? METRIC_CANDIDATE_CAPACITY_BASE : METRIC_CONTEXT_CAPACITY_BASE) + cause;
+    if (m) m->reasons[detail - METRIC_ORDINARY_BASE]++;
+    if (candidate) s_status.candidate_capacity_causes[cause]++;
+    else s_status.context_capacity_causes[cause]++;
+    s_status.capacity_last_cause = (uint32_t)cause;
+    s_status.capacity_last_sqlite_rc = (uint32_t)sqlite_rc;
+    s_status.capacity_last_owner = candidate ? 1u : 2u;
+  }
 }
 
 static uint32_t metric_slots_used(void) {
@@ -2582,11 +2615,15 @@ static int sqlite_maintenance_can_run(unsigned kind) {
       (now < s_last_maintenance_ns || now - s_last_maintenance_ns < 60000000000ULL)) {
     if (s_maintenance_work_state == MAINTENANCE_PARKED)
       set_error("maintenance deferred after bounded pressure inspection");
+    if (kind == MAINTENANCE_ADMISSION)
+      set_capacity_cause(EDR_EVIDENCE_CAPACITY_MAINTENANCE_DEFERRED, 0);
     return 0;
   }
   if (evidence_cache_pressure_active()) {
     sqlite_maintenance_park(MAINTENANCE_BACKOFF);
     set_error("maintenance deferred by resource pressure");
+    if (kind == MAINTENANCE_ADMISSION)
+      set_capacity_cause(EDR_EVIDENCE_CAPACITY_MAINTENANCE_DEFERRED, 0);
     (void)sqlite3_db_release_memory(s_db);
     (void)sqlite3_release_memory(0);
     return 0;
@@ -2594,6 +2631,8 @@ static int sqlite_maintenance_can_run(unsigned kind) {
   if (!sqlite3_get_autocommit(s_db)) {
     sqlite_maintenance_park(MAINTENANCE_BACKOFF);
     set_error("maintenance deferred by an unfinished database transaction");
+    if (kind == MAINTENANCE_ADMISSION)
+      set_capacity_cause(EDR_EVIDENCE_CAPACITY_MAINTENANCE_DEFERRED, 0);
     return 0;
   }
   if (s_maintenance_work_state == MAINTENANCE_BACKOFF ||
@@ -3207,6 +3246,7 @@ static int sqlite_physical_write_allow(uint64_t payload_bytes) {
   int overflow=payload_bytes>(UINT64_MAX-8u*1024u*1024u)/3u;
   int rc=overflow ? -2 : edr_storage_physical_admit(s_status.path,payload_bytes*3u+8u*1024u*1024u,0,&snapshot);
   if(rc) {
+    set_capacity_cause(EDR_EVIDENCE_CAPACITY_PHYSICAL_GUARD, 0);
     set_error(overflow ? "physical_size_overflow" : snapshot.cause);
     ++s_status.db_budget_dropped;
     if(rc==-1) ++s_status.physical_refusals; else ++s_status.physical_guard_failures;
@@ -3419,6 +3459,7 @@ failed:
 static int sqlite_maintenance_checkpoint(int mode);
 
 static int sqlite_size_budget_allow_mode(int allow_retirement) {
+  set_capacity_cause(EDR_EVIDENCE_CAPACITY_UNKNOWN, 0);
   if (!sqlite_physical_write_allow(EDR_EVIDENCE_MANIFEST_MAX_BYTES)) return 0;
   if (!db_size_over_limit()) {
     s_last_capacity_failure_ns = 0u;
@@ -3434,6 +3475,8 @@ static int sqlite_size_budget_allow_mode(int allow_retirement) {
     int rc = sqlite3_wal_checkpoint_v2(s_db, NULL, SQLITE_CHECKPOINT_TRUNCATE,
                                       NULL, NULL);
     if (rc != SQLITE_OK) {
+      set_capacity_cause((rc & 0xff) == SQLITE_BUSY || (rc & 0xff) == SQLITE_LOCKED
+          ? EDR_EVIDENCE_CAPACITY_WAL_BUSY : EDR_EVIDENCE_CAPACITY_WAL_ERROR, rc);
       char error[128];
       snprintf(error, sizeof(error), "evidence cache WAL reset blocked or failed: sqlite rc=%d", rc);
       set_error(error);
@@ -3454,6 +3497,7 @@ static int sqlite_size_budget_allow_mode(int allow_retirement) {
    * WAL above, but otherwise refuses until normal maintenance frees space. */
   if (allow_retirement && (s_last_capacity_failure_ns == 0u ||
       now - s_last_capacity_failure_ns >= 10000000000ULL)) {
+    set_capacity_cause(EDR_EVIDENCE_CAPACITY_MAINTENANCE_FAILED, 0);
     int maintenance_result = sqlite_maintenance(0);
     if (!db_size_over_limit()) {
       s_maintenance_reclaim_pages = 0u;
@@ -3469,6 +3513,7 @@ static int sqlite_size_budget_allow_mode(int allow_retirement) {
     }
   }
   s_status.db_budget_dropped++;
+  set_capacity_cause(EDR_EVIDENCE_CAPACITY_DB_WAL_LIMIT, 0);
   set_error("evidence cache size budget exceeded");
   return 0;
 }
@@ -5539,6 +5584,7 @@ static int sqlite_record_candidate(const EdrBehaviorRecord *r, const char *candi
     sqlite_rollback_silent(); return -1;
   }
   if (live_size_over > 0) {
+    set_capacity_cause(EDR_EVIDENCE_CAPACITY_POSTWRITE_PAGE_LIMIT, 0);
     s_persistence_failure = EDR_EVIDENCE_FAILURE_CAPACITY;
     ++s_status.db_budget_dropped;
     set_error("candidate context page budget exceeded; protected evidence preserved");
@@ -5711,6 +5757,7 @@ static int sqlite_live_size_over_limit(uint64_t limit) {
 }
 
 static int sqlite_maintenance_error(const char *stage, int rc) {
+  set_capacity_cause(EDR_EVIDENCE_CAPACITY_MAINTENANCE_FAILED, rc);
   char error[sizeof(s_status.last_error)];
   snprintf(error, sizeof(error), "maintenance %s: sqlite=%d/%d %s", stage,
            rc, sqlite3_extended_errcode(s_db), sqlite3_errmsg(s_db));
@@ -7369,8 +7416,10 @@ static void evidence_cache_close_locked(void) {
       for (size_t i = 0; i < EDR_EVIDENCE_METRIC_SLOTS; ++i) {
         MetricSlot *m = &s_metrics[i];
         for (size_t j = 0; j < METRIC_COUNT; ++j) {
-          /* Ordinary type and reason label the same observation. Count once. */
-          if (j >= METRIC_ORDINARY_BASE && j < METRIC_CANDIDATE_BASE) continue;
+          /* Type/reason and capacity/subcause label the same observation.
+           * Preserve the existing operation-count loss unit. */
+          if ((j >= METRIC_ORDINARY_BASE && j < METRIC_CANDIDATE_BASE) ||
+              j >= METRIC_CANDIDATE_CAPACITY_BASE) continue;
           evidence_cache_add_saturating(&lost, metric_slot_value(m, j) - m->committed[j]);
         }
       }
@@ -10537,6 +10586,11 @@ static void metric_reason_json(char *out, size_t cap, const char *const *names,
 int edr_local_evidence_cache_accounting_json(const EdrEvidenceCacheStatus *st, char *out, size_t cap) {
   if (!st || !out || !cap) return -1;
   char ordinary_reasons[512], candidate_failures[1024], context_failures[1024];
+  char candidate_capacity[512], context_capacity[512];
+  metric_reason_json(candidate_capacity, sizeof(candidate_capacity), capacity_cause_names,
+                    st->candidate_capacity_causes, EDR_EVIDENCE_CAPACITY_CAUSE_COUNT);
+  metric_reason_json(context_capacity, sizeof(context_capacity), capacity_cause_names,
+                    st->context_capacity_causes, EDR_EVIDENCE_CAPACITY_CAUSE_COUNT);
   metric_reason_json(ordinary_reasons, sizeof(ordinary_reasons), metric_names + METRIC_ORDINARY_BASE,
                     st->ordinary_reasons, EDR_EVIDENCE_ORDINARY_REASON_COUNT);
   metric_reason_json(candidate_failures, sizeof(candidate_failures), metric_names + METRIC_CANDIDATE_BASE,
@@ -10546,6 +10600,7 @@ int edr_local_evidence_cache_accounting_json(const EdrEvidenceCacheStatus *st, c
   int written = snprintf(out, cap,
       "{\"scope\":\"current_process\",\"ordinary_unit\":\"record_behavior_call\",\"ordinary_reasons\":%s,"
       "\"failure_unit\":\"persistence_operation\",\"candidate_failures\":%s,\"context_failures\":%s,"
+      "\"capacity_failures\":{\"candidate\":%s,\"context\":%s,\"last_cause\":%u,\"last_sqlite_rc\":%u,\"last_owner\":%u},"
       "\"pmfe_followup\":{\"scheduled\":%u,\"running\":%u,\"result_bound\":%u,\"result_acked_await_queue\":%u,"
       "\"active\":%u,\"expired\":%u,\"capacity\":64,\"failures\":%llu,\"cause_code\":%u},"
       "\"budget_protection\":{\"physical_refusals\":%llu,\"physical_guard_failures\":%llu,\"query_pin_exhausted\":%llu,\"cause_code\":%u},"
@@ -10554,6 +10609,8 @@ int edr_local_evidence_cache_accounting_json(const EdrEvidenceCacheStatus *st, c
       "\"active_ms\":%llu,\"clock_valid\":%u,\"clock_failures\":%llu,\"clock_cause_code\":%u,"
       "\"parent_protections\":%llu,\"floor_held\":%llu}}",
       ordinary_reasons, candidate_failures, context_failures,
+      candidate_capacity, context_capacity, st->capacity_last_cause,
+      st->capacity_last_sqlite_rc, st->capacity_last_owner,
       st->pmfe_scheduled,st->pmfe_running,st->pmfe_result_bound,st->pmfe_result_acked,
       st->pmfe_active,st->pmfe_expired,(unsigned long long)st->pmfe_failures,st->pmfe_cause_code,
       (unsigned long long)st->physical_refusals,(unsigned long long)st->physical_guard_failures,
@@ -10577,7 +10634,7 @@ void edr_local_evidence_cache_status_json(char *out, size_t cap) {
   char err[220];
   char eng[80];
   char context_ref_sources[8192];
-  char accounting[2048];
+  char accounting[EDR_EVIDENCE_ACCOUNTING_JSON_BYTES];
   if (edr_local_evidence_cache_accounting_json(&st, accounting, sizeof(accounting)) != 0)
     snprintf(accounting, sizeof(accounting), "{\"status\":\"unavailable\"}");
   json_escape(path, sizeof(path), st.path);

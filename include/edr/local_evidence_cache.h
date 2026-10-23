@@ -34,6 +34,23 @@ typedef enum {
   EDR_EVIDENCE_FAILURE_UNCLASSIFIED, EDR_EVIDENCE_FAILURE_REASON_COUNT
 } EdrEvidenceFailureReason;
 
+/* Subdivide CAPACITY persistence failures, not unique events or lost alerts.
+ * DB_WAL_LIMIT does not assert that every remaining owner is protected.
+ * Codes are stable diagnostics; no admission or retirement authority. */
+typedef enum {
+  EDR_EVIDENCE_CAPACITY_UNKNOWN,
+  EDR_EVIDENCE_CAPACITY_DB_WAL_LIMIT,
+  EDR_EVIDENCE_CAPACITY_WAL_BUSY,
+  EDR_EVIDENCE_CAPACITY_WAL_ERROR,
+  EDR_EVIDENCE_CAPACITY_PHYSICAL_GUARD,
+  EDR_EVIDENCE_CAPACITY_MAINTENANCE_DEFERRED,
+  EDR_EVIDENCE_CAPACITY_MAINTENANCE_FAILED,
+  EDR_EVIDENCE_CAPACITY_POSTWRITE_PAGE_LIMIT,
+  EDR_EVIDENCE_CAPACITY_CAUSE_COUNT
+} EdrEvidenceCapacityCause;
+
+#define EDR_EVIDENCE_ACCOUNTING_JSON_BYTES 4096u
+
 typedef struct {
   int db_open;
   uint32_t storage_format; /* 0 legacy, 1 mixed compact writes, 2 fully compact */
@@ -127,6 +144,13 @@ typedef struct {
   uint64_t ordinary_reasons[EDR_EVIDENCE_ORDINARY_REASON_COUNT];
   uint64_t candidate_failure_reasons[EDR_EVIDENCE_FAILURE_REASON_COUNT];
   uint64_t context_failure_reasons[EDR_EVIDENCE_FAILURE_REASON_COUNT];
+  /* Each CAPACITY failure increments exactly one cause for the same owner.
+   * Current-open counters; minute metrics use the existing bounded TTL store. */
+  uint64_t candidate_capacity_causes[EDR_EVIDENCE_CAPACITY_CAUSE_COUNT];
+  uint64_t context_capacity_causes[EDR_EVIDENCE_CAPACITY_CAUSE_COUNT];
+  uint32_t capacity_last_cause;
+  uint32_t capacity_last_sqlite_rc; /* 0 when no SQLite result was captured. */
+  uint32_t capacity_last_owner; /* 0 none, 1 candidate, 2 context. */
   uint64_t maintenance_runs;
   uint64_t identity_observations_total;
   uint64_t identity_none;

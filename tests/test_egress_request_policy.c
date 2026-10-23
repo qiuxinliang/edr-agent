@@ -490,6 +490,51 @@ static void test_retention_floor_health_is_numeric_and_bounded(void) {
   cJSON_Delete(o); free(projected);
 }
 
+static void test_capacity_failure_health_is_numeric_and_bounded(void) {
+  const char *causes[] = {"unknown", "db_wal_limit", "wal_busy", "wal_error",
+      "physical_guard", "maintenance_deferred", "maintenance_failed", "postwrite_page_limit"};
+  const char *profiles[] = {"basic", "diagnostic"};
+  const char *invalid[] = {"\"PRIVATE_COMMAND\"", "-1", "1.5", "true", "null", "{}", "[]"};
+  for (unsigned profile = 0; profile < 2u; ++profile) {
+    cJSON *expected = cJSON_Parse("{\"endpoint_id\":\"ep\",\"agent_version\":\"test\",\"policy_version\":\"p\","
+        "\"engine_health\":{\"monitor\":{},\"p0_acceptance\":{\"evidence_cache\":{\"accounting\":{"
+        "\"candidate_failures\":{\"candidate_capacity_refused\":8},\"context_failures\":{\"context_capacity_refused\":8},"
+        "\"capacity_failures\":{\"candidate\":{},\"context\":{},\"last_cause\":2,\"last_sqlite_rc\":5,\"last_owner\":2}}}}}}");
+    assert(expected);
+    cJSON *health = cJSON_GetObjectItemCaseSensitive(expected,"engine_health");
+    assert(cJSON_AddStringToObject(cJSON_GetObjectItemCaseSensitive(health,"monitor"),"profile",profiles[profile]));
+    cJSON *details = cJSON_GetObjectItemCaseSensitive(cJSON_GetObjectItemCaseSensitive(
+        cJSON_GetObjectItemCaseSensitive(cJSON_GetObjectItemCaseSensitive(health,"p0_acceptance"),"evidence_cache"),
+        "accounting"),"capacity_failures");
+    for (unsigned owner=0;owner<2u;++owner) {
+      cJSON *counts=cJSON_GetObjectItemCaseSensitive(details,owner ? "context" : "candidate");
+      for (unsigned cause=0;cause<8u;++cause) assert(cJSON_AddNumberToObject(counts,causes[cause],1));
+    }
+    check_health_routes(expected,1);
+    assert(cJSON_AddStringToObject(details,"last_error","PRIVATE_PATH_AND_COMMAND"));
+    assert(cJSON_AddObjectToObject(details,"raw_event"));
+    check_health_routes(expected,0);
+    char *body=cJSON_PrintUnformatted(expected), reason[128]; assert(body);
+    char *wire=edr_egress_health_project(body,reason,sizeof(reason)); assert(wire);
+    assert(!strstr(wire,"PRIVATE_") && !strstr(wire,"last_error") && !strstr(wire,"raw_event"));
+    cJSON_DeleteItemFromObjectCaseSensitive(details,"last_error");
+    cJSON_DeleteItemFromObjectCaseSensitive(details,"raw_event");
+    cJSON *projected=cJSON_Parse(wire); assert(projected && cJSON_Compare(expected,projected,1));
+    check_health_routes(projected,1); cJSON_Delete(projected); free(body); free(wire);
+    for (unsigned value=0;value<sizeof(invalid)/sizeof(invalid[0]);++value) {
+      cJSON *counts=cJSON_GetObjectItemCaseSensitive(details,"context");
+      assert(cJSON_ReplaceItemInObjectCaseSensitive(counts,"wal_busy",cJSON_Parse(invalid[value])));
+      check_health_routes(expected,0);
+      body=cJSON_PrintUnformatted(expected); assert(body);
+      wire=edr_egress_health_project(body,reason,sizeof(reason)); assert(wire);
+      projected=cJSON_Parse(wire); assert(projected); check_health_routes(projected,1);
+      assert(!strstr(wire,"PRIVATE_"));
+      cJSON_Delete(projected); free(body); free(wire);
+    }
+    cJSON_Delete(expected);
+  }
+}
+
 static void test_storage_health_is_numeric_and_bounded(void) {
   const char *raw="{\"endpoint_id\":\"ep\",\"agent_version\":\"v1\",\"policy_version\":\"p1\",\"engine_health\":{\"storage_protection\":{\"directory_hard_limit\":false,\"min_free_bytes\":143479824,\"queue_available_bytes\":200000000,\"command_owner\":{\"accounting_available\":true,\"reserved_bytes\":197190,\"admission_rejected\":2,\"raw_command\":\"PRIVATE_COMMAND\"}},\"queue_local_retention\":{\"retirement_enabled\":true,\"local_retention_policy_version\":2,\"retired_rows\":100,\"unclassified_rows\":4,\"payload\":\"PRIVATE_FACT\"}}}";
   char why[128];
@@ -517,6 +562,7 @@ static void test_storage_health_is_numeric_and_bounded(void) {
 int main(void) {
   test_evidence_pressure_health_projection();
   test_storage_health_is_numeric_and_bounded();
+  test_capacity_failure_health_is_numeric_and_bounded();
   test_retention_floor_health_is_numeric_and_bounded();
   test_parent_exit_health_projection();
   test_diagnostic_health_commitments();

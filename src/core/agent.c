@@ -2492,7 +2492,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
   memset(&p0_metrics, 0, sizeof(p0_metrics));
   memset(&p0_emit_metrics, 0, sizeof(p0_emit_metrics));
   memset(&queue_capacity_metrics, 0, sizeof(queue_capacity_metrics));
-  char evidence_accounting_json[4096];
+  char evidence_accounting_json[EDR_EVIDENCE_ACCOUNTING_JSON_BYTES];
   if (edr_local_evidence_cache_accounting_json(&evidence_status, evidence_accounting_json,
                                               sizeof(evidence_accounting_json)) != 0)
     snprintf(evidence_accounting_json, sizeof(evidence_accounting_json), "{\"status\":\"unavailable\"}");

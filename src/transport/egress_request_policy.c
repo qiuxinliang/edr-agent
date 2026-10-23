@@ -140,6 +140,23 @@ static const HealthField health_fields[] = {
   N("p0_acceptance.evidence_cache.physical_bytes"), N("p0_acceptance.evidence_cache.max_db_mb"),
   N("p0_acceptance.evidence_cache.candidate_requests"),
   N("p0_acceptance.evidence_cache.candidate_admitted"), N("p0_acceptance.evidence_cache.candidate_rejected"),
+  /* Numeric persistence diagnostics only; detailed errors and evidence remain local. */
+  N("p0_acceptance.evidence_cache.accounting.candidate_failures.candidate_capacity_refused"),
+  N("p0_acceptance.evidence_cache.accounting.context_failures.context_capacity_refused"),
+#define CAPACITY_COUNTS(owner) \
+  N("p0_acceptance.evidence_cache.accounting.capacity_failures." owner ".unknown"), \
+  N("p0_acceptance.evidence_cache.accounting.capacity_failures." owner ".db_wal_limit"), \
+  N("p0_acceptance.evidence_cache.accounting.capacity_failures." owner ".wal_busy"), \
+  N("p0_acceptance.evidence_cache.accounting.capacity_failures." owner ".wal_error"), \
+  N("p0_acceptance.evidence_cache.accounting.capacity_failures." owner ".physical_guard"), \
+  N("p0_acceptance.evidence_cache.accounting.capacity_failures." owner ".maintenance_deferred"), \
+  N("p0_acceptance.evidence_cache.accounting.capacity_failures." owner ".maintenance_failed"), \
+  N("p0_acceptance.evidence_cache.accounting.capacity_failures." owner ".postwrite_page_limit")
+  CAPACITY_COUNTS("candidate"), CAPACITY_COUNTS("context"),
+#undef CAPACITY_COUNTS
+  {"engine_health.p0_acceptance.evidence_cache.accounting.capacity_failures.last_cause", H_UINT},
+  {"engine_health.p0_acceptance.evidence_cache.accounting.capacity_failures.last_sqlite_rc", H_UINT},
+  {"engine_health.p0_acceptance.evidence_cache.accounting.capacity_failures.last_owner", H_UINT},
   N("p0_acceptance.evidence_cache.accounting.pmfe_followup.scheduled"),
   N("p0_acceptance.evidence_cache.accounting.pmfe_followup.running"),
   N("p0_acceptance.evidence_cache.accounting.pmfe_followup.result_bound"),
