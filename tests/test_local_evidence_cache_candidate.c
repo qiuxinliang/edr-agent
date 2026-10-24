@@ -8906,6 +8906,7 @@ static void test_maintenance_failure_retains_cause_and_retry_interval(void) {
   edr_local_evidence_cache_get_status(&after);
   assert(after.maintenance_runs == before.maintenance_runs + 1);
   assert(after.db_retention_evicted == before.db_retention_evicted);
+  assert(after.retention_failures == before.retention_failures + 1u);
   assert(strstr(after.last_error, "1811") && strstr(after.last_error, "injected retention failure"));
   assert(compact_scalar(db, "SELECT COUNT(*) FROM p0_candidates WHERE candidate_id='expired'") == 1);
   assert(compact_scalar(db, "SELECT COUNT(*) FROM artifacts WHERE artifact_id='expired:p0_context_bundle:candidate'") == 1);
@@ -12406,6 +12407,68 @@ static void startup_fill_pages(sqlite3 *db, sqlite3_int64 target) {
   assert(compact_scalar(db,"PRAGMA page_count")==target && compact_scalar(db,"PRAGMA freelist_count")==0);
 }
 
+/* At a full compatible store the retained -> retirement_eligible update can
+ * cross SQLite's local-payload boundary before the same transaction deletes
+ * that group. Startup DDL's page ceiling must not become the runtime pager
+ * ceiling for this temporary allocation. The committed store remains bounded. */
+static void test_startup_retirement_transient_page(void) {
+  const int64_t now=INT64_C(1700000000000000000);
+  char path[512],before[65],after[65],sql[128];sqlite3 *db=NULL;
+  EdrEvidenceCacheStatus status;
+  EdrBehaviorRecord *protected=calloc(1,sizeof(*protected));assert(protected);
+  assert(make_test_sqlite_path(path,sizeof(path))==0);
+  edr_local_evidence_cache_test_set_now_unix_ns(now);
+  edr_local_evidence_cache_test_set_retention_monotonic_ms(1000);
+  assert(edr_local_evidence_cache_open_with_policy(path,1u,24u,72u)==0);
+  init_floor_parent(protected,now);
+  EdrCommandFacts facts={protected->cmdline,protected->parent_cmdline};
+  assert(edr_local_evidence_cache_record_alert_context(protected,&facts)==0);
+  edr_local_evidence_cache_close();assert(sqlite3_open(path,&db)==SQLITE_OK);
+  compact_exec(db,
+      "INSERT INTO p0_candidates(candidate_id,endpoint_id,tenant_id,event_time_ns,created_ns,context_post_until_ns,retention_policy_version,retention_value_class,retention_value_reason,cmdline) "
+      "VALUES('expired','failure-endpoint','failure-tenant',1,1,1,1,1,'recent_detail',printf('%03950d',1));"
+      "INSERT INTO artifacts(artifact_id,endpoint_id,tenant_id,candidate_id,artifact_type,manifest_json,created_ns,upload_status,minio_key) "
+      "VALUES('expired:p0_context_bundle:candidate','failure-endpoint','failure-tenant','expired','p0_context_bundle','{}',1,'local_manifest','');"
+      "INSERT INTO p0_candidates(candidate_id,retention_policy_version) VALUES('unclassified-owner',0);"
+      "INSERT INTO artifacts(artifact_id,artifact_type,manifest_json,upload_status) VALUES('unclassified-payload','unknown-v1','public frozen bytes','pending');");
+  parent_fixture_owner_hash(db,protected->pid,before);
+  startup_fill_pages(db,256);
+  sqlite3_int64 prior=compact_scalar(db,"PRAGMA max_page_count");
+  assert(compact_scalar(db,"PRAGMA max_page_count=256")==256);
+  compact_exec(db,"BEGIN IMMEDIATE;");
+  int full=sqlite3_exec(db,"UPDATE p0_candidates SET local_retention_state='retirement_eligible' WHERE candidate_id='expired';",NULL,NULL,NULL);
+  assert(full==SQLITE_FULL);
+  if(!sqlite3_get_autocommit(db))compact_exec(db,"ROLLBACK;");
+  assert(compact_scalar(db,"SELECT COUNT(*) FROM p0_candidates WHERE candidate_id='expired' AND local_retention_state='retained'")==1);
+  snprintf(sql,sizeof(sql),"PRAGMA max_page_count=%lld;",(long long)prior);compact_exec(db,sql);
+  assert(edr_local_evidence_cache_open_with_policy(path,1u,24u,72u)==0);
+  edr_local_evidence_cache_get_status(&status);
+  fprintf(stderr,"startup_retirement_transient_page full_probe_rc=%d failures=%llu retired=%llu pages=%lld cause=%s\n",full,
+      (unsigned long long)status.retention_failures,(unsigned long long)status.retention_groups_retired,
+      (long long)compact_scalar(db,"PRAGMA page_count"),status.last_error);
+  assert(status.db_open && status.retention_clock_valid && !status.retention_clock_failures);
+  assert(status.retention_failures==0 && status.retention_groups_retired==1);
+  assert(compact_scalar(db,"SELECT COUNT(*) FROM p0_candidates WHERE candidate_id='expired'")==0);
+  assert(compact_scalar(db,"SELECT COUNT(*) FROM artifacts WHERE candidate_id='expired'")==0);
+  assert(compact_scalar(db,"SELECT value FROM metrics WHERE minute_unix=0 AND endpoint_id='' AND metric_name='local_retention_v1_expired_groups'")==1);
+  assert(compact_scalar(db,"PRAGMA page_count")<=256);
+  assert(compact_scalar(db,"SELECT COUNT(*) FROM p0_candidates WHERE candidate_id='unclassified-owner' AND retention_policy_version=0 AND local_retention_state='retained'")==1);
+  assert(compact_scalar(db,"SELECT COUNT(*) FROM artifacts WHERE artifact_id='unclassified-payload' AND manifest_json='public frozen bytes' AND upload_status='pending'")==1);
+  parent_fixture_owner_hash(db,protected->pid,after);assert(!strcmp(before,after));
+  EdrParentContextQuery query=floor_query(protected,now);
+  parent_pressure_query(&query,"startup_transient_floor_preserved",1);
+  edr_local_evidence_cache_close();
+  assert(edr_local_evidence_cache_open_with_policy(path,1u,24u,72u)==0);
+  edr_local_evidence_cache_get_status(&status);
+  assert(status.db_open && status.retention_clock_valid && !status.retention_failures);
+  assert(compact_scalar(db,"SELECT COUNT(*) FROM p0_candidates WHERE candidate_id='expired'")==0);
+  assert(compact_scalar(db,"PRAGMA page_count")<=256);
+  parent_fixture_owner_hash(db,protected->pid,after);assert(!strcmp(before,after));
+  edr_local_evidence_cache_close();assert(sqlite3_close(db)==SQLITE_OK);cleanup_test_sqlite_path(path);free(protected);
+  edr_local_evidence_cache_test_set_now_unix_ns(0);
+  edr_local_evidence_cache_test_set_retention_monotonic_ms(-1);
+}
+
 static void test_startup_logical_budget_legacy(int vacuum_mode, int already_over, uint32_t budget_mb) {
   char path[512];sqlite3 *db=NULL;EdrEvidenceCacheStatus status;
   assert(make_test_sqlite_path(path,sizeof(path))==0 && sqlite3_open(path,&db)==SQLITE_OK);
@@ -12755,6 +12818,7 @@ static void test_startup_preclock_owner_integrity(void) {
 
 static void test_startup_logical_budget(void) {
   s_test_pressure=false;
+  test_startup_retirement_transient_page();
   test_startup_preclock_full(0,0);
   test_startup_preclock_full(1,0);
   test_startup_preclock_full(0,1);
@@ -13446,6 +13510,7 @@ static void test_compact_startup_contract(void) {
 
 int main(int argc, char **argv) {
 #if defined(EDR_HAVE_SQLITE)
+  if (argc==2 && !strcmp(argv[1],"--startup-retirement-transient-page")) {test_startup_retirement_transient_page();return 0;}
   if (argc==2 && !strcmp(argv[1],"--startup-preclock")) {
     test_startup_preclock_full(0,0);test_startup_preclock_full(1,0);
     test_startup_preclock_full(0,1);test_startup_preclock_full(1,1);

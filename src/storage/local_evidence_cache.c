@@ -7777,7 +7777,6 @@ int edr_local_evidence_cache_open_with_policy(const char *path, uint32_t max_db_
   const int was_legacy_context = s_context_store.format == 0;
   if (sqlite_enable_compact_context_writes() != 0) goto startup_failed;
   const int enabled_compact_context = was_legacy_context && s_context_store.format == 1;
-  sqlite_maintenance(0);
   if (!sqlite_database_write_allow(EDR_EVIDENCE_MANIFEST_MAX_BYTES) ||
       exec_sql("UPDATE artifacts SET upload_status='scheduled' WHERE artifact_type='pmfe_followup_local_v1' AND upload_status='running';") != 0) {
     goto startup_failed;
@@ -7790,6 +7789,10 @@ int edr_local_evidence_cache_open_with_policy(const char *path, uint32_t max_db_
       goto startup_failed;
     }
   }
+  /* Ordinary retirement may grow a row transiently before freeing its group.
+   * Finish all bounded startup metadata first, then let the existing runtime
+   * maintenance owner run with its normal pager limit and physical guard. */
+  sqlite_maintenance(0);
   /* Maintenance can copy the new schema into the DB while retaining WAL
    * allocation. Finish this activation after all startup writes, through the
    * existing physical guard; normal format-1/2 opens and cadence are unchanged. */
