@@ -13,7 +13,10 @@ declarations = re.compile(
 def declared(source, context_owner=False):
     # Adjacent C string literals may split an index name from its ON clause.
     source = re.sub(r'"\s*"', "", source)
-    return {(name, table, (1 if optional else 2) if context_owner else 0)
+    # Retirement progress is shared by legacy, mixed and compact stores.
+    # Other context indexes belong to the optional legacy or compact DDL.
+    return {(name, table, (1 if optional else 2)
+             if context_owner and table != "context_retirement_progress" else 0)
             for optional, name, table in declarations.findall(source)}
 
 

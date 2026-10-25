@@ -3381,6 +3381,7 @@ static const struct { const char *name, *table; unsigned layout; } startup_index
     {"idx_registry_evidence_retention", "registry_evidence", 0},
     {"idx_command_results_retention", "command_results", 0},
     {"idx_artifacts_pmfe_terminal_retention", "artifacts", 0},
+    {"idx_context_retirement_phase", "context_retirement_progress", 0},
     {"idx_context_facts_ep_time", "context_facts", 1},
     {"idx_candidate_context_refs_candidate", "candidate_context_refs", 1},
     {"idx_candidate_context_refs_fact", "candidate_context_refs", 1},
