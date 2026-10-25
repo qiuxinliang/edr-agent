@@ -52,12 +52,12 @@ class PrivateP0InputTests(unittest.TestCase):
                         "commit", "-qm", "synthetic test input"], check=True)
         self.ref = subprocess.check_output(["git", "-C", str(self.directory), "rev-parse", "HEAD"], text=True).strip()
 
-    def test_ir7_ir8_ir9_inputs_remain_bound_and_future_schema_rejects(self):
+    def test_supported_ir_inputs_remain_bound_and_future_schema_rejects(self):
         ir_path, wire_path, sensor_path = (self.directory / name for name in cp.P0_TEST_INPUT_FILES)
         ir, sensor = json.loads(ir_path.read_bytes()), json.loads(sensor_path.read_bytes())
         raw = lambda value: (json.dumps(value, sort_keys=True, indent=2) + "\n").encode()
         key = envelope.hkdf_sha256(envelope.HKDF_SALT, envelope.SEED, envelope.HKDF_INFO, envelope.KEY_LEN)
-        for schema in (7, 8, 9, 10):
+        for schema in (7, 8, 9, 10, 11):
             with self.subTest(schema=schema):
                 ir["ir_schema_version"] = schema
                 plain = raw(ir)
@@ -70,7 +70,7 @@ class PrivateP0InputTests(unittest.TestCase):
                                 "-c", "user.email=fixture@example.invalid", "-c", "commit.gpgsign=false",
                                 "commit", "-qm", "synthetic schema input"], check=True)
                 ref = subprocess.check_output(["git", "-C", str(self.directory), "rev-parse", "HEAD"], text=True).strip()
-                if schema == 10:
+                if schema == 11:
                     with self.assertRaises(ValueError):
                         cp.verify_p0_test_inputs(self.directory, ref)
                 else:

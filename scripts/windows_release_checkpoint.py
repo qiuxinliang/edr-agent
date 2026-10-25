@@ -203,7 +203,7 @@ def verify_p0_test_inputs(directory, ref, expected_sha=""):
     if not isinstance(ir, dict) or not isinstance(sensor, dict):
         raise ValueError("Private P0 test input JSON must contain objects")
     count = ir.get("rule_count")
-    if (ir.get("kind") != "edr_p0_rule_bundle_ir_v1" or ir.get("ir_schema_version") not in (7, 8, 9) or
+    if (ir.get("kind") != "edr_p0_rule_bundle_ir_v1" or ir.get("ir_schema_version") not in (7, 8, 9, 10) or
             type(count) is not int or count <= 0 or not isinstance(ir.get("rules"), list) or
             len(ir["rules"]) != count or sensor.get("kind") != "edr_sensor_interest_manifest" or
             sensor.get("p0_artifact_rule_count") != count or
