@@ -4167,8 +4167,7 @@ static int edr_collector_should_admit_slot(EdrEventSlot *slot,
     int file_priority = edr_behavior_file_activity_priority(&br);
     if (file_priority >= 0) {
       slot->ransom_sample_process_start_key = br.ransom_sample_process_start_key;
-      slot->ransom_content_entropy = br.ransom_content_entropy;
-      slot->ransom_content_sample_bytes = br.ransom_content_sample_bytes;
+      slot->ransom_content = br.ransom_content;
       slot->ransom_content_sampled = br.ransom_content_sampled;
       slot->priority = (uint32_t)file_priority;
       slot->p0_critical = file_priority == 0 ? 1u : 0u;

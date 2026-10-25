@@ -35,7 +35,7 @@ typedef struct {
   uint64_t identity;
   uint16_t alias_index;
   int64_t last_sample_ns;
-  float baseline_entropy;
+  EdrRansomContentSample baseline;
   uint8_t sampled;
   uint8_t counted;
   uint8_t content_changed;
@@ -485,70 +485,76 @@ static double path_entropy_score(const char *path) {
   return ((double)uniq / (double)len) * 8.0;
 }
 
-static int file_content_entropy_sample_with_cap(const char *path, int cap,
-                                                double *out_entropy, size_t *out_bytes) {
-  if (out_entropy) {
-    *out_entropy = 0.0;
-  }
-  if (out_bytes) {
-    *out_bytes = 0u;
-  }
-  if (!path || !path[0]) {
-    return 0;
-  }
-  if (cap <= 0) {
-    return 0;
-  }
-  FILE *f = fopen(path, "rb");
-  if (!f) {
-    return 0;
-  }
-  unsigned long counts[256];
-  memset(counts, 0, sizeof(counts));
-  unsigned char buf[4096];
-  size_t total = 0u;
-  while (total < (size_t)cap) {
-    size_t want = sizeof(buf);
-    if ((size_t)cap - total < want) {
-      want = (size_t)cap - total;
-    }
-    size_t n = fread(buf, 1u, want, f);
-    if (n == 0u) {
-      break;
-    }
-    for (size_t i = 0; i < n; i++) {
-      counts[buf[i]]++;
-    }
-    total += n;
-  }
-  int read_failed = ferror(f);
-  fclose(f);
-  if (read_failed) {
-    return 0;
-  }
-  if (out_bytes) {
-    *out_bytes = total;
-  }
-  if (total == 0u) {
-    return 0;
-  }
-  double entropy = 0.0;
-  for (size_t i = 0; i < 256u; i++) {
-    if (counts[i] == 0ul) {
-      continue;
-    }
-    double p = (double)counts[i] / (double)total;
-    entropy -= p * (log(p) / log(2.0));
-  }
-  if (out_entropy) {
-    *out_entropy = entropy;
+static int ransom_sample_seek(FILE *f, int64_t offset, int origin) {
+#ifdef _WIN32
+  return _fseeki64(f, offset, origin);
+#else
+  return fseeko(f, (off_t)offset, origin);
+#endif
+}
+
+static int64_t ransom_sample_position(FILE *f) {
+#ifdef _WIN32
+  return _ftelli64(f);
+#else
+  return (int64_t)ftello(f);
+#endif
+}
+
+static int ransom_sample_valid(const EdrRansomContentSample *sample) {
+  if (!sample || (sample->region_count != 1u && sample->region_count != EDR_RANSOM_CONTENT_REGIONS) ||
+      sample->region_bytes < 512u || sample->region_bytes > 8192u / sample->region_count ||
+      sample->file_bytes < (uint64_t)sample->region_bytes * sample->region_count) return 0;
+  for (unsigned i = 0; i < sample->region_count; ++i) {
+    if (!isfinite(sample->entropy[i]) || sample->entropy[i] < 0.0f || sample->entropy[i] > 8.0f) return 0;
   }
   return 1;
 }
 
-static int file_content_entropy_sample(const char *path, double *out_entropy, size_t *out_bytes) {
+static int file_content_entropy_sample(const char *path, EdrRansomContentSample *out) {
+  memset(out, 0, sizeof(*out));
   int cap = env_int_clamped("EDR_RANSOM_CONTENT_ENTROPY_SAMPLE_BYTES", 65536, 0, 1048576);
-  return file_content_entropy_sample_with_cap(path, cap, out_entropy, out_bytes);
+  /* Preserve the collector's existing 8 KiB per-snapshot I/O ceiling. Spread
+   * those bytes across the file instead of spending them all on its prefix. */
+  if (cap > 8192) cap = 8192;
+  if (!path || !path[0] || cap < 512) return 0;
+  FILE *f = fopen(path, "rb");
+  if (!f) return 0;
+  EdrRansomContentSample sample;
+  memset(&sample, 0, sizeof(sample));
+  if (ransom_sample_seek(f, 0, SEEK_END) != 0) { fclose(f); return 0; }
+  int64_t length = ransom_sample_position(f);
+  if (length < 512) { fclose(f); return 0; }
+  sample.file_bytes = (uint64_t)length;
+  sample.region_count = length > cap && cap >= 2048 ? EDR_RANSOM_CONTENT_REGIONS : 1u;
+  sample.region_bytes = (uint32_t)(length < cap ? length : cap) / sample.region_count;
+  unsigned char buf[8192];
+  for (unsigned region = 0; region < sample.region_count; ++region) {
+    /* Division before multiplication keeps offsets bounded even for sparse files. */
+    uint64_t span = sample.file_bytes - sample.region_bytes;
+    uint64_t offset = sample.region_count == 1u ? 0u :
+        (span / (sample.region_count - 1u)) * region +
+        ((span % (sample.region_count - 1u)) * region) / (sample.region_count - 1u);
+    if (ransom_sample_seek(f, (int64_t)offset, SEEK_SET) != 0 ||
+        fread(buf, 1u, sample.region_bytes, f) != sample.region_bytes || ferror(f)) {
+      fclose(f); return 0;
+    }
+    unsigned counts[256] = {0};
+    for (unsigned i = 0; i < sample.region_bytes; ++i) counts[buf[i]]++;
+    double entropy = 0.0;
+    for (unsigned i = 0; i < 256u; ++i) {
+      if (!counts[i]) continue;
+      double probability = (double)counts[i] / sample.region_bytes;
+      entropy -= probability * (log(probability) / log(2.0));
+    }
+    sample.entropy[region] = (float)entropy;
+  }
+  /* A resize during sampling invalidates its geometry, not a partial success. */
+  int stable = ransom_sample_seek(f, 0, SEEK_END) == 0 && ransom_sample_position(f) == length;
+  int closed = fclose(f) == 0;
+  if (!stable || !closed || !ransom_sample_valid(&sample)) return 0;
+  *out = sample;
+  return 1;
 }
 
 static int should_sample_ransom_content_entropy(const RansomCounterBucket *b, int ext_changed, int canary) {
@@ -972,13 +978,8 @@ int edr_behavior_file_activity_priority(EdrBehaviorRecord *r) {
   ransom_admission_unlock();
 
   if (should_sample) {
-    double entropy = 0.0;
-    size_t sample_bytes = 0u;
-    int sample_cap = env_int_clamped("EDR_RANSOM_CONTENT_ENTROPY_SAMPLE_BYTES", 65536, 0, 1048576);
-    if (sample_cap > 8192) sample_cap = 8192;
-    int sampled = file_content_entropy_sample_with_cap(r->file_path, sample_cap,
-                                                       &entropy, &sample_bytes) &&
-                  sample_bytes >= 512u;
+    EdrRansomContentSample sample;
+    int sampled = file_content_entropy_sample(r->file_path, &sample);
     ransom_admission_lock();
     b = ransom_admission_bucket_for(r, now_ns, window_ns);
     file = ransom_admission_file_find(b, path_identity);
@@ -993,8 +994,7 @@ int edr_behavior_file_activity_priority(EdrBehaviorRecord *r) {
     ransom_admission_unlock();
     if (sampled) {
       r->ransom_content_sampled = 1u;
-      r->ransom_content_entropy = (float)entropy;
-      r->ransom_content_sample_bytes = (uint32_t)sample_bytes;
+      r->ransom_content = sample;
       r->ransom_sample_process_start_key = r->process_start_key;
     }
   }
@@ -1084,7 +1084,7 @@ void edr_behavior_enrich_file_activity(EdrBehaviorRecord *r) {
     }
   }
   int admission_content_ok = r->ransom_content_sampled &&
-      r->ransom_content_sample_bytes >= 512u && r->file_actor_generation_validated &&
+      ransom_sample_valid(&r->ransom_content) && r->file_actor_generation_validated &&
       r->ransom_sample_process_start_key != 0u &&
       r->ransom_sample_process_start_key == r->process_start_key;
   int content_deferred = !file || r->type == EDR_EVENT_FILE_DELETE ||
@@ -1092,40 +1092,44 @@ void edr_behavior_enrich_file_activity(EdrBehaviorRecord *r) {
       (!admission_content_ok && !should_sample_ransom_content_entropy(b, ext_changed, canary)) ||
       (!admission_content_ok && file->last_sample_ns > 0 &&
        now_ns - file->last_sample_ns < 1000000000LL && !ext_changed);
+  EdrRansomContentSample sample;
+  memset(&sample, 0, sizeof(sample));
   int content_ok = 0;
   if (!content_deferred && admission_content_ok) {
-    content_entropy = r->ransom_content_entropy;
-    content_sample = r->ransom_content_sample_bytes;
+    sample = r->ransom_content;
     content_ok = 1;
   } else if (!content_deferred) {
-    content_ok = file_content_entropy_sample(r->file_path, &content_entropy, &content_sample);
+    content_ok = file_content_entropy_sample(r->file_path, &sample);
   }
   double entropy_delta = 0.0;
-  int content_high = content_ok && content_entropy >= 7.20 && content_sample >= 512u;
-  /* Create may arrive while overwrite has truncated the file to zero bytes.
-   * An unusable baseline must not consume the following Write's sample slot.
-   * Failed mutation reads still retain their per-file retry interval. */
-  if (!content_deferred && (mutation || (content_ok && content_sample >= 512u)))
-    file->last_sample_ns = now_ns;
-  if (content_ok && content_sample >= 512u) {
-    if (file->sampled) {
-      /* Only a measured change of this same file is an entropy delta. */
-      entropy_delta = content_entropy - file->baseline_entropy;
-      if (entropy_delta < 0.0) entropy_delta = 0.0;
-    } else {
-      file->sampled = 1;
-      file->baseline_entropy = (float)content_entropy;
-      b->sampled_files++;
+  if (!content_deferred && (mutation || content_ok)) file->last_sample_ns = now_ns;
+  if (content_ok) {
+    int comparable = file->sampled && sample.file_bytes == file->baseline.file_bytes &&
+        sample.region_bytes == file->baseline.region_bytes && sample.region_count == file->baseline.region_count;
+    unsigned selected = 0u;
+    for (unsigned i = 0; i < sample.region_count; ++i) {
+      double delta = comparable ? sample.entropy[i] - file->baseline.entropy[i] : 0.0;
+      if ((sample.entropy[i] >= 7.20f && delta > entropy_delta) ||
+          (entropy_delta == 0.0 && sample.entropy[i] > sample.entropy[selected])) {
+        selected = i;
+        if (sample.entropy[i] >= 7.20f && delta > entropy_delta) entropy_delta = delta;
+      }
     }
-    if (content_high && !file->high_entropy) {
+    content_entropy = sample.entropy[selected];
+    content_sample = sample.region_bytes;
+    if (!file->sampled) { file->sampled = 1; b->sampled_files++; }
+    /* Never compare different offsets/lengths, including resize or budget changes. */
+    if (!comparable) file->baseline = sample;
+    if (content_entropy >= 7.20 && !file->high_entropy) {
       file->high_entropy = 1;
       b->high_entropy_events++;
     }
-    if (mutation && content_high && entropy_delta >= 1.5 && !file->content_changed) {
+    if (mutation && content_entropy >= 7.20 && entropy_delta >= 1.5 && !file->content_changed) {
       file->content_changed = 1;
       b->content_changed_files++;
     }
   }
+  int content_high = content_ok && content_entropy >= 7.20 && content_sample >= 512u;
   if (!mutation && !canary) {
     append_record_kv(r, "ransom_operation_context=1");
     return;
@@ -1180,6 +1184,10 @@ void edr_behavior_enrich_file_activity(EdrBehaviorRecord *r) {
                      periodic_summary ? " ransom_counter_summary=1" : "",
                      confirmed ? " ransomware_kind=ENCRYPTION_CONFIRMED ransomware_severity=4" :
                      " ransomware_kind=ENCRYPTION_SUSPECTED ransomware_severity=3");
+    if (content_ok) {
+      append_record_kv(r, "content_sample_regions=%u content_sample_file_bytes=%llu",
+                       (unsigned)sample.region_count, (unsigned long long)sample.file_bytes);
+    }
     if (admission_content_ok) {
       append_record_kv(r, "content_sample_source=collector_admission");
     }
@@ -2200,8 +2208,7 @@ void edr_behavior_from_slot(const EdrEventSlot *slot, EdrBehaviorRecord *r) {
   r->type = slot->type;
   r->priority = slot->priority;
   r->ransom_sample_process_start_key = slot->ransom_sample_process_start_key;
-  r->ransom_content_entropy = slot->ransom_content_entropy;
-  r->ransom_content_sample_bytes = slot->ransom_content_sample_bytes;
+  r->ransom_content = slot->ransom_content;
   r->ransom_content_sampled = slot->ransom_content_sampled;
   edr_gen_event_id(r->event_id, sizeof(r->event_id), r->event_time_ns);
 

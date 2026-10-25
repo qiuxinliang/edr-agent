@@ -70,6 +70,16 @@ typedef enum {
 /** 优先级：0=高 1=中 2=低（§2.3） */
 typedef uint8_t EdrEventPriority;
 
+/* Bounded content snapshot: small files use one region, large files use four
+ * equally spaced regions. Geometry must match before comparing entropy. */
+#define EDR_RANSOM_CONTENT_REGIONS 4u
+typedef struct {
+  uint64_t file_bytes;
+  uint32_t region_bytes;
+  float entropy[EDR_RANSOM_CONTENT_REGIONS];
+  uint8_t region_count;
+} EdrRansomContentSample;
+
 typedef struct {
   uint8_t data[EDR_MAX_EVENT_PAYLOAD];
   uint32_t size;
@@ -78,8 +88,7 @@ typedef struct {
    * mutation. It is accepted only after preprocess proves the same immutable
    * ProcessStartKey generation; it is never parsed from producer payload. */
   uint64_t ransom_sample_process_start_key;
-  float ransom_content_entropy;
-  uint32_t ransom_content_sample_bytes;
+  EdrRansomContentSample ransom_content;
   /* Collector-owned binding for a token tuple captured from the validated
    * ProcessStart handle. Never accepted from an ETW1 payload or copied to
    * another process generation. The SID/LUID remain in the bounded payload. */

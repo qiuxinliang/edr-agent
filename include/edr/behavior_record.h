@@ -129,8 +129,7 @@ typedef struct {
   /* Internal collector snapshot. The ransomware counter may consume it only
    * after exact process-generation validation succeeds. */
   uint64_t ransom_sample_process_start_key;
-  float ransom_content_entropy;
-  uint32_t ransom_content_sample_bytes;
+  EdrRansomContentSample ransom_content;
   uint8_t ransom_content_sampled;
   /* A collector capability gate is source-only metadata, never a rule hit.
    * The reason is constrained by p0_source_only_contract.h before it crosses

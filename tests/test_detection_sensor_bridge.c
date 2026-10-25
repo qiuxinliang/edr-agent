@@ -60,8 +60,7 @@ static int prepare_file_slot_for_admission(EdrEventSlot *slot) {
     slot->priority = (uint8_t)priority;
     slot->p0_critical = priority == 0 ? 1u : 0u;
     slot->ransom_sample_process_start_key = record.ransom_sample_process_start_key;
-    slot->ransom_content_entropy = record.ransom_content_entropy;
-    slot->ransom_content_sample_bytes = record.ransom_content_sample_bytes;
+    slot->ransom_content = record.ransom_content;
     slot->ransom_content_sampled = record.ransom_content_sampled;
   }
   return priority;
@@ -112,17 +111,17 @@ static void test_ransom_admission_snapshot_is_internal_only(void) {
             "ransom_content_sample_bytes=8192\nransom_sample_process_start_key=8990\n");
   edr_behavior_from_slot(&slot, &record);
   assert(!record.ransom_content_sampled);
-  assert(record.ransom_content_sample_bytes == 0u);
+  assert(record.ransom_content.region_bytes == 0u);
   assert(record.ransom_sample_process_start_key == 0u);
 
   slot.ransom_content_sampled = 1u;
-  slot.ransom_content_entropy = 7.75f;
-  slot.ransom_content_sample_bytes = 8192u;
+  slot.ransom_content.entropy[0] = 7.75f;
+  slot.ransom_content.region_bytes = 8192u;
   slot.ransom_sample_process_start_key = 8990u;
   edr_behavior_from_slot(&slot, &record);
   assert(record.ransom_content_sampled);
-  assert(record.ransom_content_entropy == 7.75f);
-  assert(record.ransom_content_sample_bytes == 8192u);
+  assert(record.ransom_content.entropy[0] == 7.75f);
+  assert(record.ransom_content.region_bytes == 8192u);
   assert(record.ransom_sample_process_start_key == 8990u);
 }
 
@@ -452,7 +451,7 @@ static void test_ransom_delayed_queue_preserves_burst_and_content_change(void) {
       assert(!slot.ransom_content_sampled);
     } else if (i < 83) {
       assert(slot.ransom_content_sampled);
-      assert(slot.ransom_content_sample_bytes == 8192u);
+      assert(slot.ransom_content.region_bytes == 8192u);
     }
     /* Model a saturated ordinary partition: only burst-promoted records reach
      * preprocess, and none are consumed until the later overwrite finishes. */
@@ -496,6 +495,108 @@ static void test_ransom_delayed_queue_preserves_burst_and_content_change(void) {
   }
   remove_fixture_directory(dir);
   free(queued);
+}
+
+/* Harmless file fixtures: no encryption program or recovery command is executed.
+ * Only the test directory is written, and response remains a counted hook. */
+static void write_partial_fixture(const char *path, int tail_changed, int high_prefix, int resized) {
+  FILE *f = fopen(path, "wb");
+  assert(f);
+  unsigned size = 262144u + (resized ? 4096u : 0u);
+  for (unsigned i = 0; i < size; ++i) {
+    int changed = (tail_changed && i >= size - 2048u) || (high_prefix && i < 8192u);
+    assert(fputc(changed ? (int)(i & 255u) : 'a', f) != EOF);
+  }
+  assert(fclose(f) == 0);
+}
+
+static void test_ransom_partial_content_regions(void) {
+  char dir[512];
+  create_fixture_directory(dir, sizeof(dir));
+  test_setenv("EDR_RANSOM_CONTENT_ENTROPY_ALWAYS", "1");
+  test_setenv("EDR_RANSOM_RATE_CONFIRM_FILES", "20");
+  for (unsigned scenario = 0; scenario < 5; ++scenario) {
+    unsigned before = ransom_response_calls;
+    unsigned confirmed = 0u;
+    for (unsigned pass = 0; pass < 2; ++pass) {
+      for (unsigned i = 0; i < 20; ++i) {
+        char path[768], payload[1200];
+        EdrEventSlot slot;
+        EdrBehaviorRecord r;
+        EdrDetectionDecision d;
+        snprintf(path, sizeof(path), "%s/partial-%u.bin", dir, i);
+        /* 0 tail-only, 1 tail plus already-high prefix, 2 unchanged archive,
+         * 3 resize invalidates geometry, 4 first observation already changed. */
+        int changed = (scenario < 2 || scenario == 3) ? pass != 0 : scenario == 4;
+        write_partial_fixture(path, changed, scenario == 1 || scenario == 2, scenario == 3 && pass);
+        snprintf(payload, sizeof(payload), "ETW1\nprov=kfile\npid=%u\nprocess_start_key=9550\n"
+            "img=C:\\Tools\\fixture.exe\nfile=%s\n", 59600u + scenario, path);
+        fill_slot(&slot, EDR_EVENT_FILE_WRITE, payload);
+        slot.timestamp_ns += (int64_t)(pass * 20 + i) * 1000000000LL;
+        eval_slot(&slot, &r, &d);
+        if (strstr(r.detection_context, "\"kind\":\"ENCRYPTION_CONFIRMED\"")) confirmed++;
+        if (pass && i == 19 && scenario < 2 && confirmed) {
+          assert(strstr(r.script_snippet, "content_sample_regions=4"));
+          assert(strstr(r.script_snippet, "content_sample_bytes=2048"));
+          cJSON *context = cJSON_Parse(r.detection_context);
+          assert(context);
+          cJSON *control = cJSON_GetObjectItemCaseSensitive(context, "ransom_control");
+          cJSON *regions = cJSON_GetObjectItemCaseSensitive(control, "content_sample_regions");
+          cJSON *file_bytes = cJSON_GetObjectItemCaseSensitive(control, "content_sample_file_bytes");
+          assert(cJSON_IsNumber(regions) && regions->valueint == 4);
+          assert(cJSON_IsString(file_bytes) && strcmp(file_bytes->valuestring, "262144") == 0);
+          cJSON_Delete(context);
+        }
+      }
+    }
+    if ((scenario < 2) != (confirmed > 0u)) {
+      fprintf(stderr, "partial scenario %u confirmations=%u\n", scenario, confirmed);
+      abort();
+    }
+    assert(ransom_response_calls == before + (scenario < 2 ? 1u : 0u));
+  }
+  for (unsigned i = 0; i < 20; ++i) {
+    char path[768]; snprintf(path, sizeof(path), "%s/partial-%u.bin", dir, i); assert(remove(path) == 0);
+  }
+  test_unsetenv("EDR_RANSOM_CONTENT_ENTROPY_ALWAYS");
+  test_unsetenv("EDR_RANSOM_RATE_CONFIRM_FILES");
+  remove_fixture_directory(dir);
+}
+
+static void test_ransom_slow_window_and_unreadable_content(void) {
+  char dir[512]; create_fixture_directory(dir, sizeof(dir));
+  test_setenv("EDR_RANSOM_CONTENT_ENTROPY_ALWAYS", "1");
+  test_setenv("EDR_RANSOM_RATE_CONFIRM_FILES", "20");
+  for (unsigned extended = 0; extended < 2; ++extended) {
+    test_setenv("EDR_RANSOM_COUNTER_WINDOW_S", extended ? "300" : "60");
+    unsigned before = ransom_response_calls;
+    for (unsigned pass = 0; pass < 2; ++pass) {
+      for (unsigned i = 0; i < 20; ++i) {
+        char path[768], payload[1200]; EdrEventSlot slot; EdrBehaviorRecord r;
+        snprintf(path, sizeof(path), "%s/slow-%u.bin", dir, i);
+        write_partial_fixture(path, pass != 0, 0, 0);
+        snprintf(payload, sizeof(payload), "ETW1\nprov=kfile\npid=%u\nprocess_start_key=9560\n"
+            "img=C:\\Tools\\fixture.exe\nfile=%s\n", 59610u + extended, path);
+        fill_slot(&slot, EDR_EVENT_FILE_WRITE, payload);
+        slot.timestamp_ns += (int64_t)(pass * 20 + i) * 4000000000LL;
+        enrich_slot_fixture(&slot, &r);
+      }
+    }
+    assert(ransom_response_calls == before + extended);
+  }
+  unsigned before = ransom_response_calls;
+  for (unsigned i = 0; i < 20; ++i) {
+    char path[768], payload[1200]; EdrEventSlot slot; EdrBehaviorRecord r;
+    snprintf(path, sizeof(path), "%s/slow-%u.bin", dir, i); assert(remove(path) == 0);
+    snprintf(payload, sizeof(payload), "ETW1\nprov=kfile\npid=59612\nprocess_start_key=9561\n"
+        "img=C:\\Tools\\fixture.exe\nfile=%s\n", path);
+    fill_slot(&slot, EDR_EVENT_FILE_WRITE, payload); enrich_slot_fixture(&slot, &r);
+  }
+  assert(ransom_response_calls == before);
+  test_unsetenv("EDR_RANSOM_CONTENT_ENTROPY_ALWAYS");
+  test_unsetenv("EDR_RANSOM_RATE_CONFIRM_FILES");
+  test_unsetenv("EDR_RANSOM_COUNTER_WINDOW_S");
+  remove_fixture_directory(dir);
 }
 
 static void test_ransom_tracking_capacity_is_explicit(void) {
@@ -1388,6 +1489,8 @@ int main(void) {
   test_ransom_generation_and_file_key_dedup();
   test_ransom_content_change_contract();
   test_ransom_delayed_queue_preserves_burst_and_content_change();
+  test_ransom_partial_content_regions();
+  test_ransom_slow_window_and_unreadable_content();
   test_ransom_tracking_capacity_is_explicit();
   test_ransom_alert_volume_is_bounded();
   test_invalid_file_path_does_not_raise_ransom_counter();

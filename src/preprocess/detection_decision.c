@@ -1692,6 +1692,8 @@ static void build_detection_context_full(EdrBehaviorRecord *r, const EdrDetectio
   char path_entropy_buf[32];
   char content_entropy_buf[32];
   char content_sample_bytes_buf[32];
+  char content_sample_regions_buf[16];
+  char content_sample_file_bytes_buf[32];
   char evidence_version_buf[16];
   char file_event_count_buf[32];
   char unique_file_count_buf[32];
@@ -1773,6 +1775,8 @@ static void build_detection_context_full(EdrBehaviorRecord *r, const EdrDetectio
   detail_value(r->script_snippet, "path_entropy", path_entropy_buf, sizeof(path_entropy_buf));
   detail_value(r->script_snippet, "content_entropy", content_entropy_buf, sizeof(content_entropy_buf));
   detail_value(r->script_snippet, "content_sample_bytes", content_sample_bytes_buf, sizeof(content_sample_bytes_buf));
+  detail_value(r->script_snippet, "content_sample_regions", content_sample_regions_buf, sizeof(content_sample_regions_buf));
+  detail_value(r->script_snippet, "content_sample_file_bytes", content_sample_file_bytes_buf, sizeof(content_sample_file_bytes_buf));
   detail_value(r->script_snippet, "ransom_evidence_version", evidence_version_buf, sizeof(evidence_version_buf));
   detail_value(r->script_snippet, "file_event_count", file_event_count_buf, sizeof(file_event_count_buf));
   detail_value(r->script_snippet, "unique_file_count", unique_file_count_buf, sizeof(unique_file_count_buf));
@@ -2013,6 +2017,11 @@ static void build_detection_context_full(EdrBehaviorRecord *r, const EdrDetectio
            has_ci(r->script_snippet, "ransom_tracking_saturated=1") ? "true" : "false",
            has_ci(r->script_snippet, "content_entropy_deferred=1") ? "true" : "false");
   json_str(context, context_capacity, confirmation_basis_buf, 32u);
+  if (content_sample_regions_buf[0]) {
+    json_cat(context, context_capacity, ",\"content_sample_regions\":%ld,\"content_sample_file_bytes\":",
+             strtol(content_sample_regions_buf, NULL, 10));
+    json_str(context, context_capacity, content_sample_file_bytes_buf, 32u);
+  }
   json_cat(context, context_capacity,
            ",\"entropy_delta\":%.2f,\"high_entropy_ratio\":%.2f,"
            "\"content_entropy\":%.2f,\"content_sample_bytes\":%ld,\"path_entropy\":%.2f,"
