@@ -63,6 +63,23 @@ def verify_native_replay(root, replay):
     return architecture
 
 
+def authenticated_bundle_path(bundle, plain):
+    import encrypt_p0_rules as envelope
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    path = Path(str(bundle) + ".enc")
+    wire = path.read_bytes()
+    if len(wire) < 4 + envelope.NONCE_LEN + 16 or not wire.startswith(envelope.MAGIC):
+        raise ValueError("Rule audit requires the authenticated EDR1 companion")
+    key = envelope.hkdf_sha256(envelope.HKDF_SALT, envelope.SEED, envelope.HKDF_INFO, envelope.KEY_LEN)
+    try:
+        decoded = AESGCM(key).decrypt(wire[4:4 + envelope.NONCE_LEN], wire[4 + envelope.NONCE_LEN:], None)
+    except Exception as error:
+        raise ValueError("Rule audit envelope authentication failed") from error
+    if decoded != plain:
+        raise ValueError("Rule audit plaintext/envelope mismatch")
+    return path
+
+
 def main():
     root = Path(__file__).resolve().parents[1]
     parser = argparse.ArgumentParser(description=__doc__)
@@ -82,7 +99,7 @@ def main():
     ir = json.loads(raw)
     cases = json.loads(args.cases.read_text(encoding="utf-8"))["cases"]
     env = os.environ.copy()
-    env["EDR_P0_IR_PATH"] = str(bundle)
+    env["EDR_P0_IR_PATH"] = str(authenticated_bundle_path(bundle, raw))
     results = []
     for case in cases:
         ev = case["event"]

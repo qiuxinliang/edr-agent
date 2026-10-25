@@ -3,18 +3,39 @@ import ctypes
 import importlib.util
 from pathlib import Path
 import struct
+import sys
 import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "scripts"))
+import encrypt_p0_rules as envelope
 SPEC = importlib.util.spec_from_file_location("windows_rule_audit", ROOT / "scripts/verify_windows_rule_audit.py")
 AUDIT = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(AUDIT)
 
 
 class WindowsRuleAuditRunnerTests(unittest.TestCase):
+    def test_replay_uses_matching_authenticated_bytes_and_rejects_tampering(self):
+        with tempfile.TemporaryDirectory() as directory:
+            bundle = Path(directory) / "bundle.json"
+            plain = b'{"fixture":true}'
+            key = envelope.hkdf_sha256(envelope.HKDF_SALT, envelope.SEED, envelope.HKDF_INFO, envelope.KEY_LEN)
+            wire = envelope.aes_256_gcm_encrypt(plain, key)
+            companion = Path(str(bundle) + ".enc")
+            with self.assertRaises(OSError):
+                AUDIT.authenticated_bundle_path(bundle, plain)
+            companion.write_bytes(wire)
+            self.assertEqual(AUDIT.authenticated_bundle_path(bundle, plain), companion)
+            with self.assertRaisesRegex(ValueError, "mismatch"):
+                AUDIT.authenticated_bundle_path(bundle, plain + b" ")
+            for invalid in (plain, wire[:-1], wire[:-1] + bytes([wire[-1] ^ 1])):
+                companion.write_bytes(invalid)
+                with self.assertRaises(ValueError):
+                    AUDIT.authenticated_bundle_path(bundle, plain)
+
     def test_non_windows_host_cannot_claim_native_evidence(self):
         with patch.object(AUDIT.platform, "system", return_value="Darwin"):
             with self.assertRaisesRegex(RuntimeError, "requires a Windows host"):
@@ -70,6 +91,7 @@ class WindowsRuleAuditRunnerTests(unittest.TestCase):
             output = Path(directory) / "result.json"
             output.write_text('{"failed": 0}', encoding="utf-8")
             with patch.object(AUDIT.sys, "argv", ["audit", "--replay", "missing.exe",
+                                                   "--bundle", "unused.json",
                                                    "--output", str(output), "--native-windows"]), \
                     patch.object(AUDIT.platform, "system", return_value="Darwin"):
                 with self.assertRaisesRegex(RuntimeError, "requires a Windows host"):

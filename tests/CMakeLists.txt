@@ -1083,7 +1083,7 @@ if(EDR_PCRE2_AVAILABLE)
   edr_apply_test_warnings(test_p0_source_only_durable_contract)
   add_test(NAME p0_source_only_durable_contract COMMAND test_p0_source_only_durable_contract)
   set_tests_properties(p0_source_only_durable_contract PROPERTIES
-    ENVIRONMENT "EDR_P0_IR_PATH=${EDR_P0_TEST_CONFIG_DIR}/p0_rule_bundle_ir_v1.json")
+    ENVIRONMENT "EDR_P0_IR_PATH=${EDR_P0_TEST_CONFIG_DIR}/p0_rule_bundle_ir_v1.json.enc")
   add_executable(test_p0_observation_semantics
     ${CMAKE_CURRENT_SOURCE_DIR}/stub_command_fact_resolver.c
     ${CMAKE_CURRENT_SOURCE_DIR}/test_p0_observation_semantics.c
@@ -1122,7 +1122,7 @@ if(EDR_PCRE2_AVAILABLE)
   edr_apply_test_warnings(test_p0_observation_semantics)
   add_test(NAME p0_observation_semantics COMMAND test_p0_observation_semantics)
   set_tests_properties(p0_observation_semantics PROPERTIES
-    ENVIRONMENT "EDR_P0_IR_PATH=${EDR_P0_TEST_CONFIG_DIR}/p0_rule_bundle_ir_v1.json")
+    ENVIRONMENT "EDR_P0_IR_PATH=${EDR_P0_TEST_CONFIG_DIR}/p0_rule_bundle_ir_v1.json.enc")
 else()
   message(STATUS
     "P0 source-only durable fixture: not registered because the non-production "
@@ -1288,7 +1288,7 @@ if(EDR_PCRE2_AVAILABLE)
   edr_apply_test_warnings(test_p0_rule_ir_record_golden)
   add_test(NAME p0_rule_ir_record_golden COMMAND test_p0_rule_ir_record_golden WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
   set_tests_properties(p0_rule_ir_record_golden PROPERTIES
-    ENVIRONMENT "EDR_P0_IR_PATH=${EDR_P0_TEST_CONFIG_DIR}/p0_rule_bundle_ir_v1.json")
+    ENVIRONMENT "EDR_P0_IR_PATH=${EDR_P0_TEST_CONFIG_DIR}/p0_rule_bundle_ir_v1.json.enc")
 
   get_target_property(_process_command_ir_sources test_p0_rule_ir_record_golden SOURCES)
   list(REMOVE_ITEM _process_command_ir_sources ${CMAKE_SOURCE_DIR}/src/preprocess/p0_rule_ir_record_golden_test.c)
@@ -1309,7 +1309,7 @@ if(EDR_PCRE2_AVAILABLE)
   edr_apply_test_warnings(test_process_command_admission)
   add_test(NAME process_command_admission COMMAND test_process_command_admission)
   set_tests_properties(process_command_admission PROPERTIES
-    ENVIRONMENT "EDR_P0_IR_PATH=${EDR_P0_TEST_CONFIG_DIR}/p0_rule_bundle_ir_v1.json"
+    ENVIRONMENT "EDR_P0_IR_PATH=${EDR_P0_TEST_CONFIG_DIR}/p0_rule_bundle_ir_v1.json.enc"
     TIMEOUT 60)
 
   add_executable(test_p0_rule_ir_exclusions
@@ -1418,7 +1418,7 @@ if(EDR_PCRE2_AVAILABLE)
   edr_apply_test_warnings(test_p0_validation_matrix)
   add_test(NAME p0_validation_matrix COMMAND test_p0_validation_matrix WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
   set_tests_properties(p0_validation_matrix PROPERTIES
-    ENVIRONMENT "EDR_P0_IR_PATH=${EDR_P0_TEST_CONFIG_DIR}/p0_rule_bundle_ir_v1.json;EDR_SENSOR_INTEREST_PATH=${EDR_P0_TEST_CONFIG_DIR}/sensor_interest_manifest.json")
+    ENVIRONMENT "EDR_P0_IR_PATH=${EDR_P0_TEST_CONFIG_DIR}/p0_rule_bundle_ir_v1.json.enc;EDR_SENSOR_INTEREST_PATH=${EDR_P0_TEST_CONFIG_DIR}/sensor_interest_manifest.json")
 endif()
 
 add_executable(test_windows_event_policy ${CMAKE_CURRENT_SOURCE_DIR}/test_windows_event_policy.c
@@ -1648,7 +1648,7 @@ if(SQLite3_FOUND)
   add_test(NAME command_fact_transport COMMAND test_command_fact_transport)
   if(EDR_PCRE2_AVAILABLE)
     set_tests_properties(command_fact_transport PROPERTIES
-      ENVIRONMENT "EDR_P0_IR_PATH=${EDR_P0_TEST_CONFIG_DIR}/p0_rule_bundle_ir_v1.json")
+      ENVIRONMENT "EDR_P0_IR_PATH=${EDR_P0_TEST_CONFIG_DIR}/p0_rule_bundle_ir_v1.json.enc")
   endif()
 endif()
 
@@ -2243,6 +2243,22 @@ if(EDR_PCRE2_AVAILABLE AND EDR_WITH_P0_RULES_OPENSSL AND OpenSSL_FOUND)
   set_tests_properties(p0_rule_ir_purpose_archive PROPERTIES ENVIRONMENT "EDR_P0_IR_PATH=${EDR_P0_TEST_CONFIG_DIR}/p0_rule_bundle_ir_v1.json.enc")
 elseif(EDR_PCRE2_AVAILABLE)
   message(STATUS "P0 encrypted operation/purpose fixtures require EDR_WITH_P0_RULES_OPENSSL and OpenSSL::Crypto")
+endif()
+
+# Canonical v10 inputs carry purpose authority and must use authenticated EDR1
+# bytes through the real loader, including in matcher and transport fixtures.
+if(EDR_PCRE2_AVAILABLE AND EDR_WITH_P0_RULES_OPENSSL AND OpenSSL_FOUND)
+  foreach(_authenticated_p0_fixture
+      test_p0_source_only_durable_contract test_p0_observation_semantics
+      test_p0_candidate_replay test_p0_rule_ir_record_golden
+      test_process_command_admission test_p0_validation_matrix test_command_fact_transport)
+    if(TARGET ${_authenticated_p0_fixture})
+      target_compile_definitions(${_authenticated_p0_fixture} PRIVATE EDR_HAVE_OPENSSL_FL=1)
+      target_link_libraries(${_authenticated_p0_fixture} PRIVATE OpenSSL::Crypto)
+    endif()
+  endforeach()
+elseif(EDR_PCRE2_AVAILABLE AND EDR_P0_TEST_CONFIG_AVAILABLE)
+  message(FATAL_ERROR "Canonical P0 integration fixtures require OpenSSL for authenticated EDR1 inputs")
 endif()
 
 edr_minimization_test(p0_observation_semantics test_p0_observation_semantics)

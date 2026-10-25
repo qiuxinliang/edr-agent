@@ -38,6 +38,12 @@ int main(void) {
   memset(binding.artifact_sha256,'a',64u);
   assert(edr_p0_deferred_snapshot_encode(&original,&binding,"R-TEST",&json,&length));
   assert(edr_p0_deferred_snapshot_decode(json,length,&restored,&decoded,rule,sizeof(rule)));
+  /* A legacy prefix measurement has no file geometry. Queue recovery must
+   * preserve its bytes without inventing a live multi-region sample. */
+  assert(restored.ransom_content_entropy==7.8125f);
+  assert(restored.ransom_content_sample_bytes==127u);
+  assert(restored.ransom_content.region_count==0u);
+  assert(restored.ransom_content.file_bytes==0u);
 #define TEXT(n) assert(!strcmp(original.n,restored.n));
 #define UNSIGNED(n) if (!strcmp(#n,"parent_pid_state")) { \
     assert(edr_parent_pid_effective_state(original.ppid,original.parent_pid_state)== \

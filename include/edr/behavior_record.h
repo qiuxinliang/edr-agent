@@ -130,6 +130,12 @@ typedef struct {
    * after exact process-generation validation succeeds. */
   uint64_t ransom_sample_process_start_key;
   EdrRansomContentSample ransom_content;
+  /* Persisted schema 1-4 rows retain these legacy prefix measurements exactly
+   * across upgrade/rollback. They are not a multi-region sample and must never
+   * feed the ransomware counter. Deferred P0 replay only evaluates rule facts;
+   * it does not replay live collector content measurements. */
+  float ransom_content_entropy;
+  uint32_t ransom_content_sample_bytes;
   uint8_t ransom_content_sampled;
   /* A collector capability gate is source-only metadata, never a rule hit.
    * The reason is constrained by p0_source_only_contract.h before it crosses
