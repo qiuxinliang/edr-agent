@@ -61,24 +61,26 @@ int edr_context_store_evict(EdrContextStore *store, int orphans_only,
 
 typedef struct {
   unsigned candidates, references, artifacts, facts;
+  unsigned progressed; /* Durable proof/drain progress, only after caller commit. */
+  int pressure; /* Reason frozen at logical retirement, independent of ACK. */
   unsigned work_rows; /* Includes examined dictionaries and shared facts. */
   /* Conservative literal field bytes examined for this group, including
    * shared facts. This bounds work; it is not reclaimed or physical bytes. */
   uint64_t payload_bytes;
 } EdrContextRetirement;
 
-/* Caller owns BEGIN IMMEDIATE and has checked investigation/action/window
- * protection. Only a policy-1 retirement_eligible candidate can be removed.
- * Returns 0 for a complete group, 1 for protected/over-budget, -1 on error.
- * A private savepoint rolls back this helper on either unsuccessful result;
- * the caller still owns commit/rollback. Counts become durable only on commit.
- * Result 1 reports examined work (saturating the exceeded limit), but no
- * deleted rows. The caller must charge that work to its maintenance slice.
+/* Caller owns BEGIN IMMEDIATE and rechecks investigation/action/window
+ * protection on every slice. Policy-1 groups are proved incrementally while
+ * retained, then logically retired before bounded physical drainage. Proof
+ * invalidation and write guards prevent a stale proof or new delivery owner.
+ * Returns 0 complete, 1 protected, 2 unfinished (including budget exhaustion),
+ * -1 storage/integrity failure. Errors roll back this slice; result 2 preserves
+ * its progress in the caller transaction. All counts need caller commit.
  * max_rows is 1..4096, including dictionaries and conservatively shared facts.
  * SQLite may materialize one oversized row before its size is known; these
  * work limits therefore bound group traversal, not physical I/O or memory. */
 int edr_context_store_retire_candidate(EdrContextStore *store,
-                                       const char *candidate_id,
+                                       const char *candidate_id, int pressure,
                                        unsigned max_rows, uint64_t max_bytes,
                                        int (*yield_required)(void *), void *yield_context,
                                        EdrContextRetirement *out);

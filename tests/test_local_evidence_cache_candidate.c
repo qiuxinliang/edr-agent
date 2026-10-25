@@ -8181,11 +8181,11 @@ static void test_candidate_group_oversize_and_active_window(void) {
       "UPDATE artifacts SET manifest_json=printf('%05000000d',1) WHERE candidate_id='byte-oversize';");
   /* Budget spent proving an oversized group is also bounded work; later
    * groups become reachable through the next keyset slices. */
-  for (unsigned slice=0; slice<4; ++slice) retention_poll();
-  assert(compact_scalar(db,"SELECT COUNT(*) FROM p0_candidates WHERE candidate_id IN ('row-oversize','byte-oversize')")==2);
+  for (unsigned slice=0; slice<64 && compact_scalar(db,"SELECT COUNT(*) FROM p0_candidates WHERE candidate_id='row-oversize'"); ++slice) retention_poll();
+  assert(compact_scalar(db,"SELECT COUNT(*) FROM p0_candidates WHERE candidate_id IN ('row-oversize','byte-oversize')")==1);
   assert(compact_scalar(db,"SELECT COUNT(*) FROM p0_candidates WHERE candidate_id='small-after-large'")==0);
-  assert(compact_scalar(db,"SELECT COUNT(*) FROM context_reference_projection WHERE candidate_id='row-oversize'")==5000);
-  assert(compact_scalar(db,"SELECT COUNT(*) FROM context_facts")==5000);
+  assert(compact_scalar(db,"SELECT COUNT(*) FROM context_reference_projection WHERE candidate_id='row-oversize'")==0);
+  assert(compact_scalar(db,"SELECT COUNT(*) FROM context_facts")==0);
   assert(compact_scalar(db,"SELECT length(manifest_json) FROM artifacts WHERE candidate_id='byte-oversize'")==5000000);
   assert(sqlite3_close(db)==SQLITE_OK); edr_local_evidence_cache_close(); cleanup_test_sqlite_path(path);
 
@@ -8417,6 +8417,176 @@ static void run_cache_crash_child(const char *path, const char *mode, int phase)
             WIFSIGNALED(status) ? WTERMSIG(status) : 0);
   assert(done == child && WIFEXITED(status) && WEXITSTATUS(status) == 86);
 #endif
+}
+
+/* Public synthetic fixtures exercise the real owner, schema guards and WAL.
+ * The injected deadline advances one millisecond per boundary: deterministic
+ * on both Windows architectures, independent of runner sleep granularity. */
+static int retirement_test_deadline(void *context) {
+  unsigned *elapsed=context;
+  return ++*elapsed>=20u;
+}
+static int retirement_real_deadline(void *context) {
+  return soak_monotonic_ns()>=*(uint64_t *)context;
+}
+static int retirement_slow_select(unsigned kind,void *context,void *statement,void *unused) {
+  (void)context; (void)unused;
+  const char *sql=sqlite3_sql(statement);
+  if(kind==SQLITE_TRACE_STMT && sql && !strncmp(sql,"SELECT",6)) {
+    uint64_t until=soak_monotonic_ns()+200000u;
+    while(soak_monotonic_ns()<until) { /* deterministic 0.2ms I/O-cost model */ }
+  }
+  return 0;
+}
+static int retirement_test_step(EdrContextStore *store,unsigned rows,int timed,int pressure,
+                                EdrContextRetirement *out) {
+  unsigned elapsed=0;
+  compact_exec(store->db,"BEGIN IMMEDIATE;");
+  uint64_t deadline=soak_monotonic_ns()+20000000u;
+  if(timed==2) sqlite3_trace_v2(store->db,SQLITE_TRACE_STMT,retirement_slow_select,NULL);
+  int rc=edr_context_store_retire_candidate(store,"resume",pressure,rows,4u*1024u*1024u,
+      timed==2 ? retirement_real_deadline : timed ? retirement_test_deadline : NULL,
+      timed==2 ? (void *)&deadline : (void *)&elapsed,out);
+  if(timed==2) sqlite3_trace_v2(store->db,0,NULL,NULL);
+  if(rc<0) fprintf(stderr,"retirement step: %s\n",store->error);
+  compact_exec(store->db,rc<0 ? "ROLLBACK;" : "COMMIT;");
+  assert(out->work_rows<=rows && out->payload_bytes<=4u*1024u*1024u);
+  return rc;
+}
+static void retirement_progress_crash_child(const char *path,int phase) {
+  sqlite3 *db=NULL; EdrContextStore store; EdrContextRetirement out;
+  assert(sqlite3_open(path,&db)==SQLITE_OK);
+  compact_exec(db,"PRAGMA journal_mode=WAL;PRAGMA synchronous=FULL;PRAGMA cache_size=1;");
+  assert(edr_context_store_open(&store,db)==0);
+  if(!phase) sqlite3_commit_hook(db,migration_crash_commit,NULL);
+  assert(retirement_test_step(&store,64u,0,0,&out)==2);
+  assert(out.references>0);
+  migration_crash_commit(NULL);
+}
+static void test_candidate_retirement_resumable(void) {
+  const int64_t now=INT64_C(1700007200000000000), old=INT64_C(1700000000000000000);
+  for(int format=0;format<=2;++format) {
+    for(int timed=0;timed<=2;++timed) {
+      char path[512]; sqlite3 *db=NULL; EdrContextStore store; EdrContextRetirement out;
+      unsigned refs=timed ? 123u : 3222u, turns=0, interrupted=0, removed=0;
+      assert(make_test_sqlite_path(path,sizeof(path))==0);
+      edr_local_evidence_cache_test_set_now_unix_ns(now);
+      assert(test_open_legacy_context(path,32,1)==0); edr_local_evidence_cache_close();
+      assert(sqlite3_open(path,&db)==SQLITE_OK);
+      retention_group_fixture(db,"resume",1,old,old,old+1);
+      retention_group_fixture(db,"unknown-keep",0,old,old,old+1);
+      char *query=sqlite3_mprintf(
+          "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<%u) "
+          "INSERT INTO context_facts(fact_id,endpoint_id,tenant_id,manifest_template_json,created_ns,updated_ns) "
+          "SELECT printf('f%%06d',x),'retention-endpoint','retention-tenant',printf('%%01400d',x),1,1 FROM n;"
+          "INSERT INTO candidate_context_refs(artifact_id,candidate_id,fact_id,candidate_id_json,created_ns,upload_status,minio_key) "
+          "SELECT fact_id,'resume',fact_id,'\"resume\"',1,'local_manifest','' FROM context_facts;",refs);
+      assert(query); compact_exec(db,query); sqlite3_free(query);
+      retention_ref_fixture(db,"unknown-keep","f000001",old);
+      assert(edr_context_store_open(&store,db)==0);
+      if(format) {
+        unsigned moved=0;int complete=0;
+        assert(edr_context_store_begin_upgrade(&store)==0);
+        do { int mr=edr_context_store_migrate_batch(&store,64u,&moved,&complete); if(mr) fprintf(stderr,"progress fixture migration: %s\n",store.error); assert(mr==0); }
+        while(format==2 && !complete);
+      }
+      assert(edr_context_store_install_retention_guards(&store)==0);
+      if(!timed && format!=1) {
+        compact_exec(db,"BEGIN IMMEDIATE;");
+        if(!format) compact_exec(db,
+            "INSERT INTO context_facts VALUES('','retention-endpoint','retention-tenant','{}',1,1);"
+            "INSERT INTO candidate_context_refs VALUES('invalid-empty','resume','','\"resume\"',1,'local_manifest','');");
+        else compact_exec(db,
+            "INSERT INTO context_facts VALUES('negative','retention-endpoint','retention-tenant','{}',1,1);"
+            "INSERT INTO context_fact_keys VALUES(-1,'negative');"
+            "INSERT INTO compact_context_refs(candidate_key,fact_key,artifact_override,created_ns,upload_status,minio_key) "
+            "SELECT id,-1,'invalid-negative',1,'local_manifest','' FROM context_candidates WHERE candidate_id='resume';");
+        assert(edr_context_store_retire_candidate(&store,"resume",0,4096u,4096000u,NULL,NULL,&out)==-1);
+        assert(compact_scalar(db,"SELECT COUNT(*) FROM context_reference_projection WHERE candidate_id='resume'")==refs+1u);
+        assert(compact_scalar(db,"SELECT COUNT(*) FROM p0_candidates WHERE candidate_id='resume' AND local_retention_state='retained'")==1);
+        compact_exec(db,"ROLLBACK;");
+      }
+      compact_exec(db,"CREATE TABLE progress_expected AS SELECT * FROM materialized_artifacts WHERE candidate_id='unknown-keep';");
+      assert(retirement_test_step(&store,timed ? 4096u : 128u,timed,0,&out)==2);
+      assert(out.progressed>0 && out.references==0);
+      assert(compact_scalar(db,"SELECT COUNT(*) FROM context_reference_projection WHERE candidate_id='resume'")==refs);
+      assert(compact_scalar(db,"SELECT COUNT(*) FROM materialized_artifacts WHERE candidate_id='resume'")==refs+1u);
+      /* A new delivery relationship on an ALREADY checked edge invalidates
+       * the cursor; the next proof must start again and preserve every byte. */
+      compact_exec(db,"UPDATE candidate_context_refs SET upload_status='pending' WHERE candidate_id='resume' AND fact_id='f000001';");
+      if(format) compact_exec(db,"UPDATE compact_context_refs SET upload_status='pending' WHERE candidate_key=(SELECT id FROM context_candidates WHERE candidate_id='resume') "
+          "AND fact_key=(SELECT id FROM context_fact_keys WHERE fact_id='f000001');");
+      assert(compact_scalar(db,"SELECT COUNT(*) FROM context_retirement_progress")==0);
+      int rc=2;
+      for(unsigned i=0;i<256 && rc==2;++i) rc=retirement_test_step(&store,4096u,0,0,&out);
+      assert(rc==1 && compact_scalar(db,"SELECT COUNT(*) FROM context_reference_projection WHERE candidate_id='resume'")==refs);
+      compact_exec(db,"UPDATE candidate_context_refs SET upload_status='local_manifest' WHERE candidate_id='resume';");
+      if(format) compact_exec(db,"UPDATE compact_context_refs SET upload_status='local_manifest' WHERE candidate_key=(SELECT id FROM context_candidates WHERE candidate_id='resume');");
+      sqlite3 *reader=NULL;assert(sqlite3_open(path,&reader)==SQLITE_OK);
+      compact_exec(reader,"BEGIN;");
+      assert(compact_scalar(reader,"SELECT COUNT(*) FROM materialized_artifacts WHERE candidate_id='resume'")==refs+1u);
+      while(compact_scalar(db,"SELECT COUNT(*) FROM context_retirement_progress WHERE phase=2")==0) {
+        assert(++turns<256);
+        rc=retirement_test_step(&store,timed ? 4096u : 128u,timed,1,&out);
+        assert(rc==2 && out.progressed>0); removed+=out.references; ++interrupted;
+      }
+      assert(compact_scalar(db,"SELECT COUNT(*) FROM materialized_artifacts WHERE candidate_id='resume'")==0);
+      assert(compact_scalar(db,"SELECT reason FROM context_retirement_progress WHERE candidate_id='resume'")==1);
+      /* A pinned WAL snapshot keeps the original complete evidence. */
+      assert(compact_scalar(reader,"SELECT COUNT(*) FROM materialized_artifacts WHERE candidate_id='resume'")==refs+1u);
+      compact_exec(reader,"COMMIT;");assert(sqlite3_close(reader)==SQLITE_OK);
+      assert(sqlite3_exec(db,"UPDATE p0_candidates SET local_retention_state='retained' WHERE candidate_id='resume';",NULL,NULL,NULL)!=SQLITE_OK);
+      assert(sqlite3_exec(db,"UPDATE artifacts SET upload_status='pending' WHERE candidate_id='resume';",NULL,NULL,NULL)!=SQLITE_OK);
+      assert(sqlite3_exec(db,"UPDATE candidate_context_refs SET upload_status='pending' WHERE candidate_id='resume';",NULL,NULL,NULL)!=SQLITE_OK ||
+          compact_scalar(db,"SELECT COUNT(*) FROM candidate_context_refs WHERE candidate_id='resume'")==0);
+      if(format) assert(sqlite3_exec(db,"UPDATE compact_context_refs SET upload_status='pending' WHERE candidate_key=(SELECT id FROM context_candidates WHERE candidate_id='resume');",NULL,NULL,NULL)!=SQLITE_OK ||
+          compact_scalar(db,"SELECT COUNT(*) FROM compact_context_refs WHERE candidate_key=(SELECT id FROM context_candidates WHERE candidate_id='resume')")==0);
+      /* One failed drain transaction cannot lose its already committed cursor. */
+      int64_t before=compact_scalar(db,"SELECT COUNT(*) FROM context_reference_projection WHERE candidate_id='resume'");
+      compact_exec(db,"CREATE TRIGGER progress_fault BEFORE DELETE ON context_facts BEGIN SELECT RAISE(ABORT,'synthetic drain failure'); END;");
+      assert(retirement_test_step(&store,128u,0,0,&out)==-1);
+      assert(compact_scalar(db,"SELECT COUNT(*) FROM context_reference_projection WHERE candidate_id='resume'")==before);
+      compact_exec(db,"DROP TRIGGER progress_fault;");
+      assert(sqlite3_close(db)==SQLITE_OK);
+      if(!timed) {
+        for(int crash=0;crash<=1;++crash) {
+          run_cache_crash_child(path,"--crash-retirement-progress",crash);
+          assert(sqlite3_open(path,&db)==SQLITE_OK);
+          int64_t after=compact_scalar(db,"SELECT COUNT(*) FROM context_reference_projection WHERE candidate_id='resume'");
+          assert(crash ? after<before : after==before);
+          removed+=(unsigned)(before-after);before=after;
+          assert(sqlite3_close(db)==SQLITE_OK);
+        }
+      }
+      /* Actual cache startup accepts the durable drain marker. Resource pressure
+       * suppresses maintenance here so the persisted state can be inspected. */
+      s_test_pressure=true;assert(test_open_legacy_context(path,32,1)==0);
+      char output[2048];
+      EdrParentContextQuery q={"retention-tenant","retention-endpoint","resume",42,123,
+          UINT64_C(133444000000000000),old-1,old+1,now/1000000+60000,EDR_PARENT_CONTEXT_FIELD_NAME};
+      assert(edr_local_evidence_cache_query_parent_context_json(&q,output,sizeof(output))==0);
+      assert(strstr(output,"unavailable_or_expired") && strstr(output,"\"absence_is_evidence\":false"));
+      edr_local_evidence_cache_close();s_test_pressure=false;
+      assert(sqlite3_open(path,&db)==SQLITE_OK);assert(edr_context_store_open(&store,db)==0);
+      do {
+        assert(++turns<512);
+        rc=retirement_test_step(&store,timed ? 4096u : 128u,timed,0,&out);
+        assert(rc==0 || rc==2);assert(out.progressed>0);
+        assert(out.pressure==1); /* pressure may subside during physical drain */
+        removed+=out.references;if(rc==2)++interrupted;
+      } while(rc==2);
+      assert(removed==refs);
+      assert(compact_scalar(db,"SELECT COUNT(*) FROM context_retirement_progress")==0);
+      assert(compact_scalar(db,"SELECT COUNT(*) FROM p0_candidates WHERE candidate_id='resume'")==0);
+      assert(compact_scalar(db,"SELECT COUNT(*) FROM context_facts")==1);
+      assert(compact_scalar(db,"SELECT COUNT(*) FROM pragma_foreign_key_check")==0);
+      assert(compact_scalar(db,"SELECT COUNT(*) FROM (SELECT * FROM progress_expected EXCEPT SELECT * FROM materialized_artifacts)")==0);
+      assert(compact_scalar(db,"SELECT COUNT(*) FROM (SELECT * FROM materialized_artifacts WHERE candidate_id='unknown-keep' EXCEPT SELECT * FROM progress_expected)")==0);
+      printf("retirement_progress format=%d refs=%u deadline=%d turns=%u yields=%u resumed=1 shared_fact=1 pending_protected=1\n",format,refs,timed,turns,interrupted);
+      assert(sqlite3_close(db)==SQLITE_OK);cleanup_test_sqlite_path(path);
+    }
+  }
+  edr_local_evidence_cache_test_set_now_unix_ns(0);
 }
 
 static void test_compact_process_crash_recovery(void) {
@@ -10206,6 +10376,43 @@ static void test_candidate_retirement_respects_verified_pmfe_generation(void) {
   edr_local_evidence_cache_test_set_now_unix_ns(0);
 }
 
+static void test_retirement_rejects_new_pmfe_owner(void) {
+  const int64_t now=INT64_C(1700007200000000000),old=INT64_C(1700000000000000000);
+  char path[512];sqlite3 *db=NULL;EdrContextStore store;EdrContextRetirement out;
+  EdrBehaviorRecord *original=calloc(1,sizeof(*original));uint8_t *wire=malloc(EDR_EGRESS_FRAME_MAX);
+  assert(original && wire && make_test_sqlite_path(path,sizeof(path))==0);
+  edr_local_evidence_cache_test_set_now_unix_ns(now);
+  assert(edr_local_evidence_cache_open(path,32,1)==0);
+  pmfe_fixture_original(original,89);
+  assert(sqlite3_open(path,&db)==SQLITE_OK);
+  retention_group_fixture(db,"resume",1,old,old,old+1);
+  char *query=sqlite3_mprintf("UPDATE p0_candidates SET endpoint_id=%Q,tenant_id=%Q,pid=%u,process_start_key='%llu',"
+      "process_creation_filetime_100ns='%llu' WHERE candidate_id='resume';"
+      "UPDATE artifacts SET endpoint_id=%Q,tenant_id=%Q WHERE candidate_id='resume';"
+      "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<123) "
+      "INSERT INTO context_facts SELECT printf('f%%06d',x),%Q,%Q,'{}',1,1 FROM n;"
+      "INSERT INTO candidate_context_refs SELECT fact_id,'resume',fact_id,'\"resume\"',1,'local_manifest','' FROM context_facts;",
+      original->endpoint_id,original->tenant_id,original->pid,(unsigned long long)original->process_start_key,
+      (unsigned long long)original->process_creation_filetime_100ns,original->endpoint_id,original->tenant_id,
+      original->endpoint_id,original->tenant_id);
+  assert(query);compact_exec(db,query);sqlite3_free(query);
+  assert(edr_context_store_open(&store,db)==0);
+  unsigned turns=0;
+  while(!compact_scalar(db,"SELECT COUNT(*) FROM context_retirement_progress WHERE phase=2")) {
+    assert(++turns<64);assert(retirement_test_step(&store,128,0,0,&out)==2);
+  }
+  int64_t refs=compact_scalar(db,"SELECT COUNT(*) FROM context_reference_projection WHERE candidate_id='resume'");
+  size_t size=edr_behavior_record_encode_protobuf(original,wire,EDR_EGRESS_FRAME_MAX);assert(size>0);
+  EdrPmfeFollowupTask task;
+  assert(edr_local_evidence_cache_pmfe_prepare(original,"sc-local-89",wire,size,0,0,&task)<0);
+  EdrEvidenceCacheStatus status;edr_local_evidence_cache_get_status(&status);
+  assert(status.pmfe_cause_code==3u && strstr(status.last_error,"retirement in progress"));
+  assert(compact_scalar(db,"SELECT COUNT(*) FROM artifacts WHERE artifact_type='pmfe_followup_local_v1'")==0);
+  assert(compact_scalar(db,"SELECT COUNT(*) FROM context_reference_projection WHERE candidate_id='resume'")==refs);
+  assert(sqlite3_close(db)==SQLITE_OK);edr_local_evidence_cache_close();cleanup_test_sqlite_path(path);
+  edr_local_evidence_cache_test_set_now_unix_ns(0);free(original);free(wire);
+}
+
 static void pmfe_crash_child(const char *path,int phase) {
   edr_local_evidence_cache_test_set_now_unix_ns(1700000000000000000LL);
   assert(edr_local_evidence_cache_open(path,32u,24u)==0);
@@ -10640,10 +10847,8 @@ static void test_normal_alert_parent_context_retention(void) {
       assert(sqlite3_step(st) == SQLITE_ROW);
       char candidate[160]; snprintf(candidate, sizeof(candidate), "%s", sqlite3_column_text(st, 0)); sqlite3_finalize(st);
       compact_exec(db, "BEGIN IMMEDIATE;");
-      char *sql = sqlite3_mprintf("UPDATE p0_candidates SET local_retention_state='retirement_eligible' WHERE candidate_id=%Q", candidate);
-      assert(sql); compact_exec(db, sql); sqlite3_free(sql);
       EdrContextRetirement retired;
-      assert(edr_context_store_retire_candidate(&store, candidate, 128u, 1024u * 1024u, NULL, NULL, &retired) == 0);
+      assert(edr_context_store_retire_candidate(&store, candidate, 0, 128u, 1024u * 1024u, NULL, NULL, &retired) == 0);
       compact_exec(db, "COMMIT;");
       assert(retired.candidates == 1u && retired.references == 1u && retired.facts == 1u);
       assert(compact_scalar(db, "SELECT COUNT(*) FROM context_facts") == 1);
@@ -13703,6 +13908,12 @@ int main(int argc, char **argv) {
   if (argc == 2 && strcmp(argv[1], "--pmfe-query-cost") == 0) {
     test_pmfe_recovery_query_cost_and_index_upgrade(); return 0;
   }
+  if (argc == 2 && strcmp(argv[1], "--retirement-progress") == 0) {
+    test_candidate_retirement_resumable(); test_retirement_rejects_new_pmfe_owner(); return 0;
+  }
+  if (argc == 4 && strcmp(argv[1], "--crash-retirement-progress") == 0) {
+    retirement_progress_crash_child(argv[2],atoi(argv[3])); return 1;
+  }
   if (argc == 4 && strcmp(argv[1], "--crash-cache-migration") == 0) {
     migration_crash_child(argv[2], atoi(argv[3])); return 1;
   }
@@ -13789,6 +14000,8 @@ int main(int argc, char **argv) {
   RUN_CACHE_CASE("retention", test_candidate_group_delete_and_commit_rollback());
   RUN_CACHE_CASE("retention", test_candidate_retention_writer_does_not_promote_legacy());
   RUN_CACHE_CASE("retention", test_candidate_group_oversize_and_active_window());
+  RUN_CACHE_CASE("retention", test_candidate_retirement_resumable());
+  RUN_CACHE_CASE("retention", test_retirement_rejects_new_pmfe_owner());
   RUN_CACHE_CASE("retention", test_retention_accounting_maximum_width_is_bounded());
   RUN_CACHE_CASE("retention", test_candidate_retirement_cursor_skips_protected_prefix());
   RUN_CACHE_CASE("retention", test_context_prepared_before_pressure_cannot_resurrect_retired_group());

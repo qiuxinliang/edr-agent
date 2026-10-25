@@ -135,13 +135,15 @@ static int views(EdrContextStore *s) {
       "CREATE VIEW materialized_artifacts AS "
       "SELECT artifact_id,endpoint_id,tenant_id,candidate_id,artifact_type,path,sha256,"
       "manifest_json,created_ns,upload_status,minio_key FROM artifacts a "
-      "WHERE a.artifact_type<>'post_context' OR NOT EXISTS ("
-      "SELECT 1 FROM context_reference_projection r WHERE r.artifact_id=a.artifact_id) "
+      "WHERE NOT EXISTS(SELECT 1 FROM p0_candidates p WHERE p.candidate_id=a.candidate_id AND p.local_retention_state='retirement_eligible') "
+      "AND (a.artifact_type<>'post_context' OR NOT EXISTS ("
+      "SELECT 1 FROM context_reference_projection r WHERE r.artifact_id=a.artifact_id)) "
       "UNION ALL SELECT r.artifact_id,f.endpoint_id,f.tenant_id,r.candidate_id,'post_context','','',"
       "replace(f.manifest_template_json,'\"candidate_id\":null','\"candidate_id\":'||r.candidate_id_json),"
       "CASE WHEN f.updated_ns>r.created_ns THEN f.updated_ns ELSE r.created_ns END,"
       "r.upload_status,r.minio_key FROM context_reference_projection r "
-      "JOIN context_facts f ON f.fact_id=r.fact_id;");
+      "JOIN context_facts f ON f.fact_id=r.fact_id WHERE NOT EXISTS(SELECT 1 FROM p0_candidates p "
+      "WHERE p.candidate_id=r.candidate_id AND p.local_retention_state='retirement_eligible');");
 }
 
 int edr_context_store_check_format(EdrContextStore *s, sqlite3 *db) {
@@ -171,7 +173,74 @@ int edr_context_store_open(EdrContextStore *s, sqlite3 *db) {
   return 0;
 }
 
+/* At most one small progress row per existing policy owner; no payloads or
+ * tombstones. Validation cursors are disposable, physical-drain intent is not.
+ * Replays, delivery changes and scope changes invalidate proof before deletion.
+ * Once logically retired, a candidate cannot acquire a new delivery/reference.
+ * Shared fact payload updates remain legal: their scope and references, rather
+ * than payload age, determine whether the fact can be physically removed. */
+static int retirement_progress_schema(EdrContextStore *s) {
+  if (sql(s,
+      "CREATE TABLE IF NOT EXISTS context_retirement_progress("
+      "candidate_id TEXT PRIMARY KEY REFERENCES p0_candidates(candidate_id) ON DELETE CASCADE,"
+      "phase INTEGER NOT NULL CHECK(phase BETWEEN 0 AND 2),reason INTEGER NOT NULL CHECK(reason IN(0,1)),"
+      "legacy_cursor TEXT NOT NULL DEFAULT '',compact_cursor INTEGER NOT NULL DEFAULT 0 CHECK(compact_cursor>=0));"
+      "CREATE TRIGGER IF NOT EXISTS retirement_progress_candidate_write BEFORE UPDATE ON p0_candidates "
+      "WHEN OLD.local_retention_state='retirement_eligible' "
+      "BEGIN SELECT RAISE(ABORT,'candidate retirement in progress'); END;"
+      "CREATE TRIGGER IF NOT EXISTS retirement_progress_candidate_invalidate AFTER UPDATE ON p0_candidates "
+      "BEGIN DELETE FROM context_retirement_progress WHERE candidate_id=OLD.candidate_id AND phase<2; END;"
+      "CREATE TRIGGER IF NOT EXISTS retirement_progress_fact_scope BEFORE UPDATE OF fact_id,endpoint_id,tenant_id ON context_facts "
+      "WHEN (NEW.fact_id IS NOT OLD.fact_id OR NEW.endpoint_id IS NOT OLD.endpoint_id OR NEW.tenant_id IS NOT OLD.tenant_id) "
+      "AND EXISTS(SELECT 1 FROM context_reference_projection r JOIN context_retirement_progress p ON p.candidate_id=r.candidate_id "
+      "WHERE r.fact_id=OLD.fact_id AND p.phase=2) "
+      "BEGIN SELECT RAISE(ABORT,'retiring context fact scope is immutable'); END;"
+      "CREATE TRIGGER IF NOT EXISTS retirement_progress_fact_invalidate AFTER UPDATE OF fact_id,endpoint_id,tenant_id ON context_facts "
+      "WHEN NEW.fact_id IS NOT OLD.fact_id OR NEW.endpoint_id IS NOT OLD.endpoint_id OR NEW.tenant_id IS NOT OLD.tenant_id "
+      "BEGIN DELETE FROM context_retirement_progress WHERE phase<2 AND candidate_id IN("
+      "SELECT candidate_id FROM context_reference_projection WHERE fact_id=OLD.fact_id OR fact_id=NEW.fact_id); END;") != 0) return -1;
+  static const struct { const char *table, *owner; } tables[] = {
+    {"artifacts", "%s.candidate_id"},
+    {"candidate_context_refs", "%s.candidate_id"},
+    {"context_candidates", "%s.candidate_id"},
+    {"compact_context_refs", "(SELECT candidate_id FROM context_candidates WHERE id=%s.candidate_key)"}
+  };
+  for (unsigned i=0; i<(s->format ? 4u : 2u); ++i) {
+    char *old=sqlite3_mprintf(tables[i].owner,"OLD"), *fresh=sqlite3_mprintf(tables[i].owner,"NEW");
+    if (!old || !fresh) { sqlite3_free(old); sqlite3_free(fresh); return -1; }
+    for (unsigned op=0; op<3; ++op) {
+      const char *event=op==0 ? "INSERT" : op==1 ? "UPDATE" : "DELETE";
+      char *statement=sqlite3_mprintf(
+          "CREATE TRIGGER IF NOT EXISTS retirement_progress_%s_%s AFTER %s ON %s "
+          "BEGIN DELETE FROM context_retirement_progress WHERE phase<2 AND (candidate_id=%s OR candidate_id=%s); END;",
+          tables[i].table,event,event,tables[i].table,op==0 ? fresh : old,op==2 ? old : fresh);
+      int rc=statement ? sql(s,statement) : -1; sqlite3_free(statement);
+      if (!rc && op<2) {
+        statement=sqlite3_mprintf(
+          "CREATE TRIGGER IF NOT EXISTS retirement_freeze_%s_%s BEFORE %s ON %s "
+          "WHEN EXISTS(SELECT 1 FROM p0_candidates WHERE local_retention_state='retirement_eligible' "
+          "AND (candidate_id=%s OR candidate_id=%s)) "
+          "BEGIN SELECT RAISE(ABORT,'candidate retirement in progress'); END;",
+          tables[i].table,event,event,tables[i].table,op==0 ? fresh : old,fresh);
+        rc=statement ? sql(s,statement) : -1; sqlite3_free(statement);
+      }
+      if (rc) { sqlite3_free(old); sqlite3_free(fresh); return -1; }
+    }
+    sqlite3_free(old); sqlite3_free(fresh);
+  }
+  if (s->format && sql(s,
+      "CREATE TRIGGER IF NOT EXISTS retirement_progress_fact_key_update BEFORE UPDATE ON context_fact_keys "
+      "WHEN EXISTS(SELECT 1 FROM compact_context_refs r JOIN context_candidates c ON c.id=r.candidate_key "
+      "JOIN context_retirement_progress p ON p.candidate_id=c.candidate_id WHERE r.fact_key=OLD.id AND p.phase=2) "
+      "BEGIN SELECT RAISE(ABORT,'retiring fact dictionary is immutable'); END;"
+      "CREATE TRIGGER IF NOT EXISTS retirement_progress_fact_key_invalidate AFTER UPDATE ON context_fact_keys "
+      "BEGIN DELETE FROM context_retirement_progress WHERE phase<2 AND candidate_id IN(SELECT c.candidate_id "
+      "FROM compact_context_refs r JOIN context_candidates c ON c.id=r.candidate_key WHERE r.fact_key IN(OLD.id,NEW.id)); END;")!=0) return -1;
+  return 0;
+}
+
 int edr_context_store_install_retention_guards(EdrContextStore *s) {
+  if (retirement_progress_schema(s) != 0) return -1;
   if (sql(s,
       "CREATE TRIGGER IF NOT EXISTS candidate_retention_delete BEFORE DELETE ON p0_candidates "
       "WHEN NOT(OLD.retention_policy_version=1 AND OLD.local_retention_state='retirement_eligible') "
@@ -573,12 +642,6 @@ rollback:
   sqlite3_exec(s->db, "ROLLBACK", NULL, NULL, NULL); return -1;
 }
 
-typedef struct {
-  sqlite3_int64 id;
-  char *fact;
-  int compact;
-} RetirementRef;
-
 static int retirement_error(EdrContextStore *s, const char *cause, int result) {
   snprintf(s->error, sizeof(s->error), "%s", cause);
   return result;
@@ -625,11 +688,6 @@ static int retirement_charge(sqlite3_stmt *st, unsigned *rows, uint64_t *bytes,
   return 0;
 }
 
-static int retirement_ref_compare(const void *a, const void *b) {
-  return strcmp(((const RetirementRef *)a)->fact,
-                ((const RetirementRef *)b)->fact);
-}
-
 static int retirement_json_identity(EdrContextStore *s, const char *json,
                                      const char *candidate) {
   /* cJSON strings are NUL-terminated. Do not let an encoded NUL make an
@@ -643,37 +701,56 @@ static int retirement_json_identity(EdrContextStore *s, const char *json,
   return valid ? 0 : retirement_error(s, "retirement context candidate identity invalid", -1);
 }
 
-/* This helper deliberately leaves both the existing raw-reference eviction
- * API and compact migration unchanged. Production candidate retirement uses
- * an entire, preflighted group and never commits a partial reference prefix. */
+static int retirement_save_progress(EdrContextStore *s, const char *id, int phase, int pressure,
+                                     const char *legacy, sqlite3_int64 compact) {
+  sqlite3_stmt *st=NULL;
+  if (prepare(s,&st,"INSERT INTO context_retirement_progress(candidate_id,phase,legacy_cursor,compact_cursor,reason) "
+      "VALUES(?1,?2,?3,?4,?5) ON CONFLICT(candidate_id) DO UPDATE SET phase=excluded.phase,reason=excluded.reason,"
+      "legacy_cursor=excluded.legacy_cursor,compact_cursor=excluded.compact_cursor;") != 0) return -1;
+  int rc=text(st,1,id)==SQLITE_OK && sqlite3_bind_int(st,2,phase)==SQLITE_OK &&
+      text(st,3,legacy)==SQLITE_OK && sqlite3_bind_int64(st,4,compact)==SQLITE_OK && sqlite3_bind_int(st,5,pressure!=0)==SQLITE_OK && sqlite3_step(st)==SQLITE_DONE;
+  sqlite3_finalize(st);
+  return rc ? 0 : fail(s,"save retirement progress failed");
+}
+
+/* Proof advances by indexed reference identity, with no deletion until both
+ * layouts have been proved. Every intervening owner/reference mutation drops
+ * that proof. Logical retirement and the phase-2 marker commit atomically;
+ * readers then report unavailable, and frozen ownership prevents resurrection.
+ * Each drain unit removes one edge and only its now-unreferenced fact/keys.
+ * A deadline stops BETWEEN units, preserving committed progress on restart. */
 int edr_context_store_retire_candidate(EdrContextStore *s,
-                                       const char *candidate_id,
+                                       const char *candidate_id, int pressure,
                                        unsigned max_rows, uint64_t max_bytes,
                                        int (*yield_required)(void *), void *yield_context,
                                        EdrContextRetirement *out) {
-  sqlite3_stmt *st = NULL;
-  RetirementRef *refs = NULL;
-  char *endpoint = NULL, *tenant = NULL, *bundle = NULL;
-  sqlite3_int64 candidate_rowid = 0, bundle_rowid = 0, candidate_key = 0;
-  unsigned rows = 0, ref_count = 0;
-  uint64_t bytes = 0;
-  int result = -1, savepoint = 0, rc;
-  EdrContextRetirement counts = {0};
-  if (out) memset(out, 0, sizeof(*out));
+  sqlite3_stmt *st=NULL, *ref=NULL;
+  char *endpoint=NULL, *tenant=NULL, *bundle=NULL, *legacy=NULL;
+  sqlite3_int64 candidate_rowid=0, bundle_rowid=0, candidate_key=0, cursor=0;
+  unsigned rows=0; uint64_t bytes=0;
+  int result=-1, rc, phase=0, saved=0;
+  EdrContextRetirement counts={0};
+  if (out) memset(out,0,sizeof(*out));
   if (!s || !s->db || !out || !candidate_id || !candidate_id[0] ||
-      !max_rows || max_rows > 4096u || !max_bytes ||
-      sqlite3_get_autocommit(s->db)) {
-    if (s) retirement_error(s, "candidate retirement requires a bounded caller transaction", -1);
+      !max_rows || max_rows>4096u || !max_bytes || sqlite3_get_autocommit(s->db)) {
+    if (s) retirement_error(s,"candidate retirement requires a bounded caller transaction",-1);
     return -1;
   }
-  if (sql(s, "SAVEPOINT context_candidate_retirement;") != 0) return -1;
-  savepoint = 1;
-  refs = calloc(max_rows, sizeof(*refs));
-  bundle = sqlite3_mprintf("%s:p0_context_bundle:candidate", candidate_id);
-  if (!refs || !bundle) {
-    retirement_error(s, "candidate retirement allocation failed", -1);
-    goto done;
-  }
+  if (sql(s,"SAVEPOINT context_candidate_retirement;") != 0) return -1;
+  bundle=sqlite3_mprintf("%s:p0_context_bundle:candidate",candidate_id);
+  if (prepare(s,&st,"SELECT phase,legacy_cursor,compact_cursor,reason FROM context_retirement_progress WHERE candidate_id=?;") != 0) goto done;
+  if (text(st,1,candidate_id)!=SQLITE_OK) goto storage_failed;
+  rc=sqlite3_step(st);
+  if (rc==SQLITE_ROW) {
+    phase=sqlite3_column_int(st,0); cursor=sqlite3_column_int64(st,2);
+    if (phase==2) pressure=sqlite3_column_int(st,3);
+    const char *value=retirement_text(st,1);
+    if (phase<0 || phase>2 || cursor<0 || !value) { retirement_error(s,"invalid retirement progress; evidence preserved",-1); goto done; }
+    legacy=sqlite3_mprintf("%s",value); saved=1;
+  } else if (rc==SQLITE_DONE) legacy=sqlite3_mprintf("");
+  else goto storage_failed;
+  sqlite3_finalize(st); st=NULL;
+  if (!bundle || !legacy) { retirement_error(s,"retirement progress allocation failed",-1); goto done; }
   if (prepare(s, &st, "SELECT rowid,* FROM p0_candidates WHERE candidate_id=?;") != 0)
     goto done;
   if (text(st, 1, candidate_id) != SQLITE_OK || (rc = sqlite3_step(st)) != SQLITE_ROW) {
@@ -682,11 +759,11 @@ int edr_context_store_retire_candidate(EdrContextStore *s,
     else retirement_error(s, "retirement candidate identity unavailable", -1);
     goto done;
   }
-  if (retirement_charge(st, &rows, &bytes, max_rows, max_bytes)) goto over_budget;
+  if (retirement_charge(st, &rows, &bytes, max_rows, max_bytes)) goto unfinished;
   int policy = retirement_column(st, "retention_policy_version");
   if (policy < 0 || sqlite3_column_type(st, policy) != SQLITE_INTEGER ||
       sqlite3_column_int64(st, policy) != 1 ||
-      !retirement_equal(st, "local_retention_state", "retirement_eligible")) {
+      !retirement_equal(st, "local_retention_state", phase==2 ? "retirement_eligible" : "retained")) {
     result = retirement_error(s, "candidate retention policy protects this group", 1);
     goto done;
   }
@@ -710,8 +787,8 @@ int edr_context_store_retire_candidate(EdrContextStore *s,
   if (text(st, 1, candidate_id) != SQLITE_OK) { fail(s, "bind retirement artifact failed"); goto done; }
   unsigned bundles = 0;
   while ((rc = sqlite3_step(st)) == SQLITE_ROW) {
-    if (yield_required && yield_required(yield_context)) { rows = max_rows; bytes = max_bytes; goto over_budget; }
-    if (retirement_charge(st, &rows, &bytes, max_rows, max_bytes)) goto over_budget;
+    if (yield_required && yield_required(yield_context)) { goto unfinished; }
+    if (retirement_charge(st, &rows, &bytes, max_rows, max_bytes)) goto unfinished;
     if (!retirement_equal(st, "artifact_type", "p0_context_bundle") ||
         !retirement_equal(st, "artifact_id", bundle) ||
         !retirement_equal(st, "upload_status", "local_manifest") ||
@@ -740,7 +817,7 @@ int edr_context_store_retire_candidate(EdrContextStore *s,
     if (text(st, 1, candidate_id) != SQLITE_OK) { fail(s, "bind retirement dictionary failed"); goto done; }
     rc = sqlite3_step(st);
     if (rc == SQLITE_ROW) {
-      if (retirement_charge(st, &rows, &bytes, max_rows, max_bytes)) goto over_budget;
+      if (retirement_charge(st, &rows, &bytes, max_rows, max_bytes)) goto unfinished;
       candidate_key = sqlite3_column_int64(st, retirement_column(st, "id"));
       if (candidate_key <= 0) {
         retirement_error(s, "retirement candidate dictionary identity invalid", -1);
@@ -752,143 +829,122 @@ int edr_context_store_retire_candidate(EdrContextStore *s,
     sqlite3_finalize(st); st = NULL;
   }
 
-  for (int compact = 0; compact <= (s->format ? 1 : 0); ++compact) {
-    if (compact && !candidate_key) continue;
-    const char *query = compact
-        ? "SELECT r.id,r.candidate_key,r.fact_key,r.source_identity,r.artifact_override,"
-          "r.candidate_json_override,r.created_ns,r.upload_status,r.minio_key,f.fact_id "
-          "FROM compact_context_refs r LEFT JOIN context_fact_keys f ON f.id=r.fact_key "
-          "WHERE r.candidate_key=?1 LIMIT ?2;"
-        : "SELECT rowid,* FROM candidate_context_refs WHERE candidate_id=?1 LIMIT ?2;";
-    if (prepare(s, &st, query) != 0) goto done;
-    if ((compact ? sqlite3_bind_int64(st, 1, candidate_key) : text(st, 1, candidate_id)) != SQLITE_OK ||
-        sqlite3_bind_int(st, 2, (int)max_rows + 1) != SQLITE_OK) {
-      fail(s, "bind retirement references failed"); goto done;
-    }
-    while ((rc = sqlite3_step(st)) == SQLITE_ROW) {
-      if (yield_required && yield_required(yield_context)) {
-        rows = max_rows; bytes = max_bytes; goto over_budget;
-      }
 
-      if (retirement_charge(st, &rows, &bytes, max_rows, max_bytes)) goto over_budget;
-      if (!compact) {
-        const char *artifact = retirement_text(st, retirement_column(st, "artifact_id"));
-        if (!artifact || !artifact[0]) {
-          retirement_error(s, "retirement reference artifact identity invalid", -1);
-          goto done;
-        }
-      } else {
-        int source = retirement_column(st, "source_identity");
-        int override = retirement_column(st, "artifact_override");
-        const char *artifact = retirement_text(st, override);
-        if (!((sqlite3_column_type(st, source) == SQLITE_BLOB &&
-               sqlite3_column_bytes(st, source) == 32 &&
-               sqlite3_column_type(st, override) == SQLITE_NULL) ||
-              (sqlite3_column_type(st, source) == SQLITE_NULL && artifact && artifact[0]))) {
-          retirement_error(s, "retirement compact reference identity invalid", -1);
-          goto done;
-        }
-      }
-      if (!retirement_equal(st, "upload_status", "local_manifest") ||
-          !retirement_equal(st, "minio_key", "")) {
-        result = retirement_error(s, "candidate reference delivery state is protected", 1);
-        goto done;
-      }
-      int json_column = retirement_column(st, compact ? "candidate_json_override" : "candidate_id_json");
-      if ((!compact || sqlite3_column_type(st, json_column) != SQLITE_NULL) &&
-          retirement_json_identity(s, retirement_text(st, json_column), candidate_id) != 0)
-        goto done;
-      const char *fact = retirement_text(st, retirement_column(st, "fact_id"));
-      if (!fact || !fact[0]) {
-        retirement_error(s, "retirement reference fact identity unavailable", -1);
-        goto done;
-      }
-      refs[ref_count].id = sqlite3_column_int64(st, 0);
-      refs[ref_count].compact = compact;
-      refs[ref_count].fact = sqlite3_mprintf("%s", fact);
-      if (!refs[ref_count].fact) {
-        retirement_error(s, "retirement reference allocation failed", -1);
-        goto done;
-      }
-      ++ref_count;
+  int layout=phase==2 ? 0 : phase;
+  for (;;) {
+    if (yield_required && yield_required(yield_context)) goto unfinished;
+    if (rows>=max_rows || bytes>=max_bytes) goto unfinished;
+    if (layout>(s->format ? 1 : 0)) {
+      if (phase==2) break;
+      /* The proof is complete in the current writer transaction. This is the
+       * only point where a retained group becomes unavailable to consumers. */
+      phase=2; layout=0;
+      if (retirement_save_progress(s,candidate_id,phase,pressure,legacy,cursor)!=0) goto done;
+      saved=1;
+      if (prepare(s,&st,"UPDATE p0_candidates SET local_retention_state='retirement_eligible' "
+          "WHERE candidate_id=? AND retention_policy_version=1 AND local_retention_state='retained';")!=0) goto done;
+      if (text(st,1,candidate_id)!=SQLITE_OK || sqlite3_step(st)!=SQLITE_DONE || sqlite3_changes(s->db)!=1) goto storage_failed;
+      sqlite3_finalize(st); st=NULL; ++counts.progressed;
+      continue;
     }
-    if (rc != SQLITE_DONE) { fail(s, "read retirement references failed"); goto done; }
-    sqlite3_finalize(st); st = NULL;
-  }
-  qsort(refs, ref_count, sizeof(*refs), retirement_ref_compare);
-  for (unsigned i = 0; i < ref_count; ++i) {
-    if (yield_required && yield_required(yield_context)) {
-      rows = max_rows; bytes = max_bytes; goto over_budget;
+    int compact=layout;
+    if (compact && !candidate_key) { ++layout; continue; }
+    int first=phase==2 || (compact ? cursor==0 : legacy[0]=='\0');
+    const char *query=compact ? (first ?
+        "SELECT r.id,r.candidate_key,r.fact_key,r.source_identity,r.artifact_override,"
+        "r.candidate_json_override,r.created_ns,r.upload_status,r.minio_key,f.fact_id "
+        "FROM compact_context_refs r LEFT JOIN context_fact_keys f ON f.id=r.fact_key "
+        "WHERE r.candidate_key=?1 ORDER BY r.fact_key LIMIT 1;" :
+        "SELECT r.id,r.candidate_key,r.fact_key,r.source_identity,r.artifact_override,"
+        "r.candidate_json_override,r.created_ns,r.upload_status,r.minio_key,f.fact_id "
+        "FROM compact_context_refs r LEFT JOIN context_fact_keys f ON f.id=r.fact_key "
+        "WHERE r.candidate_key=?1 AND r.fact_key>?2 ORDER BY r.fact_key LIMIT 1;") : (first ?
+        "SELECT rowid,* FROM candidate_context_refs WHERE candidate_id=?1 ORDER BY fact_id LIMIT 1;" :
+        "SELECT rowid,* FROM candidate_context_refs WHERE candidate_id=?1 AND fact_id>?2 ORDER BY fact_id LIMIT 1;");
+    if (prepare(s,&ref,query)!=0) goto done;
+    if ((compact ? sqlite3_bind_int64(ref,1,candidate_key) : text(ref,1,candidate_id))!=SQLITE_OK ||
+        (!first && (compact ? sqlite3_bind_int64(ref,2,cursor) : text(ref,2,legacy))!=SQLITE_OK)) goto storage_failed;
+    rc=sqlite3_step(ref);
+    if (rc==SQLITE_DONE) {
+      sqlite3_finalize(ref); ref=NULL; ++layout;
+      if (phase!=2 && layout<=1) { phase=layout; ++counts.progressed; }
+      continue;
     }
-
-    if (i && !strcmp(refs[i - 1u].fact, refs[i].fact)) continue;
-    if (prepare(s, &st, "SELECT * FROM context_facts WHERE fact_id=?;") != 0) goto done;
-    if (text(st, 1, refs[i].fact) != SQLITE_OK || sqlite3_step(st) != SQLITE_ROW) {
-      retirement_error(s, "retirement referenced fact unavailable", -1); goto done;
+    if (rc!=SQLITE_ROW) goto storage_failed;
+    if (retirement_charge(ref,&rows,&bytes,max_rows,max_bytes)) goto unfinished;
+    if (!compact) {
+      const char *artifact=retirement_text(ref,retirement_column(ref,"artifact_id"));
+      if (!artifact || !artifact[0]) { retirement_error(s,"retirement reference artifact identity invalid",-1); goto done; }
+    } else {
+      int source=retirement_column(ref,"source_identity"), override=retirement_column(ref,"artifact_override");
+      const char *artifact=retirement_text(ref,override);
+      if (!((sqlite3_column_type(ref,source)==SQLITE_BLOB && sqlite3_column_bytes(ref,source)==32 &&
+             sqlite3_column_type(ref,override)==SQLITE_NULL) ||
+            (sqlite3_column_type(ref,source)==SQLITE_NULL && artifact && artifact[0]))) {
+        retirement_error(s,"retirement compact reference identity invalid",-1); goto done;
+      }
     }
-    if (retirement_charge(st, &rows, &bytes, max_rows, max_bytes)) goto over_budget;
-    if (!retirement_equal(st, "endpoint_id", endpoint) ||
-        !retirement_equal(st, "tenant_id", tenant)) {
-      result = retirement_error(s, "retirement fact belongs to another scope", 1);
-      goto done;
+    if (!retirement_equal(ref,"upload_status","local_manifest") || !retirement_equal(ref,"minio_key","")) {
+      result=retirement_error(s,"candidate reference delivery state is protected",1); goto done;
     }
-    sqlite3_finalize(st); st = NULL;
+    int json=retirement_column(ref,compact ? "candidate_json_override" : "candidate_id_json");
+    if ((!compact || sqlite3_column_type(ref,json)!=SQLITE_NULL) &&
+        retirement_json_identity(s,retirement_text(ref,json),candidate_id)!=0) goto done;
+    const char *fact=retirement_text(ref,retirement_column(ref,"fact_id"));
+    if (!fact || !fact[0]) { retirement_error(s,"retirement reference fact identity unavailable",-1); goto done; }
+    sqlite3_int64 ref_id=sqlite3_column_int64(ref,0);
+    sqlite3_int64 fact_key=compact ? sqlite3_column_int64(ref,retirement_column(ref,"fact_key")) : 0;
+    if (compact && fact_key<=0) { retirement_error(s,"retirement fact dictionary identity invalid",-1); goto done; }
+    if (prepare(s,&st,"SELECT * FROM context_facts WHERE fact_id=?;")!=0) goto done;
+    if (text(st,1,fact)!=SQLITE_OK || sqlite3_step(st)!=SQLITE_ROW) {
+      retirement_error(s,"retirement referenced fact unavailable",-1); goto done;
+    }
+    if (retirement_charge(st,&rows,&bytes,max_rows,max_bytes)) goto unfinished;
+    if (!retirement_equal(st,"endpoint_id",endpoint) || !retirement_equal(st,"tenant_id",tenant)) {
+      result=retirement_error(s,"retirement fact belongs to another scope",1); goto done;
+    }
+    sqlite3_finalize(st); st=NULL;
     if (s->format) {
-      if (prepare(s, &st, "SELECT * FROM context_fact_keys WHERE fact_id=?;") != 0) goto done;
-      if (text(st, 1, refs[i].fact) != SQLITE_OK) { fail(s, "bind retirement fact key failed"); goto done; }
-      rc = sqlite3_step(st);
-      if (rc == SQLITE_ROW) {
-        if (retirement_charge(st, &rows, &bytes, max_rows, max_bytes)) goto over_budget;
-      } else if (rc != SQLITE_DONE) { fail(s, "read retirement fact key failed"); goto done; }
-      sqlite3_finalize(st); st = NULL;
+      if (prepare(s,&st,"SELECT * FROM context_fact_keys WHERE fact_id=?;")!=0) goto done;
+      if (text(st,1,fact)!=SQLITE_OK) goto storage_failed;
+      rc=sqlite3_step(st);
+      if (rc==SQLITE_ROW) {
+        if (retirement_charge(st,&rows,&bytes,max_rows,max_bytes)) goto unfinished;
+      } else if (rc!=SQLITE_DONE) goto storage_failed;
+      sqlite3_finalize(st); st=NULL;
     }
-  }
-
-  /* All identities, ownership and work limits are proven before the first
-   * DELETE. Shared facts remain until both reference layouts release them. */
-  for (unsigned i = 0; i < ref_count; ++i) {
-    if (yield_required && yield_required(yield_context)) {
-      rows = max_rows; bytes = max_bytes; goto over_budget;
-    }
-
-    const char *query = refs[i].compact
-        ? "DELETE FROM compact_context_refs WHERE id=?1 AND candidate_key=?2;"
-        : "DELETE FROM candidate_context_refs WHERE rowid=?1 AND candidate_id=?2;";
-    if (prepare(s, &st, query) != 0) goto done;
-    if (sqlite3_bind_int64(st, 1, refs[i].id) != SQLITE_OK ||
-        (refs[i].compact ? sqlite3_bind_int64(st, 2, candidate_key) : text(st, 2, candidate_id)) != SQLITE_OK ||
-        sqlite3_step(st) != SQLITE_DONE || sqlite3_changes(s->db) != 1) {
-      fail(s, "delete retirement reference failed"); goto done;
-    }
-    sqlite3_finalize(st); st = NULL;
-  }
-  for (unsigned i = 0; i < ref_count; ++i) {
-    if (yield_required && yield_required(yield_context)) {
-      rows = max_rows; bytes = max_bytes; goto over_budget;
-    }
-
-    if (i && !strcmp(refs[i - 1u].fact, refs[i].fact)) continue;
-    if (s->format) {
-      if (prepare(s, &st, "DELETE FROM context_fact_keys WHERE fact_id=? AND NOT EXISTS("
-          "SELECT 1 FROM compact_context_refs r WHERE r.fact_key=context_fact_keys.id);") != 0)
-        goto done;
-      if (text(st, 1, refs[i].fact) != SQLITE_OK || sqlite3_step(st) != SQLITE_DONE) {
-        fail(s, "delete retirement fact key failed"); goto done;
+    /* A complete unit has been proved and charged. Do not yield between its
+     * edge and fact/key deletion; an I/O error rolls back this whole slice. */
+    if (phase==2) {
+      query=compact ? "DELETE FROM compact_context_refs WHERE id=?1 AND candidate_key=?2;" :
+          "DELETE FROM candidate_context_refs WHERE rowid=?1 AND candidate_id=?2;";
+      if (prepare(s,&st,query)!=0) goto done;
+      if (sqlite3_bind_int64(st,1,ref_id)!=SQLITE_OK ||
+          (compact ? sqlite3_bind_int64(st,2,candidate_key) : text(st,2,candidate_id))!=SQLITE_OK ||
+          sqlite3_step(st)!=SQLITE_DONE || sqlite3_changes(s->db)!=1) goto storage_failed;
+      sqlite3_finalize(st); st=NULL; ++counts.references;
+      if (s->format) {
+        if (prepare(s,&st,"DELETE FROM context_fact_keys WHERE fact_id=? AND NOT EXISTS("
+            "SELECT 1 FROM compact_context_refs r WHERE r.fact_key=context_fact_keys.id);")!=0) goto done;
+        if (text(st,1,fact)!=SQLITE_OK || sqlite3_step(st)!=SQLITE_DONE) goto storage_failed;
+        sqlite3_finalize(st); st=NULL;
       }
-      sqlite3_finalize(st); st = NULL;
-    }
-    const char *query = s->format
-        ? "DELETE FROM context_facts WHERE fact_id=? AND NOT EXISTS(SELECT 1 FROM "
+      query=s->format ? "DELETE FROM context_facts WHERE fact_id=? AND NOT EXISTS(SELECT 1 FROM "
           "candidate_context_refs r WHERE r.fact_id=context_facts.fact_id) AND NOT EXISTS("
-          "SELECT 1 FROM context_fact_keys k WHERE k.fact_id=context_facts.fact_id);"
-        : "DELETE FROM context_facts WHERE fact_id=? AND NOT EXISTS(SELECT 1 FROM "
-          "candidate_context_refs r WHERE r.fact_id=context_facts.fact_id);";
-    if (prepare(s, &st, query) != 0) goto done;
-    if (text(st, 1, refs[i].fact) != SQLITE_OK || sqlite3_step(st) != SQLITE_DONE) {
-      fail(s, "delete retirement fact failed"); goto done;
+          "SELECT 1 FROM context_fact_keys k WHERE k.fact_id=context_facts.fact_id);" :
+          "DELETE FROM context_facts WHERE fact_id=? AND NOT EXISTS(SELECT 1 FROM candidate_context_refs r WHERE r.fact_id=context_facts.fact_id);";
+      if (prepare(s,&st,query)!=0) goto done;
+      if (text(st,1,fact)!=SQLITE_OK || sqlite3_step(st)!=SQLITE_DONE) goto storage_failed;
+      counts.facts+=(unsigned)sqlite3_changes(s->db);
+      sqlite3_finalize(st); st=NULL;
+    } else if (compact) cursor=fact_key;
+    else {
+      char *next=sqlite3_mprintf("%s",fact);
+      if (!next) { retirement_error(s,"retirement cursor allocation failed",-1); goto done; }
+      sqlite3_free(legacy); legacy=next;
     }
-    counts.facts += (unsigned)sqlite3_changes(s->db);
-    sqlite3_finalize(st); st = NULL;
+    ++counts.progressed;
+    sqlite3_finalize(ref); ref=NULL;
   }
   if (s->format && candidate_key) {
     if (prepare(s, &st, "DELETE FROM context_candidates WHERE id=?1 AND candidate_id=?2 "
@@ -914,31 +970,32 @@ int edr_context_store_retire_candidate(EdrContextStore *s,
     fail(s, "delete retirement candidate failed"); goto done;
   }
   sqlite3_finalize(st); st = NULL;
-  counts.candidates = 1u; counts.artifacts = 1u;
-  counts.references = ref_count; counts.payload_bytes = bytes; counts.work_rows = rows;
-  result = 0;
-  goto done;
-over_budget:
-  result = retirement_error(s, "candidate group exceeds retirement work budget", 1);
+  counts.candidates=1; counts.artifacts=1; ++counts.progressed;
+  result=0; goto done;
+unfinished:
+  sqlite3_finalize(st); st=NULL; sqlite3_finalize(ref); ref=NULL;
+  if (counts.progressed && retirement_save_progress(s,candidate_id,phase,pressure,legacy,cursor)!=0) goto done;
+  result=2; goto done;
+storage_failed:
+  fail(s,"retirement progress storage failed");
 done:
-  sqlite3_finalize(st);
-  if (savepoint) {
-    if (result != 0 && sql(s, "ROLLBACK TO context_candidate_retirement;") != 0) result = -1;
-    if (sql(s, "RELEASE context_candidate_retirement;") != 0) {
-      result = -1;
-      /* Preserve the release error, while undoing mutations if SQLite kept
-       * the savepoint active. The caller must also roll back on any error. */
-      sqlite3_exec(s->db, "ROLLBACK TO context_candidate_retirement;"
-                         "RELEASE context_candidate_retirement;", NULL, NULL, NULL);
+  sqlite3_finalize(st); sqlite3_finalize(ref);
+  if (result==1 && phase==2) result=-1;
+  if (result<0 || result==1) {
+    if (sql(s,"ROLLBACK TO context_candidate_retirement;")!=0) result=-1;
+    if (result==1 && saved && phase<2) {
+      if (prepare(s,&st,"DELETE FROM context_retirement_progress WHERE candidate_id=? AND phase<2;")!=0 ||
+          text(st,1,candidate_id)!=SQLITE_OK || sqlite3_step(st)!=SQLITE_DONE) result=-1;
+      sqlite3_finalize(st);
     }
+    memset(&counts,0,sizeof(counts));
   }
-  for (unsigned i = 0; i < ref_count; ++i) sqlite3_free(refs[i].fact);
-  free(refs); sqlite3_free(endpoint); sqlite3_free(tenant); sqlite3_free(bundle);
-  if (result == 0) *out = counts;
-  else if (result == 1) {
-    out->work_rows = rows;
-    out->payload_bytes = bytes;
+  if (sql(s,"RELEASE context_candidate_retirement;")!=0) {
+    result=-1;
+    sqlite3_exec(s->db,"ROLLBACK TO context_candidate_retirement;RELEASE context_candidate_retirement;",NULL,NULL,NULL);
   }
+  sqlite3_free(endpoint); sqlite3_free(tenant); sqlite3_free(bundle); sqlite3_free(legacy);
+  if (result>=0) { counts.pressure=pressure!=0; counts.work_rows=rows; counts.payload_bytes=bytes; *out=counts; }
   return result;
 }
 
