@@ -40,7 +40,7 @@ WINDOWS_EXPECTED = {
     "response_file_security_behavior", "response_forensic_path_contract",
     "windows_isolation_mock_behavior", "windows_install_compatibility_behavior", "http_telemetry_budget",
     "windows_release_collector_pe_closure", "windows_inplace_collector_transaction",
-    "windows_update_physical_guard", "windows_updater_health_clock", "windows_updater_stop", "windows_inno_evidence_space",
+    "windows_update_physical_guard", "windows_updater_health_clock", "windows_updater_storage_start", "windows_updater_stop", "windows_inno_evidence_space",
     "windows_updater_task_recovery", "windows_updater_atomic_json", "windows_autorun_acl", "windows_autorun_task",
     "windows_storage_space_preflight",
     "windows_installer_log_redaction",
@@ -208,6 +208,7 @@ class WindowsReleaseGateTests(unittest.TestCase):
             tests = json.loads(listed.stdout)["tests"]
             specs = {
                 "windows_updater_health_clock": (30, "scripts/edr_agent_inplace_update.ps1", "Updater"),
+                "windows_updater_storage_start": (60, "scripts/edr_agent_inplace_update.ps1", "Updater"),
                 "windows_updater_stop": (120, "scripts/edr_agent_inplace_update.ps1", "Updater"),
                 "windows_updater_task_recovery": (60, "scripts/edr_agent_inplace_update.ps1", "Updater"),
                 "windows_updater_atomic_json": (30, "scripts/edr_agent_inplace_update.ps1", "Updater"),
@@ -221,9 +222,11 @@ class WindowsReleaseGateTests(unittest.TestCase):
                 self.assertIn("--unset=PSModulePath", command)
                 self.assertIn("powershell.exe", command)
                 self.assertIn("-NonInteractive", command)
-                if test["name"] in ("windows_updater_health_clock", "windows_updater_stop"):
-                    expected = hashlib.sha256((ROOT / source_file).read_bytes()).hexdigest()
-                    self.assertIn("-UpdaterSha256 '" + expected + "'", command[-1])
+                if test["name"] in ("windows_updater_health_clock", "windows_updater_storage_start", "windows_updater_stop"):
+                    self.assertIn((ROOT / "tests" / ("test_" + test["name"] + ".ps1")).as_posix(), command[-1])
+                    if test["name"] != "windows_updater_storage_start":
+                        expected = hashlib.sha256((ROOT / source_file).read_bytes()).hexdigest()
+                        self.assertIn("-UpdaterSha256 '" + expected + "'", command[-1])
                     self.assertIn("-UpdaterPath '" + (ROOT / source_file).as_posix() + "'", command[-1])
                 else:
                     self.assertEqual(command[command.index("-File") + 1],
@@ -244,7 +247,7 @@ class WindowsReleaseGateTests(unittest.TestCase):
                 self.assertEqual(selected_modules.resolve(), (build / "foreign-powershell-modules").resolve())
 
     def test_updater_and_autorun_are_required_and_failure_blocks_windows_gate(self):
-        for name in ("windows_updater_health_clock", "windows_updater_stop",
+        for name in ("windows_updater_health_clock", "windows_updater_storage_start", "windows_updater_stop",
                      "windows_updater_task_recovery", "windows_updater_atomic_json",
                      "windows_autorun_acl", "windows_autorun_task"):
             with tempfile.TemporaryDirectory() as directory:
