@@ -8179,9 +8179,21 @@ static void test_candidate_group_oversize_and_active_window(void) {
       "INSERT INTO candidate_context_refs(artifact_id,candidate_id,fact_id,candidate_id_json,created_ns,upload_status,minio_key) "
       "SELECT fact_id,'row-oversize',fact_id,'\"row-oversize\"',1,'local_manifest','' FROM context_facts;"
       "UPDATE artifacts SET manifest_json=printf('%05000000d',1) WHERE candidate_id='byte-oversize';");
-  /* Budget spent proving an oversized group is also bounded work; later
-   * groups become reachable through the next keyset slices. */
-  for (unsigned slice=0; slice<64 && compact_scalar(db,"SELECT COUNT(*) FROM p0_candidates WHERE candidate_id='row-oversize'"); ++slice) retention_poll();
+  /* Keep the real 20 ms maintenance deadline. A slice count cannot express
+   * completion latency across filesystems: proof and drain both resume, and
+   * the other maintenance stages also consume turns. Bound this fixture by
+   * elapsed time, then still require complete drainage and protected bytes. */
+  const uint64_t started=soak_monotonic_ns();
+  unsigned slices=0;
+  while (compact_scalar(db,"SELECT COUNT(*) FROM p0_candidates WHERE candidate_id='row-oversize'") &&
+         soak_monotonic_ns()-started<UINT64_C(30000000000)) {
+    retention_poll(); ++slices;
+  }
+  printf("oversize_retirement slices=%u elapsed_ms=%llu remaining_refs=%lld phase=%lld\n",slices,
+      (unsigned long long)((soak_monotonic_ns()-started)/1000000u),
+      (long long)compact_scalar(db,"SELECT COUNT(*) FROM context_reference_projection WHERE candidate_id='row-oversize'"),
+      (long long)compact_scalar(db,"SELECT COALESCE(MAX(phase),-1) FROM context_retirement_progress WHERE candidate_id='row-oversize'"));
+  assert(!fflush(stdout));
   assert(compact_scalar(db,"SELECT COUNT(*) FROM p0_candidates WHERE candidate_id IN ('row-oversize','byte-oversize')")==1);
   assert(compact_scalar(db,"SELECT COUNT(*) FROM p0_candidates WHERE candidate_id='small-after-large'")==0);
   assert(compact_scalar(db,"SELECT COUNT(*) FROM context_reference_projection WHERE candidate_id='row-oversize'")==0);
