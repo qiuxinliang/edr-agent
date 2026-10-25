@@ -62,15 +62,24 @@ EdrError edr_storage_queue_enqueue(const char *id,const uint8_t *wire,size_t len
   if(dir && dir[0]) {char file[1024];snprintf(file,sizeof(file),"%s/frame-%u.pb",dir,frames);FILE *f=fopen(file,"wb");assert(f);assert(fwrite(wire+16,1,len-16,f)==len-16);assert(fclose(f)==0);}
   if(operation_frame) {
     uint64_t original_mask=e->required_evidence_fields;
-    e->required_evidence_fields|=EDR_EVIDENCE_PARENT_NAME;
+    /* The authenticated IR10 operation rules explicitly allow parent_identity
+     * (name only). Keep that positive contract and reject disclosure beyond it. */
+    assert(original_mask & EDR_EVIDENCE_PARENT_NAME);
     e->has_process_context=true;e->process_context.has_parent_name=true;
-    strcpy(e->process_context.parent_name,"UNRELATED-PARENT");
+    strcpy(e->process_context.parent_name,"fixture-parent.exe");
     uint8_t parent_mutated[8192];pb_ostream_t parent_out=pb_ostream_from_buffer(parent_mutated,sizeof(parent_mutated));
+    assert(pb_encode(&parent_out,edr_v1_BehaviorEvent_fields,e));
+    assert(edr_egress_frame_validate(parent_mutated,parent_out.bytes_written,reason,sizeof(reason)));
+    e->required_evidence_fields|=EDR_EVIDENCE_PARENT_PATH;
+    e->process_context.has_parent_path=true;
+    strcpy(e->process_context.parent_path,"C:\\Private\\UNRELATED-PARENT.exe");
+    parent_out=pb_ostream_from_buffer(parent_mutated,sizeof(parent_mutated));
     assert(pb_encode(&parent_out,edr_v1_BehaviorEvent_fields,e));
     assert(!edr_egress_frame_validate(parent_mutated,parent_out.bytes_written,reason,sizeof(reason)));
     assert(!strcmp(reason,"rule_projection_authority_unproven"));
     e->required_evidence_fields=original_mask;
     e->process_context.has_parent_name=false;e->process_context.parent_name[0]=0;
+    e->process_context.has_parent_path=false;e->process_context.parent_path[0]=0;
     e->required_evidence_fields|=EDR_EVIDENCE_COMMAND;
     strcpy(e->cmdline,"UNRELATED-COMMAND");strcpy(e->behavior_alert.cmdline,"UNRELATED-COMMAND");
     uint8_t mutated[8192];pb_ostream_t out=pb_ostream_from_buffer(mutated,sizeof(mutated));
@@ -129,6 +138,8 @@ static void check_case(const char *label,EdrEventType type,const char *name,cons
   }
   unsigned before=frames,local_before=deferred_fake_local_observation_count;
   int emitted=edr_p0_rule_try_emit_with_command_facts(r,&facts);
+  if ((emitted>0)!=want_alert || ((frames-before)>0)!=want_alert)
+    fprintf(stderr,"case=%s expected_alert=%d emitted=%d frames=%u\n",label,want_alert,emitted,frames-before);
   assert((emitted>0)==want_alert && ((frames-before)>0)==want_alert);
   assert(deferred_fake_local_observation_count==local_before);
   EdrDetectionDecision decision={0};

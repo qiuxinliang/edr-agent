@@ -616,7 +616,9 @@ static int operation_evidence_valid(const edr_v1_BehaviorEvent *ev) {
     return (ev->required_evidence_fields & EDR_EVIDENCE_NETWORK)!=0;
   if (!strcmp(ev->operation_evidence_json,"{\"kind\":\"credential_tool_attempt\"}"))
     return ev->type==EDR_EVENT_PROCESS_CREATE &&
-        (ev->required_evidence_fields & ~EDR_EVIDENCE_USER)==EDR_EVIDENCE_OPERATION;
+        /* IR10 parent_identity permits only the name. The final frame gate
+         * still requires the exact mask from the authenticated rule owner. */
+        (ev->required_evidence_fields & ~(EDR_EVIDENCE_USER|EDR_EVIDENCE_PARENT_NAME))==EDR_EVIDENCE_OPERATION;
   return 0;
 }
 static int dynamic_context_purpose(cJSON *subject,uint64_t mask,int project) {

@@ -538,6 +538,9 @@ static void operation_without_user_purpose(void) {
   assert(!event->username[0]&&!event->cmdline[0]&&!event->identity_source[0]);
   event->required_evidence_fields|=EDR_EVIDENCE_USER;
   n=immutable_encode(event,wire);assert(!edr_egress_frame_validate(wire,n,NULL,0));
+  /* An allowed operation shape does not grant a rule a new purpose. */
+  event->required_evidence_fields=EDR_EVIDENCE_OPERATION|EDR_EVIDENCE_PARENT_NAME;
+  n=immutable_encode(event,wire);assert(!edr_egress_frame_validate(wire,n,NULL,0));
   free(event);free(wire);free(r);
 }
 static void historical_projection(void) {
