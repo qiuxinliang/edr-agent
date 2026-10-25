@@ -8910,6 +8910,71 @@ static void test_compact_near_full_existing_page_rewrites(void) {
   assert(sqlite3_close(db) == SQLITE_OK); cleanup_test_sqlite_path(path);
 }
 
+static void test_compact_time_index_order_and_legacy_compatibility(void) {
+  char path[512];
+  assert(make_test_sqlite_path(path, sizeof(path)) == 0);
+  assert(test_open_legacy_context(path, 16, 24) == 0);
+  edr_local_evidence_cache_close();
+  sqlite3 *db = NULL; EdrContextStore store;
+  assert(sqlite3_open(path, &db) == SQLITE_OK);
+  assert(edr_context_store_open(&store, db) == 0 && store.format == 0);
+  assert(edr_context_store_begin_upgrade(&store) == 0 && store.format == 1);
+  compact_exec(db,
+      "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<32) "
+      "INSERT INTO context_candidates(id,candidate_id,candidate_id_json) "
+      "SELECT x,'time-owner-'||x,'\"time-owner-'||x||'\"' FROM n;"
+      "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<4096) "
+      "INSERT INTO context_facts(fact_id,manifest_template_json) "
+      "SELECT 'time-fact-'||x,'{\"candidate_id\":null,\"n\":'||x||'}' FROM n;"
+      "INSERT INTO context_fact_keys(id,fact_id) "
+      "SELECT CAST(substr(fact_id,11) AS INTEGER),fact_id FROM context_facts;"
+      "INSERT INTO compact_context_refs(id,candidate_key,fact_key,artifact_override,created_ns) "
+      "SELECT id,32-(id%32),id,'time-ref-'||id,CASE WHEN id<=16 THEN NULL ELSE 1000 END "
+      "FROM context_fact_keys ORDER BY id DESC;"
+      "CREATE TABLE migration_expected AS SELECT * FROM materialized_artifacts;");
+  unsigned moved = 0; int complete = 0;
+  assert(edr_context_store_migrate_batch(&store, 64, &moved, &complete) == 0);
+  assert(complete && moved == 0 && store.format == 2);
+  /* Equal timestamps deliberately interleave candidate keys. The oldest-id
+   * consumer must return stable ties without sorting the entire reference
+   * population; NULL timestamps retain the existing SQLite ordering. */
+  const char *oldest = "SELECT id,created_ns FROM compact_context_refs ORDER BY created_ns,id LIMIT 512;";
+  sqlite3_stmt *st = NULL;
+  assert(sqlite3_prepare_v2(db, oldest, -1, &st, NULL) == SQLITE_OK);
+  for (unsigned id = 1; id <= 512; ++id) {
+    assert(sqlite3_step(st) == SQLITE_ROW);
+    assert(sqlite3_column_int64(st, 0) == (sqlite3_int64)id);
+    assert(id <= 16 ? sqlite3_column_type(st, 1) == SQLITE_NULL :
+        sqlite3_column_int64(st, 1) == 1000);
+  }
+  assert(sqlite3_step(st) == SQLITE_DONE);
+  assert(sqlite3_stmt_status(st, SQLITE_STMTSTATUS_SORT, 0) == 0);
+  sqlite3_finalize(st); st = NULL;
+  compact_assert_projection(db);
+  assert(compact_scalar(db, "SELECT COUNT(*) FROM pragma_foreign_key_check") == 0);
+  /* The original format-1/2 definition is still a supported physical layout.
+   * Opening it must not trigger an unsolicited index rebuild or alter rows. */
+  compact_exec(db, "DROP INDEX idx_compact_context_time;"
+      "CREATE INDEX idx_compact_context_time ON compact_context_refs(created_ns,candidate_key);");
+  assert(sqlite3_close(db) == SQLITE_OK);
+  assert(test_open_legacy_context(path, 16, 24) == 0);
+  edr_local_evidence_cache_close();
+  assert(sqlite3_open(path, &db) == SQLITE_OK);
+  assert(compact_scalar(db, "SELECT COUNT(*) FROM pragma_index_info('idx_compact_context_time')") == 2);
+  assert(edr_context_store_open(&store, db) == 0 && store.format == 2);
+  compact_assert_projection(db);
+  assert(sqlite3_prepare_v2(db, oldest, -1, &st, NULL) == SQLITE_OK);
+  for (unsigned id = 1; id <= 512; ++id) {
+    assert(sqlite3_step(st) == SQLITE_ROW);
+    assert(sqlite3_column_int64(st, 0) == (sqlite3_int64)id);
+  }
+  assert(sqlite3_step(st) == SQLITE_DONE);
+  sqlite3_finalize(st);
+  assert(compact_scalar(db, "SELECT COUNT(*) FROM pragma_foreign_key_check") == 0);
+  assert(sqlite3_close(db) == SQLITE_OK);
+  cleanup_test_sqlite_path(path);
+}
+
 static void test_compact_format_resume_and_projection(void) {
   char path[512];
   assert(make_test_sqlite_path(path, sizeof(path)) == 0);
@@ -13967,8 +14032,154 @@ static void test_compact_startup_contract(void) {
 }
 #endif
 
+#if defined(EDR_HAVE_SQLITE)
+typedef struct { unsigned fact_lookups; } ContextWriterTrace;
+
+static int context_writer_trace(unsigned event, void *context, void *statement,
+                                void *detail) {
+  (void)detail;
+  if (event == SQLITE_TRACE_STMT) {
+    const char *sql = sqlite3_sql((sqlite3_stmt *)statement);
+    if (sql && !strcmp(sql, "SELECT id FROM context_fact_keys WHERE fact_id=?"))
+      ++((ContextWriterTrace *)context)->fact_lookups;
+  }
+  return 0;
+}
+
+static int context_writer_deny_fact_insert(void *context, int operation,
+    const char *table, const char *column, const char *database, const char *origin) {
+  (void)context; (void)column; (void)database; (void)origin;
+  return operation == SQLITE_INSERT && table && !strcmp(table, "context_fact_keys")
+      ? SQLITE_DENY : SQLITE_OK;
+}
+
+static void context_writer_fact_fixture(sqlite3 *db, const char *fact) {
+  char *sql = sqlite3_mprintf("INSERT INTO context_facts VALUES(%Q,'writer-endpoint',"
+      "'writer-tenant','{\"candidate_id\":null,\"event_id\":\"writer-fixture\"}',1,1);", fact);
+  assert(sql); compact_exec(db, sql); sqlite3_free(sql);
+}
+
+static int context_writer_fixture_put(EdrContextWriter *writer, unsigned candidate,
+                                      unsigned source, const char *fact) {
+  char id[64], json[80], artifact[192];
+  snprintf(id, sizeof(id), "writer-%u", candidate);
+  snprintf(json, sizeof(json), "\"%s\"", id);
+  snprintf(artifact, sizeof(artifact), "%s:post_context:%064x", id, source);
+  return edr_context_writer_put(writer, artifact, id, fact, json, 23, 0,
+                                 "local_manifest", "");
+}
+
+static void test_context_writer_transaction_reuse(void) {
+  enum { fanout = 128 };
+  char path[512], fact[65], other[65], long_fact[97];
+  memset(fact, 'a', sizeof(fact) - 1); fact[sizeof(fact) - 1] = 0;
+  memset(other, 'b', sizeof(other) - 1); other[sizeof(other) - 1] = 0;
+  memset(long_fact, 'x', sizeof(long_fact) - 1); long_fact[sizeof(long_fact) - 1] = 0;
+  assert(make_test_sqlite_path(path, sizeof(path)) == 0);
+  edr_local_evidence_cache_test_set_legacy_context_writes(0);
+  assert(edr_local_evidence_cache_open(path, 16u, 24u) == 0);
+  edr_local_evidence_cache_close();
+  sqlite3 *db = NULL; assert(sqlite3_open(path, &db) == SQLITE_OK);
+  compact_exec(db, "PRAGMA foreign_keys=ON;");
+  EdrContextStore store; EdrContextWriter writer;
+  assert(edr_context_store_open(&store, db) == 0 && store.format == 1);
+  context_writer_fact_fixture(db, fact); context_writer_fact_fixture(db, other);
+  context_writer_fact_fixture(db, long_fact);
+  ContextWriterTrace trace = {0};
+  assert(sqlite3_trace_v2(db, SQLITE_TRACE_STMT, context_writer_trace, &trace) == SQLITE_OK);
+  assert(edr_context_writer_open(&store, &writer, 0) < 0);
+  edr_context_writer_close(&writer);
+  compact_exec(db, "BEGIN IMMEDIATE;");
+  assert(edr_context_writer_open(&store, &writer, 0) == 0);
+  for (unsigned i = 0; i < fanout; ++i)
+    assert(context_writer_fixture_put(&writer, i, 1, fact) == 0);
+  /* The SQL trace measures actual work; the projection below verifies that
+   * reducing lookups still attaches the same fact to every candidate. */
+  assert(trace.fact_lookups == 1);
+  assert(context_writer_fixture_put(&writer, 0, 1, other) == 0);
+  assert(context_writer_fixture_put(&writer, 1, 1, other) == 0);
+  assert(trace.fact_lookups == 2);
+  assert(context_writer_fixture_put(&writer, 2, 1, fact) == 0);
+  assert(trace.fact_lookups == 3);
+  assert(context_writer_fixture_put(&writer, 0, 2, long_fact) == 0);
+  assert(context_writer_fixture_put(&writer, 1, 2, long_fact) == 0);
+  assert(trace.fact_lookups == 5);
+  edr_context_writer_close(&writer); compact_exec(db, "COMMIT;");
+  assert(compact_scalar(db, "SELECT COUNT(*) FROM context_reference_projection") == fanout + 2);
+  char *sql = sqlite3_mprintf("SELECT COUNT(*) FROM context_reference_projection WHERE fact_id=%Q", fact);
+  assert(sql && compact_scalar(db, sql) == fanout - 2); sqlite3_free(sql);
+  sql = sqlite3_mprintf("SELECT COUNT(*) FROM context_reference_projection WHERE fact_id=%Q", other);
+  assert(sql && compact_scalar(db, sql) == 2); sqlite3_free(sql);
+  sql = sqlite3_mprintf("SELECT COUNT(*) FROM context_reference_projection WHERE fact_id=%Q", long_fact);
+  assert(sql && compact_scalar(db, sql) == 2); sqlite3_free(sql);
+
+  /* Lazy legacy SQL must preserve an existing mixed-format identity and every
+   * nullable/overridden projection column. It must not convert the old row. */
+  retention_ref_fixture(db, "writer-legacy", fact, 23);
+  char legacy_artifact[192]; snprintf(legacy_artifact, sizeof(legacy_artifact), "writer-legacy-%s", fact);
+  compact_exec(db, "BEGIN IMMEDIATE;");
+  assert(edr_context_writer_open(&store, &writer, 0) == 0);
+  assert(edr_context_writer_put(&writer, legacy_artifact, "writer-legacy", other,
+      "\"writer-legacy\" ", 0, 1, NULL, NULL) == 0);
+  edr_context_writer_close(&writer); compact_exec(db, "COMMIT;");
+  assert(compact_scalar(db, "SELECT COUNT(*) FROM candidate_context_refs WHERE candidate_id='writer-legacy' "
+      "AND candidate_id_json='\"writer-legacy\" ' AND created_ns IS NULL AND upload_status IS NULL AND minio_key IS NULL") == 1);
+  assert(compact_scalar(db, "SELECT COUNT(*) FROM compact_context_refs") == fanout + 2);
+  assert(trace.fact_lookups == 5);
+
+  /* A failed transaction may reuse dictionary rowids. A fresh writer must
+   * resolve the fact again, never retain a key from the rolled-back writer. */
+  context_writer_fact_fixture(db, "rollback-fact");
+  context_writer_fact_fixture(db, "rowid-reuser");
+  compact_exec(db, "BEGIN IMMEDIATE;");
+  assert(edr_context_writer_open(&store, &writer, 0) == 0);
+  assert(context_writer_fixture_put(&writer, fanout, 1, "rollback-fact") == 0);
+  assert(context_writer_fixture_put(&writer, fanout + 1, 1, "missing-fact") < 0);
+  edr_context_writer_close(&writer); compact_exec(db, "ROLLBACK;");
+  assert(compact_scalar(db, "SELECT COUNT(*) FROM compact_context_refs") == fanout + 2);
+  assert(compact_scalar(db, "SELECT COUNT(*) FROM context_fact_keys WHERE fact_id='rollback-fact'") == 0);
+  compact_exec(db, "INSERT INTO context_fact_keys(fact_id) VALUES('rowid-reuser');BEGIN IMMEDIATE;");
+  assert(edr_context_writer_open(&store, &writer, 0) == 0);
+  assert(context_writer_fixture_put(&writer, fanout, 1, "rollback-fact") == 0);
+  edr_context_writer_close(&writer); compact_exec(db, "COMMIT;");
+  assert(compact_scalar(db, "SELECT COUNT(*) FROM context_reference_projection WHERE "
+      "candidate_id='writer-128' AND fact_id='rollback-fact'") == 1);
+  assert(compact_scalar(db, "SELECT COUNT(*) FROM context_reference_projection WHERE fact_id='rowid-reuser'") == 0);
+  assert(compact_scalar(db, "SELECT COUNT(*) FROM pragma_foreign_key_check") == 0);
+  /* A statement first needed during put can fail to compile. Report the
+   * storage error and let the caller roll back every partial dictionary row. */
+  context_writer_fact_fixture(db, "prepare-denied-fact");
+  compact_exec(db, "BEGIN IMMEDIATE;");
+  assert(edr_context_writer_open(&store, &writer, 0) == 0);
+  assert(sqlite3_set_authorizer(db, context_writer_deny_fact_insert, NULL) == SQLITE_OK);
+  assert(context_writer_fixture_put(&writer, fanout + 1, 1, "prepare-denied-fact") < 0);
+  assert(store.sqlite_error_code == SQLITE_AUTH && store.error[0]);
+  edr_context_writer_close(&writer);
+  assert(sqlite3_set_authorizer(db, NULL, NULL) == SQLITE_OK);
+  compact_exec(db, "ROLLBACK;");
+  assert(compact_scalar(db, "SELECT COUNT(*) FROM context_candidates WHERE candidate_id='writer-129'") == 0);
+  assert(compact_scalar(db, "SELECT COUNT(*) FROM context_fact_keys WHERE fact_id='prepare-denied-fact'") == 0);
+  assert(sqlite3_trace_v2(db, 0, NULL, NULL) == SQLITE_OK);
+  assert(sqlite3_close(db) == SQLITE_OK);
+  assert(edr_local_evidence_cache_open(path, 16u, 24u) == 0);
+  edr_local_evidence_cache_close();
+  assert(sqlite3_open(path, &db) == SQLITE_OK);
+  assert(compact_scalar(db, "SELECT COUNT(*) FROM context_reference_projection") == fanout + 4);
+  assert(compact_scalar(db, "SELECT COUNT(*) FROM pragma_foreign_key_check") == 0);
+  assert(sqlite3_close(db) == SQLITE_OK); cleanup_test_sqlite_path(path);
+  puts("context_writer_reuse fanout=128 fact_lookups=1 fact_switch=1 long_legacy_ids=1 mixed_identity_preserved=1 rollback_reopen=1 prepare_failure_rollback=1 projection_reopen=1");
+}
+#endif
+
 int main(int argc, char **argv) {
 #if defined(EDR_HAVE_SQLITE)
+  if (argc == 2 && !strcmp(argv[1], "--context-writer-reuse")) {
+    test_context_writer_transaction_reuse();
+    test_post_context_exact_replay_charges_only_durable_changes();
+    test_critical_context_high_fanout_is_atomically_bounded();
+    test_candidate_commit_failure_leaves_no_dedupe_or_context_state();
+    return 0;
+  }
   if (argc==2 && !strcmp(argv[1],"--startup-retirement-transient-page")) {
     test_startup_retirement_transient_page(0u);test_startup_retirement_transient_page(30u);return 0;
   }
@@ -14157,6 +14368,7 @@ int main(int argc, char **argv) {
   }
   RUN_CACHE_CASE("context", test_pmfe_names_and_negative_values_are_not_signals());
 #if defined(EDR_HAVE_SQLITE)
+  RUN_CACHE_CASE("context", test_context_writer_transaction_reuse());
   RUN_CACHE_CASE("context", test_normal_alert_parent_context_retention());
   RUN_CACHE_CASE("context", test_alert_parent_context_refusal_and_unresolved());
   RUN_CACHE_CASE("context", test_alert_parent_context_pressure_counterfactual(0));
@@ -14199,6 +14411,7 @@ int main(int argc, char **argv) {
   RUN_CACHE_CASE("migration", test_compact_near_full_migration_releases_clean_pages());
   RUN_CACHE_CASE("migration", test_compact_near_full_cancel_resume());
   RUN_CACHE_CASE("migration", test_compact_near_full_existing_page_rewrites());
+  RUN_CACHE_CASE("migration", test_compact_time_index_order_and_legacy_compatibility());
   RUN_CACHE_CASE("migration", test_compact_format_resume_and_projection());
   RUN_CACHE_CASE("retention", test_context_fact_collection_preserves_references());
   RUN_CACHE_CASE("retention", test_context_batch_reclaim_recovery_and_scope());

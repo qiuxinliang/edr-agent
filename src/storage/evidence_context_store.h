@@ -21,6 +21,9 @@ typedef struct {
   sqlite3_stmt *ref_insert, *old_delete;
   sqlite3_stmt *lookup;
   sqlite3_stmt *legacy_insert;
+  sqlite3_int64 last_fact_key;
+  char last_fact_id[65];
+  int last_fact_valid;
   int migrate_existing;
 } EdrContextWriter;
 
@@ -55,7 +58,10 @@ sqlite3_stmt *edr_context_store_prepare_lookup(EdrContextStore *store);
 int edr_context_store_bind_lookup(EdrContextStore *store, sqlite3_stmt *stmt,
                                   const char *artifact_id);
 /* Normal writes keep an existing legacy identity in place. Only the explicit
- * migration owner may replace it with a compact reference in its transaction. */
+ * migration owner may replace it with a compact reference in its transaction.
+ * One writer lives inside one uninterrupted caller-owned write transaction.
+ * Close it before commit/rollback, after a failed put, or before deleting or
+ * rekeying a fact dictionary entry. Nothing is cached across writer lifetimes. */
 int edr_context_writer_open(EdrContextStore *store, EdrContextWriter *writer,
                             int migrate_existing);
 int edr_context_writer_put(EdrContextWriter *writer, const char *artifact_id,

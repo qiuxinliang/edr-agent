@@ -4678,13 +4678,20 @@ typedef struct {
   uint32_t fact_insert;
 } PreparedContextArtifacts;
 
-static void sqlite_free_prepared_context_artifacts(PreparedContextArtifacts *prepared) {
+static void sqlite_free_prepared_context_refs(PreparedContextArtifacts *prepared) {
   if (!prepared) return;
   for (uint32_t i = 0u; i < prepared->ref_count; ++i) {
     cJSON_free(prepared->refs[i].candidate_id_json);
   }
-  cJSON_free(prepared->manifest_template);
   free(prepared->refs);
+  prepared->refs = NULL;
+  prepared->ref_count = 0u;
+}
+
+static void sqlite_free_prepared_context_artifacts(PreparedContextArtifacts *prepared) {
+  if (!prepared) return;
+  sqlite_free_prepared_context_refs(prepared);
+  cJSON_free(prepared->manifest_template);
   memset(prepared, 0, sizeof(*prepared));
 }
 
@@ -4694,13 +4701,17 @@ static int sqlite_prepare_context_fact(const EdrBehaviorRecord *r,
       "SELECT manifest_template_json FROM context_facts WHERE fact_id=?;";
   sqlite3_stmt *st = NULL;
   int step;
-  if (!s_db || !r || !prepared ||
-      build_post_context_manifest_template_json(r,
+  if (!s_db || !r || !prepared) return -1;
+  /* Reuse this invocation's captured source/parent snapshot after admission
+   * maintenance. Keep its bytes/hash; re-read all mutable database state. */
+  if (!prepared->manifest_template &&
+      (build_post_context_manifest_template_json(r,
                                                 &prepared->manifest_template) != 0 ||
-      context_fact_id_for(r, prepared->manifest_template,
-                          prepared->fact_id) != 0) {
+       context_fact_id_for(r, prepared->manifest_template,
+                          prepared->fact_id) != 0)) {
     return -1;
   }
+  prepared->fact_insert = 0u;
   s_persistence_failure = EDR_EVIDENCE_FAILURE_STORAGE;
   if (sqlite3_prepare_v2(s_db, sql, -1, &st, NULL) != SQLITE_OK) {
     set_error("prepare context fact replay lookup failed");
@@ -4735,7 +4746,7 @@ static int sqlite_prepare_context_artifacts(const EdrBehaviorRecord *r,
   if (!s_db || !r || !candidate_ids || candidate_count == 0u || !prepared) {
     return -1;
   }
-  memset(prepared, 0, sizeof(*prepared));
+  sqlite_free_prepared_context_refs(prepared);
   if (sqlite_prepare_context_fact(r, prepared) != 0) goto fail;
   prepared->refs = (PreparedContextRef *)calloc(
       candidate_count, sizeof(PreparedContextRef));
@@ -4917,7 +4928,7 @@ static int sqlite_record_budgeted_context_artifacts(const EdrBehaviorRecord *r,
                                                     EvidenceWriteClass write_class,
                                                     uint32_t *written) {
   s_persistence_failure = EDR_EVIDENCE_FAILURE_STORAGE;
-  PreparedContextArtifacts prepared;
+  PreparedContextArtifacts prepared = {0};
   uint32_t budget_units;
   uint32_t materialized_changes;
   uint64_t maintenance_runs;
@@ -4941,7 +4952,6 @@ static int sqlite_record_budgeted_context_artifacts(const EdrBehaviorRecord *r,
   if (s_status.maintenance_runs != maintenance_runs) {
     /* Capacity maintenance may remove the last old ref and its fact after
      * preparation. Recheck before writing a ref to that fact. */
-    sqlite_free_prepared_context_artifacts(&prepared);
     if (sqlite_prepare_context_artifacts(r, candidate_ids, candidate_count,
                                          &prepared) != 0) return -1;
     budget_units = (prepared.fact_insert || prepared.ref_count) ? 1u : 0u;
@@ -5166,6 +5176,7 @@ row_done:
     cJSON_free(candidate_json);
     goto done;
   }
+  edr_context_writer_close(&writer);
   if (exec_sql("COMMIT;") != 0) {
     goto done;
   }
@@ -8568,7 +8579,8 @@ void edr_local_evidence_cache_record_behavior(const EdrBehaviorRecord *r) {
     candidate_reused = candidate_dedupe_reuse(r, ts, candidate_id, sizeof(candidate_id));
   }
   char context_candidate_ids[EDR_EVIDENCE_CONTEXT_WINDOWS][160];
-  memset(context_candidate_ids, 0, sizeof(context_candidate_ids));
+  /* context_window_matches initializes every returned entry. Consumers use
+   * only that prefix, so ordinary events need not clear the entire 40 KiB. */
   uint32_t context_candidate_count = low_value_file_noise
       ? 0u
       : context_window_matches(r, ts, context_candidate_ids,
