@@ -132,6 +132,9 @@ static int result_typed(const char *type,const char *command_id,const cJSON *bod
   if(!result_member(type,"kill_process|isolate_host|restore_host|isolate_status|pmfe_scan|yara_scan|collect_forensic|forensic|deep_forensic|forensic_deep|targeted_forensic|forensic_targeted|memory_dump|memdump"))return 0;
   if(!cJSON_IsObject(body))return status==1?-1:0;
   const char *schema=result_text(body,"schema");
+  /* OS/queue errors may carry an untyped diagnostic object. Only their finite
+   * failure status may leave the endpoint; no error prose is authorized. */
+  if(status!=1 && !*schema && result_member(type,"kill_process|isolate_host|restore_host|isolate_status"))return 0;
   if(!strcmp(type,"kill_process")) {
     if(strcmp(schema,"edr.process_response.v1")||strcmp(result_text(body,"action"),"kill_process"))return -1;
     const char *reason=result_text(body,"reason"),*creation=result_text(body,"process_creation_filetime_100ns");double pid,want;

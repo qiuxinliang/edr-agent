@@ -39,7 +39,16 @@ function New-NetFirewallRule {
   param($PolicyStore,$Name,$DisplayName,$Direction,$Action,$Enabled,$Profile,$RemoteAddress,$Protocol,$LocalPort,$RemotePort,$Service,$ErrorAction)
   $script:rules += [pscustomobject]@{Name=$Name;DisplayName=$DisplayName;Direction=$Direction;Action=$Action;Enabled=[string]$Enabled;RemoteAddress=$RemoteAddress;LocalPort=$LocalPort;RemotePort=$RemotePort;Protocol=$Protocol;Service=$Service;PolicyStoreSourceType='Local'}
 }
-function Disable-NetFirewallRule { param($PolicyStore,$Name,$ErrorAction) ($script:rules | Where-Object Name -eq $Name).Enabled = 'False' }
+function Disable-NetFirewallRule {
+  param($PolicyStore,$Name,$ErrorAction)
+  $script:disableCalls++
+  if (@($Name).Count -gt 32) { throw 'firewall_query_quota_exceeded' }
+  foreach ($n in @($Name)) {
+    $matched = @($script:rules | Where-Object Name -eq $n)
+    if ($matched.Count -ne 1) { throw 'firewall_rule_missing' }
+    $matched[0].Enabled = 'False'
+  }
+}
 function Enable-NetFirewallRule {
   param($PolicyStore,$Name,$ErrorAction)
   $script:enableCalls++
@@ -74,6 +83,7 @@ function Reset-TestState {
   $script:failProfile = 0
   $script:ruleReads = 0
   $script:enableCalls = 0
+  $script:disableCalls = 0
   $script:profiles = @('Domain','Private','Public' | ForEach-Object {
     [pscustomobject]@{Name=$_;Enabled='True';DefaultInboundAction='Block';DefaultOutboundAction='Allow'}
   })
@@ -177,6 +187,11 @@ try {
   Remove-Isolation
   Assert (@($script:rules | Where-Object Enabled -ne 'True').Count -eq 0) 'all baseline rules must be restored'
   Assert ($script:ruleReads -le 4 -and $script:enableCalls -le 10) 'restoration must bound firewall I/O and provider query size for 300 rules'
+  Enable-Isolation
+  Assert (Test-Isolation (Read-State)) '300-rule isolation must retain verified allowlist-only enforcement'
+  Assert ($script:disableCalls -le 10) 'isolation must bound firewall I/O and provider query size for 300 rules'
+  Remove-Isolation
+  Assert (Test-Restored (Read-State)) 'batched isolation must preserve complete recovery'
   $script:rules[0].Enabled = 'False'
   Assert (-not (Test-Restored (Read-State))) 'bulk verification must reject a disabled baseline rule'
   $script:rules = @($script:rules | Select-Object -Skip 1)

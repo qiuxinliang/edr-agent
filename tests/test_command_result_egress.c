@@ -81,6 +81,19 @@ static void typed_owner_tests(void) {
   const char *iso="{\"schema\":\"edr.isolation.status.v1\",\"isolated\":true,\"restored\":false,\"enforcement_verified\":true,\"management_reachable\":null,\"password\":\"UNRELATED-TEXT\"}";
   typed_owner_case("typed-isolate","isolate_host","{}",iso,1);
   typed_owner_case("typed-restore-wrong","restore_host","{}",iso,0);
+  /* The action producer goes through soar_emit's common envelope. Exercise
+   * that boundary, including restoration, instead of only bare schemas. */
+  const char *isolation_types[]={"isolate_host","restore_host"};
+  for(unsigned i=0;i<2;i++) {
+    const char *id=i?"wrapped-restore":"wrapped-isolate";
+    cJSON *wrapper=cJSON_CreateObject();CHECK(wrapper);
+    CHECK(cJSON_AddStringToObject(wrapper,"task_id",id));
+    CHECK(cJSON_AddStringToObject(wrapper,"raw_detail",i?
+        "{\"schema\":\"edr.isolation.status.v1\",\"isolated\":false,\"restored\":true,\"enforcement_verified\":true}":iso));
+    char *wrapped=cJSON_PrintUnformatted(wrapper);CHECK(wrapped);
+    typed_owner_case(id,isolation_types[i],"{}",wrapped,1);
+    free(wrapped);cJSON_Delete(wrapper);
+  }
   const char *forensic="{\"schema\":\"edr.forensic.result.v1\",\"status\":\"success\",\"source\":\"builtin\",\"sha256\":\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\",\"object_key\":\"tenant/ep/artifact\",\"artifact\":\"C:/Users/UNRELATED-TEXT/dump.bin\",\"upload_status\":\"ok\",\"truncated\":false,\"raw_detail\":\"UNRELATED-TEXT\"}";
   typed_owner_case("typed-forensic","forensic","{}",forensic,1);
   const char *yara="{\"schema\":\"edr.yara_scan.result.v1\",\"status\":\"success\",\"source\":\"libyara\",\"engine\":\"libyara\",\"scan_status\":\"completed\",\"target_type\":\"file\",\"target_path\":\"C:/Lab/a.bin\",\"sha256\":\"\",\"object_key\":\"\",\"upload_status\":\"not_requested\",\"matches\":[{\"path\":\"C:/Lab/a.bin\",\"rules\":[\"test_rule\"],\"memory\":\"UNRELATED-TEXT\"}]}";
@@ -114,6 +127,79 @@ static void typed_owner_tests(void) {
   char *wire_receipt=persisted_body("typed-real-forensic","forensic");
   CHECK(strstr(wire_receipt,"tenant/endpoint/task/bundle") && !strstr(wire_receipt,"C:/Synthetic"));free(wire_receipt);
   puts("PASS: typed kill/isolation/forensic/YARA/PMFE through durable owner, serialization and final guard; wrong generation and reverse action held without ACK");
+}
+
+static EdrSoarCommandMeta local_ransom_meta(const char *id,const char *step) {
+  EdrSoarCommandMeta m={0};
+  snprintf(m.initiated_by,sizeof(m.initiated_by),"agent_auto");
+  snprintf(m.playbook_run_id,sizeof(m.playbook_run_id),"ransom-auto");
+  snprintf(m.playbook_step_id,sizeof(m.playbook_step_id),"%s",step);
+  snprintf(m.soar_correlation_id,sizeof(m.soar_correlation_id),"e-1-2-3");
+  snprintf(m.idempotency_key,sizeof(m.idempotency_key),"%s",id);
+  m.issued_at_unix_ms=(int64_t)time(NULL)*1000;
+  return m;
+}
+static char *local_ransom_wire(const EdrCommandStateRecord *r) {
+  char *body=edr_command_result_http_json("ep","test",r->command_id,r->command_type,
+      r->execution_status,r->exit_code,r->detail,(int64_t)time(NULL)*1000,
+      r->soar_correlation_id,r->playbook_run_id,r->playbook_step_id);
+  CHECK(body);return body;
+}
+static void local_ransom_purpose_tests(void) {
+  const char *id="auto-ransom-7000-134170000000000123-terminate";
+  const char *request="{\"pid\":7000,\"process_creation_filetime_100ns\":\"134170000000000123\"}";
+  const char *detail="{\"schema\":\"edr.process_response.v1\",\"action\":\"kill_process\",\"pid\":7000,\"process_creation_filetime_100ns\":\"134170000000000123\",\"reason\":\"process_exit_verified\",\"enforcement_verified\":true}";
+  EdrSoarCommandMeta m=local_ransom_meta(id,"terminate");
+  CHECK(edr_command_result_bind_local_ransom(&m,id,"kill_process",(const uint8_t*)request,strlen(request),"tenant","ep")==0);
+  CHECK(edr_command_state_store_inbox(id,"kill_process",(const uint8_t*)request,strlen(request),&m)==0);
+  CHECK(edr_command_state_begin(id,"kill_process",&m,NULL,NULL)==EDR_COMMAND_STATE_BEGIN_READY);
+  CHECK(edr_command_state_finish(id,"kill_process",&m,"ok",1,0,detail,"",1)==0);
+  EdrCommandStateRecord *r=calloc(1,sizeof(*r));CHECK(r);
+  CHECK(edr_command_state_begin(id,"kill_process",NULL,NULL,r)==EDR_COMMAND_STATE_BEGIN_DUP_FINAL);
+  char *body=local_ransom_wire(r);
+  CHECK(allowed("tenant","ep",body) && !allowed("other","ep",body) && !allowed("tenant","other",body));
+  CHECK(!r->report_policy_held && r->report_pending);
+  CHECK(edr_command_state_mark_report_retry(r,"transport unavailable",1)==0);
+  CHECK(allowed("tenant","ep",body));
+  edr_command_state_compact_if_needed();
+  CHECK(edr_command_state_begin(id,"kill_process",NULL,NULL,r)==EDR_COMMAND_STATE_BEGIN_DUP_FINAL);
+  CHECK(r->report_attempts==1 && !strcmp(r->result_authorization.command_id,id));
+  CHECK(edr_command_state_mark_reported(r)==0 && !allowed("tenant","ep",body));
+  CHECK(edr_command_state_finish(id,"kill_process",&m,"ok",1,0,detail,"",1)==0);
+  CHECK(!allowed("tenant","ep",body)); /* duplicate cannot resurrect ACKed output */
+  free(body);
+  for(unsigned i=0;i<9;i++) {
+    EdrSoarCommandMeta invalid=m;
+    const char *bad_id=id,*bad_type="kill_process",*bad_request=request,*tenant="tenant",*endpoint="ep";
+    if(i==0)snprintf(invalid.initiated_by,sizeof(invalid.initiated_by),"operator");
+    if(i==1)snprintf(invalid.soar_correlation_id,sizeof(invalid.soar_correlation_id),"e-not-an-event");
+    if(i==2)snprintf(invalid.playbook_step_id,sizeof(invalid.playbook_step_id),"isolate");
+    if(i==3)bad_type="rtr_shell";
+    if(i==4)bad_id="auto-other-7000-134170000000000123-terminate";
+    if(i==5)bad_request="{\"pid\":7000,\"process_creation_filetime_100ns\":\"134170000000000124\"}";
+    if(i==6)bad_request="{\"pid\":7000,\"process_creation_filetime_100ns\":\"134170000000000123\",\"stdout\":\"secret\"}";
+    if(i==7)tenant="";
+    if(i==8)endpoint="";
+    CHECK(edr_command_result_bind_local_ransom(&invalid,bad_id,bad_type,(const uint8_t*)bad_request,strlen(bad_request),tenant,endpoint)!=0);
+    CHECK(!invalid.result_authorization.command_id[0]);
+  }
+  /* Local isolation success and bounded queue failures use the same durable
+   * wire owner. They do not gain arbitrary output or a generic success grant. */
+  for(unsigned i=0;i<4;i++) {
+    char action_id[128];snprintf(action_id,sizeof(action_id),"auto-ransom-7000-%u-isolate",i+1);
+    EdrSoarCommandMeta a=local_ransom_meta(action_id,"isolate");
+    if(i==3)a.issued_at_unix_ms-=86401000LL;
+    CHECK(edr_command_result_bind_local_ransom(&a,action_id,"isolate_host",(const uint8_t*)"{}",2,"tenant","ep")==0);
+    const char *raw=i==1?"{\"error\":\"UNRELATED-TEXT\"}":i==2?"{\"status\":\"isolated\"}":
+        "{\"schema\":\"edr.isolation.status.v1\",\"isolated\":true,\"restored\":false,\"enforcement_verified\":true}";
+    CHECK(edr_command_state_finish(action_id,"isolate_host",&a,i==1?"failed":"ok",i==1?3:1,i==1?4:0,raw,"",1)==0);
+    CHECK(edr_command_state_begin(action_id,"isolate_host",NULL,NULL,r)==EDR_COMMAND_STATE_BEGIN_DUP_FINAL);
+    body=local_ransom_wire(r);CHECK(allowed("tenant","ep",body)==(i<2));
+    if(i==1)CHECK(strstr(body,"command_failed") && !strstr(body,"UNRELATED"));
+    CHECK(r->report_pending);free(body);
+  }
+  free(r);
+  puts("PASS: scoped local ransomware grant, durable retry, exact wire owner, expiry, failures and ACK preservation");
 }
 
 static void shell_open_purpose_tests(void) {
@@ -882,6 +968,7 @@ int main(void) {
   body=wire("cmd-large-15","rtq_execute",large,"");
   CHECK(allowed("tenant","ep",body));free(body);
   purpose_tests();
+  local_ransom_purpose_tests();
   download_authority_tests();
   parent_context_result_tests();
   puts("PASS: admitted task scope, exact terminal, durable retry, expiry, session binding, attachment denial");

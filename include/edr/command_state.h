@@ -16,9 +16,15 @@ extern "C" {
 #define EDR_COMMAND_STATE_SERIALIZED_RECORD_CAP (EDR_COMMAND_STATE_DETAIL_CAP * 2u + 2u + 16384u + 16384u + 192u)
 #define EDR_COMMAND_STATE_DEFAULT_OWNER_BUDGET_BYTES (300ULL * 2ULL * EDR_COMMAND_STATE_SERIALIZED_RECORD_CAP)
 
-/* Called only after external signature and command payload validation. */
+/* Called after verified remote admission or the bounded local response grant. */
 int edr_command_result_bind_contract(EdrCommandResultAuthorization *authority,
     const uint8_t *payload, size_t payload_len, int64_t issued_unix_ms);
+/* Trusted in-process ransomware admission only. Never call for transport input.
+ * Grants only the matching typed response, not queries, files or diagnostics. */
+int edr_command_result_bind_local_ransom(EdrSoarCommandMeta *meta,
+    const char *command_id, const char *command_type,
+    const uint8_t *payload, size_t payload_len,
+    const char *tenant_id, const char *endpoint_id);
 /* Producer and final guard share this projection; no durable bytes are edited. */
 int edr_command_result_project_detail(const EdrCommandResultAuthorization *authority,
     const char *command_type, int execution_status, int exit_code,

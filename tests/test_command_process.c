@@ -117,7 +117,11 @@ int main(void) {
   assert(strcmp(ids[0], ids[4]) != 0);
   record.process_creation_filetime_100ns = 0;
   edr_isolate_auto_from_ransom_alarm(&record);
-  assert(queued == 7 && os_calls == 0); /* Missing identity: only isolation queued. */
+  assert(queued == 8 && os_calls == 0);
+  assert(strcmp(types[6], "kill_process") == 0 && strcmp(types[7], "isolate_host") == 0);
+  assert(edr_command_kill_process(ids[6], (uint8_t *)payloads[6], strlen(payloads[6]), &metas[6]) == EdrCmdExecRejected);
+  verify_receipt(ids[6], EdrCmdExecRejected, "observed_process_identity_required");
+  assert(os_calls == 0); /* Durable rejection, never resolve a live replacement PID. */
 
   const struct { const char *reason; int ok; EdrCommandExecutionStatus status; } cases[] = {
       {"process_exit_verified", 1, EdrCmdExecOk},

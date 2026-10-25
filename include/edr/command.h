@@ -40,8 +40,9 @@ void edr_isolate_auto_from_ransom_alarm(const EdrBehaviorRecord *record);
 /* Checked again at execution, after a queued automatic action may outlive a policy change. */
 int edr_ransom_auto_response_enabled(void);
 
-/* Local-only authority, minted after signed external command admission. Never
- * decoded from a transport field. Results may retry for 24h after issue;
+/* Local-only authority, minted after signed external command admission or
+ * scoped internal ransomware response admission. Never decoded from a
+ * transport field. Results may retry for 24h after issue;
  * this does not extend the command's execution deadline. */
 typedef struct EdrCommandResultAuthorization {
   char command_id[128];

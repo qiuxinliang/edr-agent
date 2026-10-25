@@ -104,13 +104,11 @@ void edr_isolate_auto_from_ransom_alarm(const EdrBehaviorRecord *record) {
     snprintf(id, sizeof(id), "auto-ransom-%u-%llu-terminate", (unsigned)record->pid, (unsigned long long)identity);
     snprintf(meta.idempotency_key, sizeof(meta.idempotency_key), "%s", id);
     snprintf(meta.playbook_step_id, sizeof(meta.playbook_step_id), "%s", "terminate");
-    if (!record->pid || !creation) {
-      (void)process_result(id, &meta, record->pid, creation, EdrCmdExecRejected, 2, "observed_process_identity_required");
-    } else {
-      snprintf(payload, sizeof(payload), "{\"pid\":%u,\"process_creation_filetime_100ns\":\"%llu\"}",
-          (unsigned)record->pid, (unsigned long long)creation);
-      edr_command_on_internal_envelope(id, "kill_process", (const uint8_t *)payload, strlen(payload), &meta);
-    }
+    /* Missing identity follows the same durable admission and receipt path;
+     * the handler rejects it before touching any process. */
+    snprintf(payload, sizeof(payload), "{\"pid\":%u,\"process_creation_filetime_100ns\":\"%llu\"}",
+        (unsigned)record->pid, (unsigned long long)creation);
+    edr_command_on_internal_envelope(id, "kill_process", (const uint8_t *)payload, strlen(payload), &meta);
   }
   snprintf(id, sizeof(id), "auto-ransom-%u-%llu-isolate", (unsigned)record->pid, (unsigned long long)identity);
   snprintf(meta.idempotency_key, sizeof(meta.idempotency_key), "%s", id);

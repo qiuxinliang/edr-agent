@@ -159,6 +159,58 @@ int edr_command_result_bind_contract(EdrCommandResultAuthorization *a,const uint
   return ok?0:-1;
 }
 
+int edr_command_result_bind_local_ransom(EdrSoarCommandMeta *meta,
+    const char *id, const char *type, const uint8_t *payload, size_t len,
+    const char *tenant, const char *endpoint) {
+  if(meta)memset(&meta->result_authorization,0,sizeof(meta->result_authorization));
+  if(!meta || !id || !type || !tenant || !endpoint ||
+      !*tenant || strlen(tenant)>=128u || !*endpoint || strlen(endpoint)>=128u ||
+      strncmp(id,"auto-ransom-",12u) || strlen(id)>=128u ||
+      strcmp(meta->initiated_by,"agent_auto") || strcmp(meta->playbook_run_id,"ransom-auto") ||
+      strcmp(meta->idempotency_key,id) || meta->issued_at_unix_ms<=0 ||
+      meta->issued_at_unix_ms>INT64_MAX-86400000LL)return -1;
+  const char *step=!strcmp(type,"kill_process")?"terminate":!strcmp(type,"isolate_host")?"isolate":NULL;
+  if(!step || strcmp(meta->playbook_step_id,step))return -1;
+  const char *event=meta->soar_correlation_id;
+  if(strncmp(event,"e-",2u) || strlen(event)>48u)return -1;
+  event+=2;
+  for(unsigned i=0;i<3;i++) {
+    size_t n=strspn(event,"0123456789abcdefABCDEF");
+    if(!n || n>16u || (i<2 ? event[n]!='-' : event[n]!=0))return -1;
+    event+=n+(i<2);
+  }
+  char *end=NULL;errno=0;
+  unsigned long pid=strtoul(id+12,&end,10);
+  if(errno || end==id+12 || *end!='-' || pid>2147483647UL)return -1;
+  const char *generation=end+1;errno=0;
+  unsigned long long identity=strtoull(generation,&end,10);
+  if(errno || end==generation || !identity || *end!='-' || strcmp(end+1,step))return -1;
+  char canonical[128];
+  snprintf(canonical,sizeof(canonical),"auto-ransom-%lu-%llu-%s",pid,identity,step);
+  if(strcmp(canonical,id))return -1;
+  cJSON *request=payload && len ? edr_egress_parse_purpose_object(payload,len) : NULL;
+  if(!cJSON_IsObject(request)){cJSON_Delete(request);return -1;}
+  int valid=!strcmp(type,"isolate_host") ? request->child==NULL : 0;
+  if(!strcmp(type,"kill_process")) {
+    double requested_pid;char expected[32];snprintf(expected,sizeof(expected),"%llu",identity);
+    const char *birth=result_text(request,"process_creation_filetime_100ns");
+    /* Missing identity can authorize a bounded rejection, never a kill. */
+    valid=cJSON_GetArraySize(request)==2 && result_integer(request,"pid",0,2147483647,&requested_pid) &&
+        requested_pid==(double)pid && (!strcmp(birth,expected) || !strcmp(birth,"0"));
+  }
+  cJSON_Delete(request);
+  if(!valid)return -1;
+  EdrCommandResultAuthorization grant={0};
+  snprintf(grant.command_id,sizeof(grant.command_id),"%s",id);
+  snprintf(grant.command_type,sizeof(grant.command_type),"%s",type);
+  snprintf(grant.tenant_id,sizeof(grant.tenant_id),"%s",tenant);
+  snprintf(grant.endpoint_id,sizeof(grant.endpoint_id),"%s",endpoint);
+  grant.expires_unix_ms=meta->issued_at_unix_ms+86400000LL;
+  if(edr_command_result_bind_contract(&grant,payload,len,meta->issued_at_unix_ms))return -1;
+  meta->result_authorization=grant;
+  return 0;
+}
+
 static int result_parent_decimal(const cJSON *o,const char *key,uint64_t maximum,uint64_t *out) {
   const char *s=result_text(o,key);
   if(!*s || *s=='0' || strlen(s)>20u || strspn(s,"0123456789")!=strlen(s))return 0;

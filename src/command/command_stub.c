@@ -1413,7 +1413,7 @@ static int do_isolate(const char *cmd_id, const EdrSoarCommandMeta *sm) {
   s_exec_ok++;
   audit_both(cmd_id, "isolate: enforcement verified");
   soar_emit(cmd_id, sm, EdrCmdExecOk, 0,
-            "{\"status\":\"isolated\",\"enforcement_verified\":true,\"verification\":\"enforcement_status\"}");
+            "{\"schema\":\"edr.isolation.status.v1\",\"isolated\":true,\"restored\":false,\"enforcement_verified\":true}");
   return 0;
 }
 
@@ -1451,7 +1451,7 @@ static void do_restore_host(const char *cmd_id, const EdrSoarCommandMeta *sm) {
   audit_both(cmd_id, "restore_host: completed");
 #ifdef _WIN32
   soar_emit(cmd_id, sm, EdrCmdExecOk, 0,
-            "{\"status\":\"restored\",\"enforcement_verified\":true,\"verification\":\"enforcement_status\"}");
+            "{\"schema\":\"edr.isolation.status.v1\",\"isolated\":false,\"restored\":true,\"enforcement_verified\":true}");
 #else
   soar_emit(cmd_id, sm, EdrCmdExecOk, 0,
             "{\"status\":\"restored\",\"verification\":\"enforcement_exit_code\"}");
@@ -6009,8 +6009,9 @@ static int command_receive_envelope_impl(const char *command_id, const char *com
   }
   sm = &normalized_meta;
 
-  /* Only the verified remote owner may create result authority. Local automatic
-   * actions and unsigned compatibility commands cannot authorize extra egress. */
+  /* Remote requests require signature admission. Internal ransomware actions
+   * receive only the same bounded, durable typed receipt; other automation and
+   * unsigned compatibility commands cannot authorize extra egress. */
   const EdrConfig *cfg = edr_command_get_config();
   const EdrCommandDescriptor *result_owner = edr_command_registry_lookup(t);
   if (!internal_trusted && signature_policy.required && cfg && result_owner &&
@@ -6027,6 +6028,13 @@ static int command_receive_envelope_impl(const char *command_id, const char *com
       audit_both(id, "command result purpose exceeds supported content bounds; execution rejected");
       soar_emit(id, sm, EdrCmdExecRejected, 19, "result purpose contract rejected");
       return 0;
+    }
+  } else if (internal_trusted && !strncmp(id,"auto-ransom-",12u)) {
+    if (!cfg || !edr_ransom_auto_response_enabled() ||
+        edr_command_result_bind_local_ransom(&normalized_meta,id,t,payload,payload_len,
+                                            cfg->agent.tenant_id,cfg->agent.endpoint_id) != 0) {
+      audit_both(id,"local ransomware result purpose rejected before execution");
+      return -1;
     }
   }
 

@@ -241,7 +241,13 @@ function Enable-Isolation {
     foreach ($s in $specs) {
       New-NetFirewallRule -PolicyStore PersistentStore -Name $s.name -DisplayName $s.name -Direction $s.direction -Action Allow -Enabled True -Profile Any -RemoteAddress $s.addresses -Protocol $s.protocol -LocalPort $s.local_ports -RemotePort $s.remote_ports -Service $s.service -ErrorAction Stop | Out-Null
     }
-    foreach ($r in $rules) { Disable-NetFirewallRule -PolicyStore PersistentStore -Name $r.Name -ErrorAction Stop | Out-Null }
+    # Match the bounded restoration batches. A provider round trip per rule
+    # can delay containment for over a minute on ordinary Windows hosts.
+    $names = @($state.disabled_rules)
+    for ($offset = 0; $offset -lt $names.Count; $offset += 32) {
+      $last = [Math]::Min($offset + 31, $names.Count - 1)
+      Disable-NetFirewallRule -PolicyStore PersistentStore -Name $names[$offset..$last] -ErrorAction Stop | Out-Null
+    }
     Set-NetFirewallProfile -PolicyStore PersistentStore -Profile Domain,Private,Public -Enabled True -DefaultInboundAction Block -DefaultOutboundAction Block -ErrorAction Stop
     $state.phase = 'isolated'
     if (-not (Test-Isolation $state)) { throw "isolation_effect_not_verified" }
