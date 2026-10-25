@@ -41,9 +41,24 @@ static int version(EdrContextStore *s) {
   if (prepare(s, &st, "PRAGMA user_version") == 0 && sqlite3_step(st) == SQLITE_ROW)
     v = sqlite3_column_int(st, 0);
   sqlite3_finalize(st);
-  if (v < 0 || v > 2) {
+  if (v < 0 || v > 5) {
     snprintf(s->error, sizeof(s->error), "unsupported evidence cache format %d", v);
     return -1;
+  }
+  if (v >= 3) {
+    /* An unsupported reader rejects user_version before replacing views.
+     * Never interpret an arbitrary future/corrupt marker as a supported store. */
+    int valid = 0;
+    if (prepare(s, &st, "SELECT 1 FROM context_retirement_progress r JOIN p0_candidates p "
+        "ON p.candidate_id=r.candidate_id WHERE r.phase=2 AND p.retention_policy_version=1 "
+        "AND p.local_retention_state='retirement_eligible' LIMIT 1;") == 0)
+      valid = sqlite3_step(st) == SQLITE_ROW;
+    sqlite3_finalize(st);
+    if (!valid) {
+      snprintf(s->error,sizeof(s->error),"unsupported evidence cache retirement fence %d",v);
+      return -1;
+    }
+    v -= 3;
   }
   return v;
 }
@@ -185,6 +200,7 @@ static int retirement_progress_schema(EdrContextStore *s) {
       "candidate_id TEXT PRIMARY KEY REFERENCES p0_candidates(candidate_id) ON DELETE CASCADE,"
       "phase INTEGER NOT NULL CHECK(phase BETWEEN 0 AND 2),reason INTEGER NOT NULL CHECK(reason IN(0,1)),"
       "legacy_cursor TEXT NOT NULL DEFAULT '',compact_cursor INTEGER NOT NULL DEFAULT 0 CHECK(compact_cursor>=0));"
+      "CREATE INDEX IF NOT EXISTS idx_context_retirement_phase ON context_retirement_progress(phase);"
       "CREATE TRIGGER IF NOT EXISTS retirement_progress_candidate_write BEFORE UPDATE ON p0_candidates "
       "WHEN OLD.local_retention_state='retirement_eligible' "
       "BEGIN SELECT RAISE(ABORT,'candidate retirement in progress'); END;"
@@ -237,6 +253,89 @@ static int retirement_progress_schema(EdrContextStore *s) {
       "BEGIN DELETE FROM context_retirement_progress WHERE phase<2 AND candidate_id IN(SELECT c.candidate_id "
       "FROM compact_context_refs r JOIN context_candidates c ON c.id=r.candidate_key WHERE r.fact_key IN(OLD.id,NEW.id)); END;")!=0) return -1;
   return 0;
+}
+
+int edr_context_store_retirement_schema_pages(EdrContextStore *s,
+    uint64_t pages, uint64_t page_size, uint64_t *required) {
+  sqlite3 *model = NULL; sqlite3_stmt *objects = NULL, *existing = NULL;
+  int result = -1, step;
+  if (!s || !s->db || !required || page_size < 512 || page_size > 65536 || pages > UINT32_MAX) return -1;
+  *required = 0;
+  /* Render the SAME DDL into a bounded, empty private catalog. The placeholders
+   * have no endpoint data and only satisfy CREATE TRIGGER's table lookup.
+   * This is neither a copy of the evidence DB nor a speculative new schema. */
+  if (sqlite3_open(":memory:",&model) != SQLITE_OK) goto done;
+  EdrContextStore probe = {0}; probe.db=model; probe.format=s->format;
+  if (sql(&probe,"PRAGMA max_page_count=64;"
+      "CREATE TABLE p0_candidates(candidate_id TEXT);CREATE TABLE artifacts(candidate_id TEXT);"
+      "CREATE TABLE context_facts(fact_id TEXT);CREATE TABLE candidate_context_refs(candidate_id TEXT);"
+      "CREATE TABLE context_candidates(id INTEGER,candidate_id TEXT);"
+      "CREATE TABLE compact_context_refs(candidate_key INTEGER,fact_key INTEGER);"
+      "CREATE TABLE context_fact_keys(id INTEGER);") || retirement_progress_schema(&probe)) goto done;
+  if (sqlite3_prepare_v2(model,"SELECT type,name,sql,rootpage FROM sqlite_master WHERE "
+      "type='trigger' OR tbl_name='context_retirement_progress';",-1,&objects,NULL)!=SQLITE_OK ||
+      prepare(s,&existing,"SELECT type,sql FROM sqlite_master WHERE name=?1;")!=0) goto done;
+  /* A rowid catalog branch has at least two children. Charging a whole split
+   * path per new object deliberately overestimates normal packed catalogs;
+   * do not infer free space inside already occupied catalog pages. Add a leaf
+   * and overflow allowance for the literal DDL/record header and actual roots.
+   * This admission bound is conservative, not a promise against later IO/busy. */
+  uint64_t depth=1;
+  for (uint64_t n=pages; n>1; n=(n+1)/2) ++depth;
+  /* Maximum reserved region (255), database header (100), B-tree header and
+   * cell-pointer allowance (16). Per-record headers are charged below. */
+  uint64_t usable=page_size-255u-100u-16u;
+  while ((step=sqlite3_step(objects))==SQLITE_ROW) {
+    reset(existing);
+    if (sqlite3_bind_value(existing,1,sqlite3_column_value(objects,1))!=SQLITE_OK) goto done;
+    int found=sqlite3_step(existing);
+    if (found==SQLITE_ROW) {
+      const char *kind=(const char *)sqlite3_column_text(objects,0);
+      const char *old_kind=(const char *)sqlite3_column_text(existing,0);
+      int a=sqlite3_column_bytes(objects,2), b=sqlite3_column_bytes(existing,1);
+      if (!kind || !old_kind || strcmp(kind,old_kind) || a!=b ||
+          sqlite3_column_type(objects,2)!=sqlite3_column_type(existing,1) ||
+          (a && memcmp(sqlite3_column_text(objects,2),sqlite3_column_text(existing,1),(size_t)a))) goto done;
+      continue;
+    }
+    if (found!=SQLITE_DONE) goto done;
+    uint64_t bytes=(uint64_t)sqlite3_column_bytes(objects,2)+
+                   (uint64_t)sqlite3_column_bytes(objects,1)*2u+128u;
+    *required += depth+1u+(bytes+usable-1u)/usable+
+                 (sqlite3_column_int64(objects,3)>0 ? 1u : 0u);
+  }
+  if (step==SQLITE_DONE) result=0;
+done:
+  sqlite3_finalize(objects); sqlite3_finalize(existing); if(model)sqlite3_close(model);
+  return result;
+}
+
+int edr_context_store_sync_retirement_fence(EdrContextStore *s) {
+  sqlite3_stmt *st=NULL; int pending=-1;
+  if (!s || sqlite3_get_autocommit(s->db)) return -1;
+  if (prepare(s,&st,"SELECT 1 FROM context_retirement_progress WHERE phase=2 LIMIT 1;")==0) {
+    int rc=sqlite3_step(st);
+    if (rc==SQLITE_ROW || rc==SQLITE_DONE) pending=rc==SQLITE_ROW;
+  }
+  sqlite3_finalize(st); if(pending<0)return -1;
+  st=NULL; int current=-1;
+  if (prepare(s,&st,"PRAGMA user_version;")==0 && sqlite3_step(st)==SQLITE_ROW)
+    current=sqlite3_column_int(st,0);
+  sqlite3_finalize(st); if(current<0)return -1;
+  if (current==s->format+(pending ? 3 : 0)) return 0;
+  char statement[64];
+  snprintf(statement,sizeof(statement),"PRAGMA user_version=%d;",s->format+(pending ? 3 : 0));
+  return sql(s,statement);
+}
+
+static int set_layout_version(EdrContextStore *s, int layout) {
+  sqlite3_stmt *st=NULL; int raw=-1;
+  if (prepare(s,&st,"PRAGMA user_version;")==0 && sqlite3_step(st)==SQLITE_ROW)
+    raw=sqlite3_column_int(st,0);
+  sqlite3_finalize(st); if(raw<0 || raw>5)return -1;
+  char statement[64];
+  snprintf(statement,sizeof(statement),"PRAGMA user_version=%d;",layout+(raw>=3 ? 3 : 0));
+  return sql(s,statement);
 }
 
 int edr_context_store_install_retention_guards(EdrContextStore *s) {
@@ -292,7 +391,8 @@ int edr_context_store_begin_upgrade(EdrContextStore *s) {
   sqlite3_stmt *guard=NULL;
   if (prepare(s,&guard,"SELECT 1 FROM sqlite_master WHERE type='trigger' AND name='candidate_retention_delete';") != 0) goto rollback;
   int guarded=sqlite3_step(guard)==SQLITE_ROW; sqlite3_finalize(guard);
-  if ((guarded && edr_context_store_install_retention_guards(s)!=0) || sql(s, "PRAGMA user_version=1;COMMIT;") != 0) goto rollback;
+  if ((guarded && edr_context_store_install_retention_guards(s)!=0) ||
+      set_layout_version(s,1)!=0 || sql(s,"COMMIT;")!=0) goto rollback;
   return 0;
 rollback:
   sqlite3_exec(s->db, "ROLLBACK", NULL, NULL, NULL);
@@ -522,7 +622,7 @@ int edr_context_store_migrate_batch(EdrContextStore *s, unsigned limit,
   }
   sqlite3_finalize(read); read = NULL;
   edr_context_writer_close(&writer);
-  if (*complete && sql(s, "PRAGMA user_version=2;") != 0) goto rollback;
+  if (*complete && set_layout_version(s,2) != 0) goto rollback;
   /* Reuse the migration transaction for bounded reclamation. Separate FULL
    * vacuum commits and a second WAL checkpoint dominated small Windows
    * batches. Scaling reclamation with the validated row limit lets the
@@ -845,6 +945,7 @@ int edr_context_store_retire_candidate(EdrContextStore *s,
           "WHERE candidate_id=? AND retention_policy_version=1 AND local_retention_state='retained';")!=0) goto done;
       if (text(st,1,candidate_id)!=SQLITE_OK || sqlite3_step(st)!=SQLITE_DONE || sqlite3_changes(s->db)!=1) goto storage_failed;
       sqlite3_finalize(st); st=NULL; ++counts.progressed;
+      if (edr_context_store_sync_retirement_fence(s)!=0) goto done;
       continue;
     }
     int compact=layout;
@@ -970,6 +1071,7 @@ int edr_context_store_retire_candidate(EdrContextStore *s,
     fail(s, "delete retirement candidate failed"); goto done;
   }
   sqlite3_finalize(st); st = NULL;
+  if (edr_context_store_sync_retirement_fence(s)!=0) goto done;
   counts.candidates=1; counts.artifacts=1; ++counts.progressed;
   result=0; goto done;
 unfinished:

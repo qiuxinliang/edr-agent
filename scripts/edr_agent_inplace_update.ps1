@@ -993,9 +993,51 @@ function Restore-AgentTaskDefinition {
   }
 }
 
+function Assert-AgentStorageStartup {
+  param([Parameter(Mandatory=$true)][string]$ExecutablePath)
+  # The restored binary's existing read-only CLI rejects unsupported storage
+  # before Agent initialization can replace views. Never repair the cache here.
+  $directory = Split-Path -Parent ([IO.Path]::GetFullPath($ExecutablePath))
+  $config = Join-Path $directory 'agent.toml'
+  if (-not (Test-Path -LiteralPath $config -PathType Leaf)) { throw 'storage startup configuration missing' }
+  $probeDirectory = Join-Path $directory ('.storage-preflight-' + [Guid]::NewGuid().ToString('N'))
+  [void][IO.Directory]::CreateDirectory($probeDirectory)
+  $output = Join-Path $probeDirectory 'floor'
+  $process = $null
+  try {
+    $info = New-Object Diagnostics.ProcessStartInfo
+    $info.FileName = $ExecutablePath
+    $info.WorkingDirectory = $directory
+    $info.UseShellExecute = $false
+    $info.CreateNoWindow = $true
+    $info.Arguments = '--storage-space-preflight --config "' + $config + '" --output "' + $output + '"'
+    $process = [Diagnostics.Process]::Start($info)
+    if (-not $process.WaitForExit(20000)) {
+      $process.Kill()
+      if (-not $process.WaitForExit(5000)) { throw 'storage startup preflight termination unconfirmed' }
+      throw 'storage startup preflight timed out; runtime remains stopped'
+    }
+    if ($process.ExitCode -ne 0) {
+      throw "storage startup preflight failed: exit=$($process.ExitCode); preserve cache and use a compatible runtime"
+    }
+    $file = Get-Item -LiteralPath $output -ErrorAction Stop
+    if ($file.Length -lt 1 -or $file.Length -gt 16 -or
+        ($file.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'storage startup preflight output invalid' }
+    $raw = [IO.File]::ReadAllText($output)
+    [UInt64]$floor = 0
+    if ($raw -cnotmatch '^(0|[1-9][0-9]*)$' -or -not [UInt64]::TryParse($raw,[ref]$floor) -or
+        $floor -gt 9007199254740991) { throw 'storage startup preflight output invalid' }
+  } finally {
+    if ($process) { $process.Dispose() }
+    if (Test-Path -LiteralPath $output) { Remove-Item -LiteralPath $output -Force -ErrorAction Stop }
+    Remove-Item -LiteralPath $probeDirectory -Force -ErrorAction Stop
+  }
+}
+
 function Start-AgentRuntime {
   param([string]$Mode, [string]$TaskName, [string]$TaskPath, [string]$WindowsServiceName,
     [string]$ExecutablePath, [int]$TimeoutSeconds)
+  Assert-AgentStorageStartup -ExecutablePath $ExecutablePath
   if ($Mode -eq 'service') {
     Start-Service -Name $WindowsServiceName -ErrorAction Stop
   } else {
@@ -1038,6 +1080,9 @@ function Wait-AgentHealthObservation {
   if ($ObserveForMs -gt [UInt64][Int64]::MaxValue) {
     throw 'health observation duration exceeds supported elapsed range'
   }
+  # Covers recovered observations and full-installer starts as well as the
+  # normal Start-AgentRuntime path. A live process alone is not storage health.
+  Assert-AgentStorageStartup -ExecutablePath $ExecutablePath
   # UTC fields are durable diagnostics, never elapsed-time authority. A new
   # process cannot recover Stopwatch credit, so every interrupted observation
   # starts a complete conservative window, including legacy unversioned epochs.
@@ -1467,6 +1512,7 @@ try {
       if (-not $running) {
         throw 'Agent exited after the durable local health observation passed'
       }
+      Assert-AgentStorageStartup -ExecutablePath $currentPath
       # health_check is a durable terminal platform transition.  A crash
       # between that event and the local completed checkpoint must finish
       # idempotently; reopening observation would emit restarting after

@@ -278,6 +278,11 @@ if(WIN32)
       "& ([scriptblock]::Create((Get-Content -LiteralPath '${CMAKE_CURRENT_SOURCE_DIR}/test_windows_updater_health_clock.ps1' -Raw -Encoding UTF8))) -UpdaterPath '${CMAKE_SOURCE_DIR}/scripts/edr_agent_inplace_update.ps1' -UpdaterSha256 '${_edr_updater_health_source_sha256}'")
   set_tests_properties(windows_updater_health_clock PROPERTIES TIMEOUT 30
     ENVIRONMENT "PSModulePath=${CMAKE_CURRENT_BINARY_DIR}/foreign-powershell-modules")
+  add_test(NAME windows_updater_storage_start
+    COMMAND "${CMAKE_COMMAND}" -E env --unset=PSModulePath powershell.exe -NoProfile -NonInteractive -Command
+      "& ([scriptblock]::Create((Get-Content -LiteralPath '${CMAKE_CURRENT_SOURCE_DIR}/test_windows_updater_storage_start.ps1' -Raw -Encoding UTF8))) -UpdaterPath '${CMAKE_SOURCE_DIR}/scripts/edr_agent_inplace_update.ps1'")
+  set_tests_properties(windows_updater_storage_start PROPERTIES TIMEOUT 60
+    ENVIRONMENT "PSModulePath=${CMAKE_CURRENT_BINARY_DIR}/foreign-powershell-modules")
   add_test(NAME windows_updater_stop
     COMMAND "${CMAKE_COMMAND}" -E env --unset=PSModulePath powershell.exe -NoProfile -NonInteractive -Command
       "& ([scriptblock]::Create((Get-Content -LiteralPath '${CMAKE_CURRENT_SOURCE_DIR}/test_windows_updater_stop.ps1' -Raw -Encoding UTF8))) -UpdaterPath '${CMAKE_SOURCE_DIR}/scripts/edr_agent_inplace_update.ps1' -UpdaterSha256 '${_edr_updater_health_source_sha256}'")

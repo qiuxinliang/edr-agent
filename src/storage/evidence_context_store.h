@@ -5,7 +5,8 @@
 #include <stdint.h>
 
 /* Private SQLite owner for context format compatibility. Version 0 is the
- * shipped string-key layout; 1 is resumable migration; 2 is compact. */
+ * shipped string-key layout; 1 is resumable migration; 2 is compact. On disk,
+ * layout+3 fences old readers while a logical retirement is being drained. */
 typedef struct {
   sqlite3 *db;
   int format;
@@ -30,6 +31,13 @@ int edr_context_store_begin_upgrade(EdrContextStore *store);
 /* Installed by the cache owner after its additive retention metadata exists.
  * Durable SQL guards keep older maintenance from independently breaking groups. */
 int edr_context_store_install_retention_guards(EdrContextStore *store);
+/* Read-only admission for the exact retirement schema owned below. Required
+ * pages conservatively include catalog insertion/split and root-page costs. */
+int edr_context_store_retirement_schema_pages(EdrContextStore *store,
+    uint64_t pages, uint64_t page_size, uint64_t *required);
+/* Caller owns the writer transaction. Fence and drain state commit together;
+ * only the last completed drain restores the old-reader layout version. */
+int edr_context_store_sync_retirement_fence(EdrContextStore *store);
 /* Current schema owners avoid rebuilding an identical named trigger/view. Missing
  * or changed definitions are replaced inside a nested-safe private savepoint. */
 int edr_context_store_ensure_schema_object(EdrContextStore *store, const char *kind,

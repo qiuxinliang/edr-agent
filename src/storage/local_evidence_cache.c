@@ -2978,6 +2978,9 @@ static int sqlite_retention_metadata_open(void) {
     goto failed;
   }
   sqlite3_finalize(st); st = NULL;
+  if (edr_context_store_sync_retirement_fence(&s_context_store)!=0) {
+    set_error(s_context_store.error); goto failed;
+  }
   if (exec_sql(
       "CREATE INDEX IF NOT EXISTS idx_candidates_retention ON p0_candidates(retention_policy_version,event_time_ns,candidate_id);"
       "CREATE INDEX IF NOT EXISTS idx_candidates_query_scope_time ON p0_candidates(endpoint_id,tenant_id,event_time_ns);"

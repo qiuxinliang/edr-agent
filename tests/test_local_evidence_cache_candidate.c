@@ -8528,6 +8528,7 @@ static void test_candidate_retirement_resumable(void) {
         while(format==2 && !complete);
       }
       assert(edr_context_store_install_retention_guards(&store)==0);
+      assert(compact_scalar(db,"PRAGMA user_version")==format);
       if(!timed && format!=1) {
         compact_exec(db,"BEGIN IMMEDIATE;");
         if(!format) compact_exec(db,
@@ -8569,6 +8570,7 @@ static void test_candidate_retirement_resumable(void) {
       }
       assert(compact_scalar(db,"SELECT COUNT(*) FROM materialized_artifacts WHERE candidate_id='resume'")==0);
       assert(compact_scalar(db,"SELECT reason FROM context_retirement_progress WHERE candidate_id='resume'")==1);
+      assert(compact_scalar(db,"PRAGMA user_version")==format+3);
       /* A pinned WAL snapshot keeps the original complete evidence. */
       assert(compact_scalar(reader,"SELECT COUNT(*) FROM materialized_artifacts WHERE candidate_id='resume'")==refs+1u);
       compact_exec(reader,"COMMIT;");assert(sqlite3_close(reader)==SQLITE_OK);
@@ -8615,6 +8617,7 @@ static void test_candidate_retirement_resumable(void) {
       assert(removed==refs);
       assert(compact_scalar(db,"SELECT COUNT(*) FROM context_retirement_progress")==0);
       assert(compact_scalar(db,"SELECT COUNT(*) FROM p0_candidates WHERE candidate_id='resume'")==0);
+      assert(compact_scalar(db,"PRAGMA user_version")==store.format);
       assert(compact_scalar(db,"SELECT COUNT(*) FROM context_facts")==1);
       assert(compact_scalar(db,"SELECT COUNT(*) FROM pragma_foreign_key_check")==0);
       assert(compact_scalar(db,"SELECT COUNT(*) FROM (SELECT * FROM progress_expected EXCEPT SELECT * FROM materialized_artifacts)")==0);
@@ -8625,6 +8628,51 @@ static void test_candidate_retirement_resumable(void) {
     }
   }
   edr_local_evidence_cache_test_set_now_unix_ns(0);
+}
+
+static void test_retirement_fence_atomic_and_last_owner(void) {
+  for(int format=0;format<=2;++format) {
+    char path[512];sqlite3 *db=NULL;EdrContextStore store;EdrContextRetirement out;
+    assert(make_test_sqlite_path(path,sizeof(path))==0);
+    assert(test_open_legacy_context(path,32,1)==0);edr_local_evidence_cache_close();
+    assert(sqlite3_open(path,&db)==SQLITE_OK);
+    retention_group_fixture(db,"first",1,1,1,2);retention_group_fixture(db,"second",1,1,1,2);
+    compact_exec(db,"WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<32) "
+        "INSERT INTO context_facts SELECT printf('f%d',x),'retention-endpoint','retention-tenant','{}',1,1 FROM n;"
+        "INSERT INTO candidate_context_refs SELECT p.candidate_id||f.fact_id,p.candidate_id,f.fact_id,"
+        "'\"'||p.candidate_id||'\"',1,'local_manifest','' FROM p0_candidates p CROSS JOIN context_facts f;");
+    retention_upgrade_refs(db,format);assert(edr_context_store_open(&store,db)==0);
+    const char *ids[]={"first","second"};
+    for(unsigned i=0;i<2;++i) {
+      int phase=0,rolled_back=0;unsigned turns=0;
+      while(!phase) {
+        assert(++turns<128);compact_exec(db,"BEGIN IMMEDIATE;");
+        assert(edr_context_store_retire_candidate(&store,ids[i],1,16,4096000,NULL,NULL,&out)==2);
+        phase=(int)compact_scalar(db,"SELECT COUNT(*) FROM p0_candidates WHERE candidate_id='first' AND local_retention_state='retirement_eligible';");
+        if(i)phase=(int)compact_scalar(db,"SELECT COUNT(*) FROM p0_candidates WHERE candidate_id='second' AND local_retention_state='retirement_eligible';");
+        if(phase && !i && !rolled_back) {
+          assert(compact_scalar(db,"PRAGMA user_version")==format+3);
+          compact_exec(db,"ROLLBACK;");rolled_back=1;phase=0;
+          assert(compact_scalar(db,"PRAGMA user_version")==format);
+          assert(compact_scalar(db,"SELECT COUNT(*) FROM p0_candidates WHERE local_retention_state='retirement_eligible'")==0);
+        } else compact_exec(db,"COMMIT;");
+      }
+    }
+    for(unsigned i=0;i<2;++i) {
+      unsigned turns=0;int rc;
+      do {
+        assert(++turns<128);compact_exec(db,"BEGIN IMMEDIATE;");
+        rc=edr_context_store_retire_candidate(&store,ids[i],0,16,4096000,NULL,NULL,&out);
+        assert(rc==0 || rc==2);compact_exec(db,"COMMIT;");
+      } while(rc==2);
+      assert(compact_scalar(db,"PRAGMA user_version")==format+(i ? 0 : 3));
+      if(!i) {assert(sqlite3_close(db)==SQLITE_OK);assert(sqlite3_open(path,&db)==SQLITE_OK);assert(edr_context_store_open(&store,db)==0);}
+    }
+    assert(compact_scalar(db,"SELECT COUNT(*) FROM context_retirement_progress")==0);
+    assert(compact_scalar(db,"SELECT COUNT(*) FROM pragma_foreign_key_check")==0);
+    assert(sqlite3_close(db)==SQLITE_OK);cleanup_test_sqlite_path(path);
+    printf("retirement_fence format=%d transaction_rollback=1 multiple_drains=1 last_owner_clears=1 reopen=1\n",format);
+  }
 }
 
 static void test_compact_process_crash_recovery(void) {
@@ -13021,6 +13069,57 @@ static void test_startup_preclock_full(int over, int expired_metrics) {
 
 static void compact_startup_rowset_hash(sqlite3 *db, const char *sql, char out[65]);
 
+static void test_startup_retirement_schema_admission(void) {
+  for(int format=0;format<=2;++format) for(int spare=0;spare<=1;++spare) {
+    char path[512],before[65],after[65];sqlite3 *db=NULL;EdrContextStore store;
+    assert(make_test_sqlite_path(path,sizeof(path))==0);
+    assert(test_open_legacy_context(path,4,72)==0);edr_local_evidence_cache_close();
+    assert(sqlite3_open(path,&db)==SQLITE_OK);
+    retention_group_fixture(db,"unknown-startup",0,1,1,2);
+    compact_exec(db,"INSERT INTO context_facts VALUES('first-fact','retention-endpoint','retention-tenant','{}',1,1),"
+        "('second-fact','retention-endpoint','retention-tenant','{}',1,1);");
+    retention_ref_fixture(db,"unknown-startup","first-fact",1);
+    retention_ref_fixture(db,"unknown-startup","second-fact",1);
+    retention_upgrade_refs(db,format);
+    /* Remove only this new release's structures from a public fixture. All old
+     * clock/ownership guards remain, reproducing the misleading old preflight. */
+    sqlite3_stmt *st=NULL;
+    assert(sqlite3_prepare_v2(db,"SELECT name FROM sqlite_master WHERE type='trigger' "
+        "AND (name GLOB 'retirement_progress_*' OR name GLOB 'retirement_freeze_*');",-1,&st,NULL)==SQLITE_OK);
+    char *drops=sqlite3_mprintf("");assert(drops);
+    while(sqlite3_step(st)==SQLITE_ROW) {
+      char *next=sqlite3_mprintf("%sDROP TRIGGER \"%w\";",drops,sqlite3_column_text(st,0));
+      sqlite3_free(drops);drops=next;assert(drops);
+    }
+    sqlite3_finalize(st);compact_exec(db,drops);sqlite3_free(drops);
+    compact_exec(db,"DROP TABLE context_retirement_progress;");
+    /* Include the observed already-over-budget boundary, without endpoint data. */
+    sqlite3_int64 target=format==2 ? 1024+230 : 1024-spare;
+    startup_fill_pages(db,target);
+    compact_startup_rowset_hash(db,"SELECT * FROM p0_candidates ORDER BY candidate_id;",before);
+    sqlite3_int64 schema=compact_scalar(db,"PRAGMA schema_version");
+    assert(edr_context_store_check_format(&store,db)==0);
+    uint64_t required=0;
+    assert(edr_context_store_retirement_schema_pages(&store,(uint64_t)target,4096,&required)==0 && required>1);
+    assert(edr_local_evidence_cache_startup_preflight(path,4)==1);
+    assert(compact_scalar(db,"PRAGMA schema_version")==schema && compact_scalar(db,"PRAGMA page_count")==target);
+    compact_startup_rowset_hash(db,"SELECT * FROM p0_candidates ORDER BY candidate_id;",after);assert(!strcmp(before,after));
+    assert(edr_local_evidence_cache_open_with_policy(path,4,72,72)<0);edr_local_evidence_cache_close();
+    /* Same budget, release only generated padding, then use the normal owner. */
+    for(unsigned n=0;n<32;++n) { char q[96];snprintf(q,sizeof(q),"DROP TABLE IF EXISTS startup_padding_page_%u;",n);compact_exec(db,q); }
+    compact_exec(db,"DROP TABLE startup_padding;");
+    assert(edr_local_evidence_cache_startup_preflight(path,4)==0);
+    assert(edr_local_evidence_cache_open_with_policy(path,4,72,72)==0);edr_local_evidence_cache_close();
+    compact_startup_rowset_hash(db,"SELECT * FROM p0_candidates ORDER BY candidate_id;",after);assert(!strcmp(before,after));
+    assert(edr_context_store_check_format(&store,db)==0);
+    assert(edr_context_store_retirement_schema_pages(&store,(uint64_t)target,4096,&required)==0 && required==0);
+    startup_fill_pages(db,target);assert(edr_local_evidence_cache_startup_preflight(path,4)==0);
+    assert(compact_scalar(db,"SELECT COUNT(*) FROM pragma_foreign_key_check")==0);
+    assert(sqlite3_close(db)==SQLITE_OK);cleanup_test_sqlite_path(path);
+    printf("retirement_schema_admission format=%d spare=%d old_guard_false_allow_closed=1 readonly=1 same_budget_recovery=1\n",format,spare);
+  }
+}
+
 /* Exercise the pre-clock full-store repair with actual frozen parent facts,
  * shared commands and two generations of one PID, not only a bare candidate.
  * Hash the old columns byte-for-byte; the newly added floor must remain zero. */
@@ -13112,6 +13211,7 @@ static void test_startup_logical_budget(void) {
   test_startup_preclock_full(0,3);
   test_startup_preclock_full(0,4);
   test_startup_preclock_owner_integrity();
+  test_startup_retirement_schema_admission();
   test_startup_logical_budget_legacy(1,0,1u);
   test_startup_logical_budget_legacy(1,1,1u);
   test_startup_logical_budget_legacy(0,0,1u);
@@ -13947,7 +14047,7 @@ int main(int argc, char **argv) {
     test_pmfe_recovery_query_cost_and_index_upgrade(); return 0;
   }
   if (argc == 2 && strcmp(argv[1], "--retirement-progress") == 0) {
-    test_candidate_retirement_resumable(); test_retirement_rejects_new_pmfe_owner(); return 0;
+    test_candidate_retirement_resumable(); test_retirement_fence_atomic_and_last_owner(); test_retirement_rejects_new_pmfe_owner(); return 0;
   }
   if (argc == 4 && strcmp(argv[1], "--crash-retirement-progress") == 0) {
     retirement_progress_crash_child(argv[2],atoi(argv[3])); return 1;
@@ -14039,6 +14139,7 @@ int main(int argc, char **argv) {
   RUN_CACHE_CASE("retention", test_candidate_retention_writer_does_not_promote_legacy());
   RUN_CACHE_CASE("retention", test_candidate_group_oversize_and_active_window());
   RUN_CACHE_CASE("retention", test_candidate_retirement_resumable());
+  RUN_CACHE_CASE("retention", test_retirement_fence_atomic_and_last_owner());
   RUN_CACHE_CASE("retention", test_retirement_rejects_new_pmfe_owner());
   RUN_CACHE_CASE("retention", test_retention_accounting_maximum_width_is_bounded());
   RUN_CACHE_CASE("retention", test_candidate_retirement_cursor_skips_protected_prefix());

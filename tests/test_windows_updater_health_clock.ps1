@@ -42,6 +42,7 @@ function Get-ScheduledTask {
   return [pscustomobject]@{State=$(if($script:fixtureMode -eq 'task_stopped'){'Ready'}else{'Running'})}
 }
 function Set-UpdateStage([string]$Stage,[string]$Status='running') { [void]$script:stages.Add($Stage) }
+function Assert-AgentStorageStartup([string]$ExecutablePath) { }
 $timings=New-Object 'System.Collections.Generic.List[object]'
 foreach($mode in @('healthy','wall_forward','wall_backward','legacy_future','legacy_past','versioned_recovery')) {
   $script:fixtureMode=$mode;$script:wallOffset=0L;$script:processCalls=0;$script:stages.Clear()

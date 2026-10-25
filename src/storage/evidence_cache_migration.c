@@ -139,7 +139,10 @@ int edr_local_evidence_cache_startup_preflight(const char *path, uint32_t max_db
   if (scalar(db,"PRAGMA page_count",&pages) || scalar(db,"PRAGMA freelist_count",&free_pages) ||
       scalar(db,"PRAGMA page_size",&page_size) || pages<0 || free_pages<0 || page_size<=0) goto done;
   uint64_t budget=(uint64_t)(max_db_mb ? max_db_mb : 128u)*1048576u;
-  if (free_pages>0 || (uint64_t)pages<budget/(uint64_t)page_size) { result=0; goto done; }
+  uint64_t schema_pages=0, budget_pages=budget/(uint64_t)page_size;
+  if (edr_context_store_retirement_schema_pages(&store,(uint64_t)pages,
+      (uint64_t)page_size,&schema_pages)!=0) goto done;
+  uint64_t available=(uint64_t)free_pages+(budget_pages>(uint64_t)pages ? budget_pages-(uint64_t)pages : 0u);
   if (scalar(db,"SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='metrics'",&metrics)) goto done;
   if (metrics && scalar(db,"SELECT COUNT(*) FROM metrics WHERE minute_unix=0 AND endpoint_id='' "
       "AND metric_name='local_retention_v1_active_ms'",&clock)) goto done;
@@ -150,9 +153,10 @@ int edr_local_evidence_cache_startup_preflight(const char *path, uint32_t max_db
       "'retention_active_clock_v1_insert','retention_active_clock_v1_update','retention_active_clock_v1_delete',"
       "'alert_context_floor_v1_insert','alert_context_floor_v1_update','alert_context_floor_v1_eligible',"
       "'alert_context_floor_v1_delete')",&guards)) goto done;
+  if (schema_pages>available) { result=1; goto done; }
   /* This is deliberately conservative: slack within occupied B-tree pages
    * is not proven migration capacity. Fully current full stores may reopen. */
-  result = clock == 1 && guards == 7 ? 0 : 1;
+  result = clock == 1 && guards == 7 ? 0 : available>schema_pages ? 0 : 1;
 done:
   if (interrupted(&deadline)) result=-1;
   if (db) sqlite3_close(db);
