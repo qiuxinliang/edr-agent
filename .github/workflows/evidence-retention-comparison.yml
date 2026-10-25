@@ -8,6 +8,10 @@ name: Evidence retention native comparison
 on:
   workflow_dispatch:
     inputs:
+      p0_test_inputs_ref:
+        description: 'Fixed private P0 input commit (40 hex); defaults to P0_TEST_INPUTS_REF repository variable'
+        type: string
+        required: false
       diagnose_service_stop:
         description: 'Run one isolated ARM64 Service stop diagnosis; no release or endpoint'
         type: boolean
@@ -96,7 +100,7 @@ jobs:
     env:
       VCPKG_ROOT: ${{ github.workspace }}/vcpkg
       VCPKG_DEFAULT_TRIPLET: ${{ matrix.triplet }}
-      P0_TEST_INPUTS_REF: ${{ vars.P0_TEST_INPUTS_REF }}
+      P0_TEST_INPUTS_REF: ${{ inputs.p0_test_inputs_ref || vars.P0_TEST_INPUTS_REF }}
     steps:
       - uses: actions/checkout@v6
         with:
