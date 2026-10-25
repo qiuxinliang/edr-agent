@@ -2845,6 +2845,31 @@ static void test_capacity_reserves_wal_room_below_live_limit(void) {
         (unsigned long long)after.db_bytes,(unsigned long long)after.wal_bytes,
         (unsigned long long)after.retention_groups_retired,after.last_error);
   assert(after.db_bytes + after.wal_bytes <= 960u * 1024u);
+  /* Crossing the physical target may leave a logically retired group between
+   * reference drainage and final owner removal. It must already be hidden,
+   * while every retained group stays complete. Let the normal owner finish
+   * that work after pressure subsides before asserting the settled WAL floor. */
+  assert(sqlite_scalar_integer(db,"SELECT COUNT(*) FROM materialized_artifacts a JOIN p0_candidates p "
+      "ON p.candidate_id=a.candidate_id WHERE p.local_retention_state='retirement_eligible';")==0);
+  assert(sqlite_scalar_integer(db,"SELECT COUNT(*) FROM p0_candidates p WHERE local_retention_state='retained' "
+      "AND NOT EXISTS(SELECT 1 FROM context_reference_projection r WHERE r.candidate_id=p.candidate_id);")==0);
+  assert(sqlite_scalar_integer(db,"SELECT COUNT(*) FROM context_reference_projection r "
+      "LEFT JOIN p0_candidates p ON p.candidate_id=r.candidate_id LEFT JOIN context_facts f ON f.fact_id=r.fact_id "
+      "WHERE p.candidate_id IS NULL OR f.fact_id IS NULL;")==0);
+  int64_t pending=sqlite_scalar_integer(db,"SELECT COUNT(*) FROM context_retirement_progress WHERE phase=2;");
+  const uint64_t drain_started=soak_monotonic_ns();
+  unsigned drain_turns=0;
+  while(sqlite_scalar_integer(db,"SELECT COUNT(*) FROM context_retirement_progress WHERE phase=2;") &&
+        soak_monotonic_ns()-drain_started<UINT64_C(30000000000)) {
+    s_test_monotonic_ns+=UINT64_C(60000000000);
+    edr_local_evidence_cache_poll_maintenance(); ++drain_turns;
+  }
+  printf("capacity_retirement_settled pending_before=%lld turns=%u remaining=%lld\n",
+      (long long)pending,drain_turns,(long long)sqlite_scalar_integer(db,
+      "SELECT COUNT(*) FROM p0_candidates WHERE local_retention_state='retirement_eligible';"));
+  assert(!fflush(stdout));
+  assert(sqlite_scalar_integer(db,"SELECT COUNT(*) FROM context_retirement_progress WHERE phase=2;")==0);
+  assert(sqlite_scalar_integer(db,"SELECT COUNT(*) FROM p0_candidates WHERE local_retention_state='retirement_eligible';")==0);
   /* Production stops retiring at live <= target. Force that exact boundary
    * after proving real above-target reclamation, then exercise admission and
    * reopen below. This is a pre-write admission budget, not a hard bound
@@ -8595,6 +8620,7 @@ static void test_candidate_retirement_resumable(void) {
       assert(compact_scalar(db,"SELECT COUNT(*) FROM (SELECT * FROM progress_expected EXCEPT SELECT * FROM materialized_artifacts)")==0);
       assert(compact_scalar(db,"SELECT COUNT(*) FROM (SELECT * FROM materialized_artifacts WHERE candidate_id='unknown-keep' EXCEPT SELECT * FROM progress_expected)")==0);
       printf("retirement_progress format=%d refs=%u deadline=%d turns=%u yields=%u resumed=1 shared_fact=1 pending_protected=1\n",format,refs,timed,turns,interrupted);
+      assert(!fflush(stdout));
       assert(sqlite3_close(db)==SQLITE_OK);cleanup_test_sqlite_path(path);
     }
   }
