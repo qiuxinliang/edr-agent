@@ -13069,6 +13069,79 @@ static void test_startup_preclock_full(int over, int expired_metrics) {
 
 static void compact_startup_rowset_hash(sqlite3 *db, const char *sql, char out[65]);
 
+/* Upgrade from the shipped progress schema with rows but without its phase
+ * index. A root-page/DDL estimate must not admit an index that cannot fit. */
+static void test_startup_retirement_populated_index(void) {
+  static const char *queries[]={
+    "SELECT * FROM p0_candidates ORDER BY candidate_id;",
+    "SELECT * FROM artifacts ORDER BY artifact_id;",
+    "SELECT * FROM context_retirement_progress ORDER BY candidate_id;",
+    "SELECT type,name,tbl_name,rootpage,sql FROM sqlite_master ORDER BY name;"
+  };
+  for(int format=0;format<=2;++format) for(int populated=0;populated<=1;++populated) {
+    char path[512],before[4][65],after[65];sqlite3 *db=NULL;EdrContextStore store;
+    assert(make_test_sqlite_path(path,sizeof(path))==0);
+    assert(test_open_legacy_context(path,32,72)==0);edr_local_evidence_cache_close();
+    assert(sqlite3_open(path,&db)==SQLITE_OK);
+    retention_group_fixture(db,"unknown-index-keep",0,1,1,2);
+    compact_exec(db,"INSERT INTO context_facts VALUES('index-first','retention-endpoint','retention-tenant','{}',1,1),"
+        "('index-second','retention-endpoint','retention-tenant','{}',1,1);");
+    retention_ref_fixture(db,"unknown-index-keep","index-first",1);
+    retention_ref_fixture(db,"unknown-index-keep","index-second",1);
+    retention_upgrade_refs(db,format);
+    assert(edr_context_store_check_format(&store,db)==0 && store.format==format);
+    compact_exec(db,"DROP INDEX idx_context_retirement_phase;");
+    if(populated) compact_exec(db,
+        "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<20000) "
+        "INSERT INTO p0_candidates(candidate_id,endpoint_id,tenant_id,event_time_ns,created_ns,"
+        "retention_policy_version,local_retention_state,retention_value_class,retention_value_reason) "
+        "SELECT printf('public-%08d',x),'retention-endpoint','retention-tenant',1,1,1,'retained',0,'recent' FROM n;"
+        "INSERT INTO artifacts(artifact_id,endpoint_id,tenant_id,candidate_id,artifact_type,manifest_json,created_ns,upload_status,minio_key) "
+        "SELECT candidate_id,endpoint_id,tenant_id,candidate_id,'summary','{}',1,'local_manifest','' "
+        "FROM p0_candidates WHERE candidate_id LIKE 'public-%';"
+        "INSERT INTO context_retirement_progress(candidate_id,phase,reason) "
+        "SELECT candidate_id,0,0 FROM p0_candidates WHERE candidate_id LIKE 'public-%';");
+    startup_fill_pages(db,8192-24);
+    for(unsigned i=0;i<4;++i) compact_startup_rowset_hash(db,queries[i],before[i]);
+    assert(edr_local_evidence_cache_startup_preflight(path,32)==populated);
+    uint64_t required=0;
+    assert(edr_context_store_retirement_schema_pages(&store,8192-24,4096,&required)==0);
+    assert(populated ? required>24 : required<=24);
+    for(unsigned i=0;i<4;++i) {
+      compact_startup_rowset_hash(db,queries[i],after);assert(!strcmp(before[i],after));
+    }
+    compact_exec(db,"PRAGMA max_page_count=8192;");
+    if(populated) {
+      /* Same actual owner DDL fails under the same logical budget. */
+      assert(edr_context_store_install_retention_guards(&store)<0 && store.sqlite_error_code==SQLITE_FULL);
+      assert(compact_scalar(db,"SELECT COUNT(*) FROM sqlite_master WHERE name='idx_context_retirement_phase'")==0);
+      for(unsigned i=0;i<4;++i) {
+        compact_startup_rowset_hash(db,queries[i],after);assert(!strcmp(before[i],after));
+      }
+      uint64_t ignored=0;
+      sqlite3_progress_handler(db,1000,migration_cancel,NULL);
+      assert(!edr_context_store_index_inventory(db,"context_retirement_progress",&ignored));
+      sqlite3_progress_handler(db,0,NULL,NULL);
+      /* Release generated padding only, keeping the original budget and rows. */
+      for(unsigned n=0;n<32;++n) {char q[96];snprintf(q,sizeof(q),"DROP TABLE IF EXISTS startup_padding_page_%u;",n);compact_exec(db,q);}
+      compact_exec(db,"DROP TABLE startup_padding;");
+      assert(edr_local_evidence_cache_startup_preflight(path,32)==0);
+    }
+    assert(edr_context_store_install_retention_guards(&store)==0);
+    assert(compact_scalar(db,"SELECT COUNT(*) FROM sqlite_master WHERE name='idx_context_retirement_phase'")==1);
+    assert(edr_context_store_retirement_schema_pages(&store,8192,4096,&required)==0 && required==0);
+    assert(edr_local_evidence_cache_startup_preflight(path,32)==0);
+    for(unsigned i=0;i<3;++i) {
+      compact_startup_rowset_hash(db,queries[i],after);assert(!strcmp(before[i],after));
+    }
+    assert(compact_scalar(db,"SELECT COUNT(*) FROM pragma_foreign_key_check")==0);
+    assert(compact_scalar(db,"SELECT COUNT(*) FROM pragma_quick_check WHERE quick_check!='ok'")==0);
+    assert(sqlite3_close(db)==SQLITE_OK);cleanup_test_sqlite_path(path);
+    printf("retirement_index_admission format=%d rows=%d readonly=1 same_budget_ddl=1 inventory_cancellation=%d\n",
+        format,populated?20000:0,populated);
+  }
+}
+
 static void test_startup_retirement_schema_admission(void) {
   for(int format=0;format<=2;++format) for(int spare=0;spare<=1;++spare) {
     char path[512],before[65],after[65];sqlite3 *db=NULL;EdrContextStore store;
@@ -13212,6 +13285,7 @@ static void test_startup_logical_budget(void) {
   test_startup_preclock_full(0,4);
   test_startup_preclock_owner_integrity();
   test_startup_retirement_schema_admission();
+  test_startup_retirement_populated_index();
   test_startup_logical_budget_legacy(1,0,1u);
   test_startup_logical_budget_legacy(1,1,1u);
   test_startup_logical_budget_legacy(0,0,1u);

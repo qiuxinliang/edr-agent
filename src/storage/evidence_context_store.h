@@ -31,8 +31,12 @@ int edr_context_store_begin_upgrade(EdrContextStore *store);
 /* Installed by the cache owner after its additive retention metadata exists.
  * Durable SQL guards keep older maintenance from independently breaking groups. */
 int edr_context_store_install_retention_guards(EdrContextStore *store);
+/* Shared logical/physical startup inventory for indexes over existing rows.
+ * Returns 1 on success, 0 on failure/overflow/interruption. No table means zero.
+ * Caller owns a consistent snapshot and installs its progress deadline. */
+int edr_context_store_index_inventory(sqlite3 *db, const char *table, uint64_t *bytes);
 /* Read-only admission for the exact retirement schema owned below. Required
- * pages conservatively include catalog insertion/split and root-page costs. */
+ * pages include catalog/root costs and existing rows for missing indexes. */
 int edr_context_store_retirement_schema_pages(EdrContextStore *store,
     uint64_t pages, uint64_t page_size, uint64_t *required);
 /* Caller owns the writer transaction. Fence and drain state commit together;

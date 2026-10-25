@@ -255,10 +255,41 @@ static int retirement_progress_schema(EdrContextStore *s) {
   return 0;
 }
 
+int edr_context_store_index_inventory(sqlite3 *db, const char *table, uint64_t *bytes) {
+  if (!db || !table || !bytes) return 0;
+  sqlite3_stmt *st=NULL; char *query=NULL, *next=NULL; unsigned columns=0;
+  char *pragma=sqlite3_mprintf("PRAGMA table_info(\"%w\");",table);
+  if(!pragma || sqlite3_prepare_v2(db,pragma,-1,&st,NULL)!=SQLITE_OK) {sqlite3_free(pragma);return 0;}
+  sqlite3_free(pragma);
+  query=sqlite3_mprintf("SELECT COALESCE(SUM(128");
+  if(!query) goto failed;
+  int rc;
+  while((rc=sqlite3_step(st))==SQLITE_ROW) {
+    const char *column=(const char *)sqlite3_column_text(st,1);
+    if(!column) goto failed;
+    next=sqlite3_mprintf("%s+16+COALESCE(length(CAST(\"%w\" AS BLOB)),0)",query,column);
+    sqlite3_free(query);query=next;next=NULL;
+    if(!query) goto failed;
+    ++columns;
+  }
+  sqlite3_finalize(st);st=NULL;
+  if(rc!=SQLITE_DONE) goto failed;
+  if(!columns) {*bytes=0;sqlite3_free(query);return 1;}
+  next=sqlite3_mprintf("%s),0) FROM \"%w\";",query,table);
+  sqlite3_free(query);query=next;next=NULL;
+  if(!query || sqlite3_prepare_v2(db,query,-1,&st,NULL)!=SQLITE_OK || sqlite3_step(st)!=SQLITE_ROW ||
+      sqlite3_column_type(st,0)!=SQLITE_INTEGER || sqlite3_column_int64(st,0)<0) goto failed;
+  *bytes=(uint64_t)sqlite3_column_int64(st,0);
+  sqlite3_finalize(st);sqlite3_free(query);return 1;
+failed:
+  sqlite3_finalize(st);sqlite3_free(query);return 0;
+}
+
 int edr_context_store_retirement_schema_pages(EdrContextStore *s,
     uint64_t pages, uint64_t page_size, uint64_t *required) {
   sqlite3 *model = NULL; sqlite3_stmt *objects = NULL, *existing = NULL;
-  int result = -1, step;
+  int result = -1, step, inventory_measured = 0;
+  uint64_t inventory = 0;
   if (!s || !s->db || !required || page_size < 512 || page_size > 65536 || pages > UINT32_MAX) return -1;
   *required = 0;
   /* Render the SAME DDL into a bounded, empty private catalog. The placeholders
@@ -303,6 +334,20 @@ int edr_context_store_retirement_schema_pages(EdrContextStore *s,
                    (uint64_t)sqlite3_column_bytes(objects,1)*2u+128u;
     *required += depth+1u+(bytes+usable-1u)/usable+
                  (sqlite3_column_int64(objects,3)>0 ? 1u : 0u);
+    if (!strcmp((const char *)sqlite3_column_text(objects,0),"index")) {
+      /* A supported old store may already have nonempty progress. Reuse the
+       * physical-startup inventory: twice all source-row bytes bounds the
+       * sparse index; DDL/root costs alone describe only an empty table.
+       * The caller's read transaction and progress deadline also cover SUM. */
+      if (!inventory_measured &&
+          !edr_context_store_index_inventory(s->db,"context_retirement_progress",&inventory)) goto done;
+      inventory_measured=1;
+      if (inventory>UINT64_MAX/2u) goto done;
+      uint64_t payload=inventory*2u;
+      uint64_t row_pages=payload/usable+(payload%usable!=0);
+      if (row_pages>UINT64_MAX-*required) goto done;
+      *required+=row_pages;
+    }
   }
   if (step==SQLITE_DONE) result=0;
 done:

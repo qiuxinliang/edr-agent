@@ -3394,35 +3394,6 @@ static int sqlite_startup_probe_cancel(void *deadline) {
   return evidence_cache_clock_ns() >= *(const uint64_t *)deadline;
 }
 
-static int sqlite_table_index_inventory(const char *table, uint64_t *bytes) {
-  sqlite3_stmt *st=NULL; char *query=NULL, *next=NULL; unsigned columns=0;
-  char *pragma=sqlite3_mprintf("PRAGMA table_info(\"%w\");",table);
-  if(!pragma || sqlite3_prepare_v2(s_db,pragma,-1,&st,NULL)!=SQLITE_OK) {sqlite3_free(pragma);return 0;}
-  sqlite3_free(pragma);
-  query=sqlite3_mprintf("SELECT COALESCE(SUM(128");
-  if(!query) goto failed;
-  int rc;
-  while((rc=sqlite3_step(st))==SQLITE_ROW) {
-    const char *column=(const char *)sqlite3_column_text(st,1);
-    if(!column) goto failed;
-    next=sqlite3_mprintf("%s+16+COALESCE(length(CAST(\"%w\" AS BLOB)),0)",query,column);
-    sqlite3_free(query);query=next;next=NULL;
-    if(!query) goto failed;
-    ++columns;
-  }
-  sqlite3_finalize(st);st=NULL;
-  if(rc!=SQLITE_DONE) goto failed;
-  if(!columns) {*bytes=0;sqlite3_free(query);return 1;}
-  next=sqlite3_mprintf("%s),0) FROM \"%w\";",query,table);
-  sqlite3_free(query);query=next;next=NULL;
-  if(!query || sqlite3_prepare_v2(s_db,query,-1,&st,NULL)!=SQLITE_OK || sqlite3_step(st)!=SQLITE_ROW ||
-      sqlite3_column_type(st,0)!=SQLITE_INTEGER || sqlite3_column_int64(st,0)<0) goto failed;
-  *bytes=(uint64_t)sqlite3_column_int64(st,0);
-  sqlite3_finalize(st);sqlite3_free(query);return 1;
-failed:
-  sqlite3_finalize(st);sqlite3_free(query);return 0;
-}
-
 static int sqlite_startup_schema_write_allow(void) {
   sqlite3_stmt *st=NULL; uint64_t current=0,growth=0;
   uint64_t inventory[sizeof(startup_index_cost_manifest)/sizeof(startup_index_cost_manifest[0])]={0};
@@ -3443,7 +3414,7 @@ static int sqlite_startup_schema_write_allow(void) {
     unsigned owner=i;
     for(unsigned j=0;j<i;++j) if(measured[j] && !strcmp(startup_index_cost_manifest[j].table,startup_index_cost_manifest[i].table)) {owner=j;break;}
     if(!measured[owner]) {
-      if(!sqlite_table_index_inventory(startup_index_cost_manifest[i].table,&inventory[owner])) goto failed;
+      if(!edr_context_store_index_inventory(s_db,startup_index_cost_manifest[i].table,&inventory[owner])) goto failed;
       measured[owner]=1;
     }
     /* Twice the entire source row inventory, including 128 bytes/row and
