@@ -184,6 +184,34 @@ int edr_context_store_open(EdrContextStore *s, sqlite3 *db) {
                         "JOIN context_fact_keys f ON f.id=r.fact_key LIMIT 0") != 0) return -1;
     sqlite3_finalize(st);
   } else if (sql(s, legacy_schema) != 0) return -1;
+  /* octet_length arrived in SQLite 3.43. Unlike length(CAST(text AS BLOB)),
+   * its column-size optimization avoids reading overflow payload pages.
+   * column_bytes counts UTF-8 after text conversion; keep the original path
+   * for UTF-16 databases so retirement's literal-byte budget stays identical. */
+  if (sqlite3_libversion_number() >= 3043000) {
+    sqlite3_stmt *st = NULL;
+    if (prepare(s, &st, "PRAGMA main.encoding;") != 0) return -1;
+    if (sqlite3_step(st) != SQLITE_ROW) {
+      sqlite3_finalize(st);
+      return fail(s, "read context database encoding failed");
+    }
+    const char *encoding = (const char *)sqlite3_column_text(st, 0);
+    s->use_fact_octet_length = encoding && !strcmp(encoding, "UTF-8");
+    sqlite3_finalize(st);
+    if (s->use_fact_octet_length) {
+      /* An additive/foreign schema still receives the original SELECT * byte
+       * accounting. Only replace the payload in the exact owned layout. */
+      static const char *columns[] = {"fact_id", "endpoint_id", "tenant_id",
+          "manifest_template_json", "created_ns", "updated_ns"};
+      if (prepare(s, &st, "SELECT * FROM context_facts LIMIT 0;") != 0) return -1;
+      s->use_fact_octet_length = sqlite3_column_count(st) == 6;
+      for (int i = 0; s->use_fact_octet_length && i < 6; ++i) {
+        const char *name = sqlite3_column_name(st, i);
+        s->use_fact_octet_length = name && !strcmp(name, columns[i]);
+      }
+      sqlite3_finalize(st);
+    }
+  }
   if (sql(s, "BEGIN IMMEDIATE;") != 0) return -1;
   if (views(s) != 0 || sql(s, "COMMIT;") != 0) {
     sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
@@ -846,13 +874,15 @@ static int retirement_equal(sqlite3_stmt *st, const char *column, const char *va
  * Counting the latter again intentionally overestimates the amount of work.
  * No SQLite page/index/WAL size is inferred from these literal byte counts. */
 static int retirement_charge(sqlite3_stmt *st, unsigned *rows, uint64_t *bytes,
-                              unsigned max_rows, uint64_t max_bytes) {
+                              unsigned max_rows, uint64_t max_bytes,
+                              int literal_bytes_column) {
   if (*rows >= max_rows) return 1;
   ++*rows;
   uint64_t added = 0;
   for (int i = 0; i < sqlite3_column_count(st); ++i) {
     int type = sqlite3_column_type(st, i);
-    uint64_t n = type == SQLITE_NULL ? 0u :
+    uint64_t n = i == literal_bytes_column ? (uint64_t)sqlite3_column_int64(st, i) :
+        type == SQLITE_NULL ? 0u :
         type == SQLITE_INTEGER || type == SQLITE_FLOAT ? 8u :
         (uint64_t)sqlite3_column_bytes(st, i);
     if (n > max_bytes - added) { *bytes = max_bytes; return 1; }
@@ -900,6 +930,11 @@ int edr_context_store_retire_candidate(EdrContextStore *s,
                                        int (*yield_required)(void *), void *yield_context,
                                        EdrContextRetirement *out) {
   sqlite3_stmt *st=NULL, *ref=NULL;
+  enum { FACT_READ, KEY_READ, LEGACY_DELETE, COMPACT_DELETE, KEY_DELETE,
+         FACT_DELETE, RETIRE_STATEMENT_COUNT };
+  /* Reuse only within this caller-owned transaction. Every yield/error
+   * finalizes these statements; no bound identity survives a resumed slice. */
+  sqlite3_stmt *repeat[RETIRE_STATEMENT_COUNT] = {0};
   char *endpoint=NULL, *tenant=NULL, *bundle=NULL, *legacy=NULL;
   sqlite3_int64 candidate_rowid=0, bundle_rowid=0, candidate_key=0, cursor=0;
   unsigned rows=0; uint64_t bytes=0;
@@ -934,7 +969,7 @@ int edr_context_store_retire_candidate(EdrContextStore *s,
     else retirement_error(s, "retirement candidate identity unavailable", -1);
     goto done;
   }
-  if (retirement_charge(st, &rows, &bytes, max_rows, max_bytes)) goto unfinished;
+  if (retirement_charge(st, &rows, &bytes, max_rows, max_bytes,-1)) goto unfinished;
   int policy = retirement_column(st, "retention_policy_version");
   if (policy < 0 || sqlite3_column_type(st, policy) != SQLITE_INTEGER ||
       sqlite3_column_int64(st, policy) != 1 ||
@@ -963,7 +998,7 @@ int edr_context_store_retire_candidate(EdrContextStore *s,
   unsigned bundles = 0;
   while ((rc = sqlite3_step(st)) == SQLITE_ROW) {
     if (yield_required && yield_required(yield_context)) { goto unfinished; }
-    if (retirement_charge(st, &rows, &bytes, max_rows, max_bytes)) goto unfinished;
+    if (retirement_charge(st, &rows, &bytes, max_rows, max_bytes,-1)) goto unfinished;
     if (!retirement_equal(st, "artifact_type", "p0_context_bundle") ||
         !retirement_equal(st, "artifact_id", bundle) ||
         !retirement_equal(st, "upload_status", "local_manifest") ||
@@ -992,7 +1027,7 @@ int edr_context_store_retire_candidate(EdrContextStore *s,
     if (text(st, 1, candidate_id) != SQLITE_OK) { fail(s, "bind retirement dictionary failed"); goto done; }
     rc = sqlite3_step(st);
     if (rc == SQLITE_ROW) {
-      if (retirement_charge(st, &rows, &bytes, max_rows, max_bytes)) goto unfinished;
+      if (retirement_charge(st, &rows, &bytes, max_rows, max_bytes,-1)) goto unfinished;
       candidate_key = sqlite3_column_int64(st, retirement_column(st, "id"));
       if (candidate_key <= 0) {
         retirement_error(s, "retirement candidate dictionary identity invalid", -1);
@@ -1047,7 +1082,7 @@ int edr_context_store_retire_candidate(EdrContextStore *s,
       continue;
     }
     if (rc!=SQLITE_ROW) goto storage_failed;
-    if (retirement_charge(ref,&rows,&bytes,max_rows,max_bytes)) goto unfinished;
+    if (retirement_charge(ref,&rows,&bytes,max_rows,max_bytes,-1)) goto unfinished;
     if (!compact) {
       const char *artifact=retirement_text(ref,retirement_column(ref,"artifact_id"));
       if (!artifact || !artifact[0]) { retirement_error(s,"retirement reference artifact identity invalid",-1); goto done; }
@@ -1071,48 +1106,63 @@ int edr_context_store_retire_candidate(EdrContextStore *s,
     sqlite3_int64 ref_id=sqlite3_column_int64(ref,0);
     sqlite3_int64 fact_key=compact ? sqlite3_column_int64(ref,retirement_column(ref,"fact_key")) : 0;
     if (compact && fact_key<=0) { retirement_error(s,"retirement fact dictionary identity invalid",-1); goto done; }
-    if (prepare(s,&st,"SELECT * FROM context_facts WHERE fact_id=?;")!=0) goto done;
-    if (text(st,1,fact)!=SQLITE_OK || sqlite3_step(st)!=SQLITE_ROW) {
+    const char *fact_query = s->use_fact_octet_length ?
+        "SELECT fact_id,endpoint_id,tenant_id,CASE typeof(manifest_template_json) "
+        "WHEN 'null' THEN 0 WHEN 'integer' THEN 8 WHEN 'real' THEN 8 "
+        "ELSE octet_length(manifest_template_json) END AS manifest_literal_bytes,"
+        "created_ns,updated_ns FROM context_facts WHERE fact_id=?;" :
+        "SELECT * FROM context_facts WHERE fact_id=?;";
+    if (!repeat[FACT_READ] && prepare(s,&repeat[FACT_READ],fact_query)!=0) goto done;
+    sqlite3_stmt *fact_read=repeat[FACT_READ];
+    if (text(fact_read,1,fact)!=SQLITE_OK || sqlite3_step(fact_read)!=SQLITE_ROW) {
       retirement_error(s,"retirement referenced fact unavailable",-1); goto done;
     }
-    if (retirement_charge(st,&rows,&bytes,max_rows,max_bytes)) goto unfinished;
-    if (!retirement_equal(st,"endpoint_id",endpoint) || !retirement_equal(st,"tenant_id",tenant)) {
+    if (s->use_fact_octet_length && (sqlite3_column_type(fact_read,3)!=SQLITE_INTEGER ||
+        sqlite3_column_int64(fact_read,3)<0)) {
+      retirement_error(s,"retirement fact byte length unavailable",-1); goto done;
+    }
+    if (retirement_charge(fact_read,&rows,&bytes,max_rows,max_bytes,
+        s->use_fact_octet_length ? 3 : -1)) goto unfinished;
+    if (!retirement_equal(fact_read,"endpoint_id",endpoint) || !retirement_equal(fact_read,"tenant_id",tenant)) {
       result=retirement_error(s,"retirement fact belongs to another scope",1); goto done;
     }
-    sqlite3_finalize(st); st=NULL;
+    reset(fact_read);
     if (s->format) {
-      if (prepare(s,&st,"SELECT * FROM context_fact_keys WHERE fact_id=?;")!=0) goto done;
-      if (text(st,1,fact)!=SQLITE_OK) goto storage_failed;
-      rc=sqlite3_step(st);
+      if (!repeat[KEY_READ] && prepare(s,&repeat[KEY_READ],"SELECT * FROM context_fact_keys WHERE fact_id=?;")!=0) goto done;
+      sqlite3_stmt *key_read=repeat[KEY_READ];
+      if (text(key_read,1,fact)!=SQLITE_OK) goto storage_failed;
+      rc=sqlite3_step(key_read);
       if (rc==SQLITE_ROW) {
-        if (retirement_charge(st,&rows,&bytes,max_rows,max_bytes)) goto unfinished;
+        if (retirement_charge(key_read,&rows,&bytes,max_rows,max_bytes,-1)) goto unfinished;
       } else if (rc!=SQLITE_DONE) goto storage_failed;
-      sqlite3_finalize(st); st=NULL;
+      reset(key_read);
     }
     /* A complete unit has been proved and charged. Do not yield between its
      * edge and fact/key deletion; an I/O error rolls back this whole slice. */
     if (phase==2) {
       query=compact ? "DELETE FROM compact_context_refs WHERE id=?1 AND candidate_key=?2;" :
           "DELETE FROM candidate_context_refs WHERE rowid=?1 AND candidate_id=?2;";
-      if (prepare(s,&st,query)!=0) goto done;
-      if (sqlite3_bind_int64(st,1,ref_id)!=SQLITE_OK ||
-          (compact ? sqlite3_bind_int64(st,2,candidate_key) : text(st,2,candidate_id))!=SQLITE_OK ||
-          sqlite3_step(st)!=SQLITE_DONE || sqlite3_changes(s->db)!=1) goto storage_failed;
-      sqlite3_finalize(st); st=NULL; ++counts.references;
+      unsigned edge_slot=compact ? COMPACT_DELETE : LEGACY_DELETE;
+      if (!repeat[edge_slot] && prepare(s,&repeat[edge_slot],query)!=0) goto done;
+      sqlite3_stmt *edge_delete=repeat[edge_slot];
+      if (sqlite3_bind_int64(edge_delete,1,ref_id)!=SQLITE_OK ||
+          (compact ? sqlite3_bind_int64(edge_delete,2,candidate_key) : text(edge_delete,2,candidate_id))!=SQLITE_OK ||
+          sqlite3_step(edge_delete)!=SQLITE_DONE || sqlite3_changes(s->db)!=1) goto storage_failed;
+      reset(edge_delete); ++counts.references;
       if (s->format) {
-        if (prepare(s,&st,"DELETE FROM context_fact_keys WHERE fact_id=? AND NOT EXISTS("
+        if (!repeat[KEY_DELETE] && prepare(s,&repeat[KEY_DELETE],"DELETE FROM context_fact_keys WHERE fact_id=? AND NOT EXISTS("
             "SELECT 1 FROM compact_context_refs r WHERE r.fact_key=context_fact_keys.id);")!=0) goto done;
-        if (text(st,1,fact)!=SQLITE_OK || sqlite3_step(st)!=SQLITE_DONE) goto storage_failed;
-        sqlite3_finalize(st); st=NULL;
+        if (text(repeat[KEY_DELETE],1,fact)!=SQLITE_OK || sqlite3_step(repeat[KEY_DELETE])!=SQLITE_DONE) goto storage_failed;
+        reset(repeat[KEY_DELETE]);
       }
       query=s->format ? "DELETE FROM context_facts WHERE fact_id=? AND NOT EXISTS(SELECT 1 FROM "
           "candidate_context_refs r WHERE r.fact_id=context_facts.fact_id) AND NOT EXISTS("
           "SELECT 1 FROM context_fact_keys k WHERE k.fact_id=context_facts.fact_id);" :
           "DELETE FROM context_facts WHERE fact_id=? AND NOT EXISTS(SELECT 1 FROM candidate_context_refs r WHERE r.fact_id=context_facts.fact_id);";
-      if (prepare(s,&st,query)!=0) goto done;
-      if (text(st,1,fact)!=SQLITE_OK || sqlite3_step(st)!=SQLITE_DONE) goto storage_failed;
+      if (!repeat[FACT_DELETE] && prepare(s,&repeat[FACT_DELETE],query)!=0) goto done;
+      if (text(repeat[FACT_DELETE],1,fact)!=SQLITE_OK || sqlite3_step(repeat[FACT_DELETE])!=SQLITE_DONE) goto storage_failed;
       counts.facts+=(unsigned)sqlite3_changes(s->db);
-      sqlite3_finalize(st); st=NULL;
+      reset(repeat[FACT_DELETE]);
     } else if (compact) cursor=fact_key;
     else {
       char *next=sqlite3_mprintf("%s",fact);
@@ -1151,12 +1201,14 @@ int edr_context_store_retire_candidate(EdrContextStore *s,
   result=0; goto done;
 unfinished:
   sqlite3_finalize(st); st=NULL; sqlite3_finalize(ref); ref=NULL;
+  for (unsigned i=0;i<RETIRE_STATEMENT_COUNT;++i) if (repeat[i]) reset(repeat[i]);
   if (counts.progressed && retirement_save_progress(s,candidate_id,phase,pressure,legacy,cursor)!=0) goto done;
   result=2; goto done;
 storage_failed:
   fail(s,"retirement progress storage failed");
 done:
   sqlite3_finalize(st); sqlite3_finalize(ref);
+  for (unsigned i=0;i<RETIRE_STATEMENT_COUNT;++i) sqlite3_finalize(repeat[i]);
   if (result==1 && phase==2) result=-1;
   if (result<0 || result==1) {
     if (sql(s,"ROLLBACK TO context_candidate_retirement;")!=0) result=-1;

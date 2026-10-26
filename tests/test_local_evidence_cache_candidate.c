@@ -8675,6 +8675,254 @@ static void test_retirement_fence_atomic_and_last_owner(void) {
   }
 }
 
+static void compact_startup_rowset_hash(sqlite3 *db, const char *sql, char out[65]);
+
+/* Compare observable rows and every work-budget result against the supported
+ * full-read path. Encoding and storage class are real SQLite properties. */
+static void retirement_contract_hash(EdrContextStore *store, char out[65]) {
+  static const char *queries[] = {
+    "SELECT * FROM p0_candidates ORDER BY candidate_id",
+    "SELECT * FROM artifacts ORDER BY artifact_id",
+    "SELECT * FROM context_facts ORDER BY fact_id",
+    "SELECT * FROM candidate_context_refs ORDER BY artifact_id",
+    "SELECT * FROM context_retirement_progress ORDER BY candidate_id",
+    "SELECT * FROM context_reference_projection ORDER BY artifact_id",
+    "SELECT * FROM materialized_artifacts ORDER BY artifact_id",
+    "PRAGMA user_version",
+    "SELECT * FROM context_candidates ORDER BY id",
+    "SELECT * FROM context_fact_keys ORDER BY id",
+    "SELECT * FROM compact_context_refs ORDER BY id"
+  };
+  EdrSha256Ctx digest; uint8_t raw[32]; char part[65];
+  edr_sha256_init(&digest);
+  unsigned count = store->format ? 11u : 8u;
+  for (unsigned i = 0; i < count; ++i) {
+    compact_startup_rowset_hash(store->db, queries[i], part);
+    edr_sha256_update(&digest, (const uint8_t *)part, 64u);
+  }
+  edr_sha256_final(&digest, raw);
+  for (unsigned i = 0; i < 32u; ++i) snprintf(out + 2u*i, 3u, "%02x", raw[i]);
+}
+
+static void retirement_contract_equal(const EdrContextRetirement *a,
+                                      const EdrContextRetirement *b) {
+  assert(a->candidates == b->candidates && a->references == b->references &&
+      a->artifacts == b->artifacts && a->facts == b->facts &&
+      a->progressed == b->progressed && a->pressure == b->pressure &&
+      a->work_rows == b->work_rows && a->payload_bytes == b->payload_bytes);
+}
+
+static int retirement_contract_trial(EdrContextStore *store, int fast,
+                                      unsigned rows, uint64_t bytes,
+                                      EdrContextRetirement *out, char changed[65]) {
+  char before[65], restored[65]; retirement_contract_hash(store, before);
+  store->use_fact_octet_length = fast;
+  compact_exec(store->db, "BEGIN IMMEDIATE;");
+  int rc = edr_context_store_retire_candidate(store, "octet-retire", 1,
+      rows, bytes, NULL, NULL, out);
+  assert(out->work_rows <= rows && out->payload_bytes <= bytes);
+  assert(sqlite3_next_stmt(store->db, NULL) == NULL);
+  retirement_contract_hash(store, changed);
+  compact_exec(store->db, "ROLLBACK;");
+  retirement_contract_hash(store, restored); assert(!strcmp(before, restored));
+  return rc;
+}
+
+static int retirement_contract_compare(EdrContextStore *store, int automatic,
+                                        unsigned rows, uint64_t bytes,
+                                        EdrContextRetirement *out, char changed[65]) {
+  EdrContextRetirement reference; char other[65];
+  int rc = retirement_contract_trial(store, automatic, rows, bytes, out, changed);
+  int original = retirement_contract_trial(store, 0, rows, bytes, &reference, other);
+  assert(rc == original); retirement_contract_equal(out, &reference);
+  assert(!strcmp(changed, other)); store->use_fact_octet_length = automatic;
+  return rc;
+}
+
+static void retirement_contract_fixture(const char *path, const char *encoding,
+                                         int format, int extra, sqlite3 **database,
+                                         EdrContextStore *store) {
+  sqlite3 *db = NULL; sqlite3_stmt *st = NULL;
+  assert(sqlite3_open(path, &db) == SQLITE_OK);
+  char *sql = sqlite3_mprintf("PRAGMA encoding=%Q;CREATE TABLE encoding_fixture(value);", encoding);
+  assert(sql); compact_exec(db, sql); sqlite3_free(sql);
+  assert(sqlite3_close(db) == SQLITE_OK);
+  assert(test_open_legacy_context(path, 16u, 72u) == 0);
+  edr_local_evidence_cache_close(); assert(sqlite3_open(path, &db) == SQLITE_OK);
+  assert(sqlite3_prepare_v2(db, "PRAGMA encoding", -1, &st, NULL) == SQLITE_OK);
+  assert(sqlite3_step(st) == SQLITE_ROW &&
+      !strcmp((const char *)sqlite3_column_text(st, 0), encoding));
+  assert(sqlite3_finalize(st) == SQLITE_OK);
+  retention_group_fixture(db, "octet-retire", 1, 1, 1, 2);
+  retention_group_fixture(db, "octet-keeper", 0, 1, 1, 2);
+  static const unsigned char multibyte[] = {0xe6,0xbc,0xa2,0xf0,0x9f,0x9a,0x80};
+  static const char nul_text[] = {'l','e','f','t',0,(char)0xe6,(char)0xbc,(char)0xa2,'r'};
+  enum { text_size = 4097 * sizeof(multibyte), blob_size = 32769 };
+  char *large = malloc(text_size), *blob = malloc(blob_size); assert(large && blob);
+  for (unsigned i = 0; i < text_size; ++i) large[i] = (char)multibyte[i % sizeof(multibyte)];
+  for (unsigned i = 0; i < blob_size; ++i) blob[i] = (char)(i % 251u);
+  const char *ids[] = {"f0-shared", "f1-multibyte", "f2-nul", "f3-blob", "f4-empty", "f5-json"};
+  const char *payloads[] = {"{\"candidate_id\":null,\"value\":\"keep-\xe6\xbc\xa2\"}",
+      large, nul_text, blob, "", "{\"candidate_id\":null,\"value\":1}"};
+  int sizes[] = {(int)strlen(payloads[0]), text_size, (int)sizeof(nul_text), blob_size, 0,
+      (int)strlen(payloads[5])};
+  assert(sqlite3_prepare_v2(db, "INSERT INTO context_facts(fact_id,endpoint_id,tenant_id,"
+      "manifest_template_json,created_ns,updated_ns) VALUES(?1,'retention-endpoint',"
+      "'retention-tenant',?2,1,1)", -1, &st, NULL) == SQLITE_OK);
+  for (unsigned i = 0; i < 6u; ++i) {
+    assert(sqlite3_bind_text(st, 1, ids[i], -1, SQLITE_STATIC) == SQLITE_OK);
+    assert((i == 3u ? sqlite3_bind_blob(st, 2, payloads[i], sizes[i], SQLITE_STATIC)
+                    : sqlite3_bind_text(st, 2, payloads[i], sizes[i], SQLITE_STATIC)) == SQLITE_OK);
+    assert(sqlite3_step(st) == SQLITE_DONE && sqlite3_reset(st) == SQLITE_OK);
+    assert(sqlite3_clear_bindings(st) == SQLITE_OK);
+    retention_ref_fixture(db, "octet-retire", ids[i], 1);
+    if (i == 0u || i == 3u) retention_ref_fixture(db, "octet-keeper", ids[i], 1);
+  }
+  assert(sqlite3_finalize(st) == SQLITE_OK); free(large); free(blob);
+  retention_upgrade_refs(db, format);
+  if (extra) {
+    compact_exec(db, "ALTER TABLE context_facts ADD COLUMN extra_payload TEXT;");
+    assert(sqlite3_prepare_v2(db, "UPDATE context_facts SET extra_payload=?", -1, &st, NULL) == SQLITE_OK);
+    char *padding = malloc(32769u); assert(padding); memset(padding, 'x', 32769u);
+    assert(sqlite3_bind_text(st, 1, padding, 32769, SQLITE_STATIC) == SQLITE_OK);
+    assert(sqlite3_step(st) == SQLITE_DONE && sqlite3_finalize(st) == SQLITE_OK); free(padding);
+  }
+  assert(edr_context_store_open(store, db) == 0);
+  assert(edr_context_store_install_retention_guards(store) == 0);
+  assert(store->use_fact_octet_length ==
+      (sqlite3_libversion_number() >= 3043000 && !strcmp(encoding, "UTF-8") && !extra));
+  assert(compact_scalar(db, "SELECT typeof(manifest_template_json)='blob' AND "
+      "length(manifest_template_json)=32769 FROM context_facts WHERE fact_id='f3-blob'") == 1);
+  *database = db;
+}
+
+static void retirement_contract_scope(EdrContextStore *store, int automatic) {
+  static const char endpoint_nul[] = "retention-endpoint\0untrusted";
+  static const char tenant_nul[] = "retention-tenant\0untrusted";
+  const char *values[] = {endpoint_nul, tenant_nul, "other-endpoint", "other-tenant"};
+  int sizes[] = {(int)sizeof(endpoint_nul)-1, (int)sizeof(tenant_nul)-1, 14, 12};
+  for (unsigned kind = 0; kind < 4u; ++kind) {
+    EdrContextRetirement outputs[2]; char original[65], after[65];
+    retirement_contract_hash(store, original);
+    for (unsigned path = 0; path < 2u; ++path) {
+      store->use_fact_octet_length = path ? 0 : automatic;
+      compact_exec(store->db, "BEGIN IMMEDIATE;"); sqlite3_stmt *st = NULL;
+      const char *sql = kind % 2u ? "UPDATE context_facts SET tenant_id=? WHERE fact_id='f1-multibyte'"
+                                  : "UPDATE context_facts SET endpoint_id=? WHERE fact_id='f1-multibyte'";
+      assert(sqlite3_prepare_v2(store->db, sql, -1, &st, NULL) == SQLITE_OK);
+      assert(sqlite3_bind_text(st, 1, values[kind], sizes[kind], SQLITE_STATIC) == SQLITE_OK);
+      assert(sqlite3_step(st) == SQLITE_DONE && sqlite3_finalize(st) == SQLITE_OK);
+      char invalid[65]; retirement_contract_hash(store, invalid);
+      assert(edr_context_store_retire_candidate(store, "octet-retire", 1, 4096u,
+          UINT64_C(16)*1024u*1024u, NULL, NULL, &outputs[path]) == 1);
+      assert(outputs[path].candidates == 0 && outputs[path].references == 0 &&
+          outputs[path].facts == 0 && outputs[path].artifacts == 0 && outputs[path].progressed == 0);
+      assert(sqlite3_next_stmt(store->db, NULL) == NULL);
+      retirement_contract_hash(store, after); assert(!strcmp(invalid, after));
+      compact_exec(store->db, "ROLLBACK;"); retirement_contract_hash(store, after);
+      assert(!strcmp(original, after));
+    }
+    retirement_contract_equal(&outputs[0], &outputs[1]);
+  }
+  store->use_fact_octet_length = automatic;
+}
+
+typedef struct { int negative; unsigned calls; } RetirementInvalidLength;
+static void retirement_invalid_octet_length(sqlite3_context *context, int argc,
+                                            sqlite3_value **values) {
+  (void)values; assert(argc == 1);
+  RetirementInvalidLength *state = sqlite3_user_data(context); ++state->calls;
+  if (state->negative) sqlite3_result_int64(context, -1);
+  else sqlite3_result_null(context);
+}
+
+static void retirement_contract_bad_length(const char *path, sqlite3 **database,
+                                            EdrContextStore *store) {
+  if (!store->use_fact_octet_length) return;
+  for (int negative = 0; negative < 2; ++negative) {
+    sqlite3 *db = *database; RetirementInvalidLength state = {negative, 0};
+    EdrContextRetirement out, zero = {0}; char before[65], after[65];
+    retirement_contract_hash(store, before);
+    assert(sqlite3_create_function(db, "octet_length", 1, SQLITE_UTF8, &state,
+        retirement_invalid_octet_length, NULL, NULL) == SQLITE_OK);
+    compact_exec(db, "BEGIN IMMEDIATE;");
+    assert(edr_context_store_retire_candidate(store, "octet-retire", 1, 4096u,
+        UINT64_C(16)*1024u*1024u, NULL, NULL, &out) == -1);
+    assert(state.calls > 0); retirement_contract_equal(&out, &zero);
+    assert(sqlite3_next_stmt(db, NULL) == NULL);
+    retirement_contract_hash(store, after); assert(!strcmp(before, after));
+    compact_exec(db, "ROLLBACK;");
+    /* Discard the connection-local override, then verify the real auto path
+     * again. No invented function substitutes for an older SQLite runtime. */
+    assert(sqlite3_close(db) == SQLITE_OK); assert(sqlite3_open(path, &db) == SQLITE_OK);
+    assert(edr_context_store_open(store, db) == 0 && store->use_fact_octet_length);
+    *database = db; retirement_contract_hash(store, after); assert(!strcmp(before, after));
+  }
+}
+
+static void test_retirement_literal_byte_contract(void) {
+  const char *encodings[] = {"UTF-8", "UTF-16le", "UTF-16be"};
+  for (unsigned encoding = 0; encoding < 3u; ++encoding) {
+    for (int variant = 0; variant < (encoding ? 3 : 4); ++variant) {
+      int format = variant == 3 ? 2 : variant, extra = variant == 3;
+      char path[512], changed[65]; sqlite3 *db = NULL; EdrContextStore store;
+      assert(make_test_sqlite_path(path, sizeof(path)) == 0);
+      retirement_contract_fixture(path, encodings[encoding], format, extra, &db, &store);
+      int automatic = store.use_fact_octet_length; EdrContextRetirement full, out;
+      retirement_contract_scope(&store, automatic);
+      retirement_contract_bad_length(path, &db, &store);
+      assert(retirement_contract_compare(&store, automatic, 4096u,
+          UINT64_C(16)*1024u*1024u, &full, changed) == 0);
+      assert(full.references == 6u && full.facts == 4u && full.candidates == 1u && full.artifacts == 1u);
+      assert(full.payload_bytes > 32769u && full.work_rows > 2u && full.work_rows < 4095u);
+      if (extra) assert(full.payload_bytes > UINT64_C(6)*32769u);
+      uint64_t byte_limits[] = {1u, full.payload_bytes-1u, full.payload_bytes, full.payload_bytes+1u};
+      unsigned row_limits[] = {1u, full.work_rows-1u, full.work_rows, full.work_rows+1u};
+      for (unsigned b = 0; b < 4u; ++b) {
+        int rc = retirement_contract_compare(&store, automatic, 4096u, byte_limits[b], &out, changed);
+        assert(rc == 0 || rc == 2); if (b < 2u) assert(rc == 2); if (b == 3u) assert(rc == 0);
+        rc = retirement_contract_compare(&store, automatic, row_limits[b], UINT64_C(16)*1024u*1024u, &out, changed);
+        assert(rc == 0 || rc == 2); if (b < 2u) assert(rc == 2); if (b == 3u) assert(rc == 0);
+      }
+      char keeper[65], facts[65], actual[65];
+      compact_startup_rowset_hash(db, "SELECT * FROM materialized_artifacts WHERE candidate_id='octet-keeper' ORDER BY artifact_id", keeper);
+      compact_startup_rowset_hash(db, "SELECT * FROM context_facts WHERE fact_id IN('f0-shared','f3-blob') ORDER BY fact_id", facts);
+      unsigned turns = 0, removed = 0; int rc;
+      do {
+        assert(++turns < 64u);
+        unsigned rows = 7u + turns % 3u;
+        rc = retirement_contract_compare(&store, automatic, rows, 128u*1024u, &out, changed);
+        assert((rc == 0 || rc == 2) && out.progressed > 0);
+        EdrContextRetirement committed; compact_exec(db, "BEGIN IMMEDIATE;");
+        assert(edr_context_store_retire_candidate(&store, "octet-retire", 1, rows,
+            128u*1024u, NULL, NULL, &committed) == rc);
+        retirement_contract_equal(&out, &committed); compact_exec(db, "COMMIT;");
+        retirement_contract_hash(&store, actual); assert(!strcmp(changed, actual));
+        removed += committed.references;
+        if (turns == 2u) {
+          assert(sqlite3_close(db) == SQLITE_OK); assert(sqlite3_open(path, &db) == SQLITE_OK);
+          assert(edr_context_store_open(&store, db) == 0 && store.use_fact_octet_length == automatic);
+          retirement_contract_hash(&store, actual); assert(!strcmp(changed, actual));
+        }
+      } while (rc == 2);
+      assert(removed == 6u && compact_scalar(db, "SELECT COUNT(*) FROM context_retirement_progress") == 0);
+      assert(compact_scalar(db, "SELECT COUNT(*) FROM p0_candidates") == 1);
+      assert(compact_scalar(db, "SELECT COUNT(*) FROM context_facts") == 2);
+      assert(compact_scalar(db, "SELECT COUNT(*) FROM context_reference_projection") == 2);
+      assert(compact_scalar(db, "SELECT COUNT(*) FROM pragma_foreign_key_check") == 0);
+      assert(sqlite3_close(db) == SQLITE_OK); assert(sqlite3_open(path, &db) == SQLITE_OK);
+      assert(edr_context_store_open(&store, db) == 0 && store.use_fact_octet_length == automatic);
+      compact_startup_rowset_hash(db, "SELECT * FROM materialized_artifacts WHERE candidate_id='octet-keeper' ORDER BY artifact_id", actual);
+      assert(!strcmp(keeper, actual));
+      compact_startup_rowset_hash(db, "SELECT * FROM context_facts WHERE fact_id IN('f0-shared','f3-blob') ORDER BY fact_id", actual);
+      assert(!strcmp(facts, actual));
+      assert(sqlite3_close(db) == SQLITE_OK); cleanup_test_sqlite_path(path);
+      printf("retirement_literal_contract encoding=%s format=%d extra=%d auto=%d slices=%u budget_boundaries=1 rollback=1 scope_protected=1 keeper_reopen=1\n",
+          encodings[encoding], format, extra, automatic, turns);
+    }
+  }
+}
+
 static void test_compact_process_crash_recovery(void) {
   for (int phase = 0; phase < 4; ++phase) {
     char path[512]; assert(make_test_sqlite_path(path, sizeof(path)) == 0);
@@ -14332,7 +14580,7 @@ int main(int argc, char **argv) {
     test_pmfe_recovery_query_cost_and_index_upgrade(); return 0;
   }
   if (argc == 2 && strcmp(argv[1], "--retirement-progress") == 0) {
-    test_candidate_retirement_resumable(); test_retirement_fence_atomic_and_last_owner(); test_retirement_rejects_new_pmfe_owner(); return 0;
+    test_candidate_retirement_resumable(); test_retirement_fence_atomic_and_last_owner(); test_retirement_literal_byte_contract(); test_retirement_rejects_new_pmfe_owner(); return 0;
   }
   if (argc == 4 && strcmp(argv[1], "--crash-retirement-progress") == 0) {
     retirement_progress_crash_child(argv[2],atoi(argv[3])); return 1;
@@ -14427,6 +14675,7 @@ int main(int argc, char **argv) {
   RUN_CACHE_CASE("retention", test_candidate_group_oversize_and_active_window());
   RUN_CACHE_CASE("retention", test_candidate_retirement_resumable());
   RUN_CACHE_CASE("retention", test_retirement_fence_atomic_and_last_owner());
+  RUN_CACHE_CASE("retention", test_retirement_literal_byte_contract());
   RUN_CACHE_CASE("retention", test_retirement_rejects_new_pmfe_owner());
   RUN_CACHE_CASE("retention", test_retention_accounting_maximum_width_is_bounded());
   RUN_CACHE_CASE("retention", test_candidate_retirement_cursor_skips_protected_prefix());

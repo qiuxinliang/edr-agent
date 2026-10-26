@@ -10,6 +10,7 @@
 typedef struct {
   sqlite3 *db;
   int format;
+  int use_fact_octet_length; /* UTF-8 stores on SQLite with native octet_length. */
   int sqlite_error_code; /* Original SQLite failure; rollback does not overwrite it. */
   char error[192];
 } EdrContextStore;
