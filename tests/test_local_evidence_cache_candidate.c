@@ -14419,8 +14419,168 @@ static void test_context_writer_transaction_reuse(void) {
 }
 #endif
 
+#if defined(EDR_HAVE_SQLITE)
+static void test_accounting_generation_reopen(void) {
+  char path[512],json[EDR_EVIDENCE_ACCOUNTING_JSON_BYTES];
+  EdrEvidenceCacheStatus first,second,third;
+  assert(make_test_sqlite_path(path,sizeof(path))==0);
+  assert(edr_local_evidence_cache_open(path,512u,72u)==0);
+  edr_local_evidence_cache_get_status(&first);assert(first.accounting_generation>0);
+  edr_local_evidence_cache_get_status(&second);assert(second.accounting_generation==first.accounting_generation);
+  assert(edr_local_evidence_cache_open(path,512u,72u)==0);
+  edr_local_evidence_cache_get_status(&second);assert(second.accounting_generation==first.accounting_generation+1u);
+  edr_local_evidence_cache_close();
+  assert(edr_local_evidence_cache_open("/no-such-accounting-generation-directory/cache.db",512u,72u)<0);
+  edr_local_evidence_cache_get_status(&third);assert(third.accounting_generation==second.accounting_generation+1u && !third.db_open);
+  assert(edr_local_evidence_cache_accounting_json(&third,json,sizeof(json))==0);
+  cJSON *root=cJSON_Parse(json);assert(root);
+  assert((uint64_t)cJSON_GetObjectItemCaseSensitive(root,"accounting_generation")->valuedouble==third.accounting_generation);
+  cJSON_Delete(root);
+  uint64_t counter=UINT64_MAX-1u;
+  assert(edr_local_evidence_cache_test_next_accounting_generation(&counter)==UINT64_MAX);
+  assert(edr_local_evidence_cache_test_next_accounting_generation(&counter)==0u && counter==UINT64_MAX);
+  assert(edr_local_evidence_cache_test_next_accounting_generation(&counter)==0u && counter==UINT64_MAX);
+  edr_local_evidence_cache_close();cleanup_test_sqlite_path(path);
+  puts("accounting_generation reopen=1 failed_open=1 same_open_stable=1 saturated_unknown_not_reused=1");
+}
+
+static void test_phase2_commit_fairness_and_backoff(void) {
+  const int64_t now=INT64_C(1700000000000000000),old=now-INT64_C(360000000000000);
+  char path[512],before_hash[65],after_hash[65];sqlite3 *db=NULL;
+  EdrEvidenceCacheStatus before,failed,after;
+  assert(make_test_sqlite_path(path,sizeof(path))==0);
+  edr_local_evidence_cache_test_set_now_unix_ns(now);s_test_monotonic_ns=UINT64_C(1000000000);
+  assert(edr_local_evidence_cache_open(path,512u,72u)==0);
+  assert(sqlite3_open(path,&db)==SQLITE_OK);
+  retention_group_fixture(db,"drain-held",1,old,old,old+1);
+  retention_group_fixture(db,"drain-a",1,old,old,old+1);
+  retention_group_fixture(db,"drain-b",1,old,old,old+1);
+  retention_group_fixture(db,"drain-ordinary",1,old,old,old+1);
+  retention_group_fixture(db,"drain-unknown",0,old,old,old+1);
+  compact_exec(db,"INSERT INTO context_facts VALUES('drain-shared','retention-endpoint','retention-tenant','{}',1,1);");
+  retention_ref_fixture(db,"drain-held","drain-shared",old);
+  retention_ref_fixture(db,"drain-unknown","drain-shared",old);
+  /* Shared fact content remains mutable after logical retirement. A large
+   * enrichment can hold its indivisible drain unit without changing scope. */
+  compact_exec(db,"BEGIN IMMEDIATE;INSERT INTO context_retirement_progress(rowid,candidate_id,phase,reason) VALUES(-5,'drain-held',2,0),(1,'drain-a',2,1),(2,'drain-b',2,0);"
+      "UPDATE p0_candidates SET local_retention_state='retirement_eligible' WHERE candidate_id IN('drain-held','drain-a','drain-b');COMMIT;"
+      "UPDATE context_facts SET manifest_template_json=printf('%05000000d',1) WHERE fact_id='drain-shared';"
+      "INSERT INTO file_evidence(endpoint_id,path,last_seen_ns) VALUES('phase2-fairness','expired-copy',1);");
+  compact_startup_rowset_hash(db,"SELECT * FROM p0_candidates ORDER BY candidate_id",before_hash);
+  edr_local_evidence_cache_get_status(&before);assert(!before.maintenance_pending);
+  edr_local_evidence_cache_test_fail_next_commits(1u);
+  s_test_monotonic_ns+=UINT64_C(60000000000);edr_local_evidence_cache_poll_maintenance();
+  edr_local_evidence_cache_get_status(&failed);
+  assert(failed.maintenance_state==3u && !failed.maintenance_pending);
+  compact_startup_rowset_hash(db,"SELECT * FROM p0_candidates ORDER BY candidate_id",after_hash);assert(!strcmp(before_hash,after_hash));
+  assert(failed.retention_groups_retired==before.retention_groups_retired);
+  for(unsigned i=0;i<100u;++i) {s_test_monotonic_ns+=UINT64_C(1000000);edr_local_evidence_cache_poll_maintenance();}
+  edr_local_evidence_cache_get_status(&after);assert(after.maintenance_runs==failed.maintenance_runs);
+  s_test_monotonic_ns+=UINT64_C(60000000000);
+  uint64_t last_progress_runs=failed.maintenance_runs,retired_groups=failed.retention_groups_retired;
+  for(unsigned i=0;i<24u;++i) {
+    edr_local_evidence_cache_poll_maintenance();s_test_monotonic_ns+=UINT64_C(1000000);
+    edr_local_evidence_cache_get_status(&after);
+    if(after.retention_groups_retired!=retired_groups) {
+      retired_groups=after.retention_groups_retired;last_progress_runs=after.maintenance_runs;
+    }
+  }
+  edr_local_evidence_cache_get_status(&after);
+  assert(compact_scalar(db,"SELECT COUNT(*) FROM p0_candidates WHERE candidate_id IN('drain-a','drain-b','drain-ordinary')")==0);
+  assert(compact_scalar(db,"SELECT COUNT(*) FROM p0_candidates WHERE candidate_id IN('drain-held','drain-unknown')")==2);
+  assert(compact_scalar(db,"SELECT COUNT(*) FROM file_evidence WHERE endpoint_id='phase2-fairness'")==0);
+  assert(after.maintenance_state==2u && after.maintenance_pending);
+  assert(after.maintenance_runs<=last_progress_runs+9u);
+  uint64_t parked_runs=after.maintenance_runs;
+  for(unsigned i=0;i<100u;++i) {s_test_monotonic_ns+=UINT64_C(1000000);edr_local_evidence_cache_poll_maintenance();}
+  edr_local_evidence_cache_get_status(&after);assert(after.maintenance_runs==parked_runs);
+  assert(after.db_capacity_evicted>before.db_capacity_evicted && after.db_retention_evicted>before.db_retention_evicted);
+  assert(sqlite3_close(db)==SQLITE_OK);edr_local_evidence_cache_close();
+  assert(edr_local_evidence_cache_open(path,512u,72u)==0);
+  assert(sqlite3_open(path,&db)==SQLITE_OK);assert(compact_scalar(db,"SELECT COUNT(*) FROM context_retirement_progress WHERE candidate_id='drain-held' AND phase=2")==1);
+  assert(sqlite3_close(db)==SQLITE_OK);edr_local_evidence_cache_close();cleanup_test_sqlite_path(path);
+  edr_local_evidence_cache_test_set_now_unix_ns(0);s_test_monotonic_ns=UINT64_C(1000000000);
+  puts("phase2_scheduler commit_failure_unpublished=1 negative_rowid_wrap=1 held_preserved=1 ordinary_and_TTL_progress=1 bounded_park=1 reason_preserved=1 reopen=1");
+}
+
+/* An already retired owner must not lose its continuation merely because the
+ * next rotating TTL stage consumes a slice. The oversized optional copy is
+ * intentionally held by the existing byte budget, without delaying SQLite. */
+static void test_phase2_continues_across_ttl(int benchmark) {
+  const int64_t now=INT64_C(1700000000000000000), old=now-INT64_C(360000000000000);
+  char path[512], before_hash[65], after_hash[65]; sqlite3 *db=NULL;
+  EdrContextStore store; EdrContextRetirement disposition;
+  retention_bench_vfs_parent=sqlite3_vfs_find(NULL);assert(retention_bench_vfs_parent);
+  sqlite3_vfs vfs=*retention_bench_vfs_parent;
+  vfs.zName="phase2-scheduler-comparison";vfs.pNext=NULL;
+  vfs.szOsFile+=(int)sizeof(RetentionBenchFile);vfs.xOpen=retention_bench_open;
+  assert(sqlite3_vfs_register(&vfs,1)==SQLITE_OK);
+  assert(make_test_sqlite_path(path,sizeof(path))==0);
+  edr_local_evidence_cache_test_set_now_unix_ns(now);
+  s_test_monotonic_ns=UINT64_C(1000000000);
+  assert(edr_local_evidence_cache_open(path,512u,72u)==0);
+  assert(sqlite3_open(path,&db)==SQLITE_OK);
+  retention_group_fixture(db,"phase2-resume",1,old,old,old+1);
+  retention_group_fixture(db,"phase2-keeper",0,old,old,old+1);
+  compact_exec(db,
+      "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<8192) "
+      "INSERT INTO context_facts(fact_id,endpoint_id,tenant_id,manifest_template_json,created_ns,updated_ns) "
+      "SELECT printf('phase2-f%05d',x),'retention-endpoint','retention-tenant',printf('%0819d',x),1,1 FROM n;"
+      "INSERT INTO candidate_context_refs(artifact_id,candidate_id,fact_id,candidate_id_json,created_ns,upload_status,minio_key) "
+      "SELECT fact_id,'phase2-resume',fact_id,'\"phase2-resume\"',1,'local_manifest','' FROM context_facts;"
+      "INSERT INTO process_cache(endpoint_id,pid,name,last_seen_ns) VALUES('oversize-ttl',1,printf('%05000000d',1),1);");
+  retention_ref_fixture(db,"phase2-keeper","phase2-f00001",old);
+  assert(edr_context_store_open(&store,db)==0);
+  unsigned proof_turns=0;
+  while(!compact_scalar(db,"SELECT COUNT(*) FROM context_retirement_progress WHERE phase=2")) {
+    compact_exec(db,"BEGIN IMMEDIATE;");
+    assert(edr_context_store_retire_candidate(&store,"phase2-resume",0,128u,4096000u,NULL,NULL,&disposition)==2);
+    compact_exec(db,"COMMIT;"); assert(++proof_turns<512u);
+  }
+  compact_startup_rowset_hash(db,"SELECT * FROM materialized_artifacts WHERE candidate_id='phase2-keeper' ORDER BY artifact_id",before_hash);
+  sqlite3_int64 initial=compact_scalar(db,"SELECT COUNT(*) FROM context_reference_projection WHERE candidate_id='phase2-resume'");
+  assert(initial>4096);
+  EdrEvidenceCacheStatus before,after; edr_local_evidence_cache_get_status(&before);
+  assert(before.db_bytes+before.wal_bytes<512u*1024u*1024u);
+  unsigned turns=0, active_turns=0; uint64_t poll_wall=0,poll_cpu=0,poll_reads=0,poll_writes=0;
+  s_test_monotonic_ns+=UINT64_C(60000000000);
+  while(compact_scalar(db,"SELECT COUNT(*) FROM context_retirement_progress WHERE phase=2") && turns<(benchmark ? 2000u : 80u)) {
+    uint64_t started=soak_monotonic_ns();clock_t cpu=clock();
+    uint64_t reads=retention_bench_reads,writes=retention_bench_writes;
+    edr_local_evidence_cache_poll_maintenance(); ++turns;
+    poll_wall+=soak_monotonic_ns()-started;poll_cpu+=(uint64_t)(clock()-cpu);
+    poll_reads+=retention_bench_reads-reads;poll_writes+=retention_bench_writes-writes;
+    edr_local_evidence_cache_get_status(&after);
+    sqlite3_int64 refs=compact_scalar(db,"SELECT COUNT(*) FROM context_reference_projection WHERE candidate_id='phase2-resume'");
+    if(after.maintenance_runs!=before.maintenance_runs) {
+      ++active_turns;
+      fprintf(stderr,"phase2_ttl turn=%u runs=%llu refs=%lld\n",turns,(unsigned long long)after.maintenance_runs,(long long)refs);
+    }
+    if(!benchmark) assert(after.maintenance_runs==before.maintenance_runs+1u);
+    before=after; s_test_monotonic_ns+=benchmark ? UINT64_C(1000000000) : UINT64_C(1000000);
+  }
+  assert(compact_scalar(db,"SELECT COUNT(*) FROM context_retirement_progress WHERE phase=2")==0);
+  assert(compact_scalar(db,"SELECT COUNT(*) FROM process_cache WHERE endpoint_id='oversize-ttl'")==1);
+  compact_startup_rowset_hash(db,"SELECT * FROM materialized_artifacts WHERE candidate_id='phase2-keeper' ORDER BY artifact_id",after_hash);
+  assert(!strcmp(before_hash,after_hash));
+  printf("phase2_ttl refs=%lld turns=%u active_turns=%u owner_interval_ms=%u poll_wall_us=%llu poll_cpu_us=%llu poll_read_bytes=%llu poll_write_bytes=%llu keeper=%s\n",(long long)initial,turns,active_turns,benchmark ? 1000u : 1u,
+      (unsigned long long)(poll_wall/1000u),(unsigned long long)(poll_cpu*1000000u/CLOCKS_PER_SEC),
+      (unsigned long long)poll_reads,(unsigned long long)poll_writes,after_hash);
+  assert(sqlite3_close(db)==SQLITE_OK);edr_local_evidence_cache_close();cleanup_test_sqlite_path(path);
+  edr_local_evidence_cache_test_set_now_unix_ns(0);s_test_monotonic_ns=UINT64_C(1000000000);
+  assert(sqlite3_vfs_register(retention_bench_vfs_parent,1)==SQLITE_OK);
+  assert(sqlite3_vfs_unregister(&vfs)==SQLITE_OK);
+}
+#endif
+
 int main(int argc, char **argv) {
 #if defined(EDR_HAVE_SQLITE)
+  if (argc==2 && !strcmp(argv[1],"--phase2-continuation")) {
+    test_phase2_continues_across_ttl(0);test_phase2_commit_fairness_and_backoff();test_accounting_generation_reopen();return 0;
+  }
+  if (argc==2 && !strcmp(argv[1],"--phase2-scheduling-benchmark")) {
+    test_phase2_continues_across_ttl(1); return 0;
+  }
   if (argc == 2 && !strcmp(argv[1], "--context-writer-reuse")) {
     test_context_writer_transaction_reuse();
     test_post_context_exact_replay_charges_only_durable_changes();
@@ -14617,6 +14777,9 @@ int main(int argc, char **argv) {
   RUN_CACHE_CASE("context", test_pmfe_names_and_negative_values_are_not_signals());
 #if defined(EDR_HAVE_SQLITE)
   RUN_CACHE_CASE("context", test_context_writer_transaction_reuse());
+  RUN_CACHE_CASE("context", test_accounting_generation_reopen());
+  RUN_CACHE_CASE("retention", test_phase2_continues_across_ttl(0));
+  RUN_CACHE_CASE("retention", test_phase2_commit_fairness_and_backoff());
   RUN_CACHE_CASE("context", test_normal_alert_parent_context_retention());
   RUN_CACHE_CASE("context", test_alert_parent_context_refusal_and_unresolved());
   RUN_CACHE_CASE("context", test_alert_parent_context_pressure_counterfactual(0));

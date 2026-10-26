@@ -29,6 +29,8 @@ typedef struct {
   uint32_t cpu_p95_60s_x100;
   uint32_t cpu_sample_window_ms;
   uint32_t process_id;
+  /** OS-observed process birth in Unix milliseconds; zero means unavailable. */
+  uint64_t process_start_unix_ms;
   uint32_t logical_processor_count;
   uint64_t process_cpu_delta_100ns;
   uint64_t wall_delta_100ns;

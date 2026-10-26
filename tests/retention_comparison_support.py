@@ -249,3 +249,21 @@ def verify_native(binary, values, expected):
         raise ValueError('Benchmark was emulated or ran on a different native Windows machine')
     if not values['process_io_available'] or values['process_io_available'] == '0':
         raise ValueError('Native Windows process I/O measurement was unavailable')
+
+
+SOURCES = [
+    'src/preprocess/detection_decision.c', 'src/preprocess/detection_profile.c',
+    'src/preprocess/behavior_from_slot.c', 'src/detection/policy_v2.c',
+    'src/storage/local_evidence_cache.c', 'src/storage/evidence_context_store.c',
+    'src/storage/evidence_cache_migration.c', 'src/forensic/process_tree_cache.c',
+    'src/preprocess/behavior_record.c', 'src/preprocess/p0_rule_match.c',
+    'src/preprocess/windows_event_policy.c', 'src/preprocess/windows_file_identity.c',
+    'src/preprocess/p0_rule_ir_stub.c', 'src/command/sha256.c',
+    'src/serialize/behavior_proto.c', 'third_party/nanopb/pb_encode.c',
+    'third_party/cjson/cJSON.c', 'src/preprocess/p0_terminal_identity.c',
+    'src/transport/egress_batch_policy.c', 'src/transport/egress_request_policy.c',
+    'src/transport/egress_purpose_json.c', 'src/proto/edr/v1/event.pb.c',
+    'third_party/nanopb/pb_common.c', 'third_party/nanopb/pb_decode.c',
+    'third_party/lz4/lz4.c', 'src/core/validation_trace.c',
+]
+QUEUE_SOURCES = ['src/storage/queue_sqlite.c', 'src/transport/report_events_ack.c']

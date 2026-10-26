@@ -33,6 +33,15 @@ int main(void) {
   assert(first.sample_count == 1u);
   assert(first.sampler_reset_count == 1u);
   assert(first.process_id != 0u);
+#ifdef _WIN32
+  FILETIME created, exited, kernel, user;
+  assert(GetProcessTimes(GetCurrentProcess(), &created, &exited, &kernel, &user));
+  uint64_t ticks = ((uint64_t)created.dwHighDateTime << 32u) | created.dwLowDateTime;
+  assert(first.process_start_unix_ms == (ticks - 116444736000000000ULL) / 10000ULL);
+  assert(first.process_start_unix_ms != 0u);
+#else
+  assert(first.process_start_unix_ms == 0u); /* No guessed birth on this platform. */
+#endif
   assert(first.logical_processor_count != 0u);
   assert(first.cpu_sample_window_ms >= 500u);
   assert(first.cpu_avg_10s_x100 <= first.cpu_max_60s_x100);
@@ -44,6 +53,7 @@ int main(void) {
   edr_resource_get_sample(&after_same_config);
   assert(after_same_config.sample_count == first.sample_count + 1u);
   assert(after_same_config.sampler_reset_count == first.sampler_reset_count);
+  assert(after_same_config.process_start_unix_ms == first.process_start_unix_ms);
 #ifdef _WIN32
   assert(after_same_config.thread_sample_count == first.thread_sample_count);
   assert(after_same_config.thread_sample_age_ms >= 500u);
@@ -56,6 +66,13 @@ int main(void) {
   edr_resource_get_sample(&after_reenable);
   assert(after_reenable.sample_count == after_same_config.sample_count);
   assert(after_reenable.sampler_reset_count == first.sampler_reset_count + 1u);
+  assert(after_reenable.process_start_unix_ms == first.process_start_unix_ms);
+
+  edr_resource_shutdown();
+  edr_resource_init(&cfg);
+  edr_resource_get_sample(&after_reenable);
+  assert(after_reenable.process_start_unix_ms == first.process_start_unix_ms);
+  assert(after_reenable.process_id == first.process_id);
 
   edr_resource_shutdown();
   return 0;

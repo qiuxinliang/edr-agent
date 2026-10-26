@@ -26,6 +26,8 @@ static int s_preprocess_throttle;
 static EdrResourceSample s_sample;
 static uint32_t s_cpu_limit_percent;
 static int s_initialized;
+static int s_process_birth_observed;
+static uint64_t s_process_start_unix_ms;
 typedef struct {
   uint64_t at_ms;
   uint32_t cpu_x100;
@@ -148,6 +150,25 @@ void edr_resource_init(const EdrConfig *cfg) {
   s_emergency = 0;
   s_preprocess_throttle = 0;
   memset(&s_sample, 0, sizeof(s_sample));
+  /* Observe once per process, independently of sampler resets/reconfiguration.
+   * Do not substitute observation time for an unavailable process birth. */
+  if (!s_process_birth_observed) {
+    s_process_birth_observed = 1;
+#ifdef _WIN32
+    FILETIME created, exited, kernel, user;
+    if (GetProcessTimes(GetCurrentProcess(), &created, &exited, &kernel, &user)) {
+      uint64_t ticks = ((uint64_t)created.dwHighDateTime << 32u) | created.dwLowDateTime;
+      if (ticks >= 116444736000000000ULL)
+        s_process_start_unix_ms = (ticks - 116444736000000000ULL) / 10000ULL;
+    }
+#endif
+  }
+  s_sample.process_start_unix_ms = s_process_start_unix_ms;
+#ifdef _WIN32
+  s_sample.process_id = (uint32_t)GetCurrentProcessId();
+#else
+  s_sample.process_id = (uint32_t)getpid();
+#endif
   memset(s_cpu_window, 0, sizeof(s_cpu_window));
   s_cpu_window_next = 0u;
   s_cpu_window_count = 0u;

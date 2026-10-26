@@ -279,6 +279,17 @@ static uint32_t s_ring_pos;
 static uint32_t s_context_ring_pos;
 static uint32_t s_context_window_next;
 static EdrEvidenceCacheStatus s_status;
+/* Independent of s_status: reopening resets counters, never their identity.
+ * Saturation leaves future generations unknown rather than reusing an ID. */
+static uint64_t s_accounting_generation;
+static uint64_t evidence_cache_next_accounting_generation(uint64_t *counter) {
+  return *counter < UINT64_MAX ? ++*counter : 0u;
+}
+#ifdef EDR_LOCAL_EVIDENCE_CACHE_TESTING
+uint64_t edr_local_evidence_cache_test_next_accounting_generation(uint64_t *counter) {
+  return evidence_cache_next_accounting_generation(counter);
+}
+#endif
 static atomic_uint_fast64_t s_query_pin_exhausted;
 static uint64_t s_last_maintenance_ns;
 static uint64_t s_last_capacity_failure_ns;
@@ -2592,6 +2603,12 @@ static unsigned s_maintenance_work_state;
 enum { MAINTENANCE_STAGE_COUNT = 9 };
 static unsigned s_maintenance_pressure_turns;
 static int s_retirement_continuation;
+/* Committed phase-2 work survives unrelated TTL turns. This is a scheduling
+ * hint only; the indexed selector and owner revalidate it before every use. */
+static int s_retirement_drain_pending;
+static int s_retirement_drain_cursor_valid;
+static int s_retirement_drain_defer_priority;
+static sqlite3_int64 s_retirement_drain_cursor;
 /* Two bounded keyset cursors prevent protected old groups from starving newer
  * eligible groups. Losing a cursor on restart only repeats safe validation. */
 static struct { int value_class; sqlite3_int64 time; char id[160]; } s_retirement_cursor[2];
@@ -2638,7 +2655,7 @@ static int sqlite_maintenance_can_run(unsigned kind) {
   }
   if (s_maintenance_work_state == MAINTENANCE_BACKOFF ||
       (s_maintenance_work_state == MAINTENANCE_PARKED && kind != MAINTENANCE_RECLAIM)) {
-    s_maintenance_work_state = s_maintenance_pressure_pending
+    s_maintenance_work_state = (s_maintenance_pressure_pending || s_retirement_drain_pending)
         ? MAINTENANCE_RUNNABLE : MAINTENANCE_IDLE;
     s_maintenance_pressure_turns = 0u;
   }
@@ -5901,7 +5918,7 @@ static int sqlite_retirement_yield(void *deadline) {
  * physical drainage can span bounded transactions; unknown owners stay held. */
 static int sqlite_retire_candidate_groups(int pressure, sqlite3_int64 cutoff,
                                           unsigned *retired, EvidenceMaintenanceSlice *slice,
-                                          int *range_exhausted) {
+                                          int *range_exhausted, int prefer_drain) {
   enum { MAX_CANDIDATES = 1000, MAX_WORK_ROWS = 4096 };
   char (*ids)[160] = NULL;
   sqlite3_int64 times[MAX_CANDIDATES];
@@ -5911,6 +5928,12 @@ static int sqlite_retire_candidate_groups(int pressure, sqlite3_int64 cutoff,
   unsigned char floor_protected[MAX_CANDIDATES] = {0};
   sqlite3_stmt *st = NULL;
   sqlite3_stmt *select_st = NULL;
+  sqlite3_stmt *drain_st = NULL;
+  sqlite3_int64 drain_cursor=s_retirement_drain_cursor;
+  int drain_cursor_valid=s_retirement_drain_cursor_valid;
+  int drain_pending=0, committed_progress=0, ordinary_processed=0, drain_attempted=0, drain_progress=0;
+  unsigned ordinary_last=0;
+  char drain_id[160]={0};
   unsigned count = 0u, processed = 0u, groups = 0u, held = 0u, floor_held = 0u, work_rows = 0u;
   uint64_t reason_groups[2]={0}, reason_rows[2]={0}, reason_bytes[2]={0};
   uint64_t work_bytes = 0u, byte_limit = 0u;
@@ -5961,7 +5984,7 @@ static int sqlite_retire_candidate_groups(int pressure, sqlite3_int64 cutoff,
   if (protection != 0) { if (protection > 0) rc=0; goto done; }
   if (sqlite_maintenance_yield(slice)) { rc=0; goto done; }
   if (byte_limit > slice->bytes_left) byte_limit=slice->bytes_left;
-  if (sqlite3_prepare_v2(s_db,
+  const char *selection_columns =
       "SELECT candidate_id,event_time_ns,local_retention_state IN('retained','retirement_eligible') AND created_ns>0 "
       "AND (local_retention_state='retirement_eligible' OR (context_post_until_ns>0 AND context_post_until_ns<?1 "
       "AND (?2=1 OR (event_time_ns<CASE WHEN retention_value_class=2 THEN ?7 ELSE ?3 END "
@@ -5971,10 +5994,14 @@ static int sqlite_retire_candidate_groups(int pressure, sqlite3_int64 cutoff,
       "AND retention_value_class IN(1,2) "
       "AND NOT EXISTS(SELECT 1 FROM evidence_retention_protected x WHERE x.candidate_id=p.candidate_id),retention_value_class,"
       "typeof(alert_context_protect_until_active_ms)!='integer' OR alert_context_protect_until_active_ms<0 "
-      "OR alert_context_protect_until_active_ms>?8 "
+      "OR alert_context_protect_until_active_ms>?8 ";
+  char selection_sql[3072];
+  int selection_size=snprintf(selection_sql,sizeof(selection_sql),"%s%s",selection_columns,
       "FROM p0_candidates p WHERE retention_policy_version=1 AND event_time_ns>0 "
       "AND (retention_value_class,event_time_ns,candidate_id)>(?6,?4,?5) "
-      "ORDER BY retention_value_class,event_time_ns,candidate_id LIMIT 1;", -1, &select_st, NULL) != SQLITE_OK ||
+      "ORDER BY retention_value_class,event_time_ns,candidate_id LIMIT 1;");
+  if(selection_size<0 || (size_t)selection_size>=sizeof(selection_sql)) goto storage_failed;
+  if (sqlite3_prepare_v2(s_db,selection_sql, -1, &select_st, NULL) != SQLITE_OK ||
       sqlite3_bind_int64(select_st, 1, now) != SQLITE_OK || sqlite3_bind_int(select_st, 2, pressure != 0) != SQLITE_OK ||
       sqlite3_bind_int64(select_st, 3, cutoff) != SQLITE_OK ||
       sqlite3_bind_int64(select_st, 4, s_retirement_cursor[pressure != 0].time) != SQLITE_OK ||
@@ -5982,6 +6009,42 @@ static int sqlite_retire_candidate_groups(int pressure, sqlite3_int64 cutoff,
       sqlite3_bind_int(select_st, 6, s_retirement_cursor[pressure != 0].value_class) != SQLITE_OK ||
       sqlite3_bind_int64(select_st, 7, now - (sqlite3_int64)s_status.selected_retention_hours * 3600LL * 1000000000LL) != SQLITE_OK ||
       sqlite3_bind_int64(select_st, 8, (sqlite3_int64)s_retention_clock.pending_ms) != SQLITE_OK) goto storage_failed;
+  /* The existing phase index orders equal phases by the ordinary table's
+   * implicit rowid. Use a disposable cursor, never as deletion identity.
+   * One priority attempt per candidate turn cannot scan a held backlog before
+   * ordinary candidates get the remainder of the SAME slice/transaction. */
+  if(prefer_drain && !s_retirement_drain_defer_priority) {
+    for(unsigned attempt=0;attempt<2u;++attempt) {
+      const char *query=drain_cursor_valid
+          ? "SELECT rowid,candidate_id FROM context_retirement_progress WHERE phase=2 AND rowid>?1 ORDER BY rowid LIMIT 1;"
+          : "SELECT rowid,candidate_id FROM context_retirement_progress WHERE phase=2 ORDER BY rowid LIMIT 1;";
+      if(sqlite3_prepare_v2(s_db,query,-1,&st,NULL)!=SQLITE_OK ||
+          (drain_cursor_valid && sqlite3_bind_int64(st,1,drain_cursor)!=SQLITE_OK)) goto storage_failed;
+      step=sqlite3_step(st);
+      if(step==SQLITE_ROW) {
+        const char *id=(const char *)sqlite3_column_text(st,1);
+        int n=sqlite3_column_bytes(st,1);
+        if(!id || n<=0 || n>=(int)sizeof(drain_id) || strlen(id)!=(size_t)n) goto storage_failed;
+        memcpy(drain_id,id,(size_t)n+1u);drain_cursor=sqlite3_column_int64(st,0);drain_cursor_valid=1;
+        sqlite3_finalize(st);st=NULL;break;
+      }
+      if(step!=SQLITE_DONE) goto storage_failed;
+      sqlite3_finalize(st);st=NULL;
+      if(!drain_cursor_valid) break;
+      drain_cursor_valid=0; /* One empty-tail wrap, including negative rowids. */
+    }
+    if(drain_id[0]) {
+      selection_size=snprintf(selection_sql,sizeof(selection_sql),"%s%s",selection_columns,
+          "FROM p0_candidates p WHERE retention_policy_version=1 AND event_time_ns>0 AND candidate_id=?9;");
+      if(selection_size<0 || (size_t)selection_size>=sizeof(selection_sql) ||
+          sqlite3_prepare_v2(s_db,selection_sql,-1,&drain_st,NULL)!=SQLITE_OK ||
+          sqlite3_bind_int64(drain_st,1,now)!=SQLITE_OK || sqlite3_bind_int(drain_st,2,pressure!=0)!=SQLITE_OK ||
+          sqlite3_bind_int64(drain_st,3,cutoff)!=SQLITE_OK ||
+          sqlite3_bind_int64(drain_st,7,now-(sqlite3_int64)s_status.selected_retention_hours*3600LL*1000000000LL)!=SQLITE_OK ||
+          sqlite3_bind_int64(drain_st,8,(sqlite3_int64)s_retention_clock.pending_ms)!=SQLITE_OK ||
+          sqlite3_bind_text(drain_st,9,drain_id,-1,SQLITE_TRANSIENT)!=SQLITE_OK) goto storage_failed;
+    }
+  }
   /* An empty indexed seek may wrap once without increasing the 1000-row
    * inspection budget. Late imports and a refilled cache can sort before the
    * previous cursor; they must not require a minute-long poll to be visible.
@@ -5991,12 +6054,15 @@ static int sqlite_retire_candidate_groups(int pressure, sqlite3_int64 cutoff,
   unsigned wrapped = 0u;
   while (count < MAX_CANDIDATES && work_rows < MAX_WORK_ROWS && work_bytes < byte_limit) {
     if (sqlite_maintenance_yield(slice)) break;
-    step = sqlite3_step(select_st);
+    int priority=drain_st!=NULL;
+    sqlite3_stmt *selected=priority ? drain_st : select_st;
+    step = sqlite3_step(selected);
     if (step == SQLITE_DONE) {
+      if(priority) { drain_attempted=1;sqlite3_finalize(drain_st);drain_st=NULL;continue; }
       /* EOF exhausts this indexed interval, not a snapshot of the whole
        * cache. An empty tail still needs its one wrap; a deadline before that
        * wrap leaves unfinished work and must preserve the committed cursor. */
-      if (count || wrapped || !s_retirement_cursor[pressure != 0].time) {
+      if (ordinary_processed || wrapped || !s_retirement_cursor[pressure != 0].time) {
         *range_exhausted = 1; break;
       }
       if (sqlite_maintenance_yield(slice)) break;
@@ -6007,23 +6073,26 @@ static int sqlite_retire_candidate_groups(int pressure, sqlite3_int64 cutoff,
       continue;
     }
     if (step != SQLITE_ROW) goto storage_failed;
-    const char *id = (const char *)sqlite3_column_text(select_st, 0);
-    int n = sqlite3_column_bytes(select_st, 0);
+    const char *id = (const char *)sqlite3_column_text(selected, 0);
+    int n = sqlite3_column_bytes(selected, 0);
     if (!id || n <= 0 || n >= (int)sizeof(ids[0]) || strlen(id) != (size_t)n) {
       set_error("local retirement candidate identity unavailable; group preserved"); goto done;
     }
     unsigned i = count;
-    times[i] = sqlite3_column_int64(select_st, 1);
-    eligible[i] = sqlite3_column_int(select_st, 2) == 1;
-    classes[i] = sqlite3_column_int(select_st, 3);
-    floor_protected[i] = sqlite3_column_int(select_st, 4) != 0;
+    times[i] = sqlite3_column_int64(selected, 1);
+    eligible[i] = sqlite3_column_int(selected, 2) == 1;
+    classes[i] = sqlite3_column_int(selected, 3);
+    floor_protected[i] = sqlite3_column_int(selected, 4) != 0;
     memcpy(ids[i], id, (size_t)n + 1u);
-    if (sqlite3_reset(select_st) != SQLITE_OK) goto storage_failed;
+    if (sqlite3_reset(selected) != SQLITE_OK) goto storage_failed;
+    if(priority) { sqlite3_finalize(drain_st);drain_st=NULL; }
     if (!sqlite_maintenance_charge(slice,1,(uint64_t)n+32u)) break;
     ++count;
     if (sqlite_maintenance_yield(slice)) break;
     EdrContextRetirement disposition;
     processed = i + 1u;
+    if(priority) drain_attempted=1;
+    if(!priority) { ordinary_processed=1;ordinary_last=i; }
     if (!eligible[i] || work_rows == MAX_WORK_ROWS) {
       held_ids[i] = 1; ++held;
       if (floor_protected[i]) ++floor_held;
@@ -6034,6 +6103,7 @@ static int sqlite_retire_candidate_groups(int pressure, sqlite3_int64 cutoff,
         slice->bytes_left < byte_limit-work_bytes ? slice->bytes_left : byte_limit-work_bytes,
         sqlite_retirement_yield, &deadline, &disposition);
     if (decision < 0) { set_error(s_context_store.error); goto done; }
+    if(priority && disposition.progressed) drain_progress=1;
     work_rows += disposition.work_rows;
     work_bytes += disposition.payload_bytes;
     slice->rows_left -= disposition.work_rows;
@@ -6041,7 +6111,7 @@ static int sqlite_retire_candidate_groups(int pressure, sqlite3_int64 cutoff,
     if (decision == 1) { ++held; held_ids[i]=1; goto next_candidate; }
     if (decision == 2) {
       held_ids[i]=1; /* Complete proof is still queryable; never clear it early. */
-      if (disposition.progressed) s_retirement_continuation=1;
+      if (disposition.progressed) committed_progress=1;
       else ++held; /* An indivisible oversized row remains visibly held. */
     }
     reason_groups[disposition.pressure] += disposition.candidates;
@@ -6049,20 +6119,35 @@ static int sqlite_retire_candidate_groups(int pressure, sqlite3_int64 cutoff,
     reason_bytes[disposition.pressure] += disposition.payload_bytes;
     groups += disposition.candidates;
 next_candidate:
+    if(priority) continue;
     if (sqlite3_bind_int64(select_st, 4, times[i]) != SQLITE_OK ||
         sqlite3_bind_text(select_st, 5, ids[i], -1, SQLITE_STATIC) != SQLITE_OK ||
         sqlite3_bind_int(select_st, 6, classes[i]) != SQLITE_OK) goto storage_failed;
   }
   sqlite3_finalize(select_st); select_st = NULL;
+  sqlite3_finalize(drain_st); drain_st=NULL;
+  if(sqlite3_prepare_v2(s_db,"SELECT 1 FROM context_retirement_progress WHERE phase=2 LIMIT 1;",-1,&st,NULL)!=SQLITE_OK) goto storage_failed;
+  step=sqlite3_step(st);
+  if(step!=SQLITE_ROW && step!=SQLITE_DONE) goto storage_failed;
+  drain_pending=step==SQLITE_ROW;
+  sqlite3_finalize(st);st=NULL;
   if (sqlite_retention_record_locked(0, reason_groups[0], reason_rows[0], reason_bytes[0]) != 0 ||
       sqlite_retention_record_locked(1, reason_groups[1], reason_rows[1], reason_bytes[1]) != 0 ||
       sqlite_commit_candidate_transaction() != 0) goto done;
   began = 0;
-  if (processed) {
-    s_retirement_cursor[pressure != 0].value_class = classes[processed - 1u];
-    s_retirement_cursor[pressure != 0].time = times[processed - 1u];
-    snprintf(s_retirement_cursor[pressure != 0].id, sizeof(s_retirement_cursor[0].id), "%s", ids[processed - 1u]);
-  } else if (!count && *range_exhausted) {
+  s_retirement_drain_pending=drain_pending;
+  /* A held/oversized priority owner may exhaust the entire indivisible byte
+   * envelope. Give ordinary candidates the next candidate turn even then. */
+  if(prefer_drain) s_retirement_drain_defer_priority=drain_attempted && !drain_progress;
+  if(prefer_drain && (drain_attempted || !drain_id[0])) {
+    s_retirement_drain_cursor=drain_cursor;s_retirement_drain_cursor_valid=drain_cursor_valid && drain_pending;
+  }
+  if(committed_progress || (groups && drain_pending)) s_retirement_continuation=1;
+  if (ordinary_processed) {
+    s_retirement_cursor[pressure != 0].value_class = classes[ordinary_last];
+    s_retirement_cursor[pressure != 0].time = times[ordinary_last];
+    snprintf(s_retirement_cursor[pressure != 0].id, sizeof(s_retirement_cursor[0].id), "%s", ids[ordinary_last]);
+  } else if (!ordinary_processed && *range_exhausted) {
     memset(&s_retirement_cursor[pressure != 0], 0, sizeof(s_retirement_cursor[0]));
   }
   /* Retired groups must not be resurrected by late events in a nominally ended
@@ -6087,6 +6172,7 @@ storage_failed:
 done:
   sqlite3_finalize(st);
   sqlite3_finalize(select_st);
+  sqlite3_finalize(drain_st);
   if (began) sqlite_rollback_silent();
   if (rc != 0) s_status.retention_failures++;
   free(ids);
@@ -6204,7 +6290,7 @@ static int sqlite_maintenance(int defer_reclaim) {
         if (!pressure) s_maintenance_pressure_pending=0;
       }
       int complete = 0;
-      if (sqlite_retire_candidate_groups(pressure,cutoff,&retired,&slice,&complete)!=0) goto failed;
+      if (sqlite_retire_candidate_groups(pressure,cutoff,&retired,&slice,&complete,1)!=0) goto failed;
       if (pressure) pressure_range_exhausted = complete;
     } else if(stage==6) {
       if (sqlite_retire_command_facts(cutoff,&slice)!=0) goto failed;
@@ -6225,7 +6311,7 @@ static int sqlite_maintenance(int defer_reclaim) {
       int over=sqlite_live_size_over_limit(target);
       if(over<0) goto failed;
       if(!over) { s_maintenance_pressure_pending=0; break; }
-      if(sqlite_retire_candidate_groups(1,cutoff,&retired,&slice,&pressure_range_exhausted)!=0) goto failed;
+      if(sqlite_retire_candidate_groups(1,cutoff,&retired,&slice,&pressure_range_exhausted,0)!=0) goto failed;
       if(!retired && !s_retirement_cursor[1].time) break;
     }
     if (!sqlite_maintenance_yield(&slice) && sqlite_maintenance_checkpoint(SQLITE_CHECKPOINT_TRUNCATE)!=0) goto failed;
@@ -6247,10 +6333,10 @@ finish:
   else if (s_retirement_continuation) {
     s_maintenance_work_state=MAINTENANCE_RUNNABLE;
     s_maintenance_pressure_turns=0;
-  } else if (!s_maintenance_pressure_pending) {
+  } else if (!s_maintenance_pressure_pending && !s_retirement_drain_pending) {
     s_maintenance_work_state = MAINTENANCE_IDLE;
     s_maintenance_pressure_turns = 0u;
-  } else if (pressure_range_exhausted ||
+  } else if ((pressure_range_exhausted && !s_retirement_drain_pending) ||
              ++s_maintenance_pressure_turns >= MAINTENANCE_STAGE_COUNT) {
     sqlite_maintenance_park(MAINTENANCE_PARKED);
     s_last_capacity_failure_ns = s_last_maintenance_ns;
@@ -7414,6 +7500,10 @@ static void evidence_cache_close_locked(void) {
    * by normal startup maintenance, with no durable scheduler state to replay. */
   s_maintenance_reclaim_pages = 0u;
   s_maintenance_pressure_pending=0;
+  s_retirement_drain_pending=0;
+  s_retirement_drain_cursor_valid=0;
+  s_retirement_drain_defer_priority=0;
+  s_retirement_drain_cursor=0;
   s_maintenance_work_state=MAINTENANCE_IDLE;
   s_maintenance_pressure_turns=0u;
   s_maintenance_stage=0;
@@ -7609,6 +7699,7 @@ int edr_local_evidence_cache_open_with_policy(const char *path, uint32_t max_db_
   evidence_cache_lock();
   evidence_cache_close_locked();
   memset(&s_status, 0, sizeof(s_status));
+  s_status.accounting_generation = evidence_cache_next_accounting_generation(&s_accounting_generation);
 #if defined(EDR_HAVE_SQLITE)
   memset(&s_retention_clock, 0, sizeof(s_retention_clock));
 #endif
@@ -8931,6 +9022,8 @@ void edr_local_evidence_cache_get_status(EdrEvidenceCacheStatus *out) {
   st.write_budget_used = s_write_budget_count;
 #if defined(EDR_HAVE_SQLITE)
   EvidenceWriteBudgetLimits write_limits = sqlite_write_budget_limits();
+  st.maintenance_state = s_maintenance_work_state;
+  st.maintenance_pending = s_maintenance_pressure_pending || s_retirement_drain_pending || s_maintenance_reclaim_pages != 0u;
   st.write_budget_base_limit = write_limits.base;
   st.write_budget_limit = write_limits.ordinary_context;
   st.write_budget_critical_context_used = 0u;
@@ -10611,7 +10704,7 @@ int edr_local_evidence_cache_accounting_json(const EdrEvidenceCacheStatus *st, c
   metric_reason_json(context_failures, sizeof(context_failures), metric_names + METRIC_CONTEXT_BASE,
                     st->context_failure_reasons, EDR_EVIDENCE_FAILURE_REASON_COUNT);
   int written = snprintf(out, cap,
-      "{\"scope\":\"current_process\",\"ordinary_unit\":\"record_behavior_call\",\"ordinary_reasons\":%s,"
+      "{\"scope\":\"current_process\",\"accounting_generation\":%llu,\"ordinary_unit\":\"record_behavior_call\",\"ordinary_reasons\":%s,"
       "\"failure_unit\":\"persistence_operation\",\"candidate_failures\":%s,\"context_failures\":%s,"
       "\"capacity_failures\":{\"candidate\":%s,\"context\":%s,\"last_cause\":%u,\"last_sqlite_rc\":%u,\"last_owner\":%u},"
       "\"pmfe_followup\":{\"scheduled\":%u,\"running\":%u,\"result_bound\":%u,\"result_acked_await_queue\":%u,"
@@ -10621,7 +10714,7 @@ int edr_local_evidence_cache_accounting_json(const EdrEvidenceCacheStatus *st, c
       "\"failures\":%llu,\"legacy_candidates_at_open\":%llu,\"recent_hours\":%u,\"selected_hours\":%u,"
       "\"active_ms\":%llu,\"clock_valid\":%u,\"clock_failures\":%llu,\"clock_cause_code\":%u,"
       "\"parent_protections\":%llu,\"floor_held\":%llu}}",
-      ordinary_reasons, candidate_failures, context_failures,
+      (unsigned long long)st->accounting_generation, ordinary_reasons, candidate_failures, context_failures,
       candidate_capacity, context_capacity, st->capacity_last_cause,
       st->capacity_last_sqlite_rc, st->capacity_last_owner,
       st->pmfe_scheduled,st->pmfe_running,st->pmfe_result_bound,st->pmfe_result_acked,
@@ -10674,6 +10767,7 @@ void edr_local_evidence_cache_status_json(char *out, size_t cap) {
            "\"utilization_bps\":{\"db\":%u,\"process_slots\":%u,\"ring\":%u,\"hot_ring\":%u,\"metrics\":%u,\"aggregate\":%u,\"context_windows\":%u,\"candidate_dedup\":%u},"
            "\"evictions\":{\"ring\":%llu,\"hot_ring\":%llu,\"context_windows\":%llu,\"context_window_nominal_ended_replacements\":%llu,\"context_window_protected_replacements\":%llu,\"metrics\":%llu,\"metric_write_failures\":%llu,\"metric_unrecorded\":%llu,\"candidate_dedup\":%llu,\"aggregate\":%llu,\"db_retention_rows\":%llu,\"db_capacity_rows\":%llu},"
            "\"oldest\":{\"process_last_seen_ns\":%lld,\"ring_event_time_ns\":%lld,\"hot_ring_event_time_ns\":%lld,\"candidate_dedup_ns\":%lld,\"p0_candidate_event_time_ns\":%lld},"
+           "\"accounting_generation\":%llu,\"maintenance\":{\"state\":%u,\"pending\":%s},"
            "\"maintenance_runs\":%llu,\"process_slots_used\":%u,\"ring_events\":%u,"
            "\"last_engine\":%s,\"last_event_time_ns\":%lld,\"last_error\":%s,"
            "\"partitions\":{\"hot_ring\":{\"events\":%u},"
@@ -10761,6 +10855,7 @@ void edr_local_evidence_cache_status_json(char *out, size_t cap) {
            (long long)st.oldest_hot_ring_event_time_ns,
            (long long)st.oldest_candidate_dedup_ns,
            (long long)st.oldest_p0_candidate_event_time_ns,
+           (unsigned long long)st.accounting_generation, st.maintenance_state, st.maintenance_pending ? "true" : "false",
            (unsigned long long)st.maintenance_runs, st.process_slots_used, st.ring_events,
            eng, (long long)st.last_event_time_ns, err, st.hot_ring_events,
            (unsigned long long)st.p0_candidates_written,

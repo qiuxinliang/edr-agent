@@ -53,6 +53,9 @@ typedef enum {
 
 typedef struct {
   int db_open;
+  /* Process-local counter epoch. Zero means unknown, including exhaustion;
+   * compare counters only with the same process identity and nonzero epoch. */
+  uint64_t accounting_generation;
   uint32_t storage_format; /* 0 legacy, 1 mixed compact writes, 2 fully compact */
   uint32_t compact_startup_deferred; /* 0/1: this open retained legacy for capacity. */
   uint64_t records_written;
@@ -152,6 +155,8 @@ typedef struct {
   uint32_t capacity_last_sqlite_rc; /* 0 when no SQLite result was captured. */
   uint32_t capacity_last_owner; /* 0 none, 1 candidate, 2 context. */
   uint64_t maintenance_runs;
+  uint32_t maintenance_state; /* 0 idle, 1 runnable, 2 parked, 3 backoff. */
+  uint32_t maintenance_pending; /* RAM work intent, not a database row count. */
   uint64_t identity_observations_total;
   uint64_t identity_none;
   uint64_t process_cache_hits;
@@ -430,6 +435,8 @@ int edr_local_evidence_cache_accounting_json(const EdrEvidenceCacheStatus *statu
                                             char *out, size_t cap);
 
 #ifdef EDR_LOCAL_EVIDENCE_CACHE_TESTING
+/* Exercise the saturating epoch transition without changing the live epoch. */
+uint64_t edr_local_evidence_cache_test_next_accounting_generation(uint64_t *counter);
 /* Explicit legacy-layout fixtures only; default zero exercises normal startup. */
 void edr_local_evidence_cache_test_set_legacy_context_writes(int enabled);
 /* Test-only wall clock for historical replay and retention checks. Survives

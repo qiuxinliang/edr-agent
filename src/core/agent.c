@@ -29,6 +29,7 @@
 #include "edr/attack_surface_report.h"
 #include "edr/collector.h"
 #include "collector_health_json.h"
+#include "evidence_cache_health_json.h"
 #include "queue_retention_health_json.h"
 #include "edr/command.h"
 #include "edr/command_executor.h"
@@ -2548,6 +2549,12 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
           context_ref_sources_json, sizeof(context_ref_sources_json)) < 0) {
     snprintf(context_ref_sources_json, sizeof(context_ref_sources_json), "{}");
   }
+  char evidence_health_json[EDR_EVIDENCE_HEALTH_JSON_BYTES];
+  if (edr_evidence_cache_health_json(&evidence_status, evidence_accounting_json,
+          context_ref_sources_json, evidence_health_json, sizeof(evidence_health_json)) != 0) {
+    fprintf(stderr, "[engine-health] cache snapshot formatting failed\n");
+    snprintf(evidence_health_json, sizeof(evidence_health_json), "{}");
+  }
   if (strcmp(health_profile, "diagnostic") != 0) {
     char body_basic[49152];
     int n_basic = snprintf(
@@ -2635,7 +2642,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
         "\"cpu_percent\":%u,\"cpu_percent_x100\":%u,"
         "\"cpu_avg_10s_x100\":%u,\"cpu_avg_60s_x100\":%u,"
         "\"cpu_max_60s_x100\":%u,\"cpu_p95_60s_x100\":%u,"
-        "\"cpu_sample_window_ms\":%u,\"process_id\":%u,\"logical_processors\":%u,"
+        "\"cpu_sample_window_ms\":%u,\"process_id\":%u,\"process_start_unix_ms\":%llu,\"logical_processors\":%u,"
         "\"process_cpu_delta_100ns\":%llu,\"wall_delta_100ns\":%llu,"
         "\"rss_mb\":%llu,"
         "\"working_set_mb\":%llu,\"private_bytes_mb\":%llu,\"pagefile_mb\":%llu,"
@@ -2658,22 +2665,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
         "\"pre_rule_event_duplicates\":%llu,\"pending_backpressure\":%llu},"
         "\"source_only\":{\"terminal_unhealthy\":%s,\"unhealthy_families_mask\":%u,\"loss_detected\":%s,"
         "\"retry_pending\":%llu,\"retry_committed\":%llu,\"reason\":\"%s\"},"
-        "\"evidence_cache\":{\"db_open\":%s,\"storage_format\":%u,\"utilization_bps\":%u,"
-        "\"candidate_requests\":%llu,\"candidate_reused\":%llu,"
-        "\"candidate_admitted\":%llu,\"candidate_rejected\":%llu,"
-        "\"context_facts_written\":%llu,\"context_refs_written\":%llu,"
-		"\"write_budget\":{\"used\":%u,\"limit\":%u,\"base_limit\":%u,"
-		"\"scope\":\"context_only\",\"dropped\":%llu,"
-		"\"candidate\":{\"mode\":\"exempt\",\"dropped\":%llu},"
-		"\"critical_context\":{\"mode\":\"capacity_bound\",\"used\":%u,\"limit\":%u,\"dropped\":%llu},"
-		"\"ordinary_context\":{\"used\":%u,\"limit\":%u,\"dropped\":%llu},"
-		"\"context_dropped\":%llu},"
-        "\"p0_candidate_rows\":%llu,\"db_bytes\":%llu,\"wal_bytes\":%llu,\"shm_bytes\":%llu,\"physical_bytes\":%llu,"
-        "\"max_db_mb\":%u,\"maintenance\":{\"runs\":%llu,"
-        "\"retention_evicted\":%llu,\"capacity_evicted\":%llu,\"metric_write_failures\":%llu,\"metric_unrecorded\":%llu},"
-        "\"context_window_evictions\":%llu,"
-        "\"context_window_nominal_ended_replacements\":%llu,"
-        "\"context_window_protected_replacements\":%llu,\"context_ref_write_sources\":%s,\"accounting\":%s},"
+        "\"evidence_cache\":%s,"
         "\"process_evidence_worker\":{\"slots_used\":%u,\"capacity\":%u,"
         "\"requests_total\":%llu,\"ready_hits\":%llu,\"pending_reuse\":%llu,"
         "\"misses\":%llu,\"backpressure\":%llu,\"evictions\":%llu,"
@@ -2832,7 +2824,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
         agent->cfg.resource_limit.pmfe_scans_per_min,
         rs.cpu_percent, rs.cpu_percent_x100, rs.cpu_avg_10s_x100, rs.cpu_avg_60s_x100,
         rs.cpu_max_60s_x100, rs.cpu_p95_60s_x100, rs.cpu_sample_window_ms,
-        rs.process_id, rs.logical_processor_count,
+        rs.process_id, (unsigned long long)rs.process_start_unix_ms, rs.logical_processor_count,
         (unsigned long long)rs.process_cpu_delta_100ns,
         (unsigned long long)rs.wall_delta_100ns,
         (unsigned long long)rs.rss_mb,
@@ -2861,38 +2853,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
         p0_emit_metrics.source_only_loss_detected ? "true" : "false",
         (unsigned long long)p0_emit_metrics.source_only_retry_pending,
         (unsigned long long)p0_emit_metrics.source_only_retry_committed, source_only_reason,
-        evidence_status.db_open ? "true" : "false", evidence_status.storage_format, evidence_status.db_utilization_bps,
-        (unsigned long long)evidence_status.candidate_requests,
-        (unsigned long long)evidence_status.candidate_reused,
-        (unsigned long long)evidence_status.candidate_admitted,
-        (unsigned long long)evidence_status.candidate_rejected,
-        (unsigned long long)evidence_status.context_facts_written,
-        (unsigned long long)evidence_status.context_refs_written,
-		evidence_status.write_budget_used, evidence_status.write_budget_limit,
-		evidence_status.write_budget_base_limit,
-		(unsigned long long)evidence_status.write_budget_dropped,
-		(unsigned long long)evidence_status.write_budget_candidate_dropped,
-		evidence_status.write_budget_critical_context_used,
-		evidence_status.write_budget_critical_context_limit,
-		(unsigned long long)evidence_status.write_budget_critical_context_dropped,
-		evidence_status.write_budget_ordinary_context_used,
-		evidence_status.write_budget_ordinary_context_limit,
-		(unsigned long long)evidence_status.write_budget_ordinary_context_dropped,
-		(unsigned long long)evidence_status.write_budget_context_dropped,
-        (unsigned long long)evidence_status.p0_candidate_rows,
-        (unsigned long long)evidence_status.db_bytes,
-        (unsigned long long)evidence_status.wal_bytes,
-        (unsigned long long)evidence_status.shm_bytes,
-        (unsigned long long)evidence_status.physical_bytes, evidence_status.max_db_mb,
-        (unsigned long long)evidence_status.maintenance_runs,
-        (unsigned long long)evidence_status.db_retention_evicted,
-        (unsigned long long)evidence_status.db_capacity_evicted,
-        (unsigned long long)evidence_status.metric_write_failures,
-        (unsigned long long)evidence_status.metric_unrecorded,
-        (unsigned long long)evidence_status.context_window_evictions,
-        (unsigned long long)evidence_status.context_window_nominal_ended_replacements,
-        (unsigned long long)evidence_status.context_window_protected_replacements,
-        context_ref_sources_json, evidence_accounting_json,
+        evidence_health_json,
         process_evidence_metrics.slots_used, process_evidence_metrics.capacity,
         (unsigned long long)process_evidence_metrics.requests_total,
         (unsigned long long)process_evidence_metrics.ready_hits,
@@ -3261,7 +3222,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
                     sizeof(event_filter_last_cmdline));
   edr_agent_config_recovery_json(agent, config_recovery_json, sizeof(config_recovery_json));
 
-  char body[49152];
+  char body[49152 + EDR_EVIDENCE_HEALTH_JSON_BYTES];
   int n = snprintf(
       body, sizeof(body),
       "{\"endpoint_id\":\"%s\",\"agent_version\":\"%s\",\"policy_version\":\"%s\","
@@ -3378,7 +3339,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       "\"cpu_percent\":%u,\"cpu_percent_x100\":%u,"
       "\"cpu_avg_10s_x100\":%u,\"cpu_avg_60s_x100\":%u,"
       "\"cpu_max_60s_x100\":%u,\"cpu_p95_60s_x100\":%u,"
-      "\"cpu_sample_window_ms\":%u,\"process_id\":%u,\"logical_processors\":%u,"
+      "\"cpu_sample_window_ms\":%u,\"process_id\":%u,\"process_start_unix_ms\":%llu,\"logical_processors\":%u,"
       "\"process_cpu_delta_100ns\":%llu,\"wall_delta_100ns\":%llu,"
       "\"rss_mb\":%llu,"
       "\"working_set_mb\":%llu,\"private_bytes_mb\":%llu,\"pagefile_mb\":%llu,"
@@ -3505,7 +3466,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       "\"code_supported\":%s,\"build_supported\":%s,\"runtime_status\":\"%s\","
       "\"runtime_detail\":\"%s\",\"mode\":\"web_roots_only\",\"root_count\":%u,\"watch_count\":%u,"
       "\"max_file_size_mb\":%u,\"scan_threads\":%u,\"last_degrade_reason\":\"%s\"},"
-      "%s%s%s"
+      "\"p0_acceptance\":{\"evidence_cache\":%s},%s%s%s"
       "}}",
       agent->cfg.agent.endpoint_id, EDR_AGENT_VERSION_STRING,
       runtime_policy_ver[0] ? runtime_policy_ver : (rules_ver[0] ? rules_ver : "local"),
@@ -3659,7 +3620,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       agent->cfg.resource_limit.low_priority_keep_percent_under_pressure,
       rs.cpu_percent, rs.cpu_percent_x100, rs.cpu_avg_10s_x100, rs.cpu_avg_60s_x100,
       rs.cpu_max_60s_x100, rs.cpu_p95_60s_x100, rs.cpu_sample_window_ms,
-      rs.process_id, rs.logical_processor_count,
+      rs.process_id, (unsigned long long)rs.process_start_unix_ms, rs.logical_processor_count,
       (unsigned long long)rs.process_cpu_delta_100ns,
       (unsigned long long)rs.wall_delta_100ns,
       (unsigned long long)rs.rss_mb,
@@ -3922,7 +3883,7 @@ static void edr_agent_poll_engine_health(EdrAgent *agent, uint64_t *last_health_
       webshell_runtime.root_count, webshell_runtime.watch_count,
       agent->cfg.webshell_detector.max_file_size_mb, agent->cfg.webshell_detector.scan_threads,
       (webshell_runtime.policy_enabled && !webshell_runtime.started) ? webshell_runtime.detail : "",
-      evidence_json, corr_health_json, p0_health_json);
+      evidence_health_json, evidence_json, corr_health_json, p0_health_json);
   if (n > 0 && (size_t)n < sizeof(body)) {
     int health_rc = edr_ingest_http_post_engine_health_json(body);
     fprintf(stderr, "[engine-health] post %s profile=diagnostic http2_enabled=%d negotiated=%s protocol=%s\n",
