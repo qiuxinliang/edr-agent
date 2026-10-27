@@ -17,7 +17,11 @@ int response_forensic_copy_one_file(const char *src, const char *dst);
 #define EDR_RESPONSE_COPY_IDENTITY_CHANGED (-22)
 #define EDR_RESPONSE_COPY_SOURCE_UNAVAILABLE (-23)
 #define EDR_RESPONSE_COPY_DESTINATION_FAILED (-24)
-int response_forensic_copy_lines(const char *jobdir, const uint8_t *pl, size_t len);
+typedef int (*EdrResponseCancelCheck)(void *user);
+/* Consume the caller's remaining command budget at I/O checkpoints. OS calls
+ * themselves can still block; this is not a hard kernel-I/O deadline. */
+int response_forensic_copy_lines(const char *jobdir, const uint8_t *pl, size_t len,
+                                 uint32_t *remaining_ms, EdrResponseCancelCheck cancel, void *cancel_user);
 void response_sanitize_job_name(const char *src, char *dst, size_t cap);
 /* Build the exact request/artifact arguments for an external collector.
  * A nonzero return clears every output; callers must not execute a partially
@@ -45,7 +49,6 @@ int response_file_security_snapshot(const char *path, EdrResponseFileSecurity *o
 int response_file_security_lock(const char *path, int directory);
 int response_file_security_restore(const char *path, const EdrResponseFileSecurity *saved);
 int response_mkdir_p(const char *path);
-typedef int (*EdrResponseCancelCheck)(void *user);
 /* Reuse the 300s forensic ceiling. Timeout/cancel return existing collector
  * codes; unconfirmed termination keeps the owner's growth reservation. */
 #define EDR_RESPONSE_WRITER_UNCONFIRMED (-20)

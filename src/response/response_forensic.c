@@ -1325,11 +1325,19 @@ void edr_response_collect_forensic(const char *cmd_id, const uint8_t *pl, size_t
   int copy_rc=0;
   int collection_ready=manifest_ok && edr_forensic_storage_ready(dir) &&
       !edr_storage_physical_admit_owned(stage.staging,stage.peak_bytes,0,stage.peak_bytes,&stage_space);
-  if(collection_ready)copy_rc=response_forensic_copy_lines(dir,pl,len);
+  uint32_t timeout_ms=300000u;
+  if(sm && sm->issued_at_unix_ms>0 && sm->deadline_ms>0 &&
+      sm->issued_at_unix_ms<=INT64_MAX-sm->deadline_ms) {
+    int64_t remaining=sm->issued_at_unix_ms+sm->deadline_ms-(int64_t)time(NULL)*1000LL;
+    timeout_ms=remaining<=0 ? 0u : remaining<(int64_t)timeout_ms ? (uint32_t)remaining : timeout_ms;
+  }
+  if(collection_ready)copy_rc=response_forensic_copy_lines(dir,pl,len,&timeout_ms,forensic_cancel_check,(void *)cmd_id);
   if (!collection_ready || copy_rc != 0) {
     (void)edr_command_state_artifact_abandon(cmd_id);
     edr_cmd_inc_exec_fail();
     const char *cause=!collection_ready ? "baseline forensic manifest or disk admission unavailable; local evidence retained" :
+        copy_rc==EDR_DC_ERR_CANCELLED ? "baseline forensic copy cancelled; partial local evidence retained" :
+        copy_rc==EDR_DC_ERR_TIMEOUT ? "baseline forensic copy deadline exceeded; partial local evidence retained" :
         copy_rc==EDR_RESPONSE_BYTE_BUDGET_EXCEEDED ? "baseline forensic byte budget exceeded; partial local evidence retained" :
         copy_rc==EDR_RESPONSE_COPY_IDENTITY_CHANGED ? "baseline forensic source identity changed during copy; partial local evidence retained" :
         copy_rc==EDR_RESPONSE_COPY_SOURCE_UNAVAILABLE ? "baseline forensic source unavailable or unsupported; partial local evidence retained" :
@@ -1338,12 +1346,6 @@ void edr_response_collect_forensic(const char *cmd_id, const uint8_t *pl, size_t
     edr_command_audit_both(cmd_id,cause);
     edr_command_emit_always(cmd_id, sm, EdrCmdExecFailed, 2,cause);
     return;
-  }
-  uint32_t timeout_ms=300000u;
-  if(sm && sm->issued_at_unix_ms>0 && sm->deadline_ms>0 &&
-      sm->issued_at_unix_ms<=INT64_MAX-sm->deadline_ms) {
-    int64_t remaining=sm->issued_at_unix_ms+sm->deadline_ms-(int64_t)time(NULL)*1000LL;
-    timeout_ms=remaining<=0 ? 0u : remaining<(int64_t)timeout_ms ? (uint32_t)remaining : timeout_ms;
   }
   int bundle_rc=timeout_ms ? response_make_tar_bundle(dir,stage.staging,timeout_ms,forensic_cancel_check,(void *)cmd_id)
       : EDR_DC_ERR_TIMEOUT;

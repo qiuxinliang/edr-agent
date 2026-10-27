@@ -4,6 +4,7 @@
 #include "edr/response_utils.h"
 #include "edr/command_state.h"
 #include "edr/command_executor.h"
+#include "edr/command_cancel.h"
 #include "edr/storage_reservation.h"
 #include "edr/storage_physical_guard.h"
 #include <assert.h>
@@ -62,6 +63,20 @@ int main(void) {
   meta.issued_at_unix_ms=1;meta.deadline_ms=1;
   edr_response_collect_forensic("expired",(const uint8_t *)path,strlen(path),&meta);
   assert(edr_command_state_has_final("expired",&meta)==1 && !edr_storage_artifact_reserved());
+  snprintf(artifact,sizeof(artifact),"%s/expired.work/copied_00",root);
+  uint64_t expired_bytes=edr_storage_file_size(artifact);
+  fprintf(stderr,"expired command copied_bytes=%llu (required=0)\n",(unsigned long long)expired_bytes);
+  assert(expired_bytes==0);
+  start_owner("cancelled",&meta);
+  assert(edr_command_cancel_begin("cancelled") && edr_command_cancel_request("cancelled"));
+  edr_response_collect_forensic("cancelled",(const uint8_t *)path,strlen(path),&meta);
+  edr_command_cancel_end("cancelled");
+  assert(edr_command_state_has_final("cancelled",&meta)==1 && !edr_storage_artifact_reserved());
+  snprintf(artifact,sizeof(artifact),"%s/cancelled.work/copied_00",root);
+  assert(edr_storage_file_size(artifact)==0);
+  EdrCommandStateRecord cancelled;int cancelled_retry=0;
+  assert(edr_command_state_begin("cancelled","collect_forensic",&meta,&cancelled_retry,&cancelled)==EDR_COMMAND_STATE_BEGIN_DUP_FINAL);
+  assert(strstr(cancelled.detail,"copy cancelled") && !strstr(cancelled.detail,root));
   start_owner("unsupported",&meta);
   edr_response_collect_forensic("unsupported",(const uint8_t *)root,strlen(root),&meta);
   assert(edr_command_state_has_final("unsupported",&meta)==1 && !edr_storage_artifact_reserved());
