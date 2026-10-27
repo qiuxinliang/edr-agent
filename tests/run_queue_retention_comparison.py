@@ -15,7 +15,7 @@ from pathlib import Path
 import shutil
 import subprocess
 from retention_comparison_support import (CODEC_SOURCES, compiler_flags,
-    compile_command, dependencies, digest, includes, runtime_environment, verify_native, compiler_identity, execute_benchmark, failure_report)
+    compile_command, dependencies, digest, includes, runtime_environment, verify_native, compiler_identity, execute_benchmark, failure_report, storage_reservation_sources)
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--output', type=Path, required=True)
@@ -149,7 +149,8 @@ for name, revision in [('baseline_662', baseline), ('current', None)]:
                            [work/'include', out, *includes(source), *dep_includes], args.native_machine)
     command = compile_command(args.cc, flags,
         [out/'queue_retention_comparison.c', work/'queue_sqlite.c', source/'src/core/time_util.c',
-         source/'src/transport/report_events_ack.c'], binary, [str(library), *libraries])
+         source/'src/transport/report_events_ack.c',
+         *[source/p for p in storage_reservation_sources(source)]], binary, [str(library), *libraries])
     (work/'compile-command.json').write_text(json.dumps(command, indent=2)+'\n')
     (work/'source-binding.json').write_text(json.dumps({'source_sha256':hashlib.sha256(original).hexdigest(),
         'header_sha256':hashlib.sha256(header).hexdigest(), 'instrumented_sha256':digest(work/'queue_sqlite.c'),

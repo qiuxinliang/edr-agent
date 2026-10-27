@@ -61,6 +61,10 @@ static int edr_storage_space_preflight_body(int argc, char **argv) {
   if (rc || edr_storage_min_free_bytes(&floor) || floor > 9007199254740991ULL) {
     fprintf(stderr, "storage preflight: owner accounting or policy unavailable\n"); return 4;
   }
+  floor=edr_storage_add_bytes(floor,edr_storage_artifact_reserved());
+  if(floor>9007199254740991ULL) {
+    fprintf(stderr,"storage preflight: artifact reservation unavailable\n");return 4;
+  }
   char decimal[32];
   int size = snprintf(decimal, sizeof(decimal), "%llu", (unsigned long long)floor);
   if (size <= 0 || (size_t)size >= sizeof(decimal)) return 4;

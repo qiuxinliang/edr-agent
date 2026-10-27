@@ -127,6 +127,24 @@ with tempfile.TemporaryDirectory(prefix='edr-space-preflight-') as directory:
     protected = invoke('legacy-owner', ['--config', str(config)])
     assert protected > 27*1024*1024 and hashlib.sha256(state.read_bytes()).hexdigest() == before_hash
     assert permissions(state) == owner_permissions and permissions(state.parent) == parent_permissions
+    # Pending on-demand artifact growth is added once, not multiplied as part
+    # of the JSONL owner floor. Read-only inspection must never map/extend or
+    # update the existing command lock file's shared balance.
+    stage = json.dumps({'record':'command_state','command_id':'staged-owner','final':0,
+                       'artifact_stage':{'phase':1,'peak_bytes':129*1024*1024,
+                                         'artifact':str(root/'retained.tgz'),
+                                         'staging':str(root/'retained.tgz.staging'),
+                                         'workspace':str(root/'retained.work')}},
+                       separators=(',',':')).encode()+b'\n'
+    state.write_bytes(before+stage)
+    staged_hash=hashlib.sha256(state.read_bytes()).hexdigest()
+    lock_path=Path(str(state)+'.lock')
+    lock_before=lock_path.read_bytes()
+    assert invoke('pending-artifact',['--config',str(config)]) == protected+3*len(stage)+129*1024*1024
+    assert hashlib.sha256(state.read_bytes()).hexdigest()==staged_hash
+    assert lock_path.read_bytes()==lock_before
+    assert permissions(state)==owner_permissions and permissions(state.parent)==parent_permissions
+    state.write_bytes(before)
     # Exercise the real installer CLI with a public, full pre-clock DB. This
     # small schema tests the rejection contract; the C suite covers real schema
     # migration and query ownership using the production storage owner.

@@ -14,6 +14,13 @@ static inline int edr_evidence_window_metadata_valid(const char *state, const ch
       "monotonic_clock_reset", "restart_after_window", "live_generation_unverified"};
   int state_ok = 0, gap_ok = 0;
   if (!state || !gap) return 0;
+  /* Preserve one proven activation omission alongside the latest recovery
+   * cause. The suffix remains the same bounded enum, never arbitrary text. */
+  if (!strcmp(gap, "activation_gap")) gap_ok = 1;
+  else if (!strncmp(gap, "activation_gap+", 15)) {
+    gap += 15;
+    if (!gap[0]) return 0;
+  }
   for (size_t i = 0; i < sizeof(states)/sizeof(states[0]); ++i) state_ok |= !strcmp(state, states[i]);
   for (size_t i = 0; i < sizeof(gaps)/sizeof(gaps[0]); ++i) gap_ok |= !strcmp(gap, gaps[i]);
   return state_ok && gap_ok;

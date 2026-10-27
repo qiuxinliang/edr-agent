@@ -12,6 +12,11 @@ extern "C" {
 #endif
 
 int response_forensic_copy_one_file(const char *src, const char *dst);
+/* Bounded copy failures are carried into the command's terminal diagnosis.
+ * No path or file content is included in these finite cause codes. */
+#define EDR_RESPONSE_COPY_IDENTITY_CHANGED (-22)
+#define EDR_RESPONSE_COPY_SOURCE_UNAVAILABLE (-23)
+#define EDR_RESPONSE_COPY_DESTINATION_FAILED (-24)
 int response_forensic_copy_lines(const char *jobdir, const uint8_t *pl, size_t len);
 void response_sanitize_job_name(const char *src, char *dst, size_t cap);
 /* Build the exact request/artifact arguments for an external collector.
@@ -40,7 +45,16 @@ int response_file_security_snapshot(const char *path, EdrResponseFileSecurity *o
 int response_file_security_lock(const char *path, int directory);
 int response_file_security_restore(const char *path, const EdrResponseFileSecurity *saved);
 int response_mkdir_p(const char *path);
-int response_make_tar_bundle(const char *dir, const char *bundle_path);
+typedef int (*EdrResponseCancelCheck)(void *user);
+/* Reuse the 300s forensic ceiling. Timeout/cancel return existing collector
+ * codes; unconfirmed termination keeps the owner's growth reservation. */
+#define EDR_RESPONSE_WRITER_UNCONFIRMED (-20)
+#define EDR_RESPONSE_BYTE_BUDGET_EXCEEDED (-21)
+int response_make_tar_bundle(const char *dir, const char *bundle_path, uint32_t timeout_ms,
+                             EdrResponseCancelCheck cancel, void *cancel_user);
+#ifdef EDR_RESPONSE_TAR_TESTING
+void response_tar_test_set_binary(const char *path);
+#endif
 int response_split_args(char *buf, char *argv[], size_t argv_cap);
 int response_run_hook_no_shell(const char *hook_cmdline);
 

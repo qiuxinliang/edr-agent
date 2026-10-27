@@ -13,6 +13,7 @@
 #include "edr/p0_rule_match.h"
 #include "edr/process_tree_cache.h"
 #include "edr/sha256.h"
+#include "edr/process_generation.h"
 #include "../src/preprocess/process_cached_generation.h"
 #include "../src/preprocess/parent_context_snapshot.h"
 #include "../src/collector/process_command_preview.h"
@@ -14751,6 +14752,343 @@ static void test_phase2_continues_across_ttl(int benchmark) {
 #if defined(EDR_HAVE_SQLITE)
 /* Recovery verifies a live tuple, never boot time arithmetic or PID alone.
  * The seam substitutes only that OS handle boundary; cache/SQLite/GC are real. */
+typedef struct {
+  EvidenceCacheMutexTimingContext gate;
+  EdrBehaviorRecord *candidate;
+  int result;
+} ActivationGapContext;
+
+static void activation_gap_pause(void *opaque) {
+  ActivationGapContext *ctx = opaque;
+#if defined(_WIN32)
+  AcquireSRWLockExclusive(&ctx->gate.mutex);
+  ctx->gate.ready = 1u; WakeAllConditionVariable(&ctx->gate.cond);
+  while (!ctx->gate.go) assert(SleepConditionVariableSRW(&ctx->gate.cond, &ctx->gate.mutex, 10000, 0));
+  ReleaseSRWLockExclusive(&ctx->gate.mutex);
+#else
+  assert(pthread_mutex_lock(&ctx->gate.mutex) == 0);
+  ctx->gate.ready = 1u; assert(pthread_cond_broadcast(&ctx->gate.cond) == 0);
+  struct timespec deadline; assert(clock_gettime(CLOCK_REALTIME, &deadline) == 0); deadline.tv_sec += 10;
+  while (!ctx->gate.go) assert(pthread_cond_timedwait(&ctx->gate.cond, &ctx->gate.mutex, &deadline) == 0);
+  assert(pthread_mutex_unlock(&ctx->gate.mutex) == 0);
+#endif
+}
+
+#if defined(_WIN32)
+static DWORD WINAPI activation_gap_alert_worker(void *opaque) {
+#else
+static void *activation_gap_alert_worker(void *opaque) {
+#endif
+  ActivationGapContext *ctx = opaque;
+  EdrCommandFacts facts = {ctx->candidate->cmdline, NULL};
+  ctx->result = edr_local_evidence_cache_record_alert_context(ctx->candidate, &facts);
+  return 0;
+}
+
+static void activation_gap_query(const EdrBehaviorRecord *candidate, int64_t now,
+                                 const char *expected_gap, int enforce) {
+  EdrSoarCommandMeta meta = {0}; char out[16384];
+  meta.issued_at_unix_ms = now / 1000000LL; meta.deadline_ms = 60000;
+  EdrCommandResultAuthorization *a = &meta.result_authorization;
+  snprintf(a->command_id, sizeof(a->command_id), "activation-query");
+  snprintf(a->command_type, sizeof(a->command_type), "rtq_query");
+  snprintf(a->tenant_id, sizeof(a->tenant_id), "%s", candidate->tenant_id);
+  snprintf(a->endpoint_id, sizeof(a->endpoint_id), "%s", candidate->endpoint_id);
+  a->expires_unix_ms = meta.issued_at_unix_ms + 60000;
+  snprintf(a->content_contract, sizeof(a->content_contract),
+      "{\"schema\":\"edr.command.result-purpose.v1\",\"kind\":\"cached_rtq\",\"max_bytes\":16383,\"max_rows\":50,\"window_s\":600,\"issued_unix_ms\":%lld,\"request\":{}}",
+      (long long)meta.issued_at_unix_ms);
+  int query_rc = edr_local_evidence_cache_query_authorized_json(a->command_id, &meta, out, sizeof(out));
+  if (query_rc) fprintf(stderr, "activation query failed rc=%d cause=%s\n", query_rc, out);
+  assert(query_rc == 0);
+  cJSON *result = cJSON_Parse(out); assert(result);
+  cJSON *rows = cJSON_GetObjectItemCaseSensitive(result, "rows"), *row = NULL;
+  const cJSON *gap = NULL; unsigned candidates = 0;
+  cJSON_ArrayForEach(row, rows) {
+    const cJSON *source = cJSON_GetObjectItemCaseSensitive(row, "source");
+    if (cJSON_IsString(source) && !strcmp(source->valuestring, "p0_candidates")) {
+      gap = cJSON_GetObjectItemCaseSensitive(row, "context_window_gap_reason"); ++candidates;
+    }
+  }
+  assert(candidates == 1);
+  assert(cJSON_IsString(gap));
+  printf("activation_query gap=%s expected=%s absence_is_evidence=0\n", gap->valuestring, expected_gap);
+  fflush(stdout);
+  if (enforce) assert(!strcmp(gap->valuestring, expected_gap));
+  assert(cJSON_IsFalse(cJSON_GetObjectItemCaseSensitive(result, "absence_is_evidence")));
+  cJSON_Delete(result);
+}
+
+/* Force the actual unlocked command-preparation boundary: the alert writer
+ * waits while another thread finishes ordinary ingestion. No timing race or
+ * fabricated post-context manifest is used by this counterfactual. */
+static void test_window_activation_gap(int enforce) {
+  const int64_t base = INT64_C(1793100000000000000);
+  for (unsigned mode = 0; mode < 6u; ++mode) {
+    char path[640], queue_path[640], id[200]; EdrBehaviorRecord candidate, event;
+    assert(make_test_sqlite_path(path, sizeof(path)) == 0);
+    assert(make_test_sqlite_path(queue_path, sizeof(queue_path)) == 0);
+    edr_storage_queue_configure(8u, 24u); assert(edr_storage_queue_open(queue_path) == EDR_OK);
+    edr_local_evidence_cache_test_set_now_unix_ns(base);
+    s_test_monotonic_ns = UINT64_C(1000000000);
+    assert(edr_local_evidence_cache_open(path, 8u, 24u) == 0);
+    edr_pt_cache_init();
+    init_window_replacement_candidate(&candidate, 0, base);
+    snprintf(candidate.cmdline, sizeof(candidate.cmdline), "window-owner.exe --activation");
+    event = candidate; event.type = EDR_EVENT_FILE_WRITE; event.net_dport = 0; event.net_dst[0] = 0;
+    event.event_time_ns = base + INT64_C(1000000000);
+    snprintf(event.event_id, sizeof(event.event_id), "activation-before-owner");
+    snprintf(event.file_path, sizeof(event.file_path), "C:\\UserData\\activation.bin");
+    if (mode == 2u) snprintf(event.tenant_id, sizeof(event.tenant_id), "different-tenant");
+    if (mode == 3u) { event.process_start_key++; event.process_creation_filetime_100ns++; }
+    if (mode == 4u) event.event_time_ns = base + INT64_C(61000000000);
+    if (mode == 5u) snprintf(event.endpoint_id, sizeof(event.endpoint_id), "different-endpoint");
+    assert(!edr_local_evidence_cache_is_candidate(&event));
+    if (mode == 1u) {
+      edr_local_evidence_cache_record_behavior(&event);
+      edr_local_evidence_cache_test_fail_next_commits(1u);
+      edr_local_evidence_cache_record_behavior(&candidate);
+      assert(sqlite_table_count(path, "p0_candidates") == 0);
+      EdrEvidenceCacheStatus failed; edr_local_evidence_cache_get_status(&failed);
+      assert(failed.context_windows_used == 0u);
+      edr_local_evidence_cache_record_behavior(&candidate);
+    } else {
+      ActivationGapContext ctx = {
+#if defined(_WIN32)
+        {SRWLOCK_INIT, CONDITION_VARIABLE_INIT, 0u, 0},
+#else
+        {PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, 0u, 0},
+#endif
+        &candidate, -99};
+      edr_local_evidence_cache_test_set_alert_prepare_hook(activation_gap_pause, &ctx);
+      EvidenceCacheTestThread worker = evidence_cache_test_start_thread(activation_gap_alert_worker, &ctx);
+#if defined(_WIN32)
+      AcquireSRWLockExclusive(&ctx.gate.mutex);
+      while (!ctx.gate.ready) assert(SleepConditionVariableSRW(&ctx.gate.cond, &ctx.gate.mutex, 10000, 0));
+#else
+      assert(pthread_mutex_lock(&ctx.gate.mutex) == 0);
+      struct timespec deadline; assert(clock_gettime(CLOCK_REALTIME, &deadline) == 0); deadline.tv_sec += 10;
+      while (!ctx.gate.ready) assert(pthread_cond_timedwait(&ctx.gate.cond, &ctx.gate.mutex, &deadline) == 0);
+#endif
+      edr_local_evidence_cache_record_behavior(&event);
+      assert(sqlite_table_count(path, "p0_candidates") == 0);
+      ctx.gate.go = 1;
+#if defined(_WIN32)
+      WakeAllConditionVariable(&ctx.gate.cond); ReleaseSRWLockExclusive(&ctx.gate.mutex);
+#else
+      assert(pthread_cond_broadcast(&ctx.gate.cond) == 0);
+      assert(pthread_mutex_unlock(&ctx.gate.mutex) == 0);
+#endif
+      evidence_cache_test_join_thread(worker); assert(ctx.result == 0);
+      edr_local_evidence_cache_test_set_alert_prepare_hook(NULL, NULL);
+#if !defined(_WIN32)
+      assert(pthread_cond_destroy(&ctx.gate.cond) == 0); assert(pthread_mutex_destroy(&ctx.gate.mutex) == 0);
+#endif
+    }
+    sqlite_candidate_id_for_source_event(path, candidate.event_id, id, sizeof(id));
+    assert(sqlite_post_artifact_count(path, id, event.event_id) == 0);
+    const char *expected = mode < 2u ? "activation_gap" : "";
+    printf("activation_gap mode=%u preactivation_post_refs=0 ", mode);
+    activation_gap_query(&candidate, base, expected, enforce);
+    /* The missing source identity was not invented. Later ingestion uses the
+     * real event id and the already active window exactly once. */
+    event = candidate; event.type = EDR_EVENT_FILE_WRITE; event.net_dport = 0; event.net_dst[0] = 0;
+    event.event_time_ns = base + INT64_C(2000000000);
+    snprintf(event.event_id, sizeof(event.event_id), "activation-after-owner");
+    snprintf(event.file_path, sizeof(event.file_path), "C:\\UserData\\after-activation.bin");
+    edr_local_evidence_cache_record_behavior(&event);
+    assert(sqlite_post_artifact_count(path, id, event.event_id) == 1);
+    edr_local_evidence_cache_close();
+    edr_local_evidence_cache_test_set_window_recovery_identity(1);
+    assert(edr_local_evidence_cache_open(path, 8u, 24u) == 0);
+    activation_gap_query(&candidate, base, mode < 2u ? "activation_gap+service_restart_gap" : "service_restart_gap", enforce);
+    if (mode < 2u) {
+      EdrCommandFacts facts = {candidate.cmdline, NULL};
+      assert(edr_local_evidence_cache_record_alert_context(&candidate, &facts) == 0);
+      edr_local_evidence_cache_close();
+      edr_local_evidence_cache_test_set_window_recovery_identity(0);
+      assert(edr_local_evidence_cache_open(path, 8u, 24u) == 0);
+      activation_gap_query(&candidate, base, "activation_gap+live_generation_unverified", enforce);
+    }
+    edr_local_evidence_cache_close(); edr_pt_cache_shutdown(); cleanup_test_sqlite_path(path);
+    edr_storage_queue_close(); cleanup_test_sqlite_path(queue_path);
+  }
+  edr_local_evidence_cache_test_set_window_recovery_identity(-1);
+  edr_local_evidence_cache_test_set_now_unix_ns(0);
+}
+
+/* Existing VFS counts actual SQLite writes (WAL included), not estimated row
+ * sizes. The workload has no extra worker and keeps the ring population fixed. */
+static void test_window_activation_benchmark(void) {
+  const int64_t base = INT64_C(1793100000000000000);
+  retention_bench_vfs_parent = sqlite3_vfs_find(NULL); assert(retention_bench_vfs_parent);
+  sqlite3_vfs vfs = *retention_bench_vfs_parent;
+  vfs.zName = "window-activation-benchmark"; vfs.pNext = NULL;
+  vfs.szOsFile += (int)sizeof(RetentionBenchFile); vfs.xOpen = retention_bench_open;
+  assert(sqlite3_vfs_register(&vfs, 1) == SQLITE_OK);
+  for (unsigned mode = 0; mode < 4u; ++mode) {
+    char path[640]; EdrBehaviorRecord candidate, event;
+    assert(make_test_sqlite_path(path, sizeof(path)) == 0);
+    edr_local_evidence_cache_test_set_now_unix_ns(base);
+    assert(edr_local_evidence_cache_open(path, 8u, 24u) == 0); edr_pt_cache_init();
+    init_window_replacement_candidate(&candidate, 0u, base);
+    snprintf(candidate.cmdline, sizeof(candidate.cmdline), "window-owner.exe --benchmark");
+    event = candidate; event.type = EDR_EVENT_FILE_WRITE; event.net_dport = 0; event.net_dst[0] = 0;
+    if (mode == 1u || mode == 2u) {
+      for (unsigned i = 0; i < 256u; ++i) {
+        event.event_time_ns = base + (mode == 1u ? -INT64_C(1000000000) : INT64_C(1000000000)) + i;
+        snprintf(event.event_id, sizeof(event.event_id), "activation-bench-fill-%u", i);
+        snprintf(event.file_path, sizeof(event.file_path), "C:\\UserData\\fill-%u.bin", i);
+        edr_local_evidence_cache_record_behavior(&event);
+      }
+      EdrEvidenceCacheStatus filled; edr_local_evidence_cache_get_status(&filled);
+      assert(filled.hot_ring_events == 256u);
+    }
+    EdrCommandFacts facts = {candidate.cmdline, NULL};
+    unsigned count = mode == 3u ? 50000u : 120u;
+    retention_bench_reads = retention_bench_writes = retention_bench_syncs = 0;
+    clock_t cpu = clock(); uint64_t wall = soak_monotonic_ns();
+    for (unsigned i = 0; i < count; ++i) {
+      if (mode == 3u) {
+        event.event_time_ns = base + i;
+        snprintf(event.event_id, sizeof(event.event_id), "activation-bench-ordinary-%u", i);
+        snprintf(event.file_path, sizeof(event.file_path), "C:\\UserData\\ordinary-%u.bin", i);
+        edr_local_evidence_cache_record_behavior(&event);
+      } else assert(edr_local_evidence_cache_record_alert_context(&candidate, &facts) == 0);
+    }
+    uint64_t wall_us = (soak_monotonic_ns() - wall) / 1000u;
+    uint64_t cpu_us = (uint64_t)(clock() - cpu) * 1000000u / CLOCKS_PER_SEC;
+    uint64_t reads = retention_bench_reads, writes = retention_bench_writes, syncs = retention_bench_syncs;
+    EdrEvidenceCacheStatus status; edr_local_evidence_cache_get_status(&status);
+    printf("activation_benchmark mode=%u operations=%u wall_us=%llu cpu_us=%llu read_bytes=%llu write_bytes=%llu syncs=%llu db_bytes=%llu wal_bytes=%llu candidates=%llu\n",
+        mode, count, (unsigned long long)wall_us, (unsigned long long)cpu_us,
+        (unsigned long long)reads, (unsigned long long)writes, (unsigned long long)syncs,
+        (unsigned long long)status.db_bytes, (unsigned long long)status.wal_bytes,
+        (unsigned long long)sqlite_table_count(path, "p0_candidates"));
+    edr_local_evidence_cache_close(); edr_pt_cache_shutdown(); cleanup_test_sqlite_path(path);
+  }
+  assert(sqlite3_vfs_register(retention_bench_vfs_parent, 1) == SQLITE_OK);
+  assert(sqlite3_vfs_unregister(&vfs) == SQLITE_OK);
+  edr_local_evidence_cache_test_set_now_unix_ns(0);
+}
+
+#if defined(_WIN32)
+/* These opt-in native checks only create a fresh synthetic database, or reopen
+ * that exact one-row fixture. No installed Agent path or service is consulted. */
+static int test_window_native_recovery(const char *path, int create, int hold_open) {
+  sqlite3 *db = NULL; EdrLiveProcessGeneration live; char reason[128];
+  edr_local_evidence_cache_test_set_window_recovery_identity(-1);
+  edr_local_evidence_cache_test_set_now_unix_ns(0);
+  edr_local_evidence_cache_test_set_retention_monotonic_ms(-1);
+  s_test_real_monotonic = 1;
+  if (create) {
+    const char *suffixes[] = {"", "-wal", "-shm"};
+    for (unsigned i = 0; i < sizeof(suffixes)/sizeof(suffixes[0]); ++i) {
+      char checked_path[700];
+      int n = snprintf(checked_path, sizeof(checked_path), "%s%s", path, suffixes[i]);
+      if (n < 0 || (size_t)n >= sizeof(checked_path) ||
+          GetFileAttributesA(checked_path) != INVALID_FILE_ATTRIBUTES ||
+          (GetLastError() != ERROR_FILE_NOT_FOUND && GetLastError() != ERROR_PATH_NOT_FOUND)) {
+        fprintf(stderr, "native fixture requires a new accessible database and sidecar path\n"); return 2;
+      }
+    }
+    if (!edr_process_generation_query_live(GetCurrentProcess(), &live, reason, sizeof(reason))) {
+      fprintf(stderr, "native process generation unavailable: %s\n", reason); return 3;
+    }
+    FILETIME created, exited, kernel, user, wall;
+    assert(GetProcessTimes(GetCurrentProcess(), &created, &exited, &kernel, &user));
+    assert(live.creation_filetime_100ns == (((uint64_t)created.dwHighDateTime << 32u) | created.dwLowDateTime));
+    GetSystemTimeAsFileTime(&wall);
+    int64_t now = (int64_t)((((uint64_t)wall.dwHighDateTime << 32u) | wall.dwLowDateTime) - UINT64_C(116444736000000000)) * 100;
+    EdrBehaviorRecord candidate, event; char candidate_id[200];
+    init_window_replacement_candidate(&candidate, 0u, now);
+    candidate.pid = live.pid; candidate.process_start_key = live.process_start_key;
+    candidate.process_creation_filetime_100ns = live.creation_filetime_100ns;
+    candidate.ppid = 0; candidate.parent_pid_state = EDR_PARENT_PID_UNKNOWN;
+    snprintf(candidate.event_id, sizeof(candidate.event_id), "native-window-current-process");
+    snprintf(candidate.cmdline, sizeof(candidate.cmdline), "synthetic-native-window-fixture");
+    assert(edr_local_evidence_cache_open(path, 8u, 24u) == 0);
+    EdrCommandFacts facts = {candidate.cmdline, NULL};
+    assert(edr_local_evidence_cache_record_alert_context(&candidate, &facts) == 0);
+    sqlite_candidate_id_for_source_event(path, candidate.event_id, candidate_id, sizeof(candidate_id));
+    assert(sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK);
+    int64_t floor = compact_scalar(db, "SELECT context_window_protect_until_active_ms FROM p0_candidates");
+    assert(sqlite3_close(db) == SQLITE_OK); db = NULL;
+    edr_local_evidence_cache_close();
+    assert(edr_local_evidence_cache_open(path, 8u, 24u) == 0);
+    assert(sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK);
+    assert(compact_scalar(db, "SELECT COUNT(*) FROM p0_candidates WHERE context_window_state='active' AND context_window_gap_reason='service_restart_gap'") == 1);
+    assert(compact_scalar(db, "SELECT context_window_protect_until_active_ms FROM p0_candidates") == floor);
+    event = candidate; event.type = EDR_EVENT_FILE_WRITE; event.net_dport = 0; event.net_dst[0] = 0;
+    event.event_time_ns = now + 1000000;
+    snprintf(event.event_id, sizeof(event.event_id), "native-window-after-reopen");
+    snprintf(event.file_path, sizeof(event.file_path), "C:\\SyntheticFixture\\context.bin");
+    edr_local_evidence_cache_record_behavior(&event);
+    assert(sqlite_post_artifact_count(path, candidate_id, event.event_id) == 1);
+    printf("native_window same_process_reopen=active real_tuple=1 pid=%u start_key=%llu creation=%llu post_refs=1 frozen_floor=1\n",
+        live.pid, (unsigned long long)live.process_start_key, (unsigned long long)live.creation_filetime_100ns);
+  } else {
+    if (sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) return 2;
+    if (compact_scalar(db, "SELECT COUNT(*) FROM p0_candidates") != 1 ||
+        compact_scalar(db, "SELECT COUNT(*) FROM p0_candidates WHERE endpoint_id='ep-window-replacement' AND tenant_id='tenant-window'") != 1) {
+      fprintf(stderr, "not the dedicated native window fixture\n"); sqlite3_close(db); return 2;
+    }
+    char candidate_id[200];
+    sqlite_candidate_id_for_source_event(path, "native-window-current-process", candidate_id, sizeof(candidate_id));
+    int64_t old_pid = compact_scalar(db, "SELECT pid FROM p0_candidates");
+    int64_t floor = compact_scalar(db, "SELECT context_window_protect_until_active_ms FROM p0_candidates");
+    assert(sqlite3_close(db) == SQLITE_OK); db = NULL;
+    assert(edr_local_evidence_cache_open(path, 8u, 24u) == 0);
+    assert(sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK);
+    assert(compact_scalar(db, "SELECT COUNT(*) FROM p0_candidates WHERE context_window_state='active'") == 0);
+    assert(compact_scalar(db, "SELECT context_window_protect_until_active_ms FROM p0_candidates") == floor);
+    sqlite3_stmt *st = NULL;
+    assert(sqlite3_prepare_v2(db, "SELECT context_window_state,context_window_gap_reason FROM p0_candidates", -1, &st, NULL) == SQLITE_OK);
+    assert(sqlite3_step(st) == SQLITE_ROW);
+    printf("native_window old_process_or_boot_reopen=%s reason=%s old_pid=%lld current_pid=%lu real_identity_boundary=1 frozen_floor=1\n",
+        sqlite3_column_text(st, 0), sqlite3_column_text(st, 1), (long long)old_pid, GetCurrentProcessId());
+    assert(sqlite3_finalize(st) == SQLITE_OK);
+  }
+  if (hold_open) {
+    assert(create);
+    printf("native_window committed_open_ready=1 bounded_hold_ms=90000\n");
+    fflush(stdout);
+    Sleep(90000);
+  }
+  assert(sqlite3_close(db) == SQLITE_OK); edr_local_evidence_cache_close();
+  s_test_real_monotonic = 0;
+  return 0;
+}
+
+static int test_window_native_terminated_process(const char *path) {
+  char self[2048], command[4096]; STARTUPINFOA startup; PROCESS_INFORMATION child;
+  DWORD n = GetModuleFileNameA(NULL, self, sizeof(self));
+  if (!n || n >= sizeof(self) || strchr(path, '"')) return 2;
+  int length = snprintf(command, sizeof(command), "\"%s\" --window-native-create \"%s\"", self, path);
+  if (length < 0 || (size_t)length >= sizeof(command)) return 2;
+  memset(&startup, 0, sizeof(startup)); startup.cb = sizeof(startup);
+  memset(&child, 0, sizeof(child));
+  assert(CreateProcessA(self, command, NULL, NULL, FALSE, 0, NULL, NULL, &startup, &child));
+  CloseHandle(child.hThread);
+  DWORD waited = WaitForSingleObject(child.hProcess, 30000);
+  if (waited != WAIT_OBJECT_0) {
+    TerminateProcess(child.hProcess, 2); WaitForSingleObject(child.hProcess, 5000);
+    CloseHandle(child.hProcess); return 2;
+  }
+  DWORD exit_code = 1; FILETIME created, exited, kernel, user;
+  assert(GetExitCodeProcess(child.hProcess, &exit_code) && exit_code == 0);
+  assert(GetProcessTimes(child.hProcess, &created, &exited, &kernel, &user));
+  assert(exited.dwHighDateTime || exited.dwLowDateTime);
+  /* Holding this handle deliberately keeps the terminated process object
+   * queryable. Exact generation identity alone must not restore it as live. */
+  printf("native_window terminated_process_handle_held=1 old_pid=%lu exit_time=%llu\n",
+      child.dwProcessId, (unsigned long long)(((uint64_t)exited.dwHighDateTime << 32u) | exited.dwLowDateTime));
+  fflush(stdout);
+  int rc = test_window_native_recovery(path, 0, 0);
+  CloseHandle(child.hProcess); return rc;
+}
+#endif
+
 static void test_window_recovery_failures_and_frozen_policy(void) {
   const int64_t base = INT64_C(1793100000000000000);
   for (unsigned mode = 0; mode < 5; ++mode) {
@@ -14895,6 +15233,22 @@ static void test_window_entry_order_and_recovery(int enforce) {
 #endif
 
 int main(int argc, char **argv) {
+#if defined(EDR_HAVE_SQLITE)
+  if (argc == 2 && !strcmp(argv[1], "--window-activation-benchmark")) { test_window_activation_benchmark(); return 0; }
+#if defined(_WIN32)
+  if (argc == 3 && !strcmp(argv[1], "--window-native-terminated-process")) {
+    return test_window_native_terminated_process(argv[2]);
+  }
+  if (argc == 3 && (!strcmp(argv[1], "--window-native-create") || !strcmp(argv[1], "--window-native-check") ||
+                   !strcmp(argv[1], "--window-native-create-hold"))) {
+    return test_window_native_recovery(argv[2], strcmp(argv[1], "--window-native-check") != 0,
+        !strcmp(argv[1], "--window-native-create-hold"));
+  }
+#endif
+  if (argc == 2 && (!strcmp(argv[1], "--window-activation-probe") || !strcmp(argv[1], "--window-activation-contract"))) {
+    test_window_activation_gap(!strcmp(argv[1], "--window-activation-contract")); return 0;
+  }
+#endif
 #if defined(EDR_HAVE_SQLITE)
   if (argc==2 && !strcmp(argv[1],"--preclock-window-compat")) { test_startup_preclock_owner_integrity(); return 0; }
 #endif
@@ -15111,6 +15465,7 @@ int main(int argc, char **argv) {
   RUN_CACHE_CASE("context", test_context_writer_transaction_reuse());
   RUN_CACHE_CASE("context", test_accounting_generation_reopen());
   RUN_CACHE_CASE("context", test_window_entry_order_and_recovery(1));
+  RUN_CACHE_CASE("context", test_window_activation_gap(1));
   RUN_CACHE_CASE("context", test_window_recovery_failures_and_frozen_policy());
   RUN_CACHE_CASE("retention", test_phase2_continues_across_ttl(0));
   RUN_CACHE_CASE("retention", test_phase2_commit_fairness_and_backoff());

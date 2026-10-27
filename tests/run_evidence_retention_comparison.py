@@ -28,7 +28,7 @@ from retention_comparison_support import (dependencies, compiler_flags, compile_
     runtime_environment, verify_native, compiler_identity, execute_benchmark,
     failure_report, export_git_snapshot, verify_git_snapshot)
 
-from retention_comparison_support import SOURCES, QUEUE_SOURCES
+from retention_comparison_support import SOURCES, QUEUE_SOURCES, storage_reservation_sources
 
 def run(command, **kwargs):
     kwargs.setdefault("timeout", 180)
@@ -105,7 +105,7 @@ summaries = {}
 frozen_sources = []
 for name, source, selected in [('old',old,1), ('current_1h',current,1), ('current_4h',current,4)]:
     failure['stage'] = 'variant_prepare'
-    sources = SOURCES + (QUEUE_SOURCES if source == current else [])
+    sources = SOURCES + (QUEUE_SOURCES if source == current else []) + storage_reservation_sources(source)
     selected_defines = list(defines)
     binding_header = source/'include/edr/behavior_record.h'
     binding_api = parent_binding_api(binding_header)

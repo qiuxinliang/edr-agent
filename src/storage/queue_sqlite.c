@@ -315,20 +315,7 @@ static void load_queue_db_limit(void) {
 }
 
 static uint64_t queue_file_size_bytes(const char *path) {
-  if (!path || !path[0]) return 0u;
-#if defined(_WIN32) && defined(_MSC_VER)
-  {
-    struct __stat64 stbuf;
-    return _stat64(path, &stbuf) == 0 && stbuf.st_size > 0 ?
-        (uint64_t)stbuf.st_size : 0u;
-  }
-#else
-  {
-    struct stat stbuf;
-    return stat(path, &stbuf) == 0 && stbuf.st_size > 0 ?
-        (uint64_t)stbuf.st_size : 0u;
-  }
-#endif
+  return edr_storage_file_size(path);
 }
 
 static uint64_t queue_add_bytes(uint64_t total, uint64_t value) {
@@ -890,6 +877,10 @@ static int queue_capacity_snapshot_locked(EdrStorageQueueCapacityMetrics *out) {
   }
   out->physical_bytes = queue_add_bytes(queue_add_bytes(out->db_bytes, out->wal_bytes),
                                         out->shm_bytes);
+  if (out->physical_bytes == UINT64_MAX) {
+    out->physical_failure_kind = 2u;
+    return 0; /* accounting_available remains false; retain unknown bytes. */
+  }
   if (!queue_capacity_ledger_read_locked(&ledger, NULL) ||
       !queue_sql_sum_locked("SELECT COALESCE(SUM(" QUEUE_LEDGER_EVENT_COST("") "),0) "
                             "FROM event_queue WHERE status!='pending';",
@@ -1041,7 +1032,12 @@ static uint64_t queue_open_shm_growth(uint64_t wal_bytes) {
 }
 static int queue_open_physical_admit_locked(void) {
   char wal[sizeof(s_path)+8u];snprintf(wal,sizeof(wal),"%s-wal",s_path);
-  return queue_physical_admit_locked(queue_open_shm_growth(queue_file_size_bytes(wal)),0);
+  uint64_t bytes=queue_file_size_bytes(wal);
+  if(bytes==UINT64_MAX) {
+    s_physical_admission_failures++;s_physical_failure_kind=2u;
+    s_physical_snapshot.cause="wal_size_unavailable";return 0;
+  }
+  return queue_physical_admit_locked(queue_open_shm_growth(bytes),0);
 }
 #ifdef EDR_STORAGE_QUEUE_TESTING
 uint64_t edr_storage_queue_test_open_shm_growth(uint64_t bytes) {return queue_open_shm_growth(bytes);}
@@ -1104,6 +1100,10 @@ static int queue_checkpoint_locked(int frames) {
   } else {
     char wal[sizeof(s_path)+8u];snprintf(wal,sizeof(wal),"%s-wal",s_path);
     bytes=queue_file_size_bytes(wal);
+    if(bytes==UINT64_MAX) {
+      s_physical_admission_failures++;s_physical_failure_kind=2u;
+      s_physical_snapshot.cause="wal_size_unavailable";return 0;
+    }
   }
   if(!bytes || !queue_physical_admit_locked(bytes,0))return 0;
   int rc=sqlite3_wal_checkpoint_v2(s_db,"main",SQLITE_CHECKPOINT_PASSIVE,NULL,NULL);

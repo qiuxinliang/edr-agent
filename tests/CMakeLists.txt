@@ -16,6 +16,9 @@ endif()
 add_test(NAME edr_agent_help COMMAND edr_agent --help)
 
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
+add_test(NAME evidence_storage_inventory
+  COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/test_evidence_storage_inventory.py)
+set_tests_properties(evidence_storage_inventory PROPERTIES TIMEOUT 30)
 add_test(NAME evidence_ownership_contract
   COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/test_evidence_ownership_contract.py)
 set_tests_properties(evidence_ownership_contract PROPERTIES TIMEOUT 30)
@@ -115,9 +118,25 @@ add_executable(test_response_forensic_paths
   ${CMAKE_SOURCE_DIR}/src/response/response_utils.c
   ${CMAKE_SOURCE_DIR}/third_party/cjson/cJSON.c)
 target_include_directories(test_response_forensic_paths PRIVATE ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/third_party/cjson)
+target_compile_definitions(test_response_forensic_paths PRIVATE EDR_RESPONSE_COPY_TESTING=1)
 edr_apply_test_warnings(test_response_forensic_paths)
 add_test(NAME response_forensic_path_contract COMMAND test_response_forensic_paths
   WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+
+add_executable(test_forensic_tar_timeout test_forensic_tar_timeout.c
+  ${CMAKE_SOURCE_DIR}/src/response/response_utils.c
+  ${CMAKE_SOURCE_DIR}/third_party/cjson/cJSON.c)
+target_include_directories(test_forensic_tar_timeout PRIVATE ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/third_party/cjson)
+target_compile_definitions(test_forensic_tar_timeout PRIVATE EDR_RESPONSE_TAR_TESTING=1)
+edr_apply_test_warnings(test_forensic_tar_timeout)
+add_test(NAME forensic_tar_timeout COMMAND test_forensic_tar_timeout)
+set_tests_properties(forensic_tar_timeout PROPERTIES TIMEOUT 20)
+if(WIN32)
+  foreach(_response_io_test test_command_upload_outbox test_response_forensic_paths test_forensic_tar_timeout)
+    target_sources(${_response_io_test} PRIVATE ${CMAKE_SOURCE_DIR}/src/preprocess/windows_file_identity.c)
+  endforeach()
+  target_compile_definitions(test_response_forensic_paths PRIVATE EDR_WINDOWS_FILE_IDENTITY_TESTING=1)
+endif()
 
 # The test embeds the implementation for Win32 error/readback injection.
 add_executable(test_response_file_security
@@ -1141,6 +1160,7 @@ if(SQLite3_FOUND)
   add_executable(test_storage_queue_sqlite
     ${CMAKE_CURRENT_SOURCE_DIR}/test_storage_queue_sqlite.c
     ${CMAKE_SOURCE_DIR}/src/storage/queue_sqlite.c
+    ${CMAKE_SOURCE_DIR}/src/storage/storage_reservation.c
     ${CMAKE_SOURCE_DIR}/src/command/sha256.c
     ${CMAKE_SOURCE_DIR}/src/core/time_util.c)
   target_sources(test_storage_queue_sqlite PRIVATE
@@ -2141,6 +2161,12 @@ if(SQLite3_FOUND AND OpenSSL_FOUND)
   target_link_libraries(test_egress_tls_client PRIVATE edr_runtime_test_common)
   target_compile_definitions(test_egress_tls_client PRIVATE EDR_TEST_EXTENDED_EGRESS=1)
   edr_apply_test_warnings(test_egress_tls_client)
+  add_executable(test_forensic_baseline_staging test_forensic_baseline_staging.c
+    ${_runtime_test_agent_source} ${_runtime_test_pmfe_source})
+  target_link_libraries(test_forensic_baseline_staging PRIVATE edr_runtime_test_common)
+  edr_apply_test_warnings(test_forensic_baseline_staging)
+  add_test(NAME forensic_baseline_staging COMMAND test_forensic_baseline_staging)
+  set_tests_properties(forensic_baseline_staging PROPERTIES TIMEOUT 30)
   add_test(NAME egress_loopback_mtls COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_SOURCE_DIR}/tests/test_egress_tls_receiver.py
     --client $<TARGET_FILE:test_egress_tls_client> --exclude-update-download)
@@ -2367,7 +2393,8 @@ if(WIN32)
 endif()
 
 # Real filesystem query plus deterministic boundary arithmetic, no fake disk provider.
-add_executable(test_storage_physical_guard test_storage_physical_guard.c)
+add_executable(test_storage_physical_guard test_storage_physical_guard.c
+  ${CMAKE_SOURCE_DIR}/src/storage/storage_reservation.c)
 target_include_directories(test_storage_physical_guard PRIVATE ${PROJECT_SOURCE_DIR}/include)
 edr_apply_test_warnings(test_storage_physical_guard)
 add_test(NAME storage_physical_guard COMMAND test_storage_physical_guard)

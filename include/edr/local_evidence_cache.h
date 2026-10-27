@@ -256,6 +256,7 @@ typedef struct {
   uint64_t wal_bytes;
   uint64_t shm_bytes;
   uint64_t physical_bytes;
+  uint32_t physical_accounting_available; /* DB/WAL/SHM lengths only. */
   uint64_t p0_candidate_rows;
   int64_t oldest_process_last_seen_ns;
   int64_t oldest_ring_event_time_ns;
@@ -466,6 +467,10 @@ typedef struct {
  * Test builds observe SQLite instruction counts before statement finalization. */
 /* Test-only live-generation boundary; -1 restores native verification. */
 void edr_local_evidence_cache_test_set_window_recovery_identity(int matches);
+/* Set before starting/joining test workers. Pauses only the unlocked alert
+ * preparation boundary; production builds contain no callback. */
+void edr_local_evidence_cache_test_set_alert_prepare_hook(void (*hook)(void *),
+                                                         void *context);
 void edr_local_evidence_cache_test_pmfe_query_cost(int result_query,
                                                   EdrEvidenceCacheQueryCost *out,
                                                   int reset);

@@ -916,6 +916,7 @@ endif()
 # One policy owner is linked by the agent and by isolated transport tests.
 # Keep parsers shared with the existing wire contract; no new dependency.
 add_library(edr_egress_policy STATIC
+  src/storage/storage_reservation.c
   src/preprocess/p0_terminal_identity.c
   src/command/sha256.c
   src/transport/egress_batch_policy.c

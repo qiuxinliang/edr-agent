@@ -40,6 +40,8 @@
 #endif
 
 #include "edr/response_utils.h"
+#include "../command/command_upload_outbox.h"
+#include "edr/storage_physical_guard.h"
 
 static void response_json_escape(const char *in, char *out, size_t cap);
 
@@ -1005,6 +1007,16 @@ int edr_response_forensic_complete_queued_upload(
     const char *source, int partial, int upload_ok, const char *upload_error) {
   char result[2600];
   const char *type = command_type && command_type[0] ? command_type : "collect_forensic";
+  EdrSoarCommandMeta owned_meta;
+  int owner_meta=edr_command_state_artifact_meta(command_id,type,&owned_meta);
+  if(owner_meta<0)return -1;
+  if(owner_meta>0) {
+    if(!soar_meta || strcmp(owned_meta.idempotency_key,soar_meta->idempotency_key) ||
+        strcmp(owned_meta.soar_correlation_id,soar_meta->soar_correlation_id) ||
+        strcmp(owned_meta.playbook_run_id,soar_meta->playbook_run_id) ||
+        strcmp(owned_meta.playbook_step_id,soar_meta->playbook_step_id))return -1;
+    soar_meta=&owned_meta;
+  }
   const char *actual_source = source && source[0] ? source : "builtin";
   if (upload_ok && object_key && object_key[0]) {
     if (strcmp(type, "yara_scan") == 0) {
@@ -1152,36 +1164,18 @@ void edr_response_collect_forensic(const char *cmd_id, const uint8_t *pl, size_t
     return;
   }
 
-  /* 外移:由独立 collector 异步生成 triage bundle,完成由主循环 poll 上传+上报。 */
+  /* The installed external baseline helpers cannot prove the common 64 MiB
+   * write-time output bound. Respect STRICT, otherwise reuse the bounded
+   * in-process path before creating any external workspace/request/owner. */
   if (forensic_external_enabled()) {
-    char dc_detail[512];
-    dc_detail[0] = '\0';
-    int ar = edr_response_forensic_async_accept(cmd_id, "collect_forensic", sm, "collect_forensic",
-                                                pl, len, "tar.gz", 1, dc_detail, sizeof(dc_detail));
-    if (ar == 0) {
-      edr_command_audit_both(cmd_id, "collect_forensic: accepted(async velo); poll 上报终态");
-      return;
-    }
-    if (ar == 1) {
-      edr_cmd_inc_exec_fail();
-      edr_command_emit_always(cmd_id, sm, EdrCmdExecFailed, 7, "forensic busy: another collection running");
-      return;
-    }
-    if (response_forensic_external_failure_must_not_fallback(ar)) {
-      edr_cmd_inc_exec_fail();
-      edr_command_audit_both(cmd_id, "collect_forensic: external request exceeds bounded path or metadata limit");
-      edr_command_emit_always(cmd_id, sm, EdrCmdExecFailed, 2,
-                              "forensic request exceeds bounded path or metadata limit");
-      return;
-    }
     if (forensic_external_required()) {
       edr_cmd_inc_exec_fail();
-      char fail[600];
-      snprintf(fail, sizeof(fail), "collect_forensic external failed rc=%d: %.460s", ar, dc_detail);
-      edr_command_emit_always(cmd_id, sm, EdrCmdExecFailed, 6, fail);
+      edr_command_audit_both(cmd_id, "collect_forensic: baseline_output_limit_unsupported");
+      edr_command_emit_always(cmd_id, sm, EdrCmdExecFailed, 6,
+                              "baseline_output_limit_unsupported: strict external collection has no bounded output contract");
       return;
     }
-    edr_command_audit_both(cmd_id, "collect_forensic: external unavailable, fallback in-process");
+    edr_command_audit_both(cmd_id, "collect_forensic: bounded_builtin_fallback; external baseline_output_limit_unsupported");
   }
 
   char base[512];
@@ -1237,7 +1231,32 @@ void edr_response_collect_forensic(const char *cmd_id, const uint8_t *pl, size_t
                             "forensic output path exceeds bounded limit");
     return;
   }
+  EdrCommandArtifactStage stage={0};
+  snprintf(stage.command_id,sizeof(stage.command_id),"%s",cmd_id);
+  snprintf(stage.command_type,sizeof(stage.command_type),"collect_forensic");
+  snprintf(stage.workspace,sizeof(stage.workspace),"%s",dir);
+  if(sm)stage.meta=*sm;
+#ifdef _WIN32
+  const char stage_sep='\\';
+#else
+  const char stage_sep='/';
+#endif
+  int stage_path=snprintf(stage.artifact,sizeof(stage.artifact),"%s%c%s.tgz",base,stage_sep,job);
+  int staging_path=snprintf(stage.staging,sizeof(stage.staging),"%s.staging",stage.artifact);
+  stage.peak_bytes=129u*1024u*1024u;stage.phase=1;
+  if(stage_path<0 || (size_t)stage_path>=sizeof(stage.artifact) || staging_path<0 ||
+      (size_t)staging_path>=sizeof(stage.staging)) {
+    edr_command_emit_always(cmd_id,sm,EdrCmdExecFailed,2,"forensic staging path exceeds bounded limit");return;
+  }
+  int stage_begin=edr_command_state_artifact_begin(&stage);
+  if(stage_begin==1) {
+    edr_command_audit_both(cmd_id,"forensic staging owner already exists; recovery retains original evidence");return;
+  }
+  if(stage_begin<0) {
+    edr_command_emit_always(cmd_id,sm,EdrCmdExecFailed,2,"forensic staging reservation unavailable");return;
+  }
   if (response_mkdir_p(dir) != 0) {
+    (void)edr_command_state_artifact_abandon(cmd_id);
     edr_cmd_inc_exec_fail();
     edr_command_audit_both(cmd_id, "forensic: 创建输出目录失败");
     edr_command_emit_always(cmd_id, sm, EdrCmdExecFailed, 2, "mkdir failed");
@@ -1251,12 +1270,14 @@ void edr_response_collect_forensic(const char *cmd_id, const uint8_t *pl, size_t
 #endif
     edr_cmd_inc_exec_fail();
     edr_command_audit_both(cmd_id, "collect_forensic: manifest path exceeds bounded limit");
+    (void)edr_command_state_artifact_abandon(cmd_id);
     edr_command_emit_always(cmd_id, sm, EdrCmdExecFailed, 2,
                             "forensic manifest path exceeds bounded limit");
     return;
   }
   FILE *f = fopen(manifest, "w");
   if (!f) {
+    (void)edr_command_state_artifact_abandon(cmd_id);
     edr_cmd_inc_exec_fail();
     edr_command_audit_both(cmd_id, "forensic: 写 manifest 失败");
     edr_command_emit_always(cmd_id, sm, EdrCmdExecFailed, 2, "manifest write failed");
@@ -1298,45 +1319,72 @@ void edr_response_collect_forensic(const char *cmd_id, const uint8_t *pl, size_t
               cfg->agent.tenant_id[0] ? cfg->agent.tenant_id : "");
     }
   }
-  fclose(f);
-  if (!edr_forensic_storage_ready(dir) || response_forensic_copy_lines(dir, pl, len) != 0) {
+  int manifest_ok=!ferror(f);
+  if(fclose(f))manifest_ok=0;
+  EdrStoragePhysicalSnapshot stage_space;
+  int copy_rc=0;
+  int collection_ready=manifest_ok && edr_forensic_storage_ready(dir) &&
+      !edr_storage_physical_admit_owned(stage.staging,stage.peak_bytes,0,stage.peak_bytes,&stage_space);
+  if(collection_ready)copy_rc=response_forensic_copy_lines(dir,pl,len);
+  if (!collection_ready || copy_rc != 0) {
+    (void)edr_command_state_artifact_abandon(cmd_id);
     edr_cmd_inc_exec_fail();
-    edr_command_emit_always(cmd_id, sm, EdrCmdExecFailed, 2,
-                            "baseline forensic collection failed: insufficient disk space, unreadable evidence, or 64 MiB budget exceeded");
+    const char *cause=!collection_ready ? "baseline forensic manifest or disk admission unavailable; local evidence retained" :
+        copy_rc==EDR_RESPONSE_BYTE_BUDGET_EXCEEDED ? "baseline forensic byte budget exceeded; partial local evidence retained" :
+        copy_rc==EDR_RESPONSE_COPY_IDENTITY_CHANGED ? "baseline forensic source identity changed during copy; partial local evidence retained" :
+        copy_rc==EDR_RESPONSE_COPY_SOURCE_UNAVAILABLE ? "baseline forensic source unavailable or unsupported; partial local evidence retained" :
+        copy_rc==EDR_RESPONSE_COPY_DESTINATION_FAILED ? "baseline forensic destination conflict or write failed; local evidence retained" :
+        "baseline forensic collection I/O failed; local evidence retained";
+    edr_command_audit_both(cmd_id,cause);
+    edr_command_emit_always(cmd_id, sm, EdrCmdExecFailed, 2,cause);
     return;
   }
+  uint32_t timeout_ms=300000u;
+  if(sm && sm->issued_at_unix_ms>0 && sm->deadline_ms>0 &&
+      sm->issued_at_unix_ms<=INT64_MAX-sm->deadline_ms) {
+    int64_t remaining=sm->issued_at_unix_ms+sm->deadline_ms-(int64_t)time(NULL)*1000LL;
+    timeout_ms=remaining<=0 ? 0u : remaining<(int64_t)timeout_ms ? (uint32_t)remaining : timeout_ms;
+  }
+  int bundle_rc=timeout_ms ? response_make_tar_bundle(dir,stage.staging,timeout_ms,forensic_cancel_check,(void *)cmd_id)
+      : EDR_DC_ERR_TIMEOUT;
+  if (bundle_rc != 0) {
+    if(bundle_rc!=EDR_RESPONSE_WRITER_UNCONFIRMED)(void)edr_command_state_artifact_abandon(cmd_id);
+    edr_cmd_inc_exec_fail();
+    const char *reason=bundle_rc==EDR_DC_ERR_TIMEOUT ? "forensic archive execution deadline exceeded" :
+        bundle_rc==EDR_DC_ERR_CANCELLED ? "forensic archive cancelled" :
+        bundle_rc==EDR_RESPONSE_WRITER_UNCONFIRMED ? "forensic archive writer termination unconfirmed; evidence and reservation retained" :
+        bundle_rc==EDR_RESPONSE_BYTE_BUDGET_EXCEEDED ? "forensic archive exceeded 64 MiB output budget; local partial retained" :
+        "forensic archive failed; local evidence retained";
+    edr_command_audit_both(cmd_id,reason);
+    edr_command_emit_always(cmd_id, sm, EdrCmdExecFailed, 2, reason);
+    return;
+  }
+  FILE *sealed=fopen(stage.staging,"rb+");int sealed_ok=sealed!=NULL;
+  if(sealed) {
 #ifdef _WIN32
-  char bundle[1100];
-  if (forensic_join_path_exact(bundle, sizeof(bundle), base, '\\', job) != 0) {
+    if(_commit(_fileno(sealed)))sealed_ok=0;
 #else
-  char bundle[1000];
-  if (forensic_join_path_exact(bundle, sizeof(bundle), base, '/', job) != 0) {
+    if(fsync(fileno(sealed)))sealed_ok=0;
 #endif
-    edr_cmd_inc_exec_fail();
-    edr_command_audit_both(cmd_id, "collect_forensic: bundle path exceeds bounded limit");
-    edr_command_emit_always(cmd_id, sm, EdrCmdExecFailed, 2,
-                            "forensic bundle path exceeds bounded limit");
-    return;
+    if(fclose(sealed))sealed_ok=0;
   }
-  strcat(bundle, ".tgz");
-  if (response_make_tar_bundle(dir, bundle) == 0) {
-    edr_cmd_inc_exec_ok();
-    edr_command_audit_both(cmd_id, "forensic: manifest + bundle.tgz");
-    char minio_key[512];
-    minio_key[0] = '\0';
-    edr_transport_v2_upload_file(cmd_id, bundle, NULL, minio_key, sizeof(minio_key));
-    char result[1024];
-    if (minio_key[0]) {
-      snprintf(result, sizeof(result), "forensic bundle ok minio_key=%s", minio_key);
-    } else {
-      snprintf(result, sizeof(result), "forensic bundle ok");
-    }
-    edr_command_emit_always(cmd_id, sm, EdrCmdExecOk, 0, result);
-  } else {
-    edr_cmd_inc_exec_fail();
-    edr_command_audit_both(cmd_id, "forensic: tar bundle 失败");
-    edr_command_emit_always(cmd_id, sm, EdrCmdExecFailed, 2, "tar bundle failed");
+  if(!sealed_ok || response_file_sha256(stage.staging,stage.sha256) ||
+      edr_command_state_artifact_ready(cmd_id,stage.sha256)) {
+    /* The writer has returned and its handle is closed. Only this producer
+     * can release future growth; no local files are removed. A failed owner
+     * commit keeps an unknown/protected balance until storage recovers. */
+    int abandoned=edr_command_state_artifact_abandon(cmd_id);
+    edr_command_audit_both(cmd_id,abandoned
+        ? "forensic staging failure; owner update unavailable, evidence and reservation retained"
+        : "forensic staging close/hash/intent failed; local evidence retained");
+    edr_command_emit_always(cmd_id,sm,EdrCmdExecFailed,2,
+        "forensic staging close, hash or publication intent failed; local evidence retained");return;
   }
+  stage.phase=2;
+  if(edr_command_upload_outbox_publish_stage(&stage)) {
+    edr_command_audit_both(cmd_id,"forensic publication deferred; durable intent and evidence retained");return;
+  }
+  edr_command_audit_both(cmd_id,"forensic artifact published to existing durable outbox; delivery pending");
 }
 
 void edr_response_pmfe_scan(const char *cmd_id, const uint8_t *pl, size_t len, const EdrSoarCommandMeta *sm) {

@@ -2,6 +2,7 @@
 #include "edr/local_evidence_cache.h"
 #include "edr/sha256.h"
 #include "edr/storage_physical_guard.h"
+#include "edr/forensic_limits.h"
 
 #include "cJSON.h"
 
@@ -2258,6 +2259,8 @@ void edr_command_state_free_inbox_record(EdrCommandInboxRecord *record) {
 typedef struct CommandCapacityOwner {
   char command_id[128];
   uint64_t reserved;
+  uint64_t artifact_reserved;
+  char *artifact_json;
 } CommandCapacityOwner;
 static struct {
   char path[1024];
@@ -2298,43 +2301,73 @@ static size_t state_capacity_owner_position(const char *id, int *found) {
   return lo;
 }
 
-static int state_capacity_set_owner(const char *id, uint64_t reserve) {
+static int state_capacity_set_owner(const char *id, uint64_t reserve, const cJSON *artifact) {
+  uint64_t artifact_reserve=0u;char *artifact_json=NULL;
+  if(artifact) {
+    const cJSON *phase=cJSON_GetObjectItemCaseSensitive(artifact,"phase");
+    const cJSON *peak=cJSON_GetObjectItemCaseSensitive(artifact,"peak_bytes");
+    if(!cJSON_IsObject(artifact) || !cJSON_IsNumber(phase) ||
+        (phase->valuedouble!=1 && phase->valuedouble!=2 && phase->valuedouble!=3) ||
+        !cJSON_IsNumber(peak) || peak->valuedouble!=(double)(129u*1024u*1024u))return -1;
+    if(phase->valueint==1)artifact_reserve=(uint64_t)peak->valuedouble;
+    else if(phase->valueint==2)artifact_reserve=2u*EDR_COMMAND_STATE_LINE_CAP+12288u;
+    artifact_json=cJSON_PrintUnformatted(artifact);
+    if(!artifact_json || strlen(artifact_json)>8192u){cJSON_free(artifact_json);return -1;}
+  }
   int found=0;size_t at=state_capacity_owner_position(id,&found);
+  uint64_t old_artifact=found?s_capacity.owners[at].artifact_reserved:0u;
+  if(artifact_reserve>UINT64_MAX-(s_capacity.stats.artifact_reserved_bytes-old_artifact)) {
+    cJSON_free(artifact_json);return -1;
+  }
   if(found) {
     s_capacity.stats.reserved_bytes-=s_capacity.owners[at].reserved;
-    if(!reserve) {
+    s_capacity.stats.artifact_reserved_bytes-=old_artifact;
+    cJSON_free(s_capacity.owners[at].artifact_json);
+    if(!reserve && !artifact_json) {
       memmove(s_capacity.owners+at,s_capacity.owners+at+1u,
               (s_capacity.count-at-1u)*sizeof(*s_capacity.owners));
       s_capacity.count--;return 0;
     }
   } else {
-    if(!reserve)return 0;
+    if(!reserve && !artifact_json)return 0;
     if(s_capacity.count==s_capacity.capacity) {
       size_t next=s_capacity.capacity ? s_capacity.capacity*2u : 128u;
       if(next>EDR_COMMAND_STATE_CAPACITY_OWNER_LIMIT)next=EDR_COMMAND_STATE_CAPACITY_OWNER_LIMIT;
-      if(next<=s_capacity.count)return -1;
+      if(next<=s_capacity.count){cJSON_free(artifact_json);return -1;}
       CommandCapacityOwner *grown=realloc(s_capacity.owners,next*sizeof(*grown));
-      if(!grown)return -1;
+      if(!grown){cJSON_free(artifact_json);return -1;}
       s_capacity.owners=grown;s_capacity.capacity=next;
     }
     memmove(s_capacity.owners+at+1u,s_capacity.owners+at,
             (s_capacity.count-at)*sizeof(*s_capacity.owners));
     s_capacity.count++;snprintf(s_capacity.owners[at].command_id,128,"%s",id);
   }
+  s_capacity.owners[at].artifact_reserved=artifact_reserve;
+  s_capacity.owners[at].artifact_json=artifact_json;
+  s_capacity.stats.artifact_reserved_bytes+=artifact_reserve;
   s_capacity.owners[at].reserved=reserve;s_capacity.stats.reserved_bytes+=reserve;return 0;
 }
 
 static int state_capacity_refresh_locked_mode(const char *path, int inventory) {
   EdrCommandStateFileInfo info={0};errno=0;
-  if(state_file_info(path,&info)!=0 && errno!=ENOENT)
+  if(state_file_info(path,&info)!=0 && errno!=ENOENT) {
+    if(!inventory)edr_storage_reservation_publish(UINT64_MAX);
     return state_capacity_failure("state_capacity_stat_failed",0);
-  if(!inventory && s_capacity.valid && !strcmp(path,s_capacity.path) && state_file_info_same(info,s_capacity.file))return 0;
-  s_capacity.valid=0;s_capacity.count=0;
+  }
+  if(!inventory && edr_storage_artifact_reserved()!=UINT64_MAX && s_capacity.valid &&
+      !strcmp(path,s_capacity.path) && state_file_info_same(info,s_capacity.file))return 0;
+  s_capacity.valid=0;
+  for(size_t i=0;i<s_capacity.count;i++)cJSON_free(s_capacity.owners[i].artifact_json);
+  s_capacity.count=0;
   s_capacity.stats.new_record_bytes=0;s_capacity.stats.legacy_bytes=0;s_capacity.stats.reserved_bytes=0;
   s_capacity.stats.record_count=0;
+  s_capacity.stats.artifact_reserved_bytes=0u;
   s_capacity.stats.protected_floor_bytes=0;
   FILE *f=inventory ? state_open_read_inventory(path) : state_open_read_secure(path,NULL);
-  if(!f && errno!=ENOENT)return state_capacity_failure("state_capacity_read_failed",0);
+  if(!f && errno!=ENOENT) {
+    if(!inventory)edr_storage_reservation_publish(UINT64_MAX);
+    return state_capacity_failure("state_capacity_read_failed",0);
+  }
   char *line=malloc(EDR_COMMAND_STATE_LINE_CAP);
   int ok=line!=NULL;
   while(ok && f && fgets(line,EDR_COMMAND_STATE_LINE_CAP,f)) {
@@ -2350,7 +2383,7 @@ static int state_capacity_refresh_locked_mode(const char *path, int inventory) {
       cJSON_IsNumber(final) && (final->valuedouble==0 || final->valuedouble==1);
     if(ok && !policy && !reserve) {
       s_capacity.stats.legacy_bytes+=n;
-      ok=state_capacity_set_owner(id->valuestring,0)==0;
+      ok=state_capacity_set_owner(id->valuestring,0,cJSON_GetObjectItemCaseSensitive(o,"artifact_stage"))==0;
     } else if(ok) {
       ok=cJSON_IsNumber(policy) && policy->valuedouble==1 && cJSON_IsNumber(reserve) &&
         reserve->valuedouble>=0 && reserve->valuedouble<=3u*EDR_COMMAND_STATE_LINE_CAP &&
@@ -2364,16 +2397,29 @@ static int state_capacity_refresh_locked_mode(const char *path, int inventory) {
       }
       if(ok) {
         s_capacity.stats.new_record_bytes+=n;
-        ok=state_capacity_set_owner(id->valuestring,(uint64_t)reserve->valuedouble)==0;
+        ok=state_capacity_set_owner(id->valuestring,(uint64_t)reserve->valuedouble,
+            cJSON_GetObjectItemCaseSensitive(o,"artifact_stage"))==0;
       }
     }
     cJSON_Delete(o);
   }
   if(f){if(ferror(f))ok=0;if(fclose(f)!=0)ok=0;}
   free(line);
-  if(!ok)return state_capacity_failure("state_capacity_unclassified_or_incomplete_record",0);
+  if(!ok) {
+    if(!inventory)edr_storage_reservation_publish(UINT64_MAX);
+    return state_capacity_failure("state_capacity_unclassified_or_incomplete_record",0);
+  }
+  if(!inventory && edr_storage_artifact_reserved()==UINT64_MAX) {
+    /* A complete line can remain readable after a failed fsync. Reconfirm
+     * durability before reducing an unknown shared reservation balance. */
+    FILE *durable=state_open_append_secure(path);
+    int flushed=durable ? state_flush_file(durable) : -1;
+    if(durable && fclose(durable))flushed=-1;
+    if(flushed)return state_capacity_failure("artifact_balance_recovery_flush_failed",0);
+  }
   s_capacity.file=info;snprintf(s_capacity.path,sizeof(s_capacity.path),"%s",path);s_capacity.valid=1;
   s_capacity.stats.calibrations++;
+  if(!inventory)edr_storage_reservation_publish(s_capacity.stats.artifact_reserved_bytes);
   return 0;
 }
 
@@ -2393,6 +2439,13 @@ static int append_state_line(const char *line) {
     cJSON_Delete(o);return state_capacity_failure("state_capacity_invalid_record",0);
   }
   char command_id[128];snprintf(command_id,sizeof(command_id),"%s",id->valuestring);
+  int artifact_found=0;size_t artifact_at=state_capacity_owner_position(command_id,&artifact_found);
+  if(!cJSON_HasObjectItem(o,"artifact_stage") && artifact_found && s_capacity.owners[artifact_at].artifact_json) {
+    cJSON *stage=cJSON_Parse(s_capacity.owners[artifact_at].artifact_json);
+    if(!stage || !cJSON_AddItemToObject(o,"artifact_stage",stage)) {
+      cJSON_Delete(stage);cJSON_Delete(o);return state_capacity_failure("artifact_owner_encoding_failed",0);
+    }
+  }
   const cJSON *pending=cJSON_GetObjectItemCaseSensitive(o,"report_pending");
   int preaction=!final->valueint &&
     (!strcmp(result_text(o,"response_status"),"queued") ||
@@ -2407,11 +2460,12 @@ static int append_state_line(const char *line) {
   int ok=stored && cJSON_AddNumberToObject(o,"storage_policy_version",1) &&
     cJSON_AddNumberToObject(o,"reserved_state_bytes",(double)reserve) &&
     cJSON_PrintPreallocated(o,stored,EDR_COMMAND_STATE_LINE_CAP,0);
+  cJSON *artifact=cJSON_DetachItemFromObjectCaseSensitive(o,"artifact_stage");
   cJSON_Delete(o);
-  if(!ok){free(stored);return state_capacity_failure("state_capacity_record_encoding_failed",0);}
+  if(!ok){cJSON_Delete(artifact);free(stored);return state_capacity_failure("state_capacity_record_encoding_failed",0);}
   size_t bytes=strlen(stored)+1u;
   uint64_t budget=state_owner_budget();
-  if(!budget){free(stored);return state_capacity_failure("physical_configuration_invalid",0);}
+  if(!budget){cJSON_Delete(artifact);free(stored);return state_capacity_failure("physical_configuration_invalid",0);}
   for(int attempt=0;attempt<2;attempt++) {
     int found=0;size_t at=state_capacity_owner_position(command_id,&found);
     uint64_t prior=found?s_capacity.owners[at].reserved:0u;
@@ -2431,7 +2485,7 @@ static int append_state_line(const char *line) {
         charged<=effective && reserve<=effective-charged && scratch<=effective-charged-reserve &&
         bytes<=effective-charged-reserve-scratch)break;
     if(attempt || state_compact_locked(1,prior>0 && !preaction)!=0 || state_capacity_refresh_locked(path)!=0) {
-      free(stored);return state_capacity_failure(slots>EDR_COMMAND_STATE_CAPACITY_OWNER_LIMIT ?
+      cJSON_Delete(artifact);free(stored);return state_capacity_failure(slots>EDR_COMMAND_STATE_CAPACITY_OWNER_LIMIT ?
           "state_owner_record_slots_exhausted" : "state_owner_budget_exhausted",1);
     }
   }
@@ -2440,22 +2494,42 @@ static int append_state_line(const char *line) {
   int found=0;size_t at=state_capacity_owner_position(command_id,&found);
   uint64_t prior=found?s_capacity.owners[at].reserved:0u;
   uint64_t growth=bytes+s_capacity.stats.reserved_bytes-prior+reserve;
-  if(state_physical_allow(path,growth,prior>0 && !preaction)!=0) {free(stored);return -1;}
-  if(state_capacity_set_owner(command_id,reserve)!=0) {
-    free(stored);return state_capacity_failure("state_capacity_owner_limit",1);
+  const cJSON *artifact_phase=cJSON_GetObjectItemCaseSensitive(artifact,"phase");
+  uint64_t artifact_credit=found && cJSON_IsNumber(artifact_phase) && artifact_phase->valueint>=2
+      ? s_capacity.owners[at].artifact_reserved : 0u;
+  EdrStoragePhysicalSnapshot artifact_space;
+  /* A verified stage transition updates the existing owner, even while its
+   * public execution status is queued/running. Its command records are already
+   * promised by that owner's floor; do not charge that floor a second time. */
+  if(edr_storage_physical_admit_owned(path,growth,prior>0 && (!preaction || artifact_credit>0),
+      artifact_credit,&artifact_space)) {
+    cJSON_Delete(artifact);free(stored);
+    return state_capacity_failure(artifact_space.cause ? artifact_space.cause : "artifact_owner_space_unavailable",0);
   }
+  uint64_t artifact_before=s_capacity.stats.artifact_reserved_bytes;
+  if(state_capacity_set_owner(command_id,reserve,artifact)!=0) {
+    cJSON_Delete(artifact);free(stored);return state_capacity_failure("state_capacity_owner_limit",1);
+  }
+  cJSON_Delete(artifact);
+  /* Publish increases before mutation; lower only after durable append. A
+   * crash can over-reserve until calibration, never donate promised bytes. */
+  if(s_capacity.stats.artifact_reserved_bytes>artifact_before)
+    edr_storage_reservation_publish(s_capacity.stats.artifact_reserved_bytes);
   FILE *f=state_open_append_secure(path);
   ok=f && fputs(stored,f)>=0 && fputc('\n',f)!=EOF && state_flush_file(f)==0;
   if(f && fclose(f)!=0)ok=0;
   free(stored);
   if(!ok) {
     s_capacity.valid=0;
+    if(artifact_before || s_capacity.stats.artifact_reserved_bytes)
+      edr_storage_reservation_publish(UINT64_MAX);
     return state_capacity_failure("state_capacity_append_failed",0);
   }
   s_capacity.stats.new_record_bytes+=bytes;
   s_capacity.stats.record_count++;
   s_capacity.valid=state_file_info(path,&s_capacity.file)==0;
   s_capacity.stats.budget_bytes=budget;
+  edr_storage_reservation_publish(s_capacity.stats.artifact_reserved_bytes);
   return 0;
 }
 
@@ -2467,7 +2541,10 @@ static int state_get_capacity_stats(EdrCommandStateCapacityStats *out, int inven
   FILE *lock = inventory ? state_inventory_lock_acquire(&absent_parent,
       &inventory_status, out->last_error, sizeof(out->last_error)) : state_lock_acquire();
   if (!lock) {
-    if (!absent_parent) return inventory ? inventory_status : -1;
+    if (!absent_parent) {
+      if(!inventory)edr_storage_reservation_publish(UINT64_MAX);
+      return inventory ? inventory_status : -1;
+    }
     memset(out, 0, sizeof(*out));
     out->budget_bytes = state_owner_budget();
     out->update_headroom_bytes = EDR_COMMAND_STATE_LINE_CAP;
@@ -2476,10 +2553,21 @@ static int state_get_capacity_stats(EdrCommandStateCapacityStats *out, int inven
     return out->budget_bytes ? 0 : -1;
   }
   char path[1024];state_default_path(path,sizeof(path));
+  if(!inventory && edr_storage_reservation_attach(
+#ifdef _WIN32
+      _fileno(lock),
+#else
+      fileno(lock),
+#endif
+      path)!=0) {
+    edr_storage_reservation_publish(UINT64_MAX);
+    state_lock_release(lock);return state_capacity_failure("artifact_balance_mapping_failed",0);
+  }
 #ifdef _WIN32
   if (inventory) state_inventory_observe(9u, ERROR_SUCCESS);
 #endif
   int rc=state_capacity_refresh_locked_mode(path, inventory);
+  if(!inventory)edr_storage_reservation_publish(rc ? UINT64_MAX : s_capacity.stats.artifact_reserved_bytes);
   s_capacity.stats.budget_bytes=state_owner_budget();
   if(!s_capacity.stats.budget_bytes)rc=state_capacity_failure("physical_configuration_invalid",0);
   if (rc == 0) {
@@ -3550,4 +3638,239 @@ static int state_compact_locked(int force, int reserved_write) {
 void edr_command_state_compact_if_needed(void) {
   FILE *lock=state_lock_acquire();if(!lock)return;
   (void)state_compact_locked(0,0);state_lock_release(lock);
+}
+
+/* Artifact staging extends the existing command owner. It is used only by
+ * explicit bounded collection, never by routine event admission. */
+static cJSON *artifact_latest_locked(const char *command_id) {
+  errno=0;
+  char path[1024];state_default_path(path,sizeof(path));
+  FILE *f=state_open_read_secure(path,NULL);if(!f)return NULL;
+  char *line=malloc(EDR_COMMAND_STATE_LINE_CAP);cJSON *latest=NULL;int ok=line!=NULL;
+  while(ok && fgets(line,EDR_COMMAND_STATE_LINE_CAP,f)) {
+    if(!strchr(line,'\n')){ok=0;break;}
+    if(!line_matches_key(line,"command_id",command_id))continue;
+    cJSON *o=edr_egress_parse_purpose_object(line,strlen(line));
+    if(!o){ok=0;break;}cJSON_Delete(latest);latest=o;
+  }
+  if(ferror(f))ok=0;if(fclose(f))ok=0;free(line);
+  if(!ok){cJSON_Delete(latest);errno=EIO;return NULL;}return latest;
+}
+
+static int artifact_path_absent(const char *path) {
+#ifdef _WIN32
+  if(GetFileAttributesA(path)!=INVALID_FILE_ATTRIBUTES)return 0;
+  DWORD error=GetLastError();return error==ERROR_FILE_NOT_FOUND || error==ERROR_PATH_NOT_FOUND;
+#else
+  struct stat info;if(!lstat(path,&info))return 0;return errno==ENOENT;
+#endif
+}
+
+static FILE *artifact_owner_lock(void) {
+  FILE *lock=state_lock_acquire();if(!lock)return NULL;
+  char path[1024];state_default_path(path,sizeof(path));
+  if(edr_storage_reservation_attach(
+#ifdef _WIN32
+      _fileno(lock),
+#else
+      fileno(lock),
+#endif
+      path) || state_capacity_refresh_locked(path)) {
+    edr_storage_reservation_publish(UINT64_MAX);state_lock_release(lock);return NULL;
+  }
+  edr_storage_reservation_publish(s_capacity.stats.artifact_reserved_bytes);
+  return lock;
+}
+
+static int artifact_append_locked(cJSON *root) {
+  char *line=cJSON_PrintUnformatted(root);if(!line)return -1;
+  int rc=strlen(line)<EDR_COMMAND_STATE_LINE_CAP ? append_state_line(line) : -1;
+  cJSON_free(line);return rc;
+}
+
+int edr_command_state_artifact_begin(const EdrCommandArtifactStage *stage) {
+  if(!stage || !stage->command_id[0] || !stage->command_type[0] || !stage->artifact[0] ||
+      !stage->workspace[0] || !stage->staging[0] ||
+      stage->peak_bytes!=129u*1024u*1024u)return -1; /* Existing baseline copy + archive + metadata. */
+  char expected[1032];
+  if(snprintf(expected,sizeof(expected),"%s.staging",stage->artifact)>=(int)sizeof(expected) ||
+      strcmp(expected,stage->staging))return -1;
+  FILE *lock=artifact_owner_lock();if(!lock)return -1;
+  cJSON *root=artifact_latest_locked(stage->command_id);int rc=-1;
+  if(!root || strcmp(result_text(root,"command_type"),stage->command_type))goto done;
+  const cJSON *prior=cJSON_GetObjectItemCaseSensitive(root,"artifact_stage");
+  if(prior) {
+    rc=!strcmp(result_text(prior,"artifact"),stage->artifact) &&
+       !strcmp(result_text(prior,"staging"),stage->staging) &&
+       !strcmp(result_text(prior,"workspace"),stage->workspace) ? 1 : -1;
+    goto done;
+  }
+  const cJSON *final=cJSON_GetObjectItemCaseSensitive(root,"final");
+  if(!cJSON_IsNumber(final) || final->valueint)goto done;
+  if(!artifact_path_absent(stage->staging) || !artifact_path_absent(stage->artifact) ||
+      !artifact_path_absent(stage->workspace))goto done;
+  EdrStoragePhysicalSnapshot physical;
+  if(edr_storage_physical_admit(stage->artifact,stage->peak_bytes,0,&physical))goto done;
+  /* A distinct workspace volume receives the same conservative admission. */
+  if(edr_storage_physical_admit(stage->workspace,stage->peak_bytes,0,&physical))goto done;
+  cJSON *a=cJSON_AddObjectToObject(root,"artifact_stage");
+  char writer_boot[64];state_boot_id(writer_boot,sizeof(writer_boot));
+  if(!a || !cJSON_AddNumberToObject(a,"phase",1) ||
+      !cJSON_AddNumberToObject(a,"peak_bytes",(double)stage->peak_bytes) ||
+      !cJSON_AddStringToObject(a,"artifact",stage->artifact) ||
+      !cJSON_AddStringToObject(a,"staging",stage->staging) ||
+      !cJSON_AddStringToObject(a,"workspace",stage->workspace) ||
+      !cJSON_AddStringToObject(a,"delivery_idempotency_key",stage->meta.idempotency_key) ||
+      !cJSON_AddStringToObject(a,"writer_boot",writer_boot))goto done;
+  /* Freeze metadata in the command owner; the much smaller outbox record need
+   * not duplicate or truncate the verified content authority. */
+  char auth[EDR_COMMAND_STATE_AUTH_CAP];
+  if(authorization_json(&stage->meta.result_authorization,auth,sizeof(auth)))goto done;
+  cJSON *authority=cJSON_Parse(auth);
+  cJSON_DeleteItemFromObjectCaseSensitive(root,"result_authorization");
+  if(!authority || !cJSON_AddItemToObject(root,"result_authorization",authority) ||
+      !renewal_text(root,"soar_correlation_id",stage->meta.soar_correlation_id) ||
+      !renewal_text(root,"playbook_run_id",stage->meta.playbook_run_id) ||
+      !renewal_text(root,"playbook_step_id",stage->meta.playbook_step_id))goto done;
+  rc=artifact_append_locked(root);
+done:
+  cJSON_Delete(root);state_lock_release(lock);return rc;
+}
+
+static int artifact_transition(const char *id,const char *sha,int abandon) {
+  if(!id || !*id)return -1;
+  if(!abandon) {
+    if(!sha || strlen(sha)!=64)return -1;
+    for(size_t i=0;i<64;i++)if(!isxdigit((unsigned char)sha[i]))return -1;
+  }
+  FILE *lock=artifact_owner_lock();if(!lock)return -1;
+  cJSON *root=artifact_latest_locked(id);cJSON *a=cJSON_GetObjectItemCaseSensitive(root,"artifact_stage");
+  const cJSON *phase=cJSON_GetObjectItemCaseSensitive(a,"phase");int rc=-1;
+  if(!cJSON_IsObject(a) || !cJSON_IsNumber(phase))goto done;
+  char boot[64];state_boot_id(boot,sizeof(boot));
+  if(strcmp(result_text(a,"writer_boot"),boot))goto done;
+  if(abandon) {
+    if(phase->valueint==3){rc=0;goto done;}
+    if(!renewal_number(a,"phase",3))goto done;
+    if(!renewal_text(a,"publication_state","aborted_writer_closed"))goto done;
+  } else {
+    if(phase->valueint==2){rc=!strcmp(result_text(a,"sha256"),sha)?0:-1;goto done;}
+    if(phase->valueint!=1)goto done;
+    uint64_t bytes=edr_storage_file_size(result_text(a,"staging"));
+    if(!bytes || bytes==UINT64_MAX || bytes>EDR_FORENSIC_BASELINE_MAX_BYTES)goto done;
+    if(!renewal_number(a,"phase",2) || !renewal_text(a,"sha256",sha))goto done;
+  }
+  rc=artifact_append_locked(root);
+done:
+  cJSON_Delete(root);state_lock_release(lock);return rc;
+}
+int edr_command_state_artifact_ready(const char *id,const char *sha) {return artifact_transition(id,sha,0);}
+int edr_command_state_artifact_abandon(const char *id) {return artifact_transition(id,NULL,1);}
+
+static int artifact_fill(const cJSON *root,EdrCommandArtifactStage *out) {
+  memset(out,0,sizeof(*out));
+  const cJSON *a=cJSON_GetObjectItemCaseSensitive(root,"artifact_stage");
+  if(!scope_string(root,"command_id",out->command_id,sizeof(out->command_id)) ||
+      !scope_string(root,"command_type",out->command_type,sizeof(out->command_type)) ||
+      !scope_string(a,"artifact",out->artifact,sizeof(out->artifact)) ||
+      !scope_string(a,"staging",out->staging,sizeof(out->staging)) ||
+      !scope_string(a,"workspace",out->workspace,sizeof(out->workspace)))return -1;
+  const cJSON *phase=cJSON_GetObjectItemCaseSensitive(a,"phase"), *peak=cJSON_GetObjectItemCaseSensitive(a,"peak_bytes");
+  if(!cJSON_IsNumber(phase) || !cJSON_IsNumber(peak))return -1;
+  out->phase=phase->valueint;out->peak_bytes=(uint64_t)peak->valuedouble;
+  char boot[64];state_boot_id(boot,sizeof(boot));
+  out->interrupted=out->phase==1 && strcmp(result_text(a,"writer_boot"),boot)!=0;
+  if(out->phase==2 && !scope_string(a,"sha256",out->sha256,sizeof(out->sha256)))return -1;
+  char *raw=cJSON_PrintUnformatted(root);if(!raw)return -1;
+  EdrCommandStateRecord *record=malloc(sizeof(*record));
+  if(!record){cJSON_free(raw);return -1;}
+  fill_record_from_line(raw,record);cJSON_free(raw);
+  snprintf(out->meta.idempotency_key,sizeof(out->meta.idempotency_key),"%s",record->idempotency_key);
+  const cJSON *raw_idem=cJSON_GetObjectItemCaseSensitive(a,"delivery_idempotency_key");
+  if(cJSON_IsString(raw_idem) && raw_idem->valuestring && strlen(raw_idem->valuestring)<sizeof(out->meta.idempotency_key))
+    snprintf(out->meta.idempotency_key,sizeof(out->meta.idempotency_key),"%s",raw_idem->valuestring);
+  snprintf(out->meta.soar_correlation_id,sizeof(out->meta.soar_correlation_id),"%s",record->soar_correlation_id);
+  snprintf(out->meta.playbook_run_id,sizeof(out->meta.playbook_run_id),"%s",record->playbook_run_id);
+  snprintf(out->meta.playbook_step_id,sizeof(out->meta.playbook_step_id),"%s",record->playbook_step_id);
+  out->meta.result_authorization=record->result_authorization;free(record);return 0;
+}
+
+int edr_command_state_artifact_next(size_t *cursor,EdrCommandArtifactStage *out) {
+  if(!cursor || !out)return -1;
+  /* No extra file I/O in normal polls without pending on-demand staging. */
+  if(!edr_storage_artifact_reserved())return 0;
+  FILE *lock=artifact_owner_lock();if(!lock)return -1;int rc=0;
+  /* One bounded cursor pass over the existing in-memory owner ledger. */
+  size_t limit=*cursor+64u;if(limit<*cursor)limit=SIZE_MAX;
+  while(*cursor<s_capacity.count && *cursor<limit) {
+    const CommandCapacityOwner *owner=&s_capacity.owners[(*cursor)++];
+    if(!owner->artifact_json)continue;
+    cJSON *a=cJSON_Parse(owner->artifact_json);
+    const cJSON *phase=cJSON_GetObjectItemCaseSensitive(a,"phase");
+    char boot[64];state_boot_id(boot,sizeof(boot));
+    int publish=cJSON_IsNumber(phase) && (phase->valueint==2 ||
+        (phase->valueint==1 && strcmp(result_text(a,"writer_boot"),boot) &&
+         strcmp(result_text(a,"recovery"),"interrupted_protected")));cJSON_Delete(a);
+    if(!publish)continue;
+    cJSON *root=artifact_latest_locked(owner->command_id);
+    rc=root && !artifact_fill(root,out) ? 1 : -1;cJSON_Delete(root);break;
+  }
+  if(*cursor>=s_capacity.count)*cursor=0;
+  state_lock_release(lock);return rc;
+}
+
+int edr_command_state_artifact_meta(const char *id,const char *type,EdrSoarCommandMeta *out) {
+  if(!id || !type || !out)return -1;
+  FILE *lock=state_lock_acquire();if(!lock)return -1;
+  cJSON *root=artifact_latest_locked(id);int rc=!root && errno && errno!=ENOENT ? -1 : 0;
+  if(root && cJSON_HasObjectItem(root,"artifact_stage")) {
+    EdrCommandArtifactStage *stage=malloc(sizeof(*stage));
+    rc=stage && !strcmp(result_text(root,"command_type"),type) && !artifact_fill(root,stage)?1:-1;
+    if(rc==1)*out=stage->meta;free(stage);
+  }
+  cJSON_Delete(root);state_lock_release(lock);return rc;
+}
+
+static int artifact_stage_matches(const cJSON *root,const EdrCommandArtifactStage *stage) {
+  const cJSON *a=cJSON_GetObjectItemCaseSensitive(root,"artifact_stage");
+  return !strcmp(result_text(root,"command_type"),stage->command_type) &&
+      !strcmp(result_text(a,"artifact"),stage->artifact) &&
+      !strcmp(result_text(a,"staging"),stage->staging) &&
+      !strcmp(result_text(a,"workspace"),stage->workspace) &&
+      !strcmp(result_text(a,"sha256"),stage->sha256);
+}
+
+int edr_command_state_artifact_handoff(const EdrCommandArtifactStage *stage,
+    int (*publish)(const EdrCommandArtifactStage *,uint64_t)) {
+  if(!stage || stage->phase!=2 || !publish)return -1;
+  FILE *lock=artifact_owner_lock();if(!lock)return -1;
+  cJSON *root=artifact_latest_locked(stage->command_id);
+  cJSON *a=cJSON_GetObjectItemCaseSensitive(root,"artifact_stage");
+  const cJSON *phase=cJSON_GetObjectItemCaseSensitive(a,"phase"), *final=cJSON_GetObjectItemCaseSensitive(root,"final");
+  EdrCommandArtifactStage *frozen=NULL;int rc=-1;
+  if(!cJSON_IsNumber(phase) || !cJSON_IsNumber(final) || !artifact_stage_matches(root,stage))goto done;
+  if(phase->valueint==3){rc=0;goto done;} /* Idempotent handoff, never renewed credit. */
+  if(phase->valueint!=2)goto done;
+  if(!final->valueint) {
+    frozen=malloc(sizeof(*frozen));
+    if(!frozen || artifact_fill(root,frozen) || publish(frozen,2u*EDR_COMMAND_STATE_LINE_CAP+12288u))goto done;
+  }
+  /* Exact owner stays locked throughout metadata admission/publication. A
+   * competing publisher cannot release it and turn our credit into another
+   * owner's balance. Final commands release growth without another upload. */
+  if(!renewal_number(a,"phase",3))goto done;
+  rc=artifact_append_locked(root);
+done:
+  free(frozen);cJSON_Delete(root);state_lock_release(lock);return rc;
+}
+
+int edr_command_state_artifact_mark_interrupted(const char *id) {
+  FILE *lock=artifact_owner_lock();if(!lock)return -1;
+  cJSON *root=artifact_latest_locked(id), *a=cJSON_GetObjectItemCaseSensitive(root,"artifact_stage");
+  const cJSON *phase=cJSON_GetObjectItemCaseSensitive(a,"phase"), *final=cJSON_GetObjectItemCaseSensitive(root,"final");
+  char boot[64];state_boot_id(boot,sizeof(boot));int rc=-1;
+  if(cJSON_IsNumber(phase) && phase->valueint==1 && cJSON_IsNumber(final) && final->valueint==1 &&
+      strcmp(result_text(a,"writer_boot"),boot) && renewal_text(a,"recovery","interrupted_protected"))
+    rc=artifact_append_locked(root);
+  cJSON_Delete(root);state_lock_release(lock);return rc;
 }

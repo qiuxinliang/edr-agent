@@ -45,6 +45,8 @@ static inline int edr_storage_policy_apply(const EdrConfig *cfg, enum EdrStorage
                 (unsigned long long)owner.protected_floor_bytes);
   if (edr_storage_policy_setenv("EDR_STORAGE_OWNER_PROTECTED_BYTES", protected_bytes)) return -1;
   if (inventory_owner == EDR_STORAGE_POLICY_READ_ONLY) {
+    if(edr_storage_reservation_readonly_snapshot(unavailable ? UINT64_MAX : owner.artifact_reserved_bytes))
+      return -2;
     if (owner_rc == EDR_COMMAND_STATE_INVENTORY_LOCK_TIMEOUT)
       return EDR_STORAGE_POLICY_INVENTORY_LOCK_TIMEOUT;
     if (owner_rc == EDR_COMMAND_STATE_INVENTORY_LOCK_GRANTED_EXPIRED)

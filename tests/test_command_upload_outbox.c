@@ -10,6 +10,8 @@
 static size_t hashed_bytes;
 static const char *test_executable;
 static int policy_result;
+static int64_t fake_now_ms=1000000;
+#define EDR_UPLOAD_OUTBOX_NOW_MS() fake_now_ms
 static void measured_hash(EdrSha256Ctx *ctx,const uint8_t *bytes,size_t n) {hashed_bytes+=n;edr_sha256_update(ctx,bytes,n);}
 int edr_egress_is_policy_hold(int rc) {return rc==-3||rc==-4||rc==-7;}
 int edr_egress_upload_preflight(const char *id,const char *upload,const char *path,const char *sha,uint64_t *size) {(void)id;(void)upload;(void)path;(void)sha;if(size)*size=24;return policy_result;}
@@ -22,12 +24,33 @@ static void env(const char *key, const char *value) { _putenv_s(key, value); }
 #include <sys/stat.h>
 #include <unistd.h>
 #include <sys/wait.h>
+#include <sys/statvfs.h>
+static uint64_t forced_available_bytes;
+static int outbox_test_statvfs(const char *path,struct statvfs *out) {
+  if(!forced_available_bytes)return statvfs(path,out);
+  memset(out,0,sizeof(*out));out->f_frsize=1;out->f_bavail=forced_available_bytes;return 0;
+}
+#define statvfs(path,out) outbox_test_statvfs(path,out)
 static void env(const char *key, const char *value) { setenv(key, value, 1); }
 #endif
 
+/* Pause the first publisher after its last absent-record read, before its
+ * metadata admission. This is a real CRT boundary, not a policy substitute. */
+static void (*missing_terminal_record_hook)(void);
+static FILE *injected_fopen(const char *path,const char *mode) {
+  FILE *f=fopen(path,mode);
+  if(!f && !strcmp(mode,"rb") && strstr(path,"upload_cmd_concurrent_A_") &&
+      strstr(path,".pending.failed") && missing_terminal_record_hook) {
+    void (*hook)(void)=missing_terminal_record_hook;missing_terminal_record_hook=NULL;hook();
+  }
+  return f;
+}
 static int fail_flush, fail_close, close_after_flush, fail_publish, fail_fdopen;
 static int fail_terminal_receipt, terminal_new;
+static int fail_upload_receipt;
+static unsigned metadata_flushes;
 static int injected_fflush(FILE *file) {
+  metadata_flushes++;
   if (fail_flush) { fail_flush = 0; errno = ENOSPC; return EOF; }
   if (fail_close) { close_after_flush = 1; fail_close = 0; }
   return fflush(file);
@@ -38,8 +61,18 @@ static int injected_fclose(FILE *file) {
   return rc;
 }
 #ifdef _WIN32
+static unsigned publish_rejections, move_attempts, move_retry_wait_ms, transient_move_failures;
+static DWORD transient_move_error;
+static void injected_move_sleep(DWORD ms) {move_retry_wait_ms+=ms;Sleep(ms);}
 static BOOL WINAPI injected_move(LPCSTR src, LPCSTR dst, DWORD flags) {
-  if (fail_publish) { fail_publish = 0; SetLastError(ERROR_ACCESS_DENIED); return FALSE; }
+  move_attempts++;
+  /* Existing fail_publish=1 means one whole publication fails, including its
+   * bounded retry budget. Do not silently weaken the existing failure cases. */
+  if (fail_publish) {
+    if(++publish_rejections==3u){fail_publish=0;publish_rejections=0;}
+    SetLastError(ERROR_ACCESS_DENIED);return FALSE;
+  }
+  if(transient_move_failures) {transient_move_failures--;SetLastError(transient_move_error);return FALSE;}
   return MoveFileExA(src, dst, flags);
 }
 static FILE *injected_fdopen(int fd, const char *mode) {
@@ -48,6 +81,7 @@ static FILE *injected_fdopen(int fd, const char *mode) {
 }
 #define _fdopen injected_fdopen
 #define MoveFileExA injected_move
+#define Sleep injected_move_sleep
 #else
 static int injected_rename(const char *src, const char *dst) {
   if (fail_publish) { fail_publish = 0; errno = EACCES; return -1; }
@@ -65,26 +99,32 @@ static FILE *injected_fdopen(int fd, const char *mode) {
 #define rename injected_rename
 #define link injected_link
 #endif
+#define fopen injected_fopen
 #define fflush injected_fflush
 #define fclose injected_fclose
 #define edr_sha256_update measured_hash
 #include "../src/command/command_upload_outbox.c"
 #undef edr_sha256_update
+#undef fopen
 #undef fflush
 #undef fclose
 #ifdef _WIN32
 #undef MoveFileExA
+#undef Sleep
 #undef _fdopen
 #else
 #undef rename
 #undef fdopen
 #undef link
+#undef statvfs
 #endif
 
 /* Make failed state flushes leave complete readable bytes, as a real failed
  * fsync/_commit can. Recovery must flush again before retiring the upload. */
 static int fail_state_flush;
+static unsigned owner_flushes;
 static int state_test_fflush(FILE *file) {
+  owner_flushes++;
   int rc = fflush(file);
   if (fail_state_flush > 0) { fail_state_flush--; errno = EIO; return EOF; }
   return rc;
@@ -106,6 +146,7 @@ int edr_transport_v2_upload_file(const char *id, const char *path, const char *s
   assert(id && id[0] && path && path[0]);
   assert(strlen(sha) == 64u);
   upload_calls++;
+  if(fail_upload_receipt) {fail_upload_receipt=0;fail_publish=1;}
   snprintf(last_command, sizeof(last_command), "%s", id);
   snprintf(last_sha, sizeof(last_sha), "%s", sha);
   if (upload_fail) return -1;
@@ -170,9 +211,13 @@ static void setup(const char *name) {
   char state[1000], inbox[1000];
   snprintf(state, sizeof(state), "%s/state.jsonl", dir); env("EDR_COMMAND_STATE_DB", state);
   snprintf(inbox, sizeof(inbox), "%s/inbox", dir); env("EDR_COMMAND_INBOX_DIR", inbox);
+  EdrCommandStateCapacityStats capacity;
+  assert(edr_command_state_get_capacity_stats(&capacity)==0);
   terminal_new = fail_terminal_receipt = 0;
   policy_result=0;hashed_bytes=0;
   upload_calls = upload_fail = terminal_calls = terminal_fail = audits = 0;
+  fake_now_ms=1000000; metadata_flushes=0;
+  owner_flushes=0;
 }
 static void pending_path(char *path, size_t cap, const char *id) {
   snprintf(path, cap, "%s/upload_%s_%s.pending", dir, id, sha);
@@ -223,6 +268,32 @@ static void test_enqueue_failures(void) {
   env("EDR_UPLOAD_OUTBOX_DIR", blocked);
   assert(edr_command_upload_outbox_write_legacy("cmd_blocked", bundle, sha, "") != 0);
 }
+#ifdef _WIN32
+static void test_windows_bounded_metadata_publication(void) {
+  const DWORD errors[]={ERROR_ACCESS_DENIED,ERROR_SHARING_VIOLATION,ERROR_LOCK_VIOLATION};
+  for(size_t i=0;i<sizeof(errors)/sizeof(errors[0]);i++) {
+    char name[64],path[1200];snprintf(name,sizeof(name),"windows-transient-%lu",errors[i]);setup(name);
+    pending_path(path,sizeof(path),"cmd_move");transient_move_error=errors[i];transient_move_failures=2u;
+    move_attempts=move_retry_wait_ms=0u;
+    assert(edr_command_upload_outbox_write_legacy("cmd_move",bundle,sha,"")==0 && exists(path) && exists(bundle));
+    assert(move_attempts==3u && move_retry_wait_ms>0u && move_retry_wait_ms<=60u && !transient_move_failures);
+  }
+  setup("windows-permanent-denial");char path[1200],before[8192],after[8192];int attempted;
+  pending_path(path,sizeof(path),"cmd_move");move_attempts=move_retry_wait_ms=0u;
+  assert(edr_command_upload_outbox_write_legacy("cmd_move",bundle,sha,"")==0);
+  assert(move_attempts==1u && move_retry_wait_ms==0u);contents(path,before,sizeof(before));
+  transient_move_error=ERROR_ACCESS_DENIED;transient_move_failures=3u;move_attempts=move_retry_wait_ms=0u;
+  assert(edr_command_upload_outbox_flush_one(path,&attempted)==-2 && attempted);
+  assert(move_attempts==3u && move_retry_wait_ms<=60u && !transient_move_failures);
+  contents(path,after,sizeof(after));assert(!strcmp(before,after) && exists(bundle));
+  assert(temporary_files()==0u); /* Only this failed write's own scratch is removed. */
+  setup("windows-nonretryable-denial");
+  transient_move_error=ERROR_FILE_NOT_FOUND;transient_move_failures=1u;move_attempts=move_retry_wait_ms=0u;
+  assert(edr_command_upload_outbox_write_legacy("cmd_no_retry",bundle,sha,"")==-1);
+  assert(move_attempts==1u && move_retry_wait_ms==0u && !transient_move_failures && exists(bundle));
+  puts("Windows metadata publication: errors 5/32/33 recover within 3 attempts; persistent denial retains pending/artifact; success/nonretryable one call; scheduled wait <=60ms PASS");
+}
+#endif
 /* Exercise the existing volume reserve without filling the host disk. */
 static void test_metadata_physical_admission(void) {
   setup("physical-admission");
@@ -266,6 +337,7 @@ static void test_legacy_upgrade(void) {
   upload_fail = 1;
   assert(edr_command_upload_outbox_flush_one(path, &attempted) == -1 && attempted == 1 && exists(path));
   upload_fail = 0;
+  fake_now_ms+=61000;
   assert(edr_command_upload_outbox_flush_one(path, &attempted) == 1 && attempted == 1 && !exists(path));
   assert(upload_calls == 2 && terminal_calls == 0 && !strcmp(last_command, "cmd_old") && !strcmp(last_sha, sha));
   snprintf(done, sizeof(done), "%s.done", path); contents(done, raw, sizeof(raw));
@@ -308,7 +380,7 @@ static void test_rename_retry(void) {
 static void test_receipt_failure(void) {
   setup("receipt"); char path[1200], raw[8192]; int attempted;
   assert(edr_command_queue_forensic_upload("cmd_receipt", "collect_forensic", &meta, bundle, sha, "builtin", 0) == 0);
-  pending_path(path, sizeof(path), "cmd_receipt"); fail_publish = 1;
+  pending_path(path, sizeof(path), "cmd_receipt"); fail_upload_receipt = 1;
   assert(edr_command_upload_outbox_flush_one(path, &attempted) == -2 && attempted == 1 && exists(path));
   assert(terminal_calls == 0); contents(path, raw, sizeof(raw)); assert(!strstr(raw, "object_key="));
   assert(edr_command_upload_outbox_flush_one(path, &attempted) == 1);
@@ -421,10 +493,319 @@ static void test_policy_hold_before_hash(void) {
   assert(!hashed_bytes && exists(path));
   policy_result=0;upload_fail=1;
   assert(edr_command_upload_outbox_flush_one(path,&attempted)==-1 && attempted && hashed_bytes>0 && !exists(hold));
-  upload_fail=0;assert(edr_command_upload_outbox_flush_one(path,&attempted)==1 && !exists(path));
+  upload_fail=0;fake_now_ms+=61000;
+  assert(edr_command_upload_outbox_flush_one(path,&attempted)==1 && !exists(path));
 }
+
+static void test_durable_retry_and_deadline(void) {
+  setup("durable-retry");char path[1200],raw[8192];int attempted=0;
+  assert(edr_command_queue_forensic_upload("cmd_retry","collect_forensic",&meta,bundle,sha,"builtin",0)==0);
+  pending_path(path,sizeof(path),"cmd_retry");upload_fail=1;metadata_flushes=0;
+  assert(edr_command_upload_outbox_flush_one(path,&attempted)==-1 && attempted);
+  assert(metadata_flushes==1u);contents(path,raw,sizeof(raw));
+  assert(strstr(raw,"attempts=1\n") && strstr(raw,"retry_after_unix_ms=1060000\n"));
+  hashed_bytes=0;metadata_flushes=0;
+  for(int i=0;i<4;i++)assert(edr_command_upload_outbox_flush_one(path,&attempted)==-6 && !attempted);
+  assert(!hashed_bytes && !metadata_flushes && upload_calls==1);
+#ifdef _WIN32
+  assert(_spawnl(_P_WAIT,test_executable,test_executable,"--retry-restart",path,NULL)==0);
+#else
+  pid_t child=fork();assert(child>=0);
+  if(!child){execl(test_executable,test_executable,"--retry-restart",path,(char*)NULL);_exit(127);}
+  int status=0;assert(waitpid(child,&status,0)==child && WIFEXITED(status) && WEXITSTATUS(status)==0);
+#endif
+  fake_now_ms=1060000;
+  assert(edr_command_upload_outbox_flush_one(path,&attempted)==-1 && attempted);
+  contents(path,raw,sizeof(raw));assert(strstr(raw,"attempts=2\n") && strstr(raw,"retry_after_unix_ms=1180000\n"));
+  fake_now_ms=1000000+UPLOAD_DELIVERY_WINDOW_MS;
+  hashed_bytes=0;
+  assert(edr_command_upload_outbox_flush_one(path,&attempted)==0 && !attempted && exists(bundle));
+  assert(!hashed_bytes && strstr(last_error,"deadline") && terminal_new==1);
+  assert(edr_command_queue_forensic_upload("cmd_retry","collect_forensic",&meta,bundle,sha,"builtin",0)==0);
+  assert(!exists(path)); /* failed tombstone prevents a new retry horizon */
+  printf("outbox_retry due_failure_metadata_flushes=1 not_due_hash_bytes=0 not_due_writes=0 restart_persisted=1\n");
+}
+static void test_retry_persist_failure_and_unknown_deadline(void) {
+  setup("retry-storage-failed");char path[1200],before[8192],after[8192];int attempted=0;
+  assert(edr_command_queue_forensic_upload("cmd_retry_disk","collect_forensic",&meta,bundle,sha,"builtin",0)==0);
+  pending_path(path,sizeof(path),"cmd_retry_disk");contents(path,before,sizeof(before));
+  upload_fail=1;fail_flush=1;
+  assert(edr_command_upload_outbox_flush_one(path,&attempted)==EDR_UPLOAD_OUTBOX_RETRY_PERSIST_FAILED);
+  assert(attempted && upload_calls==1 && !terminal_calls);
+  contents(path,after,sizeof(after));assert(!strcmp(before,after) && exists(bundle));
+  setup("unknown-deadline");
+  snprintf(path,sizeof(path),"%s/unknown.pending",dir);
+  snprintf(before,sizeof(before),"command_id=unknown\nbundle_path=%s\nsha256=%s\n",bundle,sha);put(path,before);
+  hashed_bytes=0;
+  assert(edr_command_upload_outbox_flush_one(path,&attempted)==0 && !attempted);
+  snprintf(after,sizeof(after),"%s.failed",path);assert(exists(after) && exists(bundle));
+  assert(!hashed_bytes && !upload_calls && !terminal_calls);
+  printf("outbox_unknown deadline_unknown_quarantined=1 evidence_preserved=1 failed_network_retry_persist_distinct=1\n");
+}
+
+static void test_owner_final_preserved(void) {
+  setup("owner-final");char path[1200],before[65],after[65];int attempted;
+  assert(edr_command_queue_forensic_upload("cmd_final","collect_forensic",&meta,bundle,sha,"builtin",0)==0);
+  pending_path(path,sizeof(path),"cmd_final");
+  assert(edr_command_state_finish_once("cmd_final","collect_forensic",&meta,"cancelled",EdrCmdExecFailed,130,"cancelled","",1)==0);
+  assert(file_hash(getenv("EDR_COMMAND_STATE_DB"),before)==0);
+  assert(edr_command_upload_outbox_flush_one(path,&attempted)==0 && !attempted && exists(bundle));
+  assert(!upload_calls && !terminal_calls);
+  assert(file_hash(getenv("EDR_COMMAND_STATE_DB"),after)==0 && !strcmp(before,after));
+}
+
+static void test_staging_owner_recovery(void) {
+  setup("staging-owner");EdrCommandArtifactStage stage={0};
+  strcpy(stage.command_id,"cmd_stage");strcpy(stage.command_type,"collect_forensic");stage.meta=meta;
+  strcpy(stage.meta.idempotency_key,"stage|sigv2|signature");
+  snprintf(stage.artifact,sizeof(stage.artifact),"%s/published.tgz",dir);
+  snprintf(stage.staging,sizeof(stage.staging),"%s.staging",stage.artifact);
+  snprintf(stage.workspace,sizeof(stage.workspace),"%s/work",dir);
+  stage.peak_bytes=129u*1024u*1024u;stage.phase=1;
+  int retry=0;assert(edr_command_state_begin(stage.command_id,stage.command_type,&stage.meta,&retry,NULL)==0);
+  owner_flushes=metadata_flushes=0;
+  assert(edr_command_state_artifact_begin(&stage)==0 && owner_flushes==1);
+  assert(edr_command_state_artifact_begin(&stage)==1 && owner_flushes==1);
+  assert(edr_storage_artifact_reserved()==stage.peak_bytes);
+  uint64_t available=0;EdrStoragePhysicalSnapshot snapshot;
+  assert(edr_storage_volume_available(stage.staging,&available)==0 && available>stage.peak_bytes);
+  assert(edr_storage_physical_admit(stage.staging,available-stage.peak_bytes/2,1,&snapshot)==-1);
+  assert(edr_storage_physical_admit_owned(stage.staging,available-stage.peak_bytes/2,1,stage.peak_bytes,&snapshot)==0);
+  size_t cursor=0;EdrCommandArtifactStage recovered;
+  assert(edr_command_state_artifact_next(&cursor,&recovered)==0);
+  assert(edr_command_upload_outbox_publish_stage(&stage)==-1);
+  put(stage.staging,"bounded forensic fixture");
+  fail_state_flush=2;
+  assert(edr_command_state_artifact_ready(stage.command_id,sha)==-1);
+  assert(edr_storage_artifact_reserved()==UINT64_MAX);
+  assert(edr_storage_physical_admit(stage.staging,1,1,&snapshot)==-2);
+  EdrCommandStateCapacityStats stats;
+  assert(edr_command_state_get_capacity_stats(&stats)==-1 && edr_storage_artifact_reserved()==UINT64_MAX);
+  assert(edr_command_state_get_capacity_stats(&stats)==0);
+  assert(stats.artifact_reserved_bytes==2u*EDR_COMMAND_STATE_LINE_CAP+12288u);
+  assert(edr_storage_artifact_reserved()==stats.artifact_reserved_bytes);
+#ifdef _WIN32
+  assert(_spawnl(_P_WAIT,test_executable,test_executable,"--stage-restart",stage.command_id,NULL)==0);
+#else
+  pid_t child=fork();assert(child>=0);
+  if(!child){execl(test_executable,test_executable,"--stage-restart",stage.command_id,(char*)NULL);_exit(127);}
+  int status=0;assert(waitpid(child,&status,0)==child && WIFEXITED(status) && WEXITSTATUS(status)==0);
+#endif
+  assert(!exists(stage.staging) && exists(stage.artifact));
+  assert(edr_storage_artifact_reserved()==0); /* shared mapping observes child release */
+  assert(edr_command_state_get_capacity_stats(&stats)==0 && !stats.artifact_reserved_bytes);
+  EdrSoarCommandMeta frozen;
+  assert(edr_command_state_artifact_meta(stage.command_id,stage.command_type,&frozen)==1);
+  assert(!strcmp(frozen.idempotency_key,stage.meta.idempotency_key));
+  char path[1200];pending_path(path,sizeof(path),stage.command_id);assert(exists(path));
+  printf("staging_owner initial_reserved=%llu publishing_reserved=%u restart_publish=1 other_owner_credit_denied=1 unknown_retained=1\n",
+      (unsigned long long)stage.peak_bytes,2u*EDR_COMMAND_STATE_LINE_CAP+12288u);
+}
+
+static void test_staging_interrupted_and_final(void) {
+  setup("stage-interrupted");EdrCommandArtifactStage stage={0};
+  strcpy(stage.command_id,"cmd_interrupted");strcpy(stage.command_type,"collect_forensic");stage.meta=meta;
+  snprintf(stage.artifact,sizeof(stage.artifact),"%s/published.tgz",dir);
+  snprintf(stage.staging,sizeof(stage.staging),"%s.staging",stage.artifact);
+  snprintf(stage.workspace,sizeof(stage.workspace),"%s/work",dir);
+  stage.peak_bytes=129u*1024u*1024u;stage.phase=1;
+  int retry=0;assert(edr_command_state_begin(stage.command_id,stage.command_type,&stage.meta,&retry,NULL)==0);
+  assert(edr_command_state_artifact_begin(&stage)==0);put(stage.staging,"bounded forensic fixture");
+#ifdef _WIN32
+  assert(_spawnl(_P_WAIT,test_executable,test_executable,"--stage-interrupted",stage.command_id,NULL)==0);
+#else
+  pid_t child=fork();assert(child>=0);
+  if(!child){execl(test_executable,test_executable,"--stage-interrupted",stage.command_id,(char*)NULL);_exit(127);}
+  int status=0;assert(waitpid(child,&status,0)==child && WIFEXITED(status) && WEXITSTATUS(status)==0);
+#endif
+  assert(edr_storage_artifact_reserved()==stage.peak_bytes && exists(stage.staging));
+  assert(edr_command_state_has_final(stage.command_id,&stage.meta)==1);
+  setup("stage-final");
+  strcpy(stage.command_id,"cmd_stage_final");
+  snprintf(stage.artifact,sizeof(stage.artifact),"%s/published.tgz",dir);
+  snprintf(stage.staging,sizeof(stage.staging),"%s.staging",stage.artifact);
+  snprintf(stage.workspace,sizeof(stage.workspace),"%s/work",dir);
+  assert(edr_command_state_begin(stage.command_id,stage.command_type,&stage.meta,&retry,NULL)==0);
+  assert(edr_command_state_artifact_begin(&stage)==0);put(stage.staging,"bounded forensic fixture");
+  assert(edr_command_state_artifact_ready(stage.command_id,sha)==0);
+  stage.phase=2;strcpy(stage.sha256,sha);
+  assert(edr_command_state_finish_once(stage.command_id,stage.command_type,&stage.meta,"cancelled",
+      EdrCmdExecFailed,130,"cancelled","",1)==0);
+  assert(edr_command_upload_outbox_publish_stage(&stage)==0 && !edr_storage_artifact_reserved());
+  assert(exists(stage.staging) && !exists(stage.artifact) && !upload_calls && !terminal_calls);
+  printf("staging_terminal interrupted_final=1 unknown_writer_reserve_retained=1 duplicate_recovery_skipped=1 final_owner_growth_released=1 files_preserved=1\n");
+}
+#ifndef _WIN32
+static void test_stage_own_metadata_credit(void) {
+  setup("stage-credit");EdrCommandArtifactStage stage={0};
+  strcpy(stage.command_id,"cmd_credit");strcpy(stage.command_type,"collect_forensic");stage.meta=meta;
+  snprintf(stage.artifact,sizeof(stage.artifact),"%s/published.tgz",dir);
+  snprintf(stage.staging,sizeof(stage.staging),"%s.staging",stage.artifact);
+  snprintf(stage.workspace,sizeof(stage.workspace),"%s/work",dir);
+  stage.peak_bytes=129u*1024u*1024u;stage.phase=1;
+  int retry=0;assert(edr_command_state_begin(stage.command_id,stage.command_type,&stage.meta,&retry,NULL)==0);
+  owner_flushes=metadata_flushes=0;
+  assert(edr_command_state_artifact_begin(&stage)==0);put(stage.staging,"bounded forensic fixture");
+  assert(edr_command_state_artifact_ready(stage.command_id,sha)==0);
+  stage.phase=2;strcpy(stage.sha256,sha);
+  uint64_t credit=edr_storage_artifact_reserved(),floor=0;
+  assert(credit>0 && edr_storage_min_free_bytes(&floor)==0);
+  /* Exactly the existing floor plus this owner's complete publishing promise
+   * (outbox copy and remaining owner record), with no unreserved spare bytes. */
+  forced_available_bytes=floor+credit;
+  assert(!metadata_space_available(stage.artifact));
+  assert(metadata_space_available_owned(stage.artifact,credit));
+  assert(edr_command_upload_outbox_publish_stage(&stage)==0);
+  forced_available_bytes=0;
+  assert(!edr_storage_artifact_reserved() && !upload_calls && owner_flushes==3u && metadata_flushes==1u);
+  printf("stage_cost begin_ready_release_owner_flushes=%u enqueue_metadata_flushes=%u exact_metadata_credit_published=1\n",
+      owner_flushes,metadata_flushes);
+}
+#endif
+/* A second process attempts the same handoff while A is paused immediately
+ * before metadata admission. Probe the actual owner lock nonblockingly first:
+ * old code is deterministically free and lets the competitor release A; fixed
+ * code holds it and the competitor must wait until A's publication is durable. */
+static EdrCommandArtifactStage concurrent_stage;
+static int handoff_lock_held, competitor_joined;
+static uint64_t borrowed_floor_bytes;
+static char competitor_marker[1200];
+#ifdef _WIN32
+static intptr_t competitor_process;
+#else
+static pid_t competitor_process;
+#endif
+static void wait_competitor(void) {
+  if(competitor_joined)return;
+#ifdef _WIN32
+  assert(WaitForSingleObject((HANDLE)competitor_process,10000)==WAIT_OBJECT_0);
+  DWORD result=99;assert(GetExitCodeProcess((HANDLE)competitor_process,&result) && result==0);
+  CloseHandle((HANDLE)competitor_process);
+#else
+  int status=0;assert(waitpid(competitor_process,&status,0)==competitor_process);
+  assert(WIFEXITED(status) && WEXITSTATUS(status)==0);
+#endif
+  competitor_joined=1;
+}
+static void concurrent_handoff_boundary(void) {
+  char lock_path[1100];snprintf(lock_path,sizeof(lock_path),"%s.lock",getenv("EDR_COMMAND_STATE_DB"));
+  FILE *probe=state_open_lock_secure(lock_path);assert(probe);
+#ifdef _WIN32
+  HANDLE file=(HANDLE)_get_osfhandle(_fileno(probe));OVERLAPPED ov={0};
+  BOOL acquired=LockFileEx(file,LOCKFILE_EXCLUSIVE_LOCK|LOCKFILE_FAIL_IMMEDIATELY,0,1,0,&ov);
+  if(acquired)assert(UnlockFileEx(file,0,1,0,&ov));
+  else assert(GetLastError()==ERROR_LOCK_VIOLATION);
+#else
+  int acquired=flock(fileno(probe),LOCK_EX|LOCK_NB)==0;
+  if(acquired)assert(flock(fileno(probe),LOCK_UN)==0);
+  else assert(errno==EWOULDBLOCK || errno==EAGAIN);
+#endif
+  assert(fclose(probe)==0);handoff_lock_held=!acquired;
+#ifdef _WIN32
+  competitor_process=_spawnl(_P_NOWAIT,test_executable,test_executable,"--concurrent-publish",
+      concurrent_stage.command_id,competitor_marker,NULL);assert(competitor_process!=-1);
+#else
+  competitor_process=fork();assert(competitor_process>=0);
+  if(!competitor_process){execl(test_executable,test_executable,"--concurrent-publish",
+      concurrent_stage.command_id,competitor_marker,(char*)NULL);_exit(127);}
+#endif
+  unsigned waits=0;
+  while(!exists(competitor_marker) && waits++<5000u) {
+#ifdef _WIN32
+    Sleep(1);
+#else
+    struct timespec pause={0,1000000};nanosleep(&pause,NULL);
+#endif
+  }
+  assert(exists(competitor_marker));
+  if(!handoff_lock_held) {
+    wait_competitor(); /* Old A now carries stale credit while only B remains. */
+    uint64_t floor=0;assert(edr_storage_min_free_bytes(&floor)==0);
+    uint64_t reserved=edr_storage_artifact_reserved();EdrStoragePhysicalSnapshot snapshot;
+    uint64_t stale=2u*EDR_COMMAND_STATE_LINE_CAP+12288u;
+    assert(edr_storage_physical_admit_owned(concurrent_stage.artifact,12288u,0,stale,&snapshot)==0);
+    borrowed_floor_bytes=floor+reserved-snapshot.min_free_bytes;
+  }
+}
+static void create_stage_fixture(EdrCommandArtifactStage *stage,const char *id,int ready) {
+  memset(stage,0,sizeof(*stage));snprintf(stage->command_id,sizeof(stage->command_id),"%s",id);
+  strcpy(stage->command_type,"collect_forensic");stage->meta=meta;
+  snprintf(stage->meta.idempotency_key,sizeof(stage->meta.idempotency_key),"%s|stage",id);
+  snprintf(stage->artifact,sizeof(stage->artifact),"%s/%s.tgz",dir,id);
+  snprintf(stage->staging,sizeof(stage->staging),"%s.staging",stage->artifact);
+  snprintf(stage->workspace,sizeof(stage->workspace),"%s/%s.work",dir,id);
+  stage->peak_bytes=129u*1024u*1024u;stage->phase=1;int retry=0;
+  assert(edr_command_state_begin(id,stage->command_type,&stage->meta,&retry,NULL)==0);
+  assert(edr_command_state_artifact_begin(stage)==0);put(stage->staging,"bounded forensic fixture");
+  if(ready){assert(edr_command_state_artifact_ready(id,sha)==0);stage->phase=2;strcpy(stage->sha256,sha);}
+}
+static void test_concurrent_handoff_credit(void) {
+  setup("concurrent-credit");EdrCommandArtifactStage other;
+  create_stage_fixture(&concurrent_stage,"cmd_concurrent_A",1);
+  create_stage_fixture(&other,"cmd_concurrent_B",0);
+  snprintf(competitor_marker,sizeof(competitor_marker),"%s/competitor.started",dir);
+  handoff_lock_held=competitor_joined=0;borrowed_floor_bytes=0;
+  missing_terminal_record_hook=concurrent_handoff_boundary;
+  int result=edr_command_upload_outbox_publish_stage(&concurrent_stage);
+  assert(missing_terminal_record_hook==NULL);wait_competitor();
+  printf("concurrent_handoff owner_lock_held=%d other_owner_floor_borrowed=%llu reservation_after=%llu\n",
+      handoff_lock_held,(unsigned long long)borrowed_floor_bytes,(unsigned long long)edr_storage_artifact_reserved());fflush(stdout);
+  assert(handoff_lock_held && borrowed_floor_bytes==0 && result==0);
+  assert(edr_storage_artifact_reserved()==other.peak_bytes);
+  unsigned prior_flushes=metadata_flushes;
+  assert(edr_command_upload_outbox_publish_stage(&concurrent_stage)==0);
+  assert(metadata_flushes==prior_flushes); /* phase3 neither reacquires credit nor rewrites metadata */
+  assert(edr_storage_artifact_reserved()==other.peak_bytes && exists(other.staging));
+  assert(edr_command_state_artifact_abandon(other.command_id)==0);
+  /* A metadata write failure must leave the same phase2 owner and credit. */
+  setup("handoff-failure");create_stage_fixture(&concurrent_stage,"cmd_handoff_failed",1);
+  uint64_t before=edr_storage_artifact_reserved();fail_flush=1;
+  assert(edr_command_upload_outbox_publish_stage(&concurrent_stage)!=0);
+  assert(edr_storage_artifact_reserved()==before);
+  size_t cursor=0;EdrCommandArtifactStage pending;
+  assert(edr_command_state_artifact_next(&cursor,&pending)==1 && pending.phase==2 &&
+      !strcmp(pending.command_id,concurrent_stage.command_id));
+  assert(exists(concurrent_stage.artifact) && !upload_calls);
+  assert(edr_command_upload_outbox_publish_stage(&concurrent_stage)==0 && !edr_storage_artifact_reserved());
+  puts("handoff_failure phase2_credit_retained=1 retry_idempotent=1 no_remote_upload=1");
+}
+
 int main(int argc,char **argv) {
   test_executable=argv[0];
+  if(argc==4 && !strcmp(argv[1],"--concurrent-publish")) {
+    put(argv[3],"started");
+    EdrCommandStateCapacityStats stats;assert(edr_command_state_get_capacity_stats(&stats)==0);
+    FILE *lock=state_lock_acquire();assert(lock);cJSON *record=artifact_latest_locked(argv[2]);
+    EdrCommandArtifactStage stage;assert(record && artifact_fill(record,&stage)==0);
+    const cJSON *a=cJSON_GetObjectItemCaseSensitive(record,"artifact_stage");
+    snprintf(stage.sha256,sizeof(stage.sha256),"%s",result_text(a,"sha256"));
+    stage.phase=2;cJSON_Delete(record);state_lock_release(lock);
+    assert(edr_command_upload_outbox_publish_stage(&stage)==0);return 0;
+  }
+  if(argc==3 && !strcmp(argv[1],"--stage-interrupted")) {
+    EdrCommandStateCapacityStats stats;assert(edr_command_state_get_capacity_stats(&stats)==0);
+    size_t cursor=0;EdrCommandArtifactStage stage;
+    assert(edr_command_state_artifact_next(&cursor,&stage)==1 && !strcmp(stage.command_id,argv[2]));
+    assert(stage.phase==1 && stage.interrupted && edr_command_state_artifact_abandon(stage.command_id)==-1);
+    assert(edr_command_upload_outbox_publish_stage(&stage)==0);
+    assert(edr_command_state_has_final(stage.command_id,&stage.meta)==1);
+    assert(edr_storage_artifact_reserved()==stage.peak_bytes && exists(stage.staging));
+    cursor=0;assert(edr_command_state_artifact_next(&cursor,&stage)==0);
+    assert(!upload_calls && !metadata_flushes);return 0;
+  }
+  if(argc==3 && !strcmp(argv[1],"--stage-restart")) {
+    EdrCommandStateCapacityStats stats;assert(edr_command_state_get_capacity_stats(&stats)==0 && stats.artifact_reserved_bytes>0);
+    size_t cursor=0;EdrCommandArtifactStage stage;
+    assert(edr_command_state_artifact_next(&cursor,&stage)==1 && !strcmp(stage.command_id,argv[2]));
+    assert(edr_command_state_artifact_abandon(stage.command_id)==-1);
+    assert(edr_command_upload_outbox_publish_stage(&stage)==0 && !edr_storage_artifact_reserved());
+    assert(!upload_calls && metadata_flushes==1u && owner_flushes==1u);return 0;
+  }
+  if(argc==3 && !strcmp(argv[1],"--retry-restart")) {
+    int attempted=99;
+    assert(edr_command_upload_outbox_flush_one(argv[2],&attempted)==-6);
+    assert(!attempted && !hashed_bytes && !metadata_flushes && !upload_calls);return 0;
+  }
   if(argc==3 && !strcmp(argv[1],"--held-restart")) {
     policy_result=EDR_EGRESS_REQUEST_DENIED;int attempted=99;
     assert(edr_command_upload_outbox_flush_one(argv[2],&attempted)==EDR_EGRESS_REQUEST_DENIED);
@@ -448,12 +829,24 @@ int main(int argc,char **argv) {
 #endif
   strcpy(meta.idempotency_key, "idempotency|retained"); strcpy(meta.soar_correlation_id, "correlation");
   strcpy(meta.playbook_run_id, "run"); strcpy(meta.playbook_step_id, "step");
+  if (argc == 2 && !strcmp(argv[1], "--credit-handoff")) {
+    test_concurrent_handoff_credit();return 0;
+  }
   if (argc == 2 && !strcmp(argv[1], "--physical-admission")) {
     test_metadata_physical_admission();
     puts("outbox physical admission contract passed"); return 0;
   }
   test_metadata_physical_admission();
+  test_concurrent_handoff_credit();
+  test_durable_retry_and_deadline();test_retry_persist_failure_and_unknown_deadline();test_owner_final_preserved();
+  test_staging_owner_recovery();test_staging_interrupted_and_final();
+#ifndef _WIN32
+  test_stage_own_metadata_credit();
+#endif
   test_policy_hold_before_hash();
+#ifdef _WIN32
+  test_windows_bounded_metadata_publication();
+#endif
   test_enqueue_failures(); test_legacy_upgrade(); test_reopen_after_terminal_failure();
   test_rename_retry(); test_receipt_failure(); test_terminal_commit_before_receipt_failure();
   test_readable_terminal_is_not_a_durable_commit(); test_failure_receipt_survives_artifact_recovery();

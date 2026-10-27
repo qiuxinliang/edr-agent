@@ -2,10 +2,12 @@
 #define EDR_STORAGE_PHYSICAL_GUARD_H
 
 #include "edr/command_state.h"
+#include "edr/storage_reservation.h"
 #include <errno.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #ifdef _WIN32
 #include <windows.h>
 #else
@@ -20,6 +22,27 @@ typedef struct EdrStoragePhysicalSnapshot {
   uint64_t available_bytes, required_bytes, min_free_bytes;
   const char *cause;
 } EdrStoragePhysicalSnapshot;
+
+/* UINT64_MAX means unknown, never an empty file. Missing WAL/SHM (ENOENT)
+ * is normal; access errors, invalid paths and non-files must fail closed.
+ * This measures file length, not allocated blocks or a directory quota. */
+static inline uint64_t edr_storage_file_size(const char *path) {
+  if (!path || !*path) return UINT64_MAX;
+#if defined(_WIN32) && defined(_MSC_VER)
+  struct __stat64 st;
+  if (_stat64(path, &st) != 0) return errno == ENOENT ? 0u : UINT64_MAX;
+  if (!(st.st_mode & _S_IFREG) || st.st_size < 0) return UINT64_MAX;
+#else
+  struct stat st;
+  if (stat(path, &st) != 0) return errno == ENOENT ? 0u : UINT64_MAX;
+  if (!S_ISREG(st.st_mode) || st.st_size < 0) return UINT64_MAX;
+#endif
+  return (uint64_t)st.st_size;
+}
+
+static inline uint64_t edr_storage_add_bytes(uint64_t a, uint64_t b) {
+  return UINT64_MAX - a < b ? UINT64_MAX : a + b;
+}
 
 static inline int edr_storage_parse_u64(const char *s, uint64_t *value) {
   uint64_t n = 0;
@@ -117,8 +140,8 @@ static inline int edr_storage_volume_available(const char *file, uint64_t *avail
   return -1;
 }
 
-static inline int edr_storage_physical_admit(const char *file, uint64_t growth_bytes,
-    int reserved_write, EdrStoragePhysicalSnapshot *out) {
+static inline int edr_storage_physical_admit_owned(const char *file, uint64_t growth_bytes,
+    int reserved_write, uint64_t artifact_credit, EdrStoragePhysicalSnapshot *out) {
   uint64_t floor = 0, available = 0;
   EdrStoragePhysicalSnapshot s = {0, growth_bytes, 0, "physical_configuration_invalid"};
   int configured = edr_storage_min_free_bytes(&floor);
@@ -130,13 +153,28 @@ static inline int edr_storage_physical_admit(const char *file, uint64_t growth_b
     if (out) *out = s;
     return -2;
   }
+  uint64_t artifact_reserved=edr_storage_artifact_reserved();
+  if(artifact_reserved==UINT64_MAX || artifact_credit>artifact_reserved) {
+    s.cause="artifact_reservation_unavailable";if(out)*out=s;return -2;
+  }
+  /* Existing DB/command reserved completion may consume its own old floor,
+   * but never another artifact owner's promised growth. A producer receives
+   * credit only from its frozen durable staging owner. Across volumes the
+   * global balance is conservatively retained on each volume, never borrowed. */
+  floor=edr_storage_add_bytes(reserved_write?0u:floor,artifact_reserved-artifact_credit);
+  if(floor==UINT64_MAX) {s.cause="physical_size_overflow";if(out)*out=s;return -2;}
   s.min_free_bytes = floor;
   if (edr_storage_volume_available(file, &available) != 0) {
     s.cause = "volume_free_space_unavailable";
     if (out) *out = s;
     return -2;
   }
-  return edr_storage_physical_evaluate(available, growth_bytes, floor, reserved_write, out);
+  return edr_storage_physical_evaluate(available, growth_bytes, floor, 0, out);
+}
+
+static inline int edr_storage_physical_admit(const char *file, uint64_t growth_bytes,
+    int reserved_write, EdrStoragePhysicalSnapshot *out) {
+  return edr_storage_physical_admit_owned(file,growth_bytes,reserved_write,0u,out);
 }
 
 #endif

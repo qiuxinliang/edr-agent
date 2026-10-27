@@ -1,7 +1,14 @@
 #include "edr/storage_physical_guard.h"
 #include <assert.h>
 #include <stdio.h>
+#ifndef _WIN32
+#include <unistd.h>
+#include <sys/wait.h>
+#endif
 #ifdef _WIN32
+#include <fcntl.h>
+#include <io.h>
+#include <process.h>
 #define env(k,v) _putenv_s(k,v)
 #else
 #define env(k,v) setenv(k,v,1)
@@ -9,6 +16,14 @@
 int main(int argc, char **argv) {
   EdrStoragePhysicalSnapshot s;
   uint64_t value=0;
+#ifdef _WIN32
+  if(argc==3 && !strcmp(argv[1],"--reservation-child")) {
+    int fd=_open(argv[2],_O_RDWR|_O_BINARY);assert(fd>=0);
+    assert(edr_storage_reservation_attach(fd,argv[2])==0);
+    assert(edr_storage_artifact_reserved()==123u);
+    edr_storage_reservation_publish(456u);assert(_close(fd)==0);return 0;
+  }
+#endif
   /* Called only by the isolated native-volume fixture. It supplies a file
    * below its newly created mount; this executable never allocates disk data. */
   if (argc == 4 && !strcmp(argv[1], "--test-volume")) {
@@ -27,6 +42,72 @@ int main(int argc, char **argv) {
     return 0;
   }
   assert(argc == 1);
+  assert(edr_storage_reservation_readonly_snapshot(123u)==0 && edr_storage_artifact_reserved()==123u);
+  edr_storage_reservation_publish(UINT64_MAX);
+  assert(edr_storage_artifact_reserved()==UINT64_MAX);
+  assert(edr_storage_physical_admit(".",1,1,&s)==-2); /* startup failed before mapping */
+  edr_storage_reservation_publish(0u);
+  assert(edr_storage_file_size(NULL)==UINT64_MAX);
+  assert(edr_storage_file_size("")==UINT64_MAX);
+  assert(edr_storage_file_size(".")==UINT64_MAX);
+#ifdef _WIN32
+  char temp[MAX_PATH],mapped[MAX_PATH],replacement[MAX_PATH],self[MAX_PATH];
+  assert(GetTempPathA(sizeof(temp),temp));
+  assert(GetTempFileNameA(temp,"erg",0,mapped));
+  int map_fd=_open(mapped,_O_RDWR|_O_BINARY);assert(map_fd>=0);
+  assert(edr_storage_reservation_attach(map_fd,mapped)==0);
+  edr_storage_reservation_publish(123u);
+  assert(edr_storage_reservation_readonly_snapshot(1u)==-1 && edr_storage_artifact_reserved()==123u);
+  DWORD self_size=GetModuleFileNameA(NULL,self,sizeof(self));assert(self_size && self_size<sizeof(self));
+  assert(_spawnl(_P_WAIT,self,self,"--reservation-child",mapped,NULL)==0);
+  assert(edr_storage_artifact_reserved()==456u); /* actual new process, same mapping */
+  assert(GetTempFileNameA(temp,"erg",0,replacement));
+  int replacement_fd=_open(replacement,_O_RDWR|_O_BINARY);assert(replacement_fd>=0);
+  /* Supplying a different real fd with the same owner key must remap by
+   * volume/file identity. This does not pretend that a mapped Windows file
+   * can always be renamed; the production identity check is the boundary. */
+  assert(edr_storage_reservation_attach(replacement_fd,mapped)==0);
+  edr_storage_reservation_publish(789u);
+  assert(edr_storage_reservation_attach(map_fd,mapped)==0 && edr_storage_artifact_reserved()==456u);
+  assert(edr_storage_reservation_attach(replacement_fd,mapped)==0 && edr_storage_artifact_reserved()==789u);
+  edr_storage_reservation_publish(0u);
+  assert(_close(map_fd)==0 && _close(replacement_fd)==0);
+  /* Shared mappings deliberately survive readers until this process exits.
+   * Keep these two tiny synthetic TEMP files for the test evidence inventory. */
+  puts("Windows reservation: exec child shared balance, fd identity remap, runtime/read-only separation PASS");
+#else
+  char fixture[]="/tmp/edr-stat-accounting.XXXXXX";
+  int fd=mkstemp(fixture);assert(fd>=0);
+  assert(write(fd,"12345",5)==5 && close(fd)==0);
+  assert(edr_storage_file_size(fixture)==5);
+  char child[128];snprintf(child,sizeof(child),"%s/child",fixture);
+  assert(edr_storage_file_size(child)==UINT64_MAX); /* ENOTDIR != missing */
+  assert(unlink(fixture)==0);
+  char mapped[]="/tmp/edr-reservation-map.XXXXXX";
+  int map_fd=mkstemp(mapped);assert(map_fd>=0);
+  assert(edr_storage_reservation_attach(map_fd,mapped)==0);
+  edr_storage_reservation_publish(123u);assert(edr_storage_artifact_reserved()==123u);
+  assert(edr_storage_reservation_readonly_snapshot(1u)==-1 && edr_storage_artifact_reserved()==123u);
+  pid_t child_pid=fork();assert(child_pid>=0);
+  if(!child_pid){edr_storage_reservation_publish(456u);_exit(0);}
+  int child_status=0;assert(waitpid(child_pid,&child_status,0)==child_pid && WIFEXITED(child_status));
+  assert(edr_storage_artifact_reserved()==456u); /* shared, not a TU/process-local copy */
+  char replacement[]="/tmp/edr-reservation-replacement.XXXXXX";
+  int replacement_fd=mkstemp(replacement);assert(replacement_fd>=0);
+  assert(rename(replacement,mapped)==0);
+  assert(edr_storage_reservation_attach(replacement_fd,mapped)==0);
+  edr_storage_reservation_publish(789u);assert(edr_storage_artifact_reserved()==789u);
+  assert(edr_storage_reservation_attach(map_fd,mapped)==0);
+  assert(edr_storage_artifact_reserved()==456u); /* same path, different fd identity */
+  assert(edr_storage_reservation_attach(replacement_fd,mapped)==0 && edr_storage_artifact_reserved()==789u);
+  edr_storage_reservation_publish(0u);
+  assert(close(map_fd)==0 && close(replacement_fd)==0 && unlink(mapped)==0);
+  assert(edr_storage_file_size(fixture)==0); /* genuinely absent WAL */
+  assert(symlink(fixture,fixture)==0);
+  assert(edr_storage_file_size(fixture)==UINT64_MAX); /* ELOOP != empty */
+  assert(unlink(fixture)==0);
+#endif
+  assert(edr_storage_add_bytes(UINT64_MAX,1)==UINT64_MAX);
   assert(edr_storage_parse_u64("18446744073709551615",&value)==0 && value==UINT64_MAX);
   assert(edr_storage_parse_u64("18446744073709551616",&value)!=0);
   assert(edr_storage_parse_u64("-1",&value)!=0);

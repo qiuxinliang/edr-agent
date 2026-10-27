@@ -872,7 +872,42 @@ static void parent_context_result_tests(void) {
   cJSON_Delete(q);cJSON_Delete(d);cJSON_free(full_q);cJSON_free(full_d);
 }
 
-int main(void) {
+static int export_recall_projection(const char *input, const char *output) {
+  /* Bridge the real cache fixture into the production result-purpose boundary;
+   * strings preserve exact bytes for downstream cross-language verification. */
+  char raw[65536]; FILE *file=fopen(input,"rb");CHECK(file);
+  size_t n=fread(raw,1,sizeof(raw)-1,file);CHECK(!ferror(file) && feof(file));
+  CHECK(fclose(file)==0);raw[n]=0;
+  cJSON *fixture=cJSON_Parse(raw);CHECK(fixture);
+  const cJSON *schema=cJSON_GetObjectItemCaseSensitive(fixture,"schema");
+  CHECK(cJSON_IsString(schema) && !strcmp(schema->valuestring,"edr.synthetic-recall-fixture.v1"));
+  EdrCommandResultAuthorization auth={0};strcpy(auth.command_type,"rtq_query");
+  struct { const char *key; char *out; size_t cap; } fields[]={
+    {"command_id",auth.command_id,sizeof(auth.command_id)},
+    {"tenant_id",auth.tenant_id,sizeof(auth.tenant_id)},
+    {"endpoint_id",auth.endpoint_id,sizeof(auth.endpoint_id)},
+    {"content_contract_json",auth.content_contract,sizeof(auth.content_contract)}};
+  for(size_t i=0;i<sizeof(fields)/sizeof(fields[0]);i++) {
+    const cJSON *value=cJSON_GetObjectItemCaseSensitive(fixture,fields[i].key);
+    CHECK(cJSON_IsString(value) && strlen(value->valuestring)<fields[i].cap);
+    strcpy(fields[i].out,value->valuestring);
+  }
+  const cJSON *detail=cJSON_GetObjectItemCaseSensitive(fixture,"detail_json");
+  CHECK(cJSON_IsString(detail));char projected[EDR_COMMAND_STATE_DETAIL_CAP],canonical[EDR_COMMAND_STATE_DETAIL_CAP];
+  CHECK(edr_command_result_project_detail(&auth,"rtq_query",1,0,detail->valuestring,projected,sizeof(projected))==0);
+  CHECK(edr_command_result_project_detail(&auth,"rtq_query",1,0,projected,canonical,sizeof(canonical))==0);
+  CHECK(!strcmp(projected,canonical));
+  CHECK(cJSON_AddStringToObject(fixture,"query_detail_json",detail->valuestring));
+  CHECK(cJSON_ReplaceItemInObjectCaseSensitive(fixture,"detail_json",cJSON_CreateString(projected)));
+  char *encoded=cJSON_PrintUnformatted(fixture);CHECK(encoded);
+  file=fopen(output,"wx");CHECK(file);
+  CHECK(fwrite(encoded,1,strlen(encoded),file)==strlen(encoded) && fclose(file)==0);
+  printf("PASS: real recall result projection bytes=%zu canonical=yes\n",strlen(projected));
+  cJSON_free(encoded);cJSON_Delete(fixture);return 0;
+}
+int main(int argc, char **argv) {
+  if(argc==4 && !strcmp(argv[1],"--project-recall"))return export_recall_projection(argv[2],argv[3]);
+  CHECK(argc==1);
   char path[256];snprintf(path,sizeof(path),"./command-egress-%ld",(long)pid());
   env("EDR_COMMAND_STATE_DIR",path);
   EdrSoarCommandMeta m=task("cmd-query","rtq_execute");

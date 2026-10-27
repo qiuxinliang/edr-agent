@@ -14,6 +14,7 @@
 #include "edr/agent_lifecycle_command.h"
 #include "edr/command.h"
 #include "command_upload_outbox.h"
+#include "edr/storage_reservation.h"
 #include "edr/command_cancel.h"
 #include "edr/command_contract.h"
 #include "edr/command_executor.h"
@@ -215,15 +216,18 @@ static void command_update_max_u32(uint32_t value, uint32_t *max_value) {
   }
 }
 
-static int delivery_health_upload_backoff_active(int64_t now_ms) {
-  int active;
+static void delivery_health_upload_backoff_skipped(void) {
   delivery_health_lock();
-  active = s_upload_outbox_next_retry_ms > now_ms;
-  if (active) {
-    s_delivery_health.upload_skipped_backoff++;
-  }
+  s_delivery_health.upload_skipped_backoff++;
   delivery_health_unlock();
-  return active;
+}
+
+static int delivery_health_upload_locally_paused(int64_t now_ms) {
+  delivery_health_lock();
+  int paused=s_upload_outbox_next_retry_ms>now_ms;
+  if(paused)s_delivery_health.upload_skipped_backoff++;
+  delivery_health_unlock();
+  return paused;
 }
 
 static void delivery_health_upload_attempted(void) {
@@ -232,14 +236,14 @@ static void delivery_health_upload_attempted(void) {
   delivery_health_unlock();
 }
 
-static void delivery_health_upload_result(int rc, int64_t now_ms) {
+static void delivery_health_upload_result(int succeeded,int local_retry,int64_t now_ms) {
   delivery_health_lock();
-  if (rc > 0) {
-    s_delivery_health.upload_succeeded++;
+  if(succeeded)s_delivery_health.upload_succeeded++;
+  else s_delivery_health.upload_failed++;
+  if (succeeded && !local_retry) {
     s_upload_outbox_fail_streak = 0u;
     s_upload_outbox_next_retry_ms = 0;
-  } else if (rc < 0) {
-    s_delivery_health.upload_failed++;
+  } else {
     s_upload_outbox_fail_streak++;
     uint32_t base_s = command_u32_env_clamped("EDR_UPLOAD_OUTBOX_RETRY_BACKOFF_S",
                                                60u, 10u, 3600u);
@@ -250,7 +254,10 @@ static void delivery_health_upload_result(int rc, int64_t now_ms) {
     if (backoff_s > cap_s) {
       backoff_s = cap_s;
     }
-    s_upload_outbox_next_retry_ms = now_ms + (int64_t)backoff_s * 1000LL;
+    /* Normal remote failures own durable per-file schedules. Retain the
+     * existing volatile brake only when local receipt/schedule persistence
+     * failed, so an unavailable disk cannot cause a rapid uncertain retry. */
+    s_upload_outbox_next_retry_ms = local_retry ? now_ms + (int64_t)backoff_s * 1000LL : 0;
   }
   delivery_health_unlock();
 }
@@ -3393,10 +3400,18 @@ static void flush_upload_outbox(void) {
     next_scan_index = 0u;
   }
   int64_t now_ms = command_now_ms();
-  if (delivery_health_upload_backoff_active(now_ms)) {
-    return;
-  }
+  if(delivery_health_upload_locally_paused(now_ms))return;
   uint32_t max_per_poll = command_u32_env_clamped("EDR_UPLOAD_OUTBOX_MAX_PER_POLL", 1u, 1u, 64u);
+  static size_t stage_cursor;
+  if(edr_storage_artifact_reserved()) {
+    EdrCommandArtifactStage stage;
+    if(edr_command_state_artifact_next(&stage_cursor,&stage)==1) {
+      (void)edr_command_upload_outbox_publish_stage(&stage);
+      /* Recovery consumes one existing outbox poll slot, never adds another
+       * background pass or increases the configured work budget. */
+      if(--max_per_poll==0u)return;
+    }
+  }
   uint32_t attempted_this_poll = 0u;
   uint32_t seen_this_poll = 0u;
   uint32_t scan_start = next_scan_index, examined_this_poll = 0u;
@@ -3424,14 +3439,15 @@ static void flush_upload_outbox(void) {
       next_scan_index = seen_this_poll;
       int attempted = 0;
       int rc = edr_command_upload_outbox_flush_one(path, &attempted);
+      if (rc == -6) delivery_health_upload_backoff_skipped();
       if (attempted) {
         attempted_this_poll++;
         delivery_health_upload_attempted();
-        delivery_health_upload_result(rc == -1 ? -1 : 1, now_ms);
+        delivery_health_upload_result(rc!=-1 && rc!=EDR_UPLOAD_OUTBOX_RETRY_PERSIST_FAILED,
+            rc==-2 || rc==EDR_UPLOAD_OUTBOX_RETRY_PERSIST_FAILED,now_ms);
       }
-      /* Local corruption or rename failures must not strand another artifact.
-       * Network failures retain the existing capped global backoff. */
-      if (rc == -1) { traversal_complete = 0; break; }
+      /* Each file persists its own retry due time. One failed destination
+       * cannot postpone unrelated due artifacts or lose backoff on restart. */
     }
   } while (FindNextFileA(h, &fd));
   FindClose(h);
@@ -3458,14 +3474,14 @@ static void flush_upload_outbox(void) {
       next_scan_index = seen_this_poll;
       int attempted = 0;
       int rc = edr_command_upload_outbox_flush_one(path, &attempted);
+      if (rc == -6) delivery_health_upload_backoff_skipped();
       if (attempted) {
         attempted_this_poll++;
         delivery_health_upload_attempted();
-        delivery_health_upload_result(rc == -1 ? -1 : 1, now_ms);
+        delivery_health_upload_result(rc!=-1 && rc!=EDR_UPLOAD_OUTBOX_RETRY_PERSIST_FAILED,
+            rc==-2 || rc==EDR_UPLOAD_OUTBOX_RETRY_PERSIST_FAILED,now_ms);
       }
-      /* Local corruption or rename failures must not strand another artifact.
-       * Network failures retain the existing capped global backoff. */
-      if (rc == -1) { traversal_complete = 0; break; }
+      /* The per-record durable schedule also survives service restarts. */
     }
   }
   closedir(d);

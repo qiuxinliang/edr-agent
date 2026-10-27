@@ -104,6 +104,7 @@ typedef struct EdrCommandStateCapacityStats {
   uint64_t budget_bytes, new_record_bytes, legacy_bytes, reserved_bytes, protected_floor_bytes;
   uint64_t reserved_owner_count, update_headroom_bytes, admission_rejected, persistence_failed, calibrations;
   uint64_t record_count, reserved_record_slots;
+  uint64_t artifact_reserved_bytes;
   char last_error[96];
 } EdrCommandStateCapacityStats;
 int edr_command_state_get_capacity_stats(EdrCommandStateCapacityStats *out);
@@ -124,6 +125,33 @@ enum {
   EDR_COMMAND_STATE_INVENTORY_DEADLINE_BEFORE_REQUEST = -4
 };
 int edr_command_state_read_capacity_inventory(EdrCommandStateCapacityStats *out);
+
+/* One bounded artifact per existing command owner. Unknown historical files
+ * are never adopted. Publishing is frozen only after the writer closes and
+ * hashes its staging file; collecting after a crash remains protected. */
+typedef struct EdrCommandArtifactStage {
+  char command_id[128], command_type[64];
+  char artifact[1024], staging[1032], workspace[1024], sha256[65];
+  EdrSoarCommandMeta meta;
+  uint64_t peak_bytes;
+  int phase; /* 1 collecting, 2 publishing; 0 no active reservation */
+  int interrupted; /* different service instance; writer termination unknown */
+} EdrCommandArtifactStage;
+int edr_command_state_artifact_begin(const EdrCommandArtifactStage *stage);
+int edr_command_state_artifact_ready(const char *command_id,const char *sha256);
+/* Only the original live producer, after its writer has stopped. No deletion. */
+int edr_command_state_artifact_abandon(const char *command_id);
+/* Existing outbox poll budget only; no new directory walk. cursor is reset by
+ * caller after 0. Returns 1 publishing or interrupted collecting owner,
+ * 0 end, -1 unavailable. */
+int edr_command_state_artifact_next(size_t *cursor,EdrCommandArtifactStage *out);
+int edr_command_state_artifact_meta(const char *command_id,const char *command_type,EdrSoarCommandMeta *out);
+/* Handoff runs only for the exact frozen phase2 owner while its existing file
+ * lock protects credit through durable publication and phase3. The callback
+ * must not reenter command-state APIs; failure retains phase2 and its credit. */
+int edr_command_state_artifact_handoff(const EdrCommandArtifactStage *stage,
+    int (*publish)(const EdrCommandArtifactStage *frozen, uint64_t credit));
+int edr_command_state_artifact_mark_interrupted(const char *command_id);
 
 enum {
   EDR_COMMAND_STATE_BEGIN_ERROR = -1,

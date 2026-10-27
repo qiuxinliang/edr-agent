@@ -3,6 +3,7 @@
 #include "edr/ingest_http.h"
 #include "edr/egress_request_policy.h"
 #include "edr/sha256.h"
+#include "edr/forensic_limits.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -43,6 +44,12 @@ typedef struct DcLocalArgs {
   size_t count;
 } DcLocalArgs;
 
+static int dc_baseline_collection_scope(const char *scope) {
+  return scope && (!strcmp(scope,"collect_forensic") || !strcmp(scope,"triage") ||
+      !strcmp(scope,"standard") || !strcmp(scope,"full") || !strcmp(scope,"all") ||
+      !strcmp(scope,"collector") || !strcmp(scope,"deep_forensic") || !strcmp(scope,"collector:start"));
+}
+
 static int dc_local_path(const char *path) {
   if (!path || !path[0] || strlen(path) >= 1024u || strstr(path, "://") ||
       !strncmp(path, "//", 2u) || !strncmp(path, "\\\\", 2u)) return 0;
@@ -75,7 +82,7 @@ static int dc_local_arguments(const char *scope, const char *output_dir,
   for (const unsigned char *p = (const unsigned char *)scope; *p; ++p)
     if (!((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
           (*p >= '0' && *p <= '9') || *p == '-' || *p == '_')) goto denied;
-  if (!extra || !*extra) return 1;
+  if (!extra || !*extra) goto parsed;
   if (strlen(extra) >= sizeof(args->text)) goto denied;
   char *out = args->text;
   const char *in = extra;
@@ -105,6 +112,18 @@ static int dc_local_arguments(const char *scope, const char *output_dir,
     else if (!strcmp(token, "--full")) bit = 32u;
     if (!bit || (seen & bit)) goto denied;
     seen |= bit;
+  }
+parsed:
+  /* Neither the pinned unmodified Velociraptor nor the old external builtin
+   * has a write-time archive ceiling. Reject before resolving/downloading or
+   * spawning either helper; the command owner may use its bounded in-process
+   * baseline, while strict external requests remain failed. Query purposes
+   * and explicit memory/targeted commands retain their existing contracts. */
+  if (!(seen & 1u) && dc_baseline_collection_scope(scope)) {
+    if (detail && detail_cap) snprintf(detail, detail_cap,
+        "baseline_output_limit_unsupported: external helper cannot enforce %u bytes",
+        (unsigned)EDR_FORENSIC_BASELINE_MAX_BYTES);
+    return 0;
   }
   return 1;
 denied:

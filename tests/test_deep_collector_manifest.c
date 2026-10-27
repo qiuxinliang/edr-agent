@@ -564,7 +564,7 @@ static void test_async_collector_wall_timeout(void) {
   expect_true(write_file_bytes(script, body) == 0, "write timeout collector");
   expect_true(chmod(script, 0700) == 0, "make timeout collector executable");
   EdrCollectorRunSpec spec = {0};
-  spec.collector_bin = script; spec.scope = "triage"; spec.output_dir = dir; spec.timeout_s = 1;
+  spec.collector_bin = script; spec.scope = "timeout-test"; spec.output_dir = dir; spec.timeout_s = 1;
   expect_true(edr_deep_collector_spawn(&spec, detail, sizeof(detail)) == EDR_DC_OK, "spawn timeout collector");
   int rc = 1, ec = 0;
   for (unsigned i = 0; i < 30 && rc > 0; ++i) {
@@ -662,6 +662,29 @@ static void test_collector_arguments_cannot_create_independent_egress(void) {
               "legacy launch rejects an independent upload URL");
 }
 
+static void test_external_baseline_rejected_before_spawn_or_download(void) {
+  const char *scopes[]={"collect_forensic","triage","standard","full","all","collector","deep_forensic"};
+  unsigned before=g_download_calls;
+  for(size_t i=0;i<sizeof(scopes)/sizeof(scopes[0]);i++) {
+    for(int fixed=0;fixed<2;fixed++) {
+      EdrCollectorRunSpec spec={0};char detail[256];
+      spec.scope=scopes[i];spec.output_dir=".";spec.collector_bin="synthetic-absent-local-collector";
+      spec.fixed_local_binary=fixed;spec.needs_velociraptor=!fixed;
+      expect_true(edr_deep_collector_spawn(&spec,detail,sizeof(detail))==EDR_DC_ERR_DISABLED,
+          "baseline helper rejected before spawn");
+      expect_true(strstr(detail,"baseline_output_limit_unsupported")!=NULL,
+          "baseline failure reports missing hard output limit");
+      expect_true(edr_deep_collector_run_blocking(&spec,detail,sizeof(detail))==EDR_DC_ERR_DISABLED,
+          "blocking baseline helper also rejected");
+      expect_true(!edr_deep_collector_is_running(),"baseline rejection did not create a child");
+    }
+    EdrDeepCollectorParams legacy={0};legacy.scope=scopes[i];legacy.output_dir=".";
+    expect_true(edr_deep_collector_launch(&legacy)==EDR_DC_ERR_DISABLED,
+        "legacy baseline launch cannot bypass the bound");
+  }
+  expect_true(g_download_calls==before,"baseline rejection performs no download");
+}
+
 #ifndef _WIN32
 static void test_local_collector_preserves_quoted_paths(void) {
   char dir[512], script[600], rows[640], extra[1500], detail[256];
@@ -692,6 +715,7 @@ int main(int argc, char **argv) {
   (void)argc; (void)argv;
 #endif
   test_collector_arguments_cannot_create_independent_egress();
+  test_external_baseline_rejected_before_spawn_or_download();
   test_json_url_unescape();
   test_json_str_rejects_oversized_manifest_value();
   test_download_detail_keeps_curl_exit_when_prior_detail_is_full();

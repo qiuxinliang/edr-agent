@@ -268,3 +268,9 @@ SOURCES = [
     'third_party/lz4/lz4.c', 'src/core/validation_trace.c',
 ]
 QUEUE_SOURCES = ['src/storage/queue_sqlite.c', 'src/transport/report_events_ack.c']
+
+
+def storage_reservation_sources(source):
+    """The new shared guard balance is absent from historical source snapshots."""
+    relative = 'src/storage/storage_reservation.c'
+    return [relative] if (source / relative).is_file() else []
