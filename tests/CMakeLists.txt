@@ -16,6 +16,9 @@ endif()
 add_test(NAME edr_agent_help COMMAND edr_agent --help)
 
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
+add_test(NAME evidence_ownership_contract
+  COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/test_evidence_ownership_contract.py)
+set_tests_properties(evidence_ownership_contract PROPERTIES TIMEOUT 30)
 add_test(NAME evidence_startup_index_manifest
   COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/test_evidence_startup_index_manifest.py)
 add_test(NAME tdh_property_alias_order_contract

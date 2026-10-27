@@ -2502,25 +2502,11 @@ static int candidate_dedupe_reuse(const EdrBehaviorRecord *r, int64_t ts,
                                &reject_reasons)
                          : 0;
     if (evaluation > 0) {
-      s->last_ns = ts;
-      if (generation_known && !s->generation_known) {
-        s->generation = generation;
-        s->generation_known = 1u;
-      }
-      s->source_generation_shapes |= source_generation_shape;
-      if (r->event_id[0] && s->source_event_id[0] &&
-          strncmp(s->source_event_id, r->event_id,
-                  sizeof(s->source_event_id)) != 0 &&
-          !s->bridged_source_event_id[0]) {
-        copy_s(s->bridged_source_event_id,
-               sizeof(s->bridged_source_event_id), r->event_id);
-        copy_s(s->bridged_signal, sizeof(s->bridged_signal), signal);
-      }
+      /* Resolve only. The writer publishes aliases, generation and counters
+       * after commit; a refused write must not influence the next owner. */
       if (candidate_id && candidate_id_cap > 0u && s->candidate_id[0]) {
         copy_s(candidate_id, candidate_id_cap, s->candidate_id);
       }
-      s_status.candidate_deduped++;
-      s_status.candidate_reused++;
       return 1;
     }
     if (evaluation < 0) {
@@ -2548,7 +2534,10 @@ static void candidate_dedupe_admit(const EdrBehaviorRecord *r, int64_t ts,
   int64_t oldest = INT64_MAX;
   for (size_t i = 0; i < EDR_EVIDENCE_CANDIDATE_DEDUP_SLOTS; i++) {
     CandidateDedupeSlot *s = &s_candidate_dedupe[i];
-    if (candidate_dedupe_slot_evaluate(
+    /* A durable exact-source owner must not steal another candidate's
+     * in-memory aliases. Distinct stored owners retain distinct slots. */
+    if (candidate_id && strcmp(s->candidate_id, candidate_id) == 0 &&
+        candidate_dedupe_slot_evaluate(
             s, r, ts, &generation, generation_known, source_generation_shape,
             signal, semantic_signal, NULL) > 0) {
       s->last_ns = ts;
@@ -5535,7 +5524,11 @@ static int sqlite_record_candidate(const EdrBehaviorRecord *r, const char *candi
       "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,?,?,?,?) "
       "ON CONFLICT(candidate_id) DO UPDATE SET "
       "tenant_id=CASE WHEN excluded.tenant_id<>'' THEN excluded.tenant_id ELSE p0_candidates.tenant_id END,"
-      "event_time_ns=CASE WHEN p0_candidates.event_time_ns=0 THEN excluded.event_time_ns "
+      /* A frozen alert's time is part of its source query identity. Older
+       * provider enrichment still belongs in the mutable bundle/aliases; it
+       * cannot move the immutable snapshot or renew its residence floor. */
+      "event_time_ns=CASE WHEN p0_candidates.alert_context_protect_until_active_ms>0 THEN p0_candidates.event_time_ns "
+      "WHEN p0_candidates.event_time_ns=0 THEN excluded.event_time_ns "
       "WHEN excluded.event_time_ns=0 THEN p0_candidates.event_time_ns "
       "ELSE MIN(p0_candidates.event_time_ns,excluded.event_time_ns) END,"
       "type=CASE WHEN excluded.type<>0 THEN excluded.type ELSE p0_candidates.type END,"
@@ -5636,7 +5629,13 @@ static int sqlite_record_candidate(const EdrBehaviorRecord *r, const char *candi
   bind_text(st, 37, subject_command);
   bind_text(st, 38, parent_command);
   if (sqlite3_step(st) != SQLITE_DONE) {
-    set_error("insert p0_candidates failed");
+    if (sqlite3_extended_errcode(s_db) == SQLITE_CONSTRAINT_TRIGGER &&
+        strcmp(sqlite3_errmsg(s_db), "frozen parent floor or query identity changed") == 0) {
+      s_persistence_failure = EDR_EVIDENCE_FAILURE_INVALID;
+      set_error("candidate enrichment conflicts with frozen alert identity");
+    } else {
+      set_error("insert p0_candidates failed");
+    }
     sqlite3_finalize(st);
     sqlite_rollback_silent();
     return -1;
@@ -8937,6 +8936,19 @@ static void promote_context_before_window(const EdrBehaviorRecord *r, int64_t no
   }
 }
 
+/* The trigger already owns its bundle; it is not its own post-context.
+ * Filter by the resolved owner, which can differ from the incoming source key. */
+static uint32_t context_exclude_trigger_owner(char ids[][160], uint32_t count,
+                                               const char *owner) {
+  uint32_t kept = 0;
+  for (uint32_t i = 0; i < count; ++i) {
+    if (!strcmp(ids[i], owner)) continue;
+    if (kept != i) copy_s(ids[kept], sizeof(ids[kept]), ids[i]);
+    ++kept;
+  }
+  return kept;
+}
+
 void edr_local_evidence_cache_record_behavior(const EdrBehaviorRecord *r) {
   if (!r) {
     return;
@@ -8946,11 +8958,9 @@ void edr_local_evidence_cache_record_behavior(const EdrBehaviorRecord *r) {
   int store_candidate = evidence_should_store_record(r);
   int low_value_file_noise = evidence_is_low_value_file_noise(r);
   char candidate_id[160] = "";
-  int candidate_reused = 0;
   if (store_candidate) {
     s_status.candidate_requests++;
     candidate_id_for(r, candidate_id, sizeof(candidate_id));
-    candidate_reused = candidate_dedupe_reuse(r, ts, candidate_id, sizeof(candidate_id));
   }
   char context_candidate_ids[EDR_EVIDENCE_CONTEXT_WINDOWS][160];
   /* context_window_matches initializes every returned entry. Consumers use
@@ -8959,17 +8969,12 @@ void edr_local_evidence_cache_record_behavior(const EdrBehaviorRecord *r) {
       ? 0u
       : context_window_matches(r, ts, context_candidate_ids,
                                EDR_EVIDENCE_CONTEXT_WINDOWS);
-  /* The trigger already owns its bundle. Replaying it through generic
-   * admission must not add a second occurrence as its own post-context. */
-  if (context_candidate_count) {
-    if (!candidate_id[0]) candidate_id_for(r, candidate_id, sizeof(candidate_id));
-    uint32_t kept = 0;
-    for (uint32_t i = 0; i < context_candidate_count; ++i) {
-      if (!strcmp(context_candidate_ids[i], candidate_id)) continue;
-      if (kept != i) copy_s(context_candidate_ids[kept], sizeof(context_candidate_ids[kept]), context_candidate_ids[i]);
-      ++kept;
-    }
-    context_candidate_count = kept;
+  /* Noncandidate replay still excludes its exact alert owner. Candidate
+   * enrichment waits until durable/alias ownership has been resolved below. */
+  if (!store_candidate && context_candidate_count) {
+    candidate_id_for(r, candidate_id, sizeof(candidate_id));
+    context_candidate_count = context_exclude_trigger_owner(
+        context_candidate_ids, context_candidate_count, candidate_id);
   }
   int store_context = context_candidate_count != 0u;
   EvidenceWriteClass context_write_class = evidence_context_write_class(r);
@@ -9011,7 +9016,8 @@ void edr_local_evidence_cache_record_behavior(const EdrBehaviorRecord *r) {
   s_status.last_event_time_ns = ts;
 #if defined(EDR_HAVE_SQLITE)
   if (store_candidate) {
-    int candidate_existing = candidate_reused;
+    int candidate_existing = 0;
+    int candidate_reused = 0;
     if (!s_db) {
       record_persistence_failure(r, ts, 1, EDR_EVIDENCE_FAILURE_NO_DATABASE);
       s_status.candidate_rejected++;
@@ -9020,7 +9026,10 @@ void edr_local_evidence_cache_record_behavior(const EdrBehaviorRecord *r) {
       s_status.hot_ring_ingested++;
       goto done;
     }
-    if (!candidate_existing && r->event_id[0]) {
+    /* Exact source ownership wins over a provider alias. The alert writer
+     * and the parent reader both address this durable key, including after
+     * reopen. Never route its later ordinary copy to a different candidate. */
+    if (r->event_id[0]) {
       s_persistence_failure = EDR_EVIDENCE_FAILURE_STORAGE;
       int exists = sqlite_candidate_exists(candidate_id);
       if (exists < 0) {
@@ -9034,6 +9043,13 @@ void edr_local_evidence_cache_record_behavior(const EdrBehaviorRecord *r) {
       }
       candidate_existing = exists;
     }
+    candidate_reused = candidate_existing;
+    if (!candidate_existing) {
+      candidate_reused = candidate_dedupe_reuse(r, ts, candidate_id, sizeof(candidate_id));
+      candidate_existing = candidate_reused;
+    }
+    context_candidate_count = context_exclude_trigger_owner(
+        context_candidate_ids, context_candidate_count, candidate_id);
     if (!candidate_existing) {
       s_status.candidate_admission_attempts++;
     }
@@ -9063,8 +9079,10 @@ void edr_local_evidence_cache_record_behavior(const EdrBehaviorRecord *r) {
       s_status.candidate_admitted++;
       promote_context_before_window(r, ts);
     }
-    if (!candidate_reused) {
-      candidate_dedupe_admit(r, ts, candidate_id);
+    candidate_dedupe_admit(r, ts, candidate_id);
+    if (candidate_reused) {
+      s_status.candidate_deduped++;
+      s_status.candidate_reused++;
     }
     context_ring_capture(r);
     s_status.hot_ring_ingested++;

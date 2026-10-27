@@ -1,0 +1,64 @@
+Evidence-cache source ownership acceptance
+
+Run locally against a new, scoped receipt:
+  python3 -B tests/evidence_ownership_contract.py receipt.json new-report.json
+The output uses exclusive creation. Never overwrite the prior failed receipt,
+change the old window, drop extra rows, or classify a historical failure as passed.
+The script is an offline storage oracle, not a live collector or UI substitute.
+
+Receipt construction (use the existing bounded, authenticated read path):
+- scope: tenant_id and endpoint_id, verified against the running endpoint.
+- processes: every OS-observed process birth, with pid, process_start_key,
+  process_creation_filetime_100ns, and parent with the same identity fields.
+  PID alone is insufficient. Keep decimal strings for 64-bit identities.
+- candidates: all process-create rows for those births within the fixed interval,
+  including extra rows. Each contains scope, candidate_id, type, pid, StartKey,
+  birth, event_time_ns, local_retention_state, alert_context_protect_until_active_ms,
+  source_event_ids, source_event_ids_complete, and bundle_source_event_id.
+  Read aliases and latest source from the retained p0_context_bundle. Match the
+  candidate hash to an original alias, not necessarily its latest enriched source.
+- parent_facts: all alert_parent_context references for those candidates, with
+  scope, candidate_id, artifact_id, fact_id and exact manifest_template_json.
+  Read both supported reference formats without double counting. Do not
+  reserialize the raw fact before hashing. Source/fact identity is checked
+  against the production v3 / v1 digest contracts.
+- alerts: every actual alert in the same fixed scope, with scope, alert_id,
+  source_event_id, pid and process_creation_filetime_100ns, bound to the backend
+  source-event receipt. A cached parent fact does not prove an alert was emitted.
+- no_alert_sources: only positively established dispositions, with scope,
+  source_event_id, reason and evidence_receipt. An absent backend row, a current
+  provider label, or a missing parent reference cannot establish this disposition.
+- candidates_complete, alerts_complete, sources_complete: true only after bounded
+  discovery completed without truncation, skipped rows, or missing pages. A
+  limited query reaching its bound must not be represented as complete.
+
+Report each denominator separately. One OS birth may have multiple distinct
+sources and candidates; an ordinary-only candidate need not have an immutable
+alert parent snapshot. Every actual alert source requires its exact hashed
+candidate and exactly one hash-valid parent reference to the OS-observed parent.
+An alias under multiple physical owners stays visible in the report. A later
+exact source key is authoritative; aliases cannot redirect its query. Multiple
+alias owners without an exact key are a reported ambiguity, not hash damage.
+Missing source-disposition evidence is unknown. Unknown cannot pass acceptance.
+
+Tests include ten births/twelve candidates, original versus latest source hash,
+extra ordinary observations, ambiguous aliases, absent parents, wrong generation,
+wrong scope, corrupt facts, truncation and incomplete receipts. C production tests
+also cover both reference formats, arrival order, older enrichment, same-source
+parent/generation conflicts, commit failure, busy lock and reopen query results.
+No schema, trigger, alert key or reader addressing changes are introduced.
+Historical aliases and candidates remain retained; this change does not promise
+one row per birth or immediate space reclamation. An existing ordinary alias may
+later get its own exact alert snapshot. Do not delete either historical owner to
+make row counts match.
+
+After Windows native validation and authorized deployment, bind the new binary,
+process birth, configuration and all count fields, then use the existing strict
+single-process timing runner in a new window. Do not reopen/reset a failed window.
+Preserve 512 MiB and both 72-hour settings. Do not clear the cache again.
+Issue new normal signed parent queries for actual alert sources; verify command,
+nonce, receipt, source, child generation and returned parent. Retained old source
+samples may test continuity but cannot stand in for newly generated observations.
+This offline report always requires a separate consumer receipt. Clock/count,
+capacity and retention coverage remain separate gates. A light-load, no-refusal
+window is not proof of the full 512 MiB/72-hour capacity commitment.

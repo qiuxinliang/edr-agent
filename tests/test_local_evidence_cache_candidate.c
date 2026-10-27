@@ -11133,6 +11133,130 @@ static uint64_t cache_case_wall_ms(void) {
 } while (0)
 
 #if defined(EDR_HAVE_SQLITE)
+
+/* The alert reader addresses the exact source key. Provider enrichment can
+ * share an ordinary owner, but must not redirect that frozen source or move
+ * its query time. Exercise production writers and reopen the durable reader. */
+static void test_candidate_alert_source_ownership(int scenario) {
+  for (int format = 0; format <= 2; format += 2) {
+    char path[512], output[16384], frozen[16384];
+    EdrBehaviorRecord kernel, weak, conflict;
+    EdrEvidenceCacheStatus before, after;
+    int64_t now = (int64_t)time(NULL) * INT64_C(1000000000);
+    uint64_t parent_ns = (uint64_t)(now - INT64_C(8000000000));
+    assert(make_test_sqlite_path(path, sizeof(path)) == 0);
+    cleanup_test_sqlite_path(path);
+    edr_local_evidence_cache_test_set_retention_monotonic_ms(1000);
+    assert(test_open_legacy_context(path, 512u, 72u) == 0);
+    edr_local_evidence_cache_close();
+    sqlite3 *db = NULL; assert(sqlite3_open(path, &db) == SQLITE_OK);
+    retention_upgrade_refs(db, format); sqlite3_close(db);
+    assert(test_open_legacy_context(path, 512u, 72u) == 0);
+    edr_pt_cache_init();
+    assert(edr_pt_cache_put_generation(4868u, 4u, "parent.exe", "parent.exe --benign",
+        "C:\\Tools\\parent.exe", NULL, parent_ns, 0x4868,
+        test_unix_ns_to_filetime(parent_ns)) == 0);
+    assert(edr_pt_cache_mark_alive_generation(4868u, 0x4868,
+        test_unix_ns_to_filetime(parent_ns), (uint64_t)now + UINT64_C(2000000000)) == 0);
+    init_cross_provider_process_pair(&kernel, &weak, 74113u, 4868u, now, 0x74113);
+    kernel.process_creation_filetime_100ns = test_unix_ns_to_filetime((uint64_t)now);
+    kernel.parent_pid_state = weak.parent_pid_state = EDR_PARENT_PID_KNOWN;
+    kernel.parent_process_start_key = 0x4868;
+    kernel.parent_process_creation_filetime_100ns = test_unix_ns_to_filetime(parent_ns);
+    strcpy(kernel.parent_resolution_source, "live_parent_generation");
+    strcpy(kernel.parent_resolution_status, "RESOLVED");
+    strcpy(kernel.parent_name, "parent.exe");
+    strcpy(kernel.parent_path, "C:\\Tools\\parent.exe");
+    strcpy(kernel.parent_cmdline, "parent.exe --benign");
+    assert(edr_pt_cache_put_generation(kernel.pid, kernel.ppid, kernel.process_name,
+        kernel.cmdline, kernel.exe_path, "parent.exe", (uint64_t)now,
+        kernel.process_start_key, kernel.process_creation_filetime_100ns) == 0);
+    weak.event_time_ns = now + (scenario == 2 ? 3000 : -3000);
+    edr_behavior_bind_parent_context(&kernel);
+    assert(edr_behavior_parent_context_bound(&kernel));
+    EdrCommandFacts facts = {kernel.cmdline, "parent.exe --benign"};
+    if (scenario == 0 || scenario == 6 || scenario == 8) {
+      if (scenario == 6) {
+        weak.process_start_key = kernel.process_start_key;
+        weak.process_creation_filetime_100ns = kernel.process_creation_filetime_100ns;
+      }
+      edr_local_evidence_cache_record_behavior(&weak);
+      /* Historical bridge precedes a later alert for the same source. Its
+       * alias is audit history, not permission to redirect the exact reader. */
+      if (scenario == 8) edr_local_evidence_cache_record_behavior(&kernel);
+    } else {
+      edr_local_evidence_cache_record_behavior(&kernel);
+    }
+    assert(edr_local_evidence_cache_record_alert_context(&kernel, &facts) == 0);
+    EdrParentContextQuery query = {kernel.tenant_id, kernel.endpoint_id, kernel.event_id,
+        kernel.pid, kernel.process_start_key, kernel.process_creation_filetime_100ns,
+        now - INT64_C(1000000000), now + INT64_C(1000000000),
+        (int64_t)time(NULL) * 1000 + 60000, EDR_PARENT_CONTEXT_FIELD_NAME |
+        EDR_PARENT_CONTEXT_FIELD_PATH | EDR_PARENT_CONTEXT_FIELD_CMDLINE};
+    assert(edr_local_evidence_cache_query_parent_context_json(&query, frozen, sizeof(frozen)) == 0);
+    assert(strstr(frozen, "\"availability_reason\":\"available\""));
+    assert(sqlite3_open(path, &db) == SQLITE_OK);
+    int64_t floor = compact_scalar(db, "SELECT SUM(alert_context_protect_until_active_ms) FROM p0_candidates");
+    assert(floor > 0); sqlite3_close(db);
+    edr_local_evidence_cache_test_set_retention_monotonic_ms(5000);
+    edr_local_evidence_cache_get_status(&before);
+    int failed_attempt = (scenario >= 3 && scenario <= 5) || scenario == 7;
+    if (failed_attempt) {
+      conflict = weak;
+      if (scenario == 3) edr_local_evidence_cache_test_fail_next_commits(1u);
+      if (scenario == 7) {
+        assert(sqlite3_open(path, &db) == SQLITE_OK);
+        compact_exec(db, "BEGIN IMMEDIATE;");
+      }
+      if (scenario == 4) { conflict = kernel; conflict.ppid++; }
+      if (scenario == 5) { conflict = kernel; conflict.process_start_key++; }
+      edr_local_evidence_cache_record_behavior(&conflict);
+      if (scenario == 7) { compact_exec(db, "ROLLBACK;"); sqlite3_close(db); }
+      edr_local_evidence_cache_get_status(&after);
+      assert(after.candidate_rejected == before.candidate_rejected + 1u);
+      assert(after.candidate_reused == before.candidate_reused);
+      assert(after.candidate_deduped == before.candidate_deduped);
+      assert(sqlite3_open(path, &db) == SQLITE_OK);
+      assert(compact_scalar(db, "SELECT COUNT(*) FROM artifacts WHERE artifact_type='p0_context_bundle' AND json_array_length(json_extract(manifest_json,'$.source_event_ids'))=2") == 0);
+      sqlite3_close(db);
+      /* A different source after the failed write can still consume the
+       * narrow bridge. No rolled-back alias may poison the in-memory slot. */
+      if (scenario == 3 || scenario == 7) strcpy(weak.event_id, "enrichment-after-failed-write");
+    }
+    edr_local_evidence_cache_record_behavior((scenario == 0 || scenario == 6 || scenario == 8) ? &kernel : &weak);
+    edr_local_evidence_cache_get_status(&after);
+    assert(after.candidate_rejected == before.candidate_rejected + failed_attempt);
+    assert(after.candidate_reused == before.candidate_reused + 1u);
+    assert(after.candidate_deduped == before.candidate_deduped + 1u);
+    assert(sqlite3_open(path, &db) == SQLITE_OK);
+    assert(compact_scalar(db, "SELECT COUNT(*) FROM p0_candidates") == (scenario == 0 || scenario == 6 || scenario == 8 ? 2 : 1));
+    assert(compact_scalar(db, "SELECT COUNT(*) FROM artifacts WHERE artifact_type='p0_context_bundle' AND json_array_length(json_extract(manifest_json,'$.source_event_ids'))=2") == (scenario == 0 || scenario == 6 ? 0 : 1));
+    assert(compact_scalar(db, "SELECT SUM(alert_context_protect_until_active_ms) FROM p0_candidates") == floor);
+    assert(compact_scalar(db, "SELECT event_time_ns FROM p0_candidates WHERE alert_context_protect_until_active_ms>0") == now);
+    assert(compact_scalar(db, "SELECT COUNT(*) FROM context_reference_projection WHERE artifact_id LIKE '%:alert_parent_context'") == 1);
+    if (scenario != 0 && scenario != 6 && scenario != 8) {
+      assert(compact_scalar(db, "SELECT COUNT(*) FROM materialized_artifacts WHERE artifact_type='post_context' AND artifact_id NOT LIKE '%:alert_parent_context'") == 0);
+    }
+    sqlite3_close(db);
+    edr_local_evidence_cache_close(); edr_pt_cache_shutdown();
+    assert(test_open_legacy_context(path, 512u, 72u) == 0);
+    assert(edr_local_evidence_cache_query_parent_context_json(&query, output, sizeof(output)) == 0);
+    /* This compares the consumer result, including its hash-checked parent
+     * snapshot, not just a row count. No live parent cache remains. */
+    assert(strcmp(output, frozen) == 0);
+    query.source_event_id = weak.event_id;
+    assert(edr_local_evidence_cache_query_parent_context_json(&query, output, sizeof(output)) == 0);
+    assert(strstr(output, "unavailable_or_expired"));
+    /* Reopened ordinary delivery must continue to address the frozen owner. */
+    edr_local_evidence_cache_record_behavior(&kernel);
+    query.source_event_id = kernel.event_id;
+    assert(edr_local_evidence_cache_query_parent_context_json(&query, output, sizeof(output)) == 0);
+    assert(strcmp(output, frozen) == 0);
+    edr_local_evidence_cache_close(); cleanup_test_sqlite_path(path);
+    edr_local_evidence_cache_test_set_retention_monotonic_ms(-1);
+  }
+}
+
 static void test_normal_alert_parent_context_retention(void) {
   for (int format = 0; format <= 2; format += 2) {
     for (unsigned long_command = 0; long_command < 2u; ++long_command) {
@@ -14928,6 +15052,11 @@ int main(int argc, char **argv) {
   if (argc == 2 && strcmp(argv[1], "--physical-maintenance") == 0) {
     test_physical_floor_holds_maintenance_and_startup(); return 0;
   }
+  if (argc == 3 && strcmp(argv[1], "--candidate-parent-ownership") == 0) {
+    int scenario = atoi(argv[2]);
+    assert(scenario >= 0 && scenario < 9);
+    test_candidate_alert_source_ownership(scenario); return 0;
+  }
   if (argc == 2 && strcmp(argv[1], "--candidate-retention") == 0) {
     test_candidate_group_shared_facts_and_legacy_protection();
     test_candidate_group_delete_and_commit_rollback();
@@ -14985,6 +15114,9 @@ int main(int argc, char **argv) {
   RUN_CACHE_CASE("context", test_window_recovery_failures_and_frozen_policy());
   RUN_CACHE_CASE("retention", test_phase2_continues_across_ttl(0));
   RUN_CACHE_CASE("retention", test_phase2_commit_fairness_and_backoff());
+  for (int scenario = 0; scenario < 9; ++scenario) {
+    RUN_CACHE_CASE("context", test_candidate_alert_source_ownership(scenario));
+  }
   RUN_CACHE_CASE("context", test_normal_alert_parent_context_retention());
   RUN_CACHE_CASE("context", test_alert_parent_context_refusal_and_unresolved());
   RUN_CACHE_CASE("context", test_alert_parent_context_pressure_counterfactual(0));
