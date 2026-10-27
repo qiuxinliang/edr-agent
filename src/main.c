@@ -1,4 +1,5 @@
 #include "edr/validation_trace.h"
+#include "edr/forensic_worker.h"
 #include "core/storage_space_preflight.h"
 #ifdef _MSC_VER
 #ifndef _CRT_SECURE_NO_WARNINGS
@@ -843,6 +844,8 @@ static void WINAPI edr_service_main(DWORD argc, LPSTR *argv) {
 #endif
 
 int main(int argc, char **argv) {
+  if(argc>=2 && !strcmp(argv[1],EDR_FORENSIC_WORKER_ARG))
+    return argc==3 ? edr_forensic_io_worker_main(argv[2]) : 2;
   if (argc >= 2 && !strcmp(argv[1], "--storage-space-preflight"))
     return edr_storage_space_preflight_main(argc, argv);
   if (argc>=2 && !strcmp(argv[1],"--queue-recover-v1"))

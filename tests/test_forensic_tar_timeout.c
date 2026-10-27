@@ -12,6 +12,7 @@
 #else
 #include <sys/stat.h>
 #include <unistd.h>
+#include <errno.h>
 #endif
 static void pause_ms(unsigned ms) {
 #ifdef _WIN32
@@ -30,7 +31,27 @@ static unsigned long long test_monotonic_ms(void) {
 #endif
 }
 static int cancel_when_started(void *path) {
-  FILE *f=fopen((const char *)path,"rb");if(!f)return 0;int started=fgetc(f)!=EOF;fclose(f);return started;
+#ifdef _WIN32
+  WIN32_FILE_ATTRIBUTE_DATA info;
+  return GetFileAttributesExA((const char *)path,GetFileExInfoStandard,&info) && (info.nFileSizeLow || info.nFileSizeHigh);
+#else
+  struct stat st;return !stat((const char *)path,&st) && st.st_size>0;
+#endif
+}
+static int remove_synthetic(const char *path) {
+#ifdef _WIN32
+  /* A terminated Windows child can leave transient close completion. Keep
+   * cleanup bounded and restricted to this fixture's own file. */
+  for(unsigned i=0;i<6;i++) {
+    if(!remove(path))return 0;
+    DWORD error=GetLastError();
+    if(i==5 || (error!=ERROR_SHARING_VIOLATION && error!=ERROR_ACCESS_DENIED && error!=ERROR_LOCK_VIOLATION))return -1;
+    fprintf(stderr,"synthetic archive cleanup retry win32=%lu\n",error);Sleep(20);
+  }
+  return -1;
+#else
+  return remove(path);
+#endif
 }
 int main(int argc,char **argv) {
   if(argc==6 && !strcmp(argv[1],"czf")) {
@@ -54,12 +75,12 @@ int main(int argc,char **argv) {
   FILE *f=fopen(source,"wb");assert(f);fputs("synthetic tar evidence\n",f);assert(fclose(f)==0);
   snprintf(archive,sizeof(archive),"%s/archive.tgz",root);
   assert(response_make_tar_bundle(work,archive,30000,NULL,NULL)==0);
-  f=fopen(archive,"rb");assert(f);assert(fgetc(f)!=EOF);assert(fclose(f)==0);assert(remove(archive)==0);
+  f=fopen(archive,"rb");assert(f);assert(fgetc(f)!=EOF);assert(fclose(f)==0);assert(remove_synthetic(archive)==0);
   assert(response_make_tar_bundle(work,archive,1000,cancel_now,NULL)==EDR_DC_ERR_CANCELLED);
   assert(fopen(archive,"rb")==NULL);
   response_tar_test_set_binary(self);
   assert(response_make_tar_bundle(work,archive,1000,NULL,NULL)==EDR_DC_ERR_TIMEOUT);
-  f=fopen(archive,"rb");assert(f);assert(fgetc(f)=='s');assert(fclose(f)==0);assert(remove(archive)==0);
+  f=fopen(archive,"rb");assert(f);assert(fgetc(f)=='s');assert(fclose(f)==0);assert(remove_synthetic(archive)==0);
   /* The child offers >64MiB. The production parent must stop before writing
    * byte 64MiB+1, even though the source is an uncooperative process. */
 #ifdef _WIN32
@@ -73,14 +94,14 @@ int main(int argc,char **argv) {
   fprintf(stderr,"tar_overflow rc=%d elapsed_ms=%llu bytes=%ld\n",overflow_rc,
       test_monotonic_ms()-overflow_started,ftell(f));
   assert(overflow_rc==EDR_RESPONSE_BYTE_BUDGET_EXCEEDED);
-  assert(ftell(f)>0 && ftell(f)<=64L*1024L*1024L);assert(fclose(f)==0);assert(remove(archive)==0);
+  assert(ftell(f)>0 && ftell(f)<=64L*1024L*1024L);assert(fclose(f)==0);assert(remove_synthetic(archive)==0);
 #ifdef _WIN32
   _putenv_s("EDR_SYNTHETIC_TAR_OVERFLOW","");
 #else
   unsetenv("EDR_SYNTHETIC_TAR_OVERFLOW");
 #endif
   assert(response_make_tar_bundle(work,archive,5000,cancel_when_started,archive)==EDR_DC_ERR_CANCELLED);
-  f=fopen(archive,"rb");assert(f);assert(fgetc(f)=='s');assert(fclose(f)==0);assert(remove(archive)==0);
+  f=fopen(archive,"rb");assert(f);assert(fgetc(f)=='s');assert(fclose(f)==0);assert(remove_synthetic(archive)==0);
   response_tar_test_set_binary(NULL);
   assert(remove(source)==0);
 #ifdef _WIN32

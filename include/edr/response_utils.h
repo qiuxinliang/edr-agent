@@ -58,6 +58,8 @@ int response_make_tar_bundle(const char *dir, const char *bundle_path, uint32_t 
 #ifdef EDR_RESPONSE_TAR_TESTING
 void response_tar_test_set_binary(const char *path);
 #endif
+/* Private self-exec worker: descendants share its killable process group. */
+void response_tar_set_worker_group(void);
 int response_split_args(char *buf, char *argv[], size_t argv_cap);
 int response_run_hook_no_shell(const char *hook_cmdline);
 

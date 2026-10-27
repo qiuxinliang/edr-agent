@@ -17,7 +17,11 @@
 #include <unistd.h>
 #endif
 static int edr_hold_read(const char *path, char *command, size_t cap) {
+#ifdef EDR_HOLD_OPEN_READ
+  FILE *f=EDR_HOLD_OPEN_READ(path);
+#else
   FILE *f=fopen(path,"rb");
+#endif
   if (!f) return errno==ENOENT?0:EDR_EGRESS_LOCAL_STATE_FAILURE;
   char schema[32], id[160], policy[96], code[32], stamp[40];
   int ok=fgets(schema,sizeof(schema),f)&&fgets(id,sizeof(id),f)&&
@@ -38,6 +42,12 @@ static int edr_hold_write(const char *path,const char *command,int rc) {
   char existing[160];int previous=edr_hold_read(path,existing,sizeof(existing));
   if (previous==rc && !strcmp(command,existing)) return rc;
   if (previous==EDR_EGRESS_LOCAL_STATE_FAILURE) return previous;
+#ifdef EDR_HOLD_ATOMIC_WRITE
+  char raw[512];
+  int n=snprintf(raw,sizeof(raw),"edr.egress-hold.v1\n%s\n%s\n%d\n%lld\n",command,EDR_EGRESS_POLICY_VERSION,rc,(long long)time(NULL));
+  if(n<0 || (size_t)n>=sizeof(raw) || EDR_HOLD_ATOMIC_WRITE(path,raw))return EDR_EGRESS_LOCAL_STATE_FAILURE;
+  return rc;
+#else
   char temporary[1400];
   if (snprintf(temporary,sizeof(temporary),"%s.tmp",path)>=(int)sizeof(temporary)) return EDR_EGRESS_LOCAL_STATE_FAILURE;
   FILE *f=fopen(temporary,"wb");if(!f)return EDR_EGRESS_LOCAL_STATE_FAILURE;
@@ -61,8 +71,13 @@ static int edr_hold_write(const char *path,const char *command,int rc) {
 #endif
   if(!ok){(void)remove(temporary);return EDR_EGRESS_LOCAL_STATE_FAILURE;}
   return rc;
+#endif
 }
 static int edr_hold_clear(const char *path) {
+#ifdef EDR_HOLD_REMOVE
+  return EDR_HOLD_REMOVE(path)==0 || errno==ENOENT?0:EDR_EGRESS_LOCAL_STATE_FAILURE;
+#else
   return remove(path)==0 || errno==ENOENT?0:EDR_EGRESS_LOCAL_STATE_FAILURE;
+#endif
 }
 #endif

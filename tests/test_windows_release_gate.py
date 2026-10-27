@@ -51,6 +51,7 @@ WINDOWS_EXPECTED = {
     "windows_headless_log_stream_initialization",
 }
 RUNTIME_EXPECTED = {
+    "forensic_path_lifecycle", "forensic_io_hard_timeout", "forensic_tar_timeout", "forensic_baseline_staging",
     "storage_physical_guard", "storage_space_preflight", "shell_session_stream_completeness",
     "authorized_local_query_contract", "evidence_startup_index_manifest",
     "installer_runtime_health_classification", "report_events_ack_contract",

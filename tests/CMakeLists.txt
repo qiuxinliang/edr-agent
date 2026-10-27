@@ -100,6 +100,7 @@ endif()
 # Embed the production I/O boundary for bounded CRT failure injection.
 add_executable(test_command_upload_outbox
   ${CMAKE_CURRENT_SOURCE_DIR}/test_command_upload_outbox.c
+  ${CMAKE_SOURCE_DIR}/src/forensic/forensic_worker.c
   ${CMAKE_SOURCE_DIR}/src/command/sha256.c
   ${CMAKE_SOURCE_DIR}/src/response/response_utils.c
   ${CMAKE_SOURCE_DIR}/third_party/cjson/cJSON.c)
@@ -113,10 +114,37 @@ edr_apply_test_warnings(test_command_upload_outbox)
 add_test(NAME command_upload_outbox_recovery COMMAND test_command_upload_outbox
   WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 
+add_executable(test_forensic_io_timeout
+  ${CMAKE_CURRENT_SOURCE_DIR}/test_forensic_io_timeout.c
+  ${CMAKE_SOURCE_DIR}/src/forensic/forensic_worker.c
+  ${CMAKE_SOURCE_DIR}/src/forensic/forensic_path.c
+  ${CMAKE_SOURCE_DIR}/src/response/response_utils.c
+  ${CMAKE_SOURCE_DIR}/src/command/sha256.c
+  ${CMAKE_SOURCE_DIR}/third_party/cjson/cJSON.c)
+target_include_directories(test_forensic_io_timeout PRIVATE ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/third_party/cjson)
+target_compile_definitions(test_forensic_io_timeout PRIVATE EDR_FORENSIC_IO_TESTING=1)
+edr_apply_test_warnings(test_forensic_io_timeout)
+if(WIN32)
+  target_sources(test_forensic_io_timeout PRIVATE ${CMAKE_SOURCE_DIR}/src/preprocess/windows_file_identity.c)
+  target_link_libraries(test_forensic_io_timeout PRIVATE advapi32)
+endif()
+add_test(NAME forensic_io_hard_timeout COMMAND test_forensic_io_timeout)
+set_tests_properties(forensic_io_hard_timeout PROPERTIES TIMEOUT 30)
+
+add_executable(test_forensic_path_lifecycle
+  ${CMAKE_CURRENT_SOURCE_DIR}/test_forensic_path_lifecycle.c
+  ${CMAKE_SOURCE_DIR}/src/forensic/forensic_path.c
+  ${CMAKE_SOURCE_DIR}/src/command/sha256.c)
+target_include_directories(test_forensic_path_lifecycle PRIVATE ${CMAKE_SOURCE_DIR}/include)
+edr_apply_test_warnings(test_forensic_path_lifecycle)
+add_test(NAME forensic_path_lifecycle COMMAND test_forensic_path_lifecycle)
+
 add_executable(test_response_forensic_paths
   ${CMAKE_CURRENT_SOURCE_DIR}/test_response_forensic_paths.c
   ${CMAKE_SOURCE_DIR}/src/response/response_utils.c
+  ${CMAKE_SOURCE_DIR}/src/forensic/forensic_path.c
   ${CMAKE_SOURCE_DIR}/third_party/cjson/cJSON.c)
+target_sources(test_response_forensic_paths PRIVATE ${CMAKE_SOURCE_DIR}/src/command/sha256.c)
 target_include_directories(test_response_forensic_paths PRIVATE ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/third_party/cjson)
 target_compile_definitions(test_response_forensic_paths PRIVATE EDR_RESPONSE_COPY_TESTING=1)
 edr_apply_test_warnings(test_response_forensic_paths)
@@ -125,7 +153,9 @@ add_test(NAME response_forensic_path_contract COMMAND test_response_forensic_pat
 
 add_executable(test_forensic_tar_timeout test_forensic_tar_timeout.c
   ${CMAKE_SOURCE_DIR}/src/response/response_utils.c
+  ${CMAKE_SOURCE_DIR}/src/forensic/forensic_path.c
   ${CMAKE_SOURCE_DIR}/third_party/cjson/cJSON.c)
+target_sources(test_forensic_tar_timeout PRIVATE ${CMAKE_SOURCE_DIR}/src/command/sha256.c)
 target_include_directories(test_forensic_tar_timeout PRIVATE ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/third_party/cjson)
 target_compile_definitions(test_forensic_tar_timeout PRIVATE EDR_RESPONSE_TAR_TESTING=1)
 edr_apply_test_warnings(test_forensic_tar_timeout)
@@ -1650,6 +1680,13 @@ add_test(NAME local_evidence_cache_pressure_continuation COMMAND test_local_evid
 set_tests_properties(local_evidence_cache_candidate local_evidence_cache_migration
   local_evidence_cache_retention local_evidence_cache_context_layout local_evidence_cache_startup_budget local_evidence_cache_pressure_continuation PROPERTIES TIMEOUT 150
   RESOURCE_LOCK local_evidence_cache_fixture)
+if(WIN32)
+  # This contract seeds 4200 durable rows before measuring bounded retention.
+  # Hosted NTFS runners spent 143 s in seed xSync calls before the old 150 s
+  # harness limit. Keep every assertion and production budget; bound fixture
+  # preparation separately from the retention scheduler's own clock checks.
+  set_tests_properties(local_evidence_cache_pressure_continuation PROPERTIES TIMEOUT 600)
+endif()
 if(WIN32)
   # Structured connection scope uses Windows' validated numeric IP parser.
   foreach(target test_detection_decision test_detection_regression

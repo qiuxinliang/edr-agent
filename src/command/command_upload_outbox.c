@@ -6,6 +6,8 @@
 #include "edr/response.h"
 #include "edr/response_utils.h"
 #include "edr/sha256.h"
+#include "edr/forensic_path.h"
+#include "edr/forensic_worker.h"
 #include "edr/storage_physical_guard.h"
 #include "edr/transport_v2.h"
 #include <ctype.h>
@@ -23,9 +25,21 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#ifdef __linux__
+#include <sys/random.h>
+#endif
 #endif
 
+static FILE *hold_open_read(const char *path);
+static int write_record(const char *path,const char *raw,int replace);
+static int remove_metadata(const char *path);
+#define EDR_HOLD_OPEN_READ(path) hold_open_read(path)
+#define EDR_HOLD_ATOMIC_WRITE(path,raw) write_record(path,raw,1)
+#define EDR_HOLD_REMOVE(path) remove_metadata(path)
 #include "egress_hold.h"
+#undef EDR_HOLD_OPEN_READ
+#undef EDR_HOLD_ATOMIC_WRITE
+#undef EDR_HOLD_REMOVE
 
 #define UPLOAD_RECORD_CAP 8192u
 #ifndef EDR_UPLOAD_OUTBOX_NOW_MS
@@ -89,34 +103,28 @@ static int flush_file(FILE *f) {
 #endif
 }
 
-#ifndef _WIN32
 static int sync_parent(const char *path) {
-  char parent[1200];
-  if (strlen(path) >= sizeof(parent)) return -1;
-  strcpy(parent, path);
-  char *slash = strrchr(parent, '/');
-  if (slash) { if (slash == parent) slash[1] = 0; else *slash = 0; }
-  else strcpy(parent, ".");
-  int fd = open(parent, O_RDONLY);
-  if (fd < 0) return -1;
-  int rc = fsync(fd);
-  if (close(fd) != 0) rc = -1;
-  return rc;
-}
-#endif
-
-static int move_record(const char *from, const char *to, int replace) {
 #ifdef _WIN32
-  DWORD flags = MOVEFILE_WRITE_THROUGH | (replace ? MOVEFILE_REPLACE_EXISTING : 0);
-  /* A closed metadata file can still be temporarily unavailable to rename.
-   * Keep the same identity/ACL/no-replace operation on every attempt. Normal
-   * success makes one call; only sharing/access/lock denial receives 30 ms
-   * total scheduled wait, and persistent denial preserves recovery files. */
+  EdrForensicIoRequest *q=calloc(1,sizeof(*q));if(!q)return -1;
+  q->version=1;q->operation=3;q->timeout_ms=300000u;
+  int n=snprintf(q->staging,sizeof(q->staging),"%s",path);
+  EdrForensicIoResult receipt={0};
+  int rc=n<0 || (size_t)n>=sizeof(q->staging) ? -1 : edr_forensic_io_run(q,&receipt,NULL,NULL);
+  free(q);return rc;
+#else
+  EdrForensicPath *guard=NULL;
+  if(edr_forensic_path_acquire(path,0,&guard))return -1;
+  int rc=edr_forensic_path_sync_parent(guard);
+  edr_forensic_path_release(guard);return rc;
+#endif
+}
+
+static int move_guarded(EdrForensicPath *from,EdrForensicPath *to,int replace) {
+#ifdef _WIN32
   for(unsigned attempt=0;attempt<3u;attempt++) {
-    if(MoveFileExA(from,to,flags))return 0;
+    if(!edr_forensic_path_move(from,to,replace))return 0;
     DWORD error=GetLastError();
-    if(attempt==2u || (error!=ERROR_ACCESS_DENIED && error!=ERROR_SHARING_VIOLATION &&
-        error!=ERROR_LOCK_VIOLATION)) {
+    if(attempt==2u || (error!=ERROR_ACCESS_DENIED && error!=ERROR_SHARING_VIOLATION && error!=ERROR_LOCK_VIOLATION)) {
       char cause[96];snprintf(cause,sizeof(cause),"forensic file publication failed; win32_error=%lu",error);
       edr_command_audit_both("",cause);SetLastError(error);return -1;
     }
@@ -124,66 +132,90 @@ static int move_record(const char *from, const char *to, int replace) {
   }
   return -1;
 #else
-  if (replace) { if (rename(from, to) != 0) return -1; }
-  else {
-    if (link(from, to) != 0) return -1;
-    if (unlink(from) != 0) { (void)unlink(to); return -1; }
-  }
-  return sync_parent(to);
+  return edr_forensic_path_move(from,to,replace);
 #endif
 }
-
+static int move_record(const char *from,const char *to,int replace) {
+  EdrForensicPath *a=NULL,*b=NULL;int rc=-1;
+  if(!edr_forensic_path_acquire(from,0,&a) && !edr_forensic_path_acquire(to,0,&b))rc=move_guarded(a,b,replace);
+  edr_forensic_path_release(b);edr_forensic_path_release(a);return rc;
+}
 /* Publish complete metadata only after the file contents are flushed. A failed
  * replacement retains the previous pending record for recovery. */
 static int write_record_owned(const char *path, const char *raw, int replace,uint64_t credit) {
-  if (!metadata_space_available_owned(path,credit)) return -1;
   char tmp[1240];
+  EdrForensicPath *target=NULL,*scratch=NULL;
+  if(edr_forensic_path_acquire(path,1,&target))return -1;
+  if(!metadata_space_available_owned(path,credit)) {edr_forensic_path_release(target);return -1;}
 #ifdef _WIN32
   static volatile LONG sequence;
-  if (snprintf(tmp, sizeof(tmp), "%s.tmp.%lu.%ld", path,
-               (unsigned long)GetCurrentProcessId(), (long)InterlockedIncrement(&sequence)) >= (int)sizeof(tmp)) return -1;
-  int fd = _open(tmp, _O_WRONLY | _O_CREAT | _O_EXCL | _O_BINARY, _S_IREAD | _S_IWRITE);
-  FILE *f = fd < 0 ? NULL : _fdopen(fd, "wb");
-  if (!f && fd >= 0) _close(fd);
+  unsigned long serial=(unsigned long)InterlockedIncrement(&sequence),pid=GetCurrentProcessId();
 #else
-  if (snprintf(tmp, sizeof(tmp), "%s.tmp.XXXXXX", path) >= (int)sizeof(tmp)) return -1;
-  int fd = mkstemp(tmp);
-  FILE *f = fd < 0 ? NULL : fdopen(fd, "wb");
-  if (!f && fd >= 0) close(fd);
+  static unsigned long sequence;
+  unsigned long serial=__atomic_add_fetch(&sequence,1,__ATOMIC_RELAXED),pid=(unsigned long)getpid();
 #endif
-  if (!f) {
-    if (fd >= 0) (void)remove(tmp);
-    edr_command_audit_both("", "forensic upload metadata open failed");
-    return -1;
+  char nonce[17]="";
+#ifndef _WIN32
+  unsigned char random[8];
+#if defined(__linux__)
+  if(getrandom(random,sizeof(random),GRND_NONBLOCK)!=(ssize_t)sizeof(random)) {
+    edr_forensic_path_release(target);return -1;
+  }
+#else
+  arc4random_buf(random,sizeof(random));
+#endif
+  for(size_t i=0;i<sizeof(random);i++)snprintf(nonce+i*2,3,"%02x",random[i]);
+#endif
+  FILE *f=NULL;
+  if(snprintf(tmp,sizeof(tmp),"%s.tmp.%lu.%lu%s",path,pid,serial,nonce)<(int)sizeof(tmp) &&
+      !edr_forensic_path_acquire(tmp,0,&scratch))f=edr_forensic_path_file(scratch,"wbx");
+  if(!f) {
+    edr_forensic_path_release(scratch);edr_forensic_path_release(target);
+    edr_command_audit_both("", "forensic upload metadata open failed");return -1;
   }
   size_t size = strlen(raw);
   int ok = size < UPLOAD_RECORD_CAP && fwrite(raw, 1, size, f) == size && flush_file(f) == 0;
   if (fclose(f) != 0) ok = 0;
-  if (ok) ok = move_record(tmp, path, replace) == 0;
+  if (ok) ok = move_guarded(scratch, target, replace) == 0;
   if (!ok) {
-    (void)remove(tmp);
+    (void)edr_forensic_path_remove_temp(scratch);
     edr_command_audit_both("", "forensic upload metadata write, flush or publication failed");
   }
+  edr_forensic_path_release(scratch);edr_forensic_path_release(target);
   return ok ? 0 : -1;
 }
 static int write_record(const char *path,const char *raw,int replace) {
   return write_record_owned(path,raw,replace,0u);
 }
 
+static FILE *hold_open_read(const char *path) {
+  EdrForensicPath *guard=NULL;
+  if(edr_forensic_path_acquire(path,0,&guard))return NULL;
+  uint64_t ignored=0;int present=edr_forensic_path_size(guard,&ignored);
+  FILE *f=present ? NULL : edr_forensic_path_file(guard,"rb");
+  edr_forensic_path_release(guard);
+  if(present==1)errno=ENOENT;else if(!f)errno=EIO;
+  return f;
+}
+static int remove_metadata(const char *path) {
+  EdrForensicPath *guard=NULL;
+  if(edr_forensic_path_acquire(path,0,&guard)){errno=EIO;return -1;}
+  uint64_t ignored=0;int present=edr_forensic_path_size(guard,&ignored);
+  int rc=present ? -1 : edr_forensic_path_remove_temp(guard);
+  if(!rc)rc=edr_forensic_path_sync_parent(guard);
+  edr_forensic_path_release(guard);
+  if(present==1)errno=ENOENT;else if(rc)errno=EIO;
+  return rc;
+}
+
 static int file_hash(const char *path, char sha[65]) {
-  FILE *f = fopen(path, "rb");
-  if (!f) return errno == ENOENT ? -2 : -1;
-  EdrSha256Ctx ctx;
-  edr_sha256_init(&ctx);
-  unsigned char bytes[16384], digest[EDR_SHA256_DIGEST_LEN];
-  size_t size;
-  while ((size = fread(bytes, 1, sizeof(bytes), f)) > 0u) edr_sha256_update(&ctx, bytes, size);
-  int ok = !ferror(f);
-  if (fclose(f) != 0) ok = 0;
-  if (!ok) return -1;
-  edr_sha256_final(&ctx, digest);
-  for (size_t i = 0; i < sizeof(digest); ++i) snprintf(sha + i * 2u, 3u, "%02x", digest[i]);
-  return 0;
+  if(!path || strlen(path)>=sizeof(((EdrForensicIoRequest *)0)->staging))return -1;
+  EdrForensicIoRequest *request=calloc(1,sizeof(*request));if(!request)return -1;
+  request->version=1;request->operation=2;request->timeout_ms=300000u;
+  snprintf(request->staging,sizeof(request->staging),"%s",path);
+  EdrForensicIoResult receipt={0};int rc=edr_forensic_io_run(request,&receipt,NULL,NULL);free(request);
+  if(!rc)snprintf(sha,65,"%s",receipt.sha256);
+  return rc;
 }
 
 static int hash_valid(const char *sha) {
@@ -210,7 +242,6 @@ static int queue_upload(const char *command_id, const char *type, const EdrSoarC
   for (size_t i = 0; i < 64u; ++i) if (actual[i] != tolower((unsigned char)sha[i])) return -1;
   char dir[700], path[1200], safe[128], raw[UPLOAD_RECORD_CAP];
   edr_command_upload_outbox_dir(dir, sizeof(dir));
-  if (response_mkdir_p(dir) != 0) return -1;
   strcpy(safe, command_id);
   for (char *p = safe; *p; ++p) if (!isalnum((unsigned char)*p) && *p != '-' && *p != '_') *p = '_';
   /* Atomic publication does not overwrite another command's existing record. */
@@ -228,13 +259,16 @@ static int queue_upload(const char *command_id, const char *type, const EdrSoarC
   n = snprintf(path, sizeof(path), "%s/upload_%s_%s.pending", dir, safe, actual);
   if (n < 0 || (size_t)n >= sizeof(path)) return -1;
   UploadRecord prior;
+  char prior_path[1240];snprintf(prior_path,sizeof(prior_path),"%s",path);
   int prior_rc = read_record(path, &prior);
   if (prior_rc != 0) {
     char done[1240];
     if (snprintf(done, sizeof(done), "%s.done", path) >= (int)sizeof(done)) return -1;
+    snprintf(prior_path,sizeof(prior_path),"%s",done);
     prior_rc = read_record(done, &prior);
     if (prior_rc != 0) {
       if (snprintf(done, sizeof(done), "%s.failed", path) >= (int)sizeof(done)) return -1;
+      snprintf(prior_path,sizeof(prior_path),"%s",done);
       prior_rc = read_record(done, &prior);
     }
   }
@@ -244,7 +278,9 @@ static int queue_upload(const char *command_id, const char *type, const EdrSoarC
   }
   /* A repeated enqueue preserves the uploaded receipt and SOAR metadata.
    * Re-read after a competing publisher wins the no-replace operation. */
-  if (prior_rc != 0) prior_rc = read_record(path, &prior);
+  if (prior_rc != 0) {
+    snprintf(prior_path,sizeof(prior_path),"%s",path);prior_rc = read_record(path, &prior);
+  }
   if (prior_rc != 0 || strcmp(prior.command_id, command_id) ||
       strcmp(prior.type, type) || strcmp(prior.bundle, bundle) || strcmp(prior.sha, actual) ||
       strcmp(prior.manifest, manifest) || strcmp(prior.source, source) ||
@@ -252,9 +288,9 @@ static int queue_upload(const char *command_id, const char *type, const EdrSoarC
       strcmp(prior.meta.soar_correlation_id, meta->soar_correlation_id) ||
       strcmp(prior.meta.playbook_run_id, meta->playbook_run_id) ||
       strcmp(prior.meta.playbook_step_id, meta->playbook_step_id)) return -1;
-#ifndef _WIN32
-  if (sync_parent(path) != 0) return -1;
-#endif
+  /* A previous rename may be readable after its final durability flush
+   * failed. Re-confirm durability before accepting an idempotent record. */
+  if (sync_parent(prior_path) != 0) return -1;
   if(!artifact_credit)edr_command_executor_wake();
   return 0;
 }
@@ -274,8 +310,10 @@ int edr_command_queue_forensic_upload(const char *command_id, const char *comman
 /* Called only with the existing command owner lock held. It performs no
  * command-state calls; wake workers after handoff releases that lock. */
 static int publish_stage_locked(const EdrCommandArtifactStage *stage,uint64_t credit) {
-  uint64_t bytes=edr_storage_file_size(stage->staging);
-  if(bytes==UINT64_MAX)return -1;
+  EdrForensicPath *staging=NULL;uint64_t bytes=0;
+  if(edr_forensic_path_acquire(stage->staging,0,&staging))return -1;
+  int present=edr_forensic_path_size(staging,&bytes);edr_forensic_path_release(staging);
+  if(present<0)return -1;
   if(bytes) {
     if(move_record(stage->staging,stage->artifact,0)) {
       /* A prior crash may have completed the no-replace publication. Exact
@@ -307,12 +345,15 @@ int edr_command_upload_outbox_publish_stage(const EdrCommandArtifactStage *stage
 /* One bounded read preserves the exact legacy metadata when adding receipts. */
 static int read_record(const char *path, UploadRecord *r) {
   memset(r, 0, sizeof(*r));
-  FILE *f = fopen(path, "rb");
-  if (!f) return -1;
+  EdrForensicPath *guard=NULL;
+  if(edr_forensic_path_acquire(path,0,&guard))return -1;
+  FILE *f=edr_forensic_path_file(guard,"rb");
+  if(!f){edr_forensic_path_release(guard);return -1;}
   size_t size = fread(r->raw, 1, sizeof(r->raw) - 1u, f);
   int ok = !ferror(f), extra = fgetc(f);
   if (ferror(f)) ok = 0;
   if (fclose(f) != 0) ok = 0;
+  edr_forensic_path_release(guard);
   if (!ok) return -1;
   if (extra != EOF || memchr(r->raw, 0, size)) return 1;
   struct Field { const char *key; char *value; size_t cap; int seen; } fields[] = {
@@ -424,7 +465,7 @@ static int retire_record(const char *path, const char *command_id, const char *s
      * Retire only an exact duplicate; keep a conflicting receipt untouched. */
     char pending_sha[65], done_sha[65];
     if (file_hash(path, pending_sha) == 0 && file_hash(done, done_sha) == 0 &&
-        !strcmp(pending_sha, done_sha) && remove(path) == 0) {
+        !strcmp(pending_sha, done_sha) && remove_metadata(path) == 0) {
 #ifndef _WIN32
       if (sync_parent(done) != 0) return -2;
 #endif
@@ -436,7 +477,7 @@ static int retire_record(const char *path, const char *command_id, const char *s
   return !strcmp(suffix, "done") ? 1 : 0;
 }
 
-int edr_command_upload_outbox_flush_one(const char *path, int *upload_attempted) {
+static int flush_guarded(const char *path, int *upload_attempted) {
   *upload_attempted = 0;
   UploadRecord r;
   int rc = read_record(path, &r);
@@ -555,4 +596,14 @@ int edr_command_upload_outbox_flush_one(const char *path, int *upload_attempted)
   }
   if (error[0]) edr_command_audit_both(r.command_id, error);
   return retire_record(path, r.command_id, r.object_key[0] ? "done" : "failed");
+}
+
+int edr_command_upload_outbox_flush_one(const char *path,int *upload_attempted) {
+  if(!upload_attempted)return -2;
+  *upload_attempted=0;EdrForensicPath *guard=NULL;
+  if(edr_forensic_path_acquire(path,0,&guard)) {
+    edr_command_audit_both("","forensic outbox directory unsafe or unavailable; pending retained");return -2;
+  }
+  int rc=flush_guarded(path,upload_attempted);
+  edr_forensic_path_release(guard);return rc;
 }

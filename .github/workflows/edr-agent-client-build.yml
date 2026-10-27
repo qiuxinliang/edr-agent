@@ -6,6 +6,11 @@ name: edr-agent client build (Windows)
 
 on:
   workflow_dispatch:
+    inputs:
+      p0_test_inputs_ref:
+        description: Fixed private P0 test input commit (40 hex); defaults to repository variable
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -34,7 +39,7 @@ jobs:
       - name: Validate canonical P0 test input configuration
         shell: pwsh
         env:
-          P0_TEST_INPUTS_REF: ${{ vars.P0_TEST_INPUTS_REF }}
+          P0_TEST_INPUTS_REF: ${{ inputs.p0_test_inputs_ref || vars.P0_TEST_INPUTS_REF }}
           P0_TEST_INPUTS_SSH_KEY: ${{ secrets.P0_TEST_INPUTS_SSH_KEY }}
         run: |
           $ErrorActionPreference = 'Stop'
@@ -46,13 +51,13 @@ jobs:
       - name: Checkout canonical P0 test inputs
         shell: pwsh
         env:
-          P0_TEST_INPUTS_REF: ${{ vars.P0_TEST_INPUTS_REF }}
+          P0_TEST_INPUTS_REF: ${{ inputs.p0_test_inputs_ref || vars.P0_TEST_INPUTS_REF }}
           P0_TEST_INPUTS_SSH_KEY: ${{ secrets.P0_TEST_INPUTS_SSH_KEY }}
         run: .\scripts\checkout_private_p0_inputs.ps1 -Directory canonical-p0-test-inputs -Ref $env:P0_TEST_INPUTS_REF
       - name: Bind canonical P0 test input directory
         shell: pwsh
         env:
-          P0_TEST_INPUTS_REF: ${{ vars.P0_TEST_INPUTS_REF }}
+          P0_TEST_INPUTS_REF: ${{ inputs.p0_test_inputs_ref || vars.P0_TEST_INPUTS_REF }}
         run: |
           $ErrorActionPreference = 'Stop'
           $inputs = Join-Path $env:GITHUB_WORKSPACE 'canonical-p0-test-inputs'

@@ -1,6 +1,7 @@
 #include "edr/forensic_limits.h"
 #include "edr/response.h"
 #include "edr/response_utils.h"
+#include "edr/forensic_path.h"
 #include "edr/command_util.h"
 #include "edr/config.h"
 #include "edr/deep_collector.h"
@@ -145,65 +146,7 @@ int response_forensic_copy_one_file(const char *src, const char *dst) {
  * through validation; never reopen it for content or remove a partial copy. */
 #ifdef _WIN32
 #include "edr/windows_file_identity.h"
-/* Only the on-demand baseline copy uses this guard. Hold each directory before
- * resolving its child, so replacement and in-place reparse mutation cannot
- * redirect the subsequent open. Unsupported namespaces fail closed. */
-typedef struct ResponseCopyParents {
-  HANDLE handles[256];
-  size_t count;
-  wchar_t path[1024];
-  char utf8[4096];
-} ResponseCopyParents;
 
-static void response_copy_parents_close(ResponseCopyParents *parents) {
-  while (parents->count) CloseHandle(parents->handles[--parents->count]);
-}
-
-static int response_copy_parents_open(const char *path, ResponseCopyParents *parents) {
-  wchar_t input[1024];
-  if (!path || !MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1,
-                                   input, (int)(sizeof(input)/sizeof(input[0])))) return -1;
-  /* Reject drive-relative, UNC/device names, ADS and normalized-away components.
-   * Resolve supported drive-absolute paths once and use that same spelling for
-   * both held-directory validation and the leaf operation. */
-  size_t n = wcslen(input);
-  if (n < 4 || !((input[0] >= L'A' && input[0] <= L'Z') ||
-                (input[0] >= L'a' && input[0] <= L'z')) || input[1] != L':' ||
-      (input[2] != L'\\' && input[2] != L'/')) return -1;
-  for (size_t i = 3, start = 3; i <= n; ++i) {
-    if (input[i] == L':' || input[i] == L'"') return -1;
-    if (input[i] == L'/' || input[i] == L'\\' || !input[i]) {
-      if (i == start || input[i-1] == L'.' || input[i-1] == L' ') return -1;
-      start = i + 1;
-    }
-  }
-  DWORD full = GetFullPathNameW(input, (DWORD)(sizeof(parents->path)/sizeof(parents->path[0])), parents->path, NULL);
-  if (!full || full >= sizeof(parents->path)/sizeof(parents->path[0])) return -1;
-  if (!WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, parents->path, -1,
-                           parents->utf8, sizeof(parents->utf8), NULL, NULL)) return -1;
-  for (size_t i = 2; parents->path[i]; ++i) {
-    if (parents->path[i] != L'\\') continue;
-    if (parents->count == sizeof(parents->handles)/sizeof(parents->handles[0])) goto failed;
-    size_t end = i == 2 ? i + 1 : i;
-    wchar_t saved = parents->path[end]; parents->path[end] = 0;
-    /* An attributes-only handle does not participate in data-access sharing
-     * checks on Windows. LIST_DIRECTORY is required to deny a later writer. */
-    HANDLE h = CreateFileW(parents->path, FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES, FILE_SHARE_READ,
-        NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
-    parents->path[end] = saved;
-    if (h == INVALID_HANDLE_VALUE) goto failed;
-    BY_HANDLE_FILE_INFORMATION info;
-    if (!GetFileInformationByHandle(h, &info) || !(info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ||
-        (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) || GetFileType(h) != FILE_TYPE_DISK) {
-      CloseHandle(h); goto failed;
-    }
-    parents->handles[parents->count++] = h;
-  }
-  return 0;
-failed:
-  response_copy_parents_close(parents);
-  return -1;
-}
 #endif
 #ifdef EDR_RESPONSE_COPY_TESTING
 static void (*response_copy_test_chunk)(const char *, const char *);
@@ -223,15 +166,14 @@ static int response_forensic_copy_limited(const char *src, const char *dst, size
   const char *failure = "source_open_failed";
   int result = EDR_RESPONSE_COPY_SOURCE_UNAVAILABLE;
   size_t copied = 0;
+  EdrForensicPath *source_parents = NULL, *target_parents = NULL;
+  if (edr_forensic_path_acquire(src, 0, &source_parents)) { failure = "source_parent_unsafe_or_unavailable"; goto done; }
+  src = edr_forensic_path_text(source_parents);
 #ifdef _WIN32
-  ResponseCopyParents source_parents = {0}, target_parents = {0};
   void *native = NULL;
   char identity[EDR_WINDOWS_FILE_IDENTITY_V1_CAP], observed[EDR_WINDOWS_FILE_IDENTITY_V1_CAP];
   uint64_t write_time = 0, observed_time = 0;
   LARGE_INTEGER before_size, after_size;
-  failure = "source_parent_unsafe_or_unavailable";
-  if (response_copy_parents_open(src, &source_parents)) goto done;
-  src = source_parents.utf8;
   failure = "source_open_failed";
   if (!edr_windows_file_identity_open_readonly(src, &native, identity, sizeof(identity), &write_time)) goto done;
   HANDLE source = (HANDLE)native;
@@ -242,34 +184,23 @@ static int response_forensic_copy_limited(const char *src, const char *dst, size
   if (input_fd < 0) { CloseHandle(source); goto done; }
   in = _fdopen(input_fd, "rb");
   if (!in) { _close(input_fd); goto done; }
-  failure = "destination_create_failed";
-  result = EDR_RESPONSE_COPY_DESTINATION_FAILED;
-  failure = "destination_parent_unsafe_or_unavailable";
-  if (response_copy_parents_open(dst, &target_parents)) goto done;
-  failure = "destination_create_failed";
-  HANDLE target = CreateFileW(target_parents.path, GENERIC_WRITE, 0, NULL, CREATE_NEW,
-      FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
-  if (target == INVALID_HANDLE_VALUE) goto done;
-  int output_fd = _open_osfhandle((intptr_t)target, _O_WRONLY | _O_BINARY | _O_NOINHERIT);
-  if (output_fd < 0) { CloseHandle(target); goto done; }
-  out = _fdopen(output_fd, "wb");
-  if (!out) { _close(output_fd); goto done; }
+
 #else
   struct stat before, after, named;
-  int input_fd = open(src, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
-  if (input_fd < 0) goto done;
+  in = edr_forensic_path_file(source_parents, "rb");
+  if (!in) goto done;
+  int input_fd = fileno(in);
   if (fstat(input_fd, &before) || !S_ISREG(before.st_mode) || before.st_size < 0) {
-    close(input_fd); failure = "source_not_regular"; goto done;
+    failure = "source_not_regular"; goto done;
   }
-  in = fdopen(input_fd, "rb");
-  if (!in) { close(input_fd); goto done; }
-  failure = "destination_create_failed";
-  result = EDR_RESPONSE_COPY_DESTINATION_FAILED;
-  int output_fd = open(dst, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
-  if (output_fd < 0) goto done;
-  out = fdopen(output_fd, "wb");
-  if (!out) { close(output_fd); goto done; }
+
 #endif
+  result = EDR_RESPONSE_COPY_DESTINATION_FAILED;
+  failure = "destination_parent_unsafe_or_unavailable";
+  if (edr_forensic_path_acquire(dst, 0, &target_parents)) goto done;
+  failure = "destination_create_failed";
+  out = edr_forensic_path_file(target_parents, "wbx");
+  if (!out) goto done;
   char buf[65536]; size_t n;
   failure = NULL; result = 0;
   for (;;) {
@@ -316,10 +247,8 @@ static int response_forensic_copy_limited(const char *src, const char *dst, size
 done:
   if (in && fclose(in) && !failure) { failure = "source_close_failed"; result = EDR_RESPONSE_COPY_SOURCE_UNAVAILABLE; }
   if (out && fclose(out) && !failure) { failure = "destination_close_failed"; result = EDR_RESPONSE_COPY_DESTINATION_FAILED; }
-#ifdef _WIN32
-  response_copy_parents_close(&target_parents);
-  response_copy_parents_close(&source_parents);
-#endif
+  edr_forensic_path_release(target_parents);
+  edr_forensic_path_release(source_parents);
   if (!failure && (result = response_copy_checkpoint(deadline, cancel, user)) != 0)
     failure = "cancelled_or_deadline_exceeded";
   if (failure) fprintf(stderr, "[forensic] bounded_copy_%s; partial evidence retained\n", failure);
@@ -535,26 +464,18 @@ static int response_tar_quote(const char *path,char *out,size_t cap) {
   memset(out+1+n,'\\',trailing);out[1+n+trailing]='"';out[2+n+trailing]=0;return 0;
 }
 #endif
-int response_make_tar_bundle(const char *dir,const char *bundle_path,uint32_t timeout_ms,
-                             EdrResponseCancelCheck cancel,void *cancel_user) {
-  if(!dir || !*dir || !bundle_path || !*bundle_path || !timeout_ms || timeout_ms>300000u)return -1;
+static int response_tar_worker_group;
+void response_tar_set_worker_group(void) {response_tar_worker_group=1;}
+static int response_make_tar_bundle_guarded(const char *dir, FILE *output, EdrForensicPath *input_guard,
+                             uint32_t timeout_ms, EdrResponseCancelCheck cancel,void *cancel_user) {
   if(cancel && cancel(cancel_user))return EDR_DC_ERR_CANCELLED;
   uint64_t started=response_io_now_ms();if(started==UINT64_MAX)return -1;
-#ifdef _WIN32
-  int output_fd=_open(bundle_path,_O_WRONLY|_O_CREAT|_O_EXCL|_O_BINARY|_O_NOINHERIT,_S_IREAD|_S_IWRITE);
-  FILE *output=output_fd<0?NULL:_fdopen(output_fd,"wb");
-  if(!output && output_fd>=0)_close(output_fd);
-#else
-  int output_fd=open(bundle_path,O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW|O_CLOEXEC,0600);
-  FILE *output=output_fd<0?NULL:fdopen(output_fd,"wb");
-  if(!output && output_fd>=0)close(output_fd);
-#endif
-  if(!output)return -1;
   int result=-1,finished=0;size_t written=0;
   unsigned char buffer[16384];
 #ifdef _WIN32
   HANDLE reader=NULL,writer=NULL,input=NULL,errors=NULL,job=NULL;
-  PROCESS_INFORMATION process={0};STARTUPINFOEXA startup={0};
+  PROCESS_INFORMATION process={0};STARTUPINFOEXW startup={0};
+  (void)input_guard;
   char binary[1100],quoted_binary[2204],quoted_dir[2204],command[4500];
   UINT n=GetSystemDirectoryA(binary,sizeof(binary));
   if(!n || n+9u>=sizeof(binary))goto done;
@@ -595,7 +516,10 @@ int response_make_tar_bundle(const char *dir,const char *bundle_path,uint32_t ti
       inherited,sizeof(inherited),NULL,NULL))goto done;
   startup.StartupInfo.cb=sizeof(startup);startup.StartupInfo.dwFlags=STARTF_USESTDHANDLES;
   startup.StartupInfo.hStdOutput=writer;startup.StartupInfo.hStdInput=input;startup.StartupInfo.hStdError=errors;
-  if(!CreateProcessA(binary,command,NULL,NULL,TRUE,
+  wchar_t wide_binary[1100], wide_command[4500];
+  if(!MultiByteToWideChar(CP_UTF8,MB_ERR_INVALID_CHARS,binary,-1,wide_binary,1100) ||
+      !MultiByteToWideChar(CP_UTF8,MB_ERR_INVALID_CHARS,command,-1,wide_command,4500))goto done;
+  if(!CreateProcessW(wide_binary,wide_command,NULL,NULL,TRUE,
       CREATE_SUSPENDED|CREATE_NO_WINDOW|EXTENDED_STARTUPINFO_PRESENT,NULL,NULL,
       &startup.StartupInfo,&process))goto done;
   if(!AssignProcessToJobObject(job,process.hProcess) || ResumeThread(process.hThread)==(DWORD)-1)goto stop;
@@ -644,19 +568,19 @@ done:
 #ifdef EDR_RESPONSE_TAR_TESTING
   if(response_tar_test_binary)binary=response_tar_test_binary;
 #endif
-  int pipes[2];if(pipe(pipes)){fclose(output);return -1;}
+  int pipes[2];if(pipe(pipes)){return -1;}
   if(fcntl(pipes[0],F_SETFL,O_NONBLOCK)<0 || fcntl(pipes[0],F_SETFD,FD_CLOEXEC)<0 ||
       fcntl(pipes[1],F_SETFD,FD_CLOEXEC)<0) {
-    close(pipes[0]);close(pipes[1]);fclose(output);return -1;
+    close(pipes[0]);close(pipes[1]);return -1;
   }
   pid_t child=fork();
-  if(child<0){close(pipes[0]);close(pipes[1]);fclose(output);return -1;}
+  if(child<0){close(pipes[0]);close(pipes[1]);return -1;}
   if(child==0) {
-    if(setpgid(0,0) || dup2(pipes[1],STDOUT_FILENO)<0)_exit(126);
+    if((!response_tar_worker_group && setpgid(0,0)) || fchdir(edr_forensic_path_parent_fd(input_guard)) || dup2(pipes[1],STDOUT_FILENO)<0)_exit(126);
     close(pipes[0]);close(pipes[1]);
-    execlp(binary,binary,"czf","-","-C",dir,".",(char *)NULL);_exit(127);
+    execlp(binary,binary,"czf","-","-C",".",".",(char *)NULL);_exit(127);
   }
-  close(pipes[1]);(void)setpgid(child,child);int status=0;
+  close(pipes[1]);if(!response_tar_worker_group)(void)setpgid(child,child);int status=0;
   while(1) {
     if(cancel && cancel(cancel_user)){result=EDR_DC_ERR_CANCELLED;break;}
     uint64_t now=response_io_now_ms();
@@ -677,9 +601,9 @@ done:
     struct timespec pause={0,1000000};(void)nanosleep(&pause,NULL);
   }
   close(pipes[0]);
-  if(finished && result!=0)(void)kill(-child,SIGKILL);
+  if(finished && result!=0)(void)kill(response_tar_worker_group?child:-child,SIGKILL);
   if(!finished) {
-    (void)kill(-child,SIGKILL);(void)kill(child,SIGKILL);
+    (void)kill(response_tar_worker_group?child:-child,SIGKILL);(void)kill(child,SIGKILL);
     for(unsigned tries=0;tries<200u;tries++) {
       pid_t waited=waitpid(child,&status,WNOHANG);
       if(waited==child){finished=1;break;}
@@ -689,9 +613,34 @@ done:
     if(!finished)result=EDR_RESPONSE_WRITER_UNCONFIRMED;
   }
 #endif
-  if(fclose(output) && result!=EDR_RESPONSE_WRITER_UNCONFIRMED)result=-1;
   /* Failed/partial staging belongs to its durable owner; never unlink it here. */
   return result;
+}
+
+int response_make_tar_bundle(const char *dir,const char *bundle_path,uint32_t timeout_ms,
+                             EdrResponseCancelCheck cancel,void *user) {
+  if(!dir || !*dir || !bundle_path || !*bundle_path || !timeout_ms || timeout_ms>300000u)return -1;
+  if(cancel && cancel(user))return EDR_DC_ERR_CANCELLED;
+  EdrForensicPath *input=NULL,*output_path=NULL;
+  FILE *output=NULL;int result=-1;
+  char scope[4096],normalized[4096];
+  uint64_t started=response_io_now_ms();
+  if(started==UINT64_MAX || snprintf(scope,sizeof(scope),"%s/.edr_archive_scope",dir)>=(int)sizeof(scope))return -1;
+  if(edr_forensic_path_acquire(scope,0,&input) || edr_forensic_path_acquire(bundle_path,0,&output_path))goto done;
+  snprintf(normalized,sizeof(normalized),"%s",edr_forensic_path_text(input));
+  char *slash=strrchr(normalized,'/');
+#ifdef _WIN32
+  char *backslash=strrchr(normalized,'\\');
+  if(!slash || (backslash && backslash>slash))slash=backslash;
+#endif
+  if(!slash)goto done;*slash=0;
+  output=edr_forensic_path_file(output_path,"wbx");if(!output)goto done;
+  uint64_t now=response_io_now_ms();
+  result=now==UINT64_MAX || now-started>=timeout_ms ? EDR_DC_ERR_TIMEOUT :
+      response_make_tar_bundle_guarded(normalized,output,input,timeout_ms-(uint32_t)(now-started),cancel,user);
+done:
+  if(output && fclose(output) && result!=EDR_RESPONSE_WRITER_UNCONFIRMED)result=-1;
+  edr_forensic_path_release(output_path);edr_forensic_path_release(input);return result;
 }
 
 int response_split_args(char *buf, char *argv[], size_t argv_cap) {

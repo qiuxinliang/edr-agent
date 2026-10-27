@@ -573,6 +573,8 @@ set(EDR_AGENT_SOURCES
   src/response/response_file_security.c
   src/response/response_forensic.c
   src/response/response_utils.c
+  src/forensic/forensic_path.c
+  src/forensic/forensic_worker.c
   src/forensic/deep_collector.c
   src/shell/shell_session.c
   src/pmfe/pmfe_engine.c

@@ -1,6 +1,7 @@
 /* Actual bounded producer -> tar -> command owner -> outbox, synthetic files
  * only. No Agent init, collectors, transport grants or service loop. */
 #include "edr/response.h"
+#include "edr/forensic_worker.h"
 #include "edr/response_utils.h"
 #include "edr/command_state.h"
 #include "edr/command_executor.h"
@@ -26,7 +27,8 @@ static void start_owner(const char *id,EdrSoarCommandMeta *meta) {
   int retry=0;assert(edr_command_state_begin(id,"collect_forensic",meta,&retry,NULL)==0);
 }
 
-int main(void) {
+int main(int argc,char **argv) {
+  if(argc==3 && !strcmp(argv[1],EDR_FORENSIC_WORKER_ARG))return edr_forensic_io_worker_main(argv[2]);
   char root[700];
 #ifdef _WIN32
   char temp[MAX_PATH];assert(GetTempPathA(sizeof(temp),temp));
