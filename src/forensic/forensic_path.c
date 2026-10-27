@@ -220,7 +220,11 @@ int edr_forensic_path_move(EdrForensicPath *from, EdrForensicPath *to, int repla
   if(!rename_fn || !error_fn)error=ERROR_PROC_NOT_FOUND;
   else if(!FlushFileBuffers(file))error=GetLastError();
   else {
-    NTSTATUS status=rename_fn(file,&io,info,(ULONG)size,FileRenameInformation);
+    /* FILE_INFORMATION_CLASS in the desktop SDK is a subset of the WDK.
+     * Native FileRenameInformation is ABI value 10 (wdm.h); do not require
+     * the kernel-mode WDK just to name this documented information class. */
+    const FILE_INFORMATION_CLASS rename_information=(FILE_INFORMATION_CLASS)10;
+    NTSTATUS status=rename_fn(file,&io,info,(ULONG)size,rename_information);
     if(status>=0) {rc=FlushFileBuffers(file)?0:-1;error=GetLastError();}
     else error=error_fn(status);
   }
