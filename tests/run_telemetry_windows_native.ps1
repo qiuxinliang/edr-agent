@@ -89,6 +89,7 @@ try {
     'windows-release-gate' -in @($_.properties | Where-Object name -EQ 'LABELS' | ForEach-Object value)
   })
   $required = @('egress_batch_policy','egress_request_policy','command_result_egress','command_result_compaction','egress_receiver_resources','queue_recovery_real_codec',
+    'evidence_ownership_contract','evidence_recall_contract',
     'local_evidence_cache_candidate','local_evidence_cache_migration','local_evidence_cache_retention','local_evidence_cache_context_layout',
     'local_evidence_cache_pressure_continuation','local_evidence_cache_startup_budget',
     'storage_queue_sqlite_contract','deep_collector_manifest',

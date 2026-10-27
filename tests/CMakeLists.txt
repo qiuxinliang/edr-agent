@@ -18,7 +18,7 @@ add_test(NAME edr_agent_help COMMAND edr_agent --help)
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 add_test(NAME evidence_ownership_contract
   COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/test_evidence_ownership_contract.py)
-set_tests_properties(evidence_ownership_contract PROPERTIES TIMEOUT 30)
+set_tests_properties(evidence_ownership_contract PROPERTIES TIMEOUT 30 LABELS telemetry-minimization)
 add_test(NAME evidence_startup_index_manifest
   COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/test_evidence_startup_index_manifest.py)
 add_test(NAME tdh_property_alias_order_contract
@@ -2221,6 +2221,7 @@ edr_minimization_test(command_result_egress test_command_result_egress)
 edr_minimization_test(command_result_compaction test_command_result_compaction)
 edr_minimization_test(authorized_local_query_contract test_egress_tls_client)
 edr_minimization_test(queue_recovery_real_codec test_queue_recovery)
+edr_minimization_test(evidence_recall_contract test_evidence_recall_contract)
 edr_minimization_test(local_evidence_cache_candidate test_local_evidence_cache_candidate)
 edr_minimization_test(local_evidence_cache_migration test_local_evidence_cache_candidate)
 edr_minimization_test(local_evidence_cache_retention test_local_evidence_cache_candidate)
