@@ -4657,6 +4657,9 @@ static void test_context_window_prefers_nominal_end_and_retains_late_events(void
 
 static void test_context_window_protection_requires_both_clocks(void) {
   const int64_t base = ordinary_test_minute() - 180000000000LL;
+  /* This fixture corrupts only the window clock. Keep the independently
+   * tested durable-retention clock valid so admission reaches replacement. */
+  edr_local_evidence_cache_test_set_retention_monotonic_ms(1000);
   for (unsigned scenario = 0u; scenario < 3u; ++scenario) {
     char db[640];
     EdrBehaviorRecord r;
@@ -4681,6 +4684,7 @@ static void test_context_window_protection_requires_both_clocks(void) {
     cleanup_test_sqlite_path(db);
   }
   s_test_monotonic_ns = 1000000000ULL;
+  edr_local_evidence_cache_test_set_retention_monotonic_ms(-1);
 }
 
 static void test_context_generation_multicandidate_and_artifact_identity(void) {
@@ -7332,7 +7336,9 @@ static void compact_exec(sqlite3 *db, const char *sql) {
 static int64_t compact_scalar(sqlite3 *db, const char *sql) {
   sqlite3_stmt *st = NULL;
   assert(sqlite3_prepare_v2(db, sql, -1, &st, NULL) == SQLITE_OK);
-  assert(sqlite3_step(st) == SQLITE_ROW);
+  int step = sqlite3_step(st);
+  if (step != SQLITE_ROW) fprintf(stderr, "compact scalar failed rc=%d SQL=%s\n", step, sql);
+  assert(step == SQLITE_ROW);
   int64_t value = sqlite3_column_int64(st, 0);
   sqlite3_finalize(st); return value;
 }
@@ -12430,6 +12436,30 @@ static void test_pressure_continuation_empty_reclaim_and_backoff(void) {
   pressure_continuation_phase("seed_done",4200u,phase_started);
   edr_local_evidence_cache_close();
   pressure_continuation_phase("seed_close_done",4200u,phase_started);
+  /* Settle the real restart transition before constructing the zero-free-page
+   * scheduler fixture. Removing recovered active-window index entries can
+   * release pages; that valid startup work is separate from empty reclaim.
+   * Reuse the existing seed budget and compact only this synthetic database. */
+  edr_local_evidence_cache_test_set_window_recovery_identity(0);
+  assert(edr_local_evidence_cache_open_with_policy(path,32u,1u,1u) == 0);
+  edr_local_evidence_cache_close();
+  edr_local_evidence_cache_test_set_window_recovery_identity(-1);
+  assert(sqlite3_open(path,&db) == SQLITE_OK);
+  assert(compact_scalar(db,"SELECT COUNT(*) FROM p0_candidates WHERE context_window_state='active'") == 0);
+  const char *fixture_queries[] = {
+      "SELECT * FROM p0_candidates ORDER BY candidate_id",
+      "SELECT * FROM context_facts ORDER BY fact_id",
+      "SELECT * FROM context_reference_projection ORDER BY artifact_id"};
+  char fixture_hashes[3][65];
+  for (unsigned i=0;i<3u;++i) compact_startup_rowset_hash(db,fixture_queries[i],fixture_hashes[i]);
+  compact_exec(db,"PRAGMA incremental_vacuum;PRAGMA wal_checkpoint(TRUNCATE);");
+  assert(compact_scalar(db,"PRAGMA freelist_count") == 0);
+  for (unsigned i=0;i<3u;++i) {
+    compact_startup_rowset_hash(db,fixture_queries[i],after_hash);
+    assert(!strcmp(fixture_hashes[i],after_hash));
+  }
+  assert(sqlite3_close(db) == SQLITE_OK); db=NULL;
+  pressure_continuation_phase("empty_reclaim_fixture_ready",4200u,phase_started);
   assert(edr_local_evidence_cache_open_with_policy(path,1u,1u,1u) == 0);
   pressure_continuation_phase("pressure_reopen_done",4200u,phase_started);
   assert(sqlite3_open(path,&db) == SQLITE_OK);
@@ -13531,6 +13561,15 @@ static void test_startup_preclock_owner_integrity(void) {
   assert(edr_local_evidence_cache_record_command_result("preclock-result","rtq_query","done",1,0,
       "public retained result","[]")==EDR_EVIDENCE_COMMAND_RESULT_STORED);
   edr_local_evidence_cache_close();assert(sqlite3_open(path,&db)==SQLITE_OK);
+  /* Build the historical pre-clock shape, not a current window obligation
+   * with its clock removed. New recovery metadata was absent in that version. */
+  compact_exec(db,"DROP INDEX idx_candidates_window_recovery;"
+      "DROP TRIGGER context_window_floor_v1_insert;DROP TRIGGER context_window_floor_v1_update;"
+      "DROP TRIGGER context_window_floor_v1_eligible;DROP TRIGGER context_window_floor_v1_delete;"
+      "ALTER TABLE p0_candidates DROP COLUMN context_window_protect_until_active_ms;"
+      "ALTER TABLE p0_candidates DROP COLUMN context_window_state;"
+      "ALTER TABLE p0_candidates DROP COLUMN context_window_spec;"
+      "ALTER TABLE p0_candidates DROP COLUMN context_window_gap_reason;");
   compact_exec(db,"DROP TRIGGER retention_active_clock_v1_insert;DROP TRIGGER retention_active_clock_v1_update;"
       "DROP TRIGGER retention_active_clock_v1_delete;DROP TRIGGER alert_context_floor_v1_insert;"
       "DROP TRIGGER alert_context_floor_v1_update;DROP TRIGGER alert_context_floor_v1_eligible;"
@@ -13567,6 +13606,7 @@ static void test_startup_preclock_owner_integrity(void) {
       compact_startup_rowset_hash(db,queries[i],after);assert(!strcmp(before[i],after));
     }
     assert(compact_scalar(db,"SELECT COUNT(*) FROM p0_candidates WHERE alert_context_protect_until_active_ms!=0")==0);
+    assert(compact_scalar(db,"SELECT COUNT(*) FROM p0_candidates WHERE context_window_protect_until_active_ms!=0 OR context_window_state!='unknown' OR context_window_spec!='' OR context_window_gap_reason!=''")==0);
     assert(compact_scalar(db,"SELECT COUNT(*) FROM metrics WHERE metric_name LIKE 'expired-%'")<512);
     assert(compact_scalar(db,"PRAGMA page_count")<=291);
     EdrParentContextQuery q=floor_query(first,now);
@@ -14167,9 +14207,19 @@ static void test_compact_startup_contract(void) {
   compact_startup_rowset_hash(db, "SELECT * FROM candidate_context_refs ORDER BY artifact_id", refs);
   compact_startup_rowset_hash(db, "SELECT * FROM materialized_artifacts ORDER BY artifact_id", projection);
   parent_fixture_owner_hash(db, r->pid, owner);
-  compact_startup_rowset_hash(db, "SELECT * FROM p0_candidates ORDER BY candidate_id", candidates);
+  /* This is legacy context layout populated by the current writer, so its
+   * active window must truthfully become interrupted when live identity cannot
+   * be verified. Compare every candidate column against that exact transition;
+   * all evidence, frozen window spec and protection floor remain byte-identical. */
+  assert(compact_scalar(db,"SELECT COUNT(*) FROM p0_candidates WHERE context_window_state='active'") == 1);
+  compact_exec(db,"CREATE TEMP TABLE compact_expected_candidates AS SELECT * FROM p0_candidates;"
+      "UPDATE compact_expected_candidates SET context_window_state='interrupted',"
+      "context_window_gap_reason='live_generation_unverified' WHERE context_window_state='active';");
+  compact_startup_rowset_hash(db, "SELECT * FROM compact_expected_candidates ORDER BY candidate_id", candidates);
   compact_startup_rowset_hash(db, "SELECT * FROM artifacts ORDER BY artifact_id", artifacts);
+  edr_local_evidence_cache_test_set_window_recovery_identity(0);
   assert(edr_local_evidence_cache_open(path, 16u, 24u) == 0);
+  edr_local_evidence_cache_test_set_window_recovery_identity(-1);
   edr_local_evidence_cache_get_status(&status);
   assert(status.storage_format == 1u && !status.compact_startup_deferred);
   compact_startup_unchanged(db, refs, projection);
@@ -14573,7 +14623,160 @@ static void test_phase2_continues_across_ttl(int benchmark) {
 }
 #endif
 
+
+#if defined(EDR_HAVE_SQLITE)
+/* Recovery verifies a live tuple, never boot time arithmetic or PID alone.
+ * The seam substitutes only that OS handle boundary; cache/SQLite/GC are real. */
+static void test_window_recovery_failures_and_frozen_policy(void) {
+  const int64_t base = INT64_C(1793100000000000000);
+  for (unsigned mode = 0; mode < 5; ++mode) {
+    char path[640], candidate_id[200]; sqlite3 *db = NULL;
+    EdrBehaviorRecord candidate, context;
+    assert(make_test_sqlite_path(path, sizeof(path)) == 0);
+    edr_local_evidence_cache_test_set_now_unix_ns(base);
+    edr_local_evidence_cache_test_set_retention_monotonic_ms(1000);
+    s_test_monotonic_ns = UINT64_C(1000000000);
+    test_setenv("EDR_EVIDENCE_CONTEXT_WINDOW_S", "60");
+    assert(edr_local_evidence_cache_open(path, 8u, 1u) == 0);
+    init_window_replacement_candidate(&candidate, 0u, base);
+    context = candidate; context.type = EDR_EVENT_FILE_WRITE; context.net_dport = 0;
+    context.net_dst[0] = '\0'; context.event_time_ns = base - INT64_C(1000000000);
+    snprintf(context.event_id, sizeof(context.event_id), "frozen-pre-context");
+    snprintf(context.file_path, sizeof(context.file_path), "C:\\UserData\\pre.bin");
+    assert(!edr_local_evidence_cache_is_candidate(&context));
+    edr_local_evidence_cache_record_behavior(&context);
+    edr_local_evidence_cache_record_behavior(&candidate);
+    assert(sqlite3_open(path, &db) == SQLITE_OK);
+    int64_t created = compact_scalar(db, "SELECT created_ns FROM p0_candidates");
+    int64_t until = compact_scalar(db, "SELECT context_post_until_ns FROM p0_candidates");
+    int64_t floor = compact_scalar(db, "SELECT context_window_protect_until_active_ms FROM p0_candidates");
+    assert(until == base + INT64_C(60000000000));
+    assert(floor == floor_active_ms(db) + 60000);
+    assert(sqlite3_exec(db, "UPDATE p0_candidates SET context_window_protect_until_active_ms=0;", NULL, NULL, NULL) == SQLITE_CONSTRAINT);
+    assert(sqlite3_exec(db, "UPDATE p0_candidates SET context_window_protect_until_active_ms=context_window_protect_until_active_ms+1;", NULL, NULL, NULL) == SQLITE_CONSTRAINT);
+    assert(sqlite3_exec(db, "UPDATE p0_candidates SET local_retention_state='retirement_eligible';", NULL, NULL, NULL) == SQLITE_CONSTRAINT);
+    assert(sqlite3_exec(db, "DELETE FROM p0_candidates;", NULL, NULL, NULL) == SQLITE_CONSTRAINT);
+    test_setenv("EDR_EVIDENCE_CONTEXT_WINDOW_S", "120");
+    edr_local_evidence_cache_test_set_now_unix_ns(base + INT64_C(1000000000));
+    edr_local_evidence_cache_record_behavior(&candidate);
+    assert(compact_scalar(db, "SELECT created_ns FROM p0_candidates") == created);
+    assert(compact_scalar(db, "SELECT context_post_until_ns FROM p0_candidates") == until);
+    assert(compact_scalar(db, "SELECT context_window_protect_until_active_ms FROM p0_candidates") == floor);
+    assert(compact_scalar(db, "SELECT COUNT(*) FROM context_reference_projection") == 0);
+    assert(compact_scalar(db, "SELECT context_pre_count FROM p0_candidates") == 1);
+    char bundle[16384];
+    sqlite_bundle_manifest_for_source_event(path, candidate.event_id, bundle, sizeof(bundle));
+    cJSON *manifest = cJSON_Parse(bundle); assert(manifest);
+    assert(cJSON_GetArraySize(cJSON_GetObjectItemCaseSensitive(manifest, "context")) == 1);
+    cJSON *post_window = cJSON_GetObjectItemCaseSensitive(manifest, "post_window_s");
+    assert(cJSON_IsNumber(post_window) && post_window->valuedouble == 60);
+    cJSON_Delete(manifest);
+    sqlite_candidate_id_for_source_event(path, candidate.event_id, candidate_id, sizeof(candidate_id));
+    edr_local_evidence_cache_close();
+    edr_local_evidence_cache_test_set_window_recovery_identity(mode == 1u || mode == 4u ? 0 : 1);
+    s_test_monotonic_ns = mode == 2u ? 0u : mode == 3u ? UINT64_C(62000000000) : UINT64_C(2000000000);
+    int64_t reopen_now = mode == 3u ? base + INT64_C(61000000000) :
+        mode == 4u ? base + INT64_C(7200000000000) : base + INT64_C(2000000000);
+    edr_local_evidence_cache_test_set_now_unix_ns(reopen_now);
+    assert(edr_local_evidence_cache_open(path, 8u, 1u) == 0);
+    const char *expected = mode == 0u ? "active" : mode == 3u ? "expired" : "interrupted";
+    char query[256]; snprintf(query, sizeof(query), "SELECT COUNT(*) FROM p0_candidates WHERE context_window_state='%s'", expected);
+    assert(compact_scalar(db, query) == 1);
+    assert(compact_scalar(db, "SELECT context_post_until_ns FROM p0_candidates") == until);
+    assert(compact_scalar(db, "SELECT context_window_protect_until_active_ms FROM p0_candidates") == floor);
+    context = candidate; context.type = EDR_EVENT_FILE_WRITE; context.net_dport = 0;
+    context.net_dst[0] = '\0'; context.event_time_ns = base + INT64_C(3000000000);
+    snprintf(context.event_id, sizeof(context.event_id), "recovery-post");
+    snprintf(context.file_path, sizeof(context.file_path), "C:\\UserData\\recover.bin");
+    edr_local_evidence_cache_record_behavior(&context);
+    assert(sqlite_post_artifact_count(path, candidate_id, context.event_id) == (mode == 0u ? 1u : 0u));
+    if (mode == 0u) {
+      assert(compact_scalar(db, "SELECT COUNT(*) FROM p0_candidates WHERE context_window_gap_reason='service_restart_gap'") == 1);
+      /* A later verification failure must not be hidden behind the first gap. */
+      edr_local_evidence_cache_close();
+      edr_local_evidence_cache_test_set_window_recovery_identity(0);
+      assert(edr_local_evidence_cache_open(path, 8u, 1u) == 0);
+      assert(compact_scalar(db, "SELECT COUNT(*) FROM p0_candidates WHERE context_window_state='interrupted' AND context_window_gap_reason='live_generation_unverified'") == 1);
+    }
+    if (mode == 4u) {
+      /* Two-hour wall jump cannot consume the outstanding active-time floor. */
+      edr_local_evidence_cache_test_set_retention_monotonic_ms(2000);
+      s_test_monotonic_ns += UINT64_C(61000000000); retention_poll();
+      assert(compact_scalar(db, "SELECT COUNT(*) FROM p0_candidates") == 1);
+      edr_local_evidence_cache_test_set_retention_monotonic_ms(62001);
+      s_test_monotonic_ns += UINT64_C(61000000000); retention_poll();
+      assert(compact_scalar(db, "SELECT COUNT(*) FROM p0_candidates") == 0);
+    }
+    printf("window_recovery mode=%u state=%s frozen_policy=1 frozen_active_floor=1 post_refs=%u\n",
+        mode, expected, mode == 0u ? 1u : 0u);
+    assert(sqlite3_close(db) == SQLITE_OK); edr_local_evidence_cache_close(); cleanup_test_sqlite_path(path);
+  }
+  test_unsetenv("EDR_EVIDENCE_CONTEXT_WINDOW_S");
+  edr_local_evidence_cache_test_set_window_recovery_identity(-1);
+  edr_local_evidence_cache_test_set_retention_monotonic_ms(-1);
+  edr_local_evidence_cache_test_set_now_unix_ns(0);
+  s_test_monotonic_ns = UINT64_C(1000000000);
+}
+
+/* Same production entry points and identities, four fixed invocation orders.
+ * Probe mode records the old mechanism; contract mode requires the fix. */
+static void test_window_entry_order_and_recovery(int enforce) {
+  const int64_t base = INT64_C(1793100000000000000);
+  for (unsigned mode = 0u; mode < 5u; ++mode) {
+    char path[640], candidate_id[200];
+    EdrBehaviorRecord candidate, context;
+    EdrEvidenceCacheStatus status;
+    assert(make_test_sqlite_path(path, sizeof(path)) == 0);
+    edr_local_evidence_cache_test_set_now_unix_ns(base);
+    s_test_monotonic_ns = UINT64_C(1000000000);
+    test_setenv("EDR_EVIDENCE_CONTEXT_WINDOW_S", "60");
+    assert(edr_local_evidence_cache_open(path, 8u, 24u) == 0);
+    edr_pt_cache_init();
+    init_window_replacement_candidate(&candidate, 0u, base);
+    snprintf(candidate.cmdline, sizeof(candidate.cmdline), "window-owner.exe --fixture");
+    EdrCommandFacts commands = {candidate.cmdline, NULL};
+    if (mode == 3u) { candidate.net_dport = 80u; assert(!edr_local_evidence_cache_is_candidate(&candidate)); }
+    if (mode == 1u || mode == 4u) edr_local_evidence_cache_record_behavior(&candidate);
+    if (mode != 4u) assert(edr_local_evidence_cache_record_alert_context(&candidate, &commands) == 0);
+    if (mode == 0u || mode == 3u) edr_local_evidence_cache_record_behavior(&candidate);
+    if (mode == 4u) {
+      edr_local_evidence_cache_test_set_window_recovery_identity(1);
+      edr_local_evidence_cache_close();
+      edr_local_evidence_cache_test_set_now_unix_ns(base + INT64_C(1000000000));
+      s_test_monotonic_ns += UINT64_C(1000000000);
+      assert(edr_local_evidence_cache_open(path, 8u, 24u) == 0);
+    }
+    sqlite_candidate_id_for_source_event(path, candidate.event_id, candidate_id, sizeof(candidate_id));
+    context = candidate; context.type = EDR_EVENT_FILE_WRITE;
+    context.event_time_ns = base + INT64_C(2000000000);
+    context.net_dport = 0; context.net_dst[0] = '\0';
+    snprintf(context.event_id, sizeof(context.event_id), "window-post-fixture");
+    snprintf(context.file_path, sizeof(context.file_path), "C:\\UserData\\window-fixture.bin");
+    assert(!edr_local_evidence_cache_is_candidate(&context));
+    edr_local_evidence_cache_record_behavior(&context);
+    edr_local_evidence_cache_get_status(&status);
+    uint64_t post = sqlite_post_artifact_count(path, candidate_id, context.event_id);
+    printf("window_lifecycle mode=%u candidates=%llu windows=%u post_refs=%llu\n", mode,
+        (unsigned long long)sqlite_table_count(path, "p0_candidates"), status.context_windows_used,
+        (unsigned long long)post);
+    fflush(stdout);
+    if (enforce) assert(post == 1u);
+    edr_local_evidence_cache_close(); edr_pt_cache_shutdown(); cleanup_test_sqlite_path(path);
+    edr_local_evidence_cache_test_set_window_recovery_identity(-1);
+  }
+  test_unsetenv("EDR_EVIDENCE_CONTEXT_WINDOW_S");
+  edr_local_evidence_cache_test_set_now_unix_ns(0);
+  s_test_monotonic_ns = UINT64_C(1000000000);
+}
+#endif
+
 int main(int argc, char **argv) {
+#if defined(EDR_HAVE_SQLITE)
+  if (argc==2 && !strcmp(argv[1],"--preclock-window-compat")) { test_startup_preclock_owner_integrity(); return 0; }
+#endif
+#if defined(EDR_HAVE_SQLITE)
+  if (argc==2 && (!strcmp(argv[1],"--window-lifecycle-probe") || !strcmp(argv[1],"--window-lifecycle-contract"))) { test_window_entry_order_and_recovery(!strcmp(argv[1],"--window-lifecycle-contract")); if (!strcmp(argv[1],"--window-lifecycle-contract")) test_window_recovery_failures_and_frozen_policy(); return 0; }
+#endif
 #if defined(EDR_HAVE_SQLITE)
   if (argc==2 && !strcmp(argv[1],"--phase2-continuation")) {
     test_phase2_continues_across_ttl(0);test_phase2_commit_fairness_and_backoff();test_accounting_generation_reopen();return 0;
@@ -14778,6 +14981,8 @@ int main(int argc, char **argv) {
 #if defined(EDR_HAVE_SQLITE)
   RUN_CACHE_CASE("context", test_context_writer_transaction_reuse());
   RUN_CACHE_CASE("context", test_accounting_generation_reopen());
+  RUN_CACHE_CASE("context", test_window_entry_order_and_recovery(1));
+  RUN_CACHE_CASE("context", test_window_recovery_failures_and_frozen_policy());
   RUN_CACHE_CASE("retention", test_phase2_continues_across_ttl(0));
   RUN_CACHE_CASE("retention", test_phase2_commit_fairness_and_backoff());
   RUN_CACHE_CASE("context", test_normal_alert_parent_context_retention());

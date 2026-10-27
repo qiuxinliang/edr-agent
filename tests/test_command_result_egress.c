@@ -530,10 +530,48 @@ static void purpose_tests(void) {
   snprintf(cached,sizeof(cached),"{\"rows\":[{\"event_time_ns\":%.0f,\"type\":1,\"pid\":12,\"endpoint_id\":\"ep\",\"process_name\":\"foo\"}]}",(double)(now-120000)*1000000);
   CHECK(edr_command_result_project_detail(&q.result_authorization,"rtq_query",1,0,cached,projected,sizeof(projected))!=0);
   q=task("cached-absence","rtq_query");
-  const char *absent="{\"rows\":[],\"partial\":false,\"availability_reason\":\"not_collected_or_expired\",\"absence_is_evidence\":false}";
+  const char *absent="{\"rows\":[],\"partial\":false,\"availability_reason\":\"not_collected_or_expired\",\"absence_is_evidence\":false,\"manifest\":{}}";
+  CHECK(edr_command_result_project_detail(&q.result_authorization,"rtq_query",1,0,absent,projected,sizeof(projected))==0);
+  cJSON *recall=cJSON_Parse(projected);
+  const cJSON *manifest=cJSON_GetObjectItemCaseSensitive(recall,"manifest");
+  CHECK(cJSON_IsObject(manifest));
+  CHECK(!strcmp(cJSON_GetObjectItemCaseSensitive(manifest,"coverage_status")->valuestring,"unknown"));
+  CHECK(cJSON_IsNull(cJSON_GetObjectItemCaseSensitive(manifest,"omitted_count")));
+  CHECK(cJSON_IsNull(cJSON_GetObjectItemCaseSensitive(manifest,"observed_event_range")));
+  CHECK(cJSON_GetObjectItemCaseSensitive(manifest,"serialized_count")->valueint==0);
+  char empty_hash[65]; CHECK(edr_sha256_hex((const uint8_t *)"[]",2,empty_hash)==0);
+  CHECK(!strcmp(cJSON_GetObjectItemCaseSensitive(manifest,"payload_digest")->valuestring,empty_hash));
+  cJSON_Delete(recall);
+  /* Old durable results remain valid. Supplied manifest claims are never
+   * copied across the signed-purpose projection boundary. */
+  CHECK(edr_command_result_project_detail(&q.result_authorization,"rtq_query",1,0,
+      "{\"rows\":[],\"partial\":false}",projected,sizeof(projected))==0 && !strstr(projected,"manifest"));
+  CHECK(edr_command_result_project_detail(&q.result_authorization,"rtq_query",1,0,
+      "{\"rows\":[],\"partial\":true,\"manifest\":{\"coverage_status\":\"complete\",\"omitted_count\":0,\"secret\":\"UNREQUESTED_METADATA\"}}",
+      projected,sizeof(projected))==0);
+  CHECK(!strstr(projected,"UNREQUESTED") && strstr(projected,"result_budget_or_scan_limit"));
+  recall=cJSON_Parse(projected); manifest=cJSON_GetObjectItemCaseSensitive(recall,"manifest");
+  CHECK(!strcmp(cJSON_GetObjectItemCaseSensitive(manifest,"coverage_status")->valuestring,"partial"));
+  CHECK(cJSON_IsNull(cJSON_GetObjectItemCaseSensitive(manifest,"omitted_count")));
+  cJSON_Delete(recall);
   CHECK(edr_command_state_finish("cached-absence","rtq_query",&q,"ok",1,0,absent,"",1)==0);
   b=persisted_body("cached-absence","rtq_query");
   CHECK(allowed("tenant","ep",b) && strstr(b,"not_collected_or_expired")); free(b);
+  q=task("cached-window-gap","rtq_query");
+  snprintf(cached,sizeof(cached),"{\"rows\":[{\"source\":\"p0_candidates\",\"event_time_ns\":%.0f,"
+      "\"type\":1,\"pid\":12,\"endpoint_id\":\"ep\",\"process_name\":\"foo\","
+      "\"source_completeness\":\"COMPLETE\",\"context_window_state\":\"active\","
+      "\"context_window_gap_reason\":\"service_restart_gap\"}],\"partial\":false,\"manifest\":{}}",(double)now*1000000);
+  CHECK(edr_command_state_finish("cached-window-gap","rtq_query",&q,"ok",1,0,cached,"",1)==0);
+  b=persisted_body("cached-window-gap","rtq_query");
+  CHECK(allowed("tenant","ep",b) && strstr(b,"service_restart_gap") && strstr(b,"window_observation_gap"));
+  CHECK(!strstr(b,"source_fields_incomplete")); free(b);
+  recall=cJSON_Parse(cached); CHECK(recall);
+  cJSON *cached_row=cJSON_GetArrayItem(cJSON_GetObjectItemCaseSensitive(recall,"rows"),0);
+  CHECK(cJSON_ReplaceItemInObjectCaseSensitive(cached_row,"context_window_gap_reason",cJSON_CreateString("UNREQUESTED_METADATA")));
+  char *forged_window=cJSON_PrintUnformatted(recall); CHECK(forged_window);
+  CHECK(edr_command_result_project_detail(&q.result_authorization,"rtq_query",1,0,forged_window,projected,sizeof(projected))!=0);
+  cJSON_free(forged_window); cJSON_Delete(recall);
   CHECK(edr_command_result_project_detail(&q.result_authorization,"rtq_query",1,0,
       "{\"rows\":[],\"availability_reason\":\"not_collected_or_expired\",\"absence_is_evidence\":true}",projected,sizeof(projected))!=0);
   CHECK(edr_command_result_project_detail(&q.result_authorization,"rtq_query",1,0,

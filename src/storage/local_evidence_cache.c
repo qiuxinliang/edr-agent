@@ -3,6 +3,7 @@
 #include "edr/local_evidence_cache.h"
 #include "edr/command.h"
 #include "edr/storage_physical_guard.h"
+#include "edr/evidence_recall_manifest.h"
 #include "edr/storage_queue.h"
 #include "edr/transport_sink.h"
 #ifdef EDR_HAVE_LZ4
@@ -154,6 +155,21 @@ typedef struct {
   char candidate_id[160];
 } ContextWindowSlot;
 
+#if defined(EDR_HAVE_SQLITE)
+/* The owner mutex protects this two-slot activation plan. Victim interruption
+ * and the new obligation commit together; RAM is published only after commit. */
+typedef struct {
+  ContextWindowSlot slots[2];
+  size_t indexes[2];
+  char victims[2][160];
+  unsigned count, victim_count;
+} ContextWindowPlan;
+static int sqlite_prepare_context_window(const EdrBehaviorRecord *, const char *,
+    int, ContextWindowPlan *);
+static void publish_context_window_plan(const ContextWindowPlan *);
+static int sqlite_recover_context_windows(void);
+#endif
+
 #define METRIC_ORDINARY_BASE 4u
 #define METRIC_CANDIDATE_BASE (METRIC_ORDINARY_BASE + EDR_EVIDENCE_ORDINARY_REASON_COUNT)
 #define METRIC_CONTEXT_BASE (METRIC_CANDIDATE_BASE + EDR_EVIDENCE_FAILURE_REASON_COUNT)
@@ -191,6 +207,8 @@ static void set_capacity_cause(EdrEvidenceCapacityCause cause, int sqlite_rc) {
 #ifdef EDR_LOCAL_EVIDENCE_CACHE_TESTING
 static unsigned s_test_manifest_allocation_failures;
 static int s_test_legacy_context_writes;
+/* -1 uses the real platform boundary. 0/1 simulate changed/same live tuple. */
+static int s_test_window_recovery_identity = -1;
 static EdrEvidenceCacheQueryCost s_test_pmfe_query_cost[2];
 #endif
 
@@ -2707,8 +2725,13 @@ static uint64_t retention_monotonic_ms(void) {
 #ifdef EDR_LOCAL_EVIDENCE_CACHE_TESTING
   if (s_test_retention_monotonic_ms >= 0)
     return (uint64_t)s_test_retention_monotonic_ms;
-#endif
+  /* Fixtures already own this injected clock for window age and maintenance.
+   * Advance both duration clocks together unless a clock-failure test explicitly
+   * overrides the durable clock. Production keeps the same real clock below. */
+  return edr_monotonic_ns() / 1000000u;
+#else
   return evidence_cache_clock_ns() / 1000000u;
+#endif
 }
 
 static int retention_clock_error(unsigned cause, const char *message) {
@@ -2797,6 +2820,28 @@ static int sqlite_parent_floor_guards(void) {
     "CREATE TRIGGER IF NOT EXISTS retention_active_clock_v1_delete BEFORE DELETE ON metrics "
       "WHEN OLD.minute_unix=0 AND OLD.endpoint_id='' AND OLD.metric_name='" RETENTION_ACTIVE_CLOCK_KEY "' "
       "BEGIN SELECT RAISE(ABORT,'retention active clock owner required'); END;",
+    "CREATE TRIGGER IF NOT EXISTS context_window_floor_v1_insert BEFORE INSERT ON p0_candidates "
+      "WHEN typeof(NEW.context_window_protect_until_active_ms)!='integer' OR NEW.context_window_protect_until_active_ms!=0 "
+      "BEGIN SELECT RAISE(ABORT,'window floor requires a newly frozen obligation'); END;",
+    "CREATE TRIGGER IF NOT EXISTS context_window_floor_v1_update BEFORE UPDATE OF context_window_protect_until_active_ms ON p0_candidates "
+      "WHEN typeof(OLD.context_window_protect_until_active_ms)!='integer' OR OLD.context_window_protect_until_active_ms<0 "
+      "OR typeof(NEW.context_window_protect_until_active_ms)!='integer' OR NEW.context_window_protect_until_active_ms<0 "
+      "OR (OLD.context_window_protect_until_active_ms!=0 AND NEW.context_window_protect_until_active_ms IS NOT OLD.context_window_protect_until_active_ms) "
+      "OR (OLD.context_window_protect_until_active_ms=0 AND NEW.context_window_protect_until_active_ms>0 "
+      "AND NOT EXISTS(SELECT 1 FROM metrics WHERE " RETENTION_ACTIVE_CLOCK_ROW " AND typeof(value)='integer' "
+      "AND value>=0 AND value<NEW.context_window_protect_until_active_ms)) "
+      "BEGIN SELECT RAISE(ABORT,'frozen window floor cannot be renewed or reset'); END;",
+    "CREATE TRIGGER IF NOT EXISTS context_window_floor_v1_eligible BEFORE UPDATE OF local_retention_state ON p0_candidates "
+      "WHEN NEW.local_retention_state='retirement_eligible' AND ("
+      "typeof(OLD.context_window_protect_until_active_ms)!='integer' OR OLD.context_window_protect_until_active_ms<0 "
+      "OR (OLD.context_window_protect_until_active_ms>0 AND NOT EXISTS(SELECT 1 FROM metrics WHERE "
+      RETENTION_ACTIVE_CLOCK_ROW " AND typeof(value)='integer' AND value>=OLD.context_window_protect_until_active_ms))) "
+      "BEGIN SELECT RAISE(ABORT,'window active residence protects this group'); END;",
+    "CREATE TRIGGER IF NOT EXISTS context_window_floor_v1_delete BEFORE DELETE ON p0_candidates "
+      "WHEN typeof(OLD.context_window_protect_until_active_ms)!='integer' OR OLD.context_window_protect_until_active_ms<0 "
+      "OR (OLD.context_window_protect_until_active_ms>0 AND NOT EXISTS(SELECT 1 FROM metrics WHERE "
+      RETENTION_ACTIVE_CLOCK_ROW " AND typeof(value)='integer' AND value>=OLD.context_window_protect_until_active_ms)) "
+      "BEGIN SELECT RAISE(ABORT,'window active residence protects this group'); END;",
     "CREATE TRIGGER IF NOT EXISTS alert_context_floor_v1_insert BEFORE INSERT ON p0_candidates "
       "WHEN typeof(NEW.alert_context_protect_until_active_ms)!='integer' OR NEW.alert_context_protect_until_active_ms!=0 "
       "BEGIN SELECT RAISE(ABORT,'parent floor requires a newly frozen context reference'); END;",
@@ -2931,6 +2976,10 @@ static int sqlite_ensure_p0_candidate_columns(void) {
        "ALTER TABLE p0_candidates ADD COLUMN identity_source TEXT;"},
       {"identity_quality",
        "ALTER TABLE p0_candidates ADD COLUMN identity_quality TEXT;"},
+      {"context_window_protect_until_active_ms", "ALTER TABLE p0_candidates ADD COLUMN context_window_protect_until_active_ms INTEGER NOT NULL DEFAULT 0;"},
+      {"context_window_state", "ALTER TABLE p0_candidates ADD COLUMN context_window_state TEXT NOT NULL DEFAULT 'unknown';"},
+      {"context_window_spec", "ALTER TABLE p0_candidates ADD COLUMN context_window_spec TEXT NOT NULL DEFAULT '';"},
+      {"context_window_gap_reason", "ALTER TABLE p0_candidates ADD COLUMN context_window_gap_reason TEXT NOT NULL DEFAULT '';"},
       {"retention_policy_version",
        "ALTER TABLE p0_candidates ADD COLUMN retention_policy_version INTEGER NOT NULL DEFAULT 0;"},
       {"local_retention_state",
@@ -2999,6 +3048,7 @@ static int sqlite_retention_metadata_open(void) {
     set_error(s_context_store.error); goto failed;
   }
   if (exec_sql(
+      "CREATE INDEX IF NOT EXISTS idx_candidates_window_recovery ON p0_candidates(candidate_id) WHERE context_window_state='active';"
       "CREATE INDEX IF NOT EXISTS idx_candidates_retention ON p0_candidates(retention_policy_version,event_time_ns,candidate_id);"
       "CREATE INDEX IF NOT EXISTS idx_candidates_query_scope_time ON p0_candidates(endpoint_id,tenant_id,event_time_ns);"
       "CREATE INDEX IF NOT EXISTS idx_candidates_retention_value ON p0_candidates(retention_policy_version,retention_value_class,event_time_ns,candidate_id);"
@@ -3376,6 +3426,7 @@ static int sqlite_guarded_autocheckpoint(void *unused, sqlite3 *db, const char *
 static const struct { const char *name, *table; unsigned layout; } startup_index_cost_manifest[] = {
     {"idx_command_fact_retirement", "artifacts", 0},
     {"idx_candidates_retention", "p0_candidates", 0},
+    {"idx_candidates_window_recovery", "p0_candidates", 0},
     {"idx_candidates_query_scope_time", "p0_candidates", 0},
     {"idx_candidates_retention_value", "p0_candidates", 0},
     {"idx_candidates_subject_command", "p0_candidates", 0},
@@ -4467,6 +4518,32 @@ static int build_context_manifest_json(const EdrBehaviorRecord *r, const char *c
          manifest_add_u64(root, "omitted_context_count", omitted) &&
          cJSON_AddBoolToObject(root, "context_truncated", omitted != 0u);
   }
+#if defined(EDR_HAVE_SQLITE)
+  if (ok && s_db) {
+    sqlite3_stmt *previous = NULL;
+    if (sqlite3_prepare_v2(s_db, "SELECT manifest_json FROM artifacts WHERE candidate_id=? "
+        "AND artifact_type='p0_context_bundle' LIMIT 1;", -1, &previous, NULL) != SQLITE_OK) ok = 0;
+    else {
+      bind_text(previous, 1, candidate_id);
+      int step = sqlite3_step(previous);
+      if (step == SQLITE_ROW) {
+        const char *raw = (const char *)sqlite3_column_text(previous, 0);
+        cJSON *prior = cJSON_Parse(raw ? raw : "");
+        const char *fields[] = {"context", "pre_window_s", "post_window_s", "pre_context_count",
+          "post_until_ns", "serialized_context_count", "omitted_context_count", "context_truncated"};
+        if (!prior) ok = 0;
+        for (unsigned i = 0; ok && i < sizeof(fields)/sizeof(fields[0]); ++i) {
+          cJSON *value = cJSON_GetObjectItemCaseSensitive(prior, fields[i]);
+          if (!value) continue; /* Older manifests may omit diagnostic fields. */
+          cJSON *copy = cJSON_Duplicate(value, 1);
+          if (!copy || !cJSON_ReplaceItemInObjectCaseSensitive(root, fields[i], copy)) { cJSON_Delete(copy); ok = 0; }
+        }
+        cJSON_Delete(prior);
+      } else if (step != SQLITE_DONE) ok = 0;
+    }
+    sqlite3_finalize(previous);
+  }
+#endif
   if (!ok) {
     manifest_rejected("context manifest allocation or UTF-8 validation failed");
   } else {
@@ -5404,6 +5481,25 @@ static int sqlite_record_candidate(const EdrBehaviorRecord *r, const char *candi
   if (exec_sql("BEGIN IMMEDIATE;") != 0) {
     return -1;
   }
+  int candidate_existing = sqlite_candidate_exists(candidate_id);
+  ContextWindowPlan window_plan = {0};
+  sqlite3_stmt *prior = NULL;
+  if (candidate_existing < 0 || sqlite3_prepare_v2(s_db,
+      "SELECT context_post_until_ns,local_retention_state FROM p0_candidates WHERE candidate_id=?;",
+      -1, &prior, NULL) != SQLITE_OK) { sqlite_rollback_silent(); return -1; }
+  bind_text(prior, 1, candidate_id);
+  int prior_rc = sqlite3_step(prior);
+  if (prior_rc == SQLITE_ROW) {
+    const char *state = (const char *)sqlite3_column_text(prior, 1);
+    if (!state || strcmp(state, "retained")) {
+      sqlite3_finalize(prior); sqlite_rollback_silent();
+      set_error("candidate already retiring; replay cannot reactivate context"); return -1;
+    }
+    post_until_ns = sqlite3_column_int64(prior, 0);
+  } else if (prior_rc != SQLITE_DONE) {
+    sqlite3_finalize(prior); sqlite_rollback_silent(); return -1;
+  }
+  sqlite3_finalize(prior);
   if (sqlite_retention_clock_stage() != 0) {
     sqlite_rollback_silent();
     return -1;
@@ -5456,9 +5552,9 @@ static int sqlite_record_candidate(const EdrBehaviorRecord *r, const char *candi
       "reg_value_name=CASE WHEN excluded.reg_value_name<>'' THEN excluded.reg_value_name ELSE p0_candidates.reg_value_name END,"
       "reg_op=CASE WHEN excluded.reg_op<>'' THEN excluded.reg_op ELSE p0_candidates.reg_op END,"
       "detection_context=CASE WHEN excluded.detection_context<>'' THEN excluded.detection_context ELSE p0_candidates.detection_context END,"
-      "context_pre_count=MAX(p0_candidates.context_pre_count,excluded.context_pre_count),"
-      "context_post_until_ns=MAX(p0_candidates.context_post_until_ns,excluded.context_post_until_ns),"
-      "created_ns=excluded.created_ns,"
+      "context_pre_count=p0_candidates.context_pre_count,"
+      "context_post_until_ns=p0_candidates.context_post_until_ns,"
+      "created_ns=p0_candidates.created_ns,"
       "process_start_key=CASE WHEN excluded.process_start_key<>'' AND excluded.process_start_key<>'0' THEN excluded.process_start_key ELSE p0_candidates.process_start_key END,"
       "process_creation_filetime_100ns=CASE WHEN excluded.process_creation_filetime_100ns<>'' AND excluded.process_creation_filetime_100ns<>'0' THEN excluded.process_creation_filetime_100ns ELSE p0_candidates.process_creation_filetime_100ns END,"
       "process_generation_source=CASE WHEN excluded.process_generation_source<>'' THEN excluded.process_generation_source ELSE p0_candidates.process_generation_source END,"
@@ -5584,6 +5680,9 @@ static int sqlite_record_candidate(const EdrBehaviorRecord *r, const char *candi
     }
     sqlite3_finalize(st); st = NULL;
   }
+  if (sqlite_prepare_context_window(r, candidate_id, candidate_existing, &window_plan) != 0) {
+    sqlite_rollback_silent(); return -1;
+  }
   int live_size_over = sqlite_live_size_over_limit(
       (uint64_t)s_status.max_db_mb * 1024u * 1024u);
   if (live_size_over < 0) {
@@ -5618,6 +5717,7 @@ static int sqlite_record_candidate(const EdrBehaviorRecord *r, const char *candi
   if (sqlite_commit_candidate_transaction() != 0) {
     sqlite_rollback_silent(); return -1;
   }
+  publish_context_window_plan(&window_plan);
   /* These counters describe durable candidate commits, never a statement
    * that was later rolled back. */
   s_status.records_written++;
@@ -5991,10 +6091,14 @@ static int sqlite_retire_candidate_groups(int pressure, sqlite3_int64 cutoff,
       "AND created_ns<CASE WHEN retention_value_class=2 THEN ?7 ELSE ?3 END)))) "
       "AND typeof(alert_context_protect_until_active_ms)='integer' "
       "AND alert_context_protect_until_active_ms>=0 AND alert_context_protect_until_active_ms<=?8 "
+      "AND typeof(context_window_protect_until_active_ms)='integer' "
+      "AND context_window_protect_until_active_ms>=0 AND context_window_protect_until_active_ms<=?8 "
       "AND retention_value_class IN(1,2) "
       "AND NOT EXISTS(SELECT 1 FROM evidence_retention_protected x WHERE x.candidate_id=p.candidate_id),retention_value_class,"
       "typeof(alert_context_protect_until_active_ms)!='integer' OR alert_context_protect_until_active_ms<0 "
-      "OR alert_context_protect_until_active_ms>?8 ";
+      "OR alert_context_protect_until_active_ms>?8 "
+      "OR typeof(context_window_protect_until_active_ms)!='integer' OR context_window_protect_until_active_ms<0 "
+      "OR context_window_protect_until_active_ms>?8 ";
   char selection_sql[3072];
   int selection_size=snprintf(selection_sql,sizeof(selection_sql),"%s%s",selection_columns,
       "FROM p0_candidates p WHERE retention_policy_version=1 AND event_time_ns>0 "
@@ -7881,6 +7985,9 @@ int edr_local_evidence_cache_open_with_policy(const char *path, uint32_t max_db_
       exec_sql("UPDATE artifacts SET upload_status='scheduled' WHERE artifact_type='pmfe_followup_local_v1' AND upload_status='running';") != 0) {
     goto startup_failed;
   }
+  /* Recover before restoring the pager ceiling so these bounded metadata
+   * writes share startup's logical and physical admission guard. */
+  if (sqlite_recover_context_windows() != 0) goto startup_failed;
   {
     uint64_t restored=0;
     if (sqlite_startup_max_pages(startup_previous_max_pages,&restored)!=0 ||
@@ -7939,6 +8046,10 @@ void edr_local_evidence_cache_close(void) {
 }
 
 #if defined(EDR_HAVE_SQLITE) && defined(EDR_LOCAL_EVIDENCE_CACHE_TESTING)
+void edr_local_evidence_cache_test_set_window_recovery_identity(int matches) {
+  evidence_cache_lock(); s_test_window_recovery_identity = matches; evidence_cache_unlock();
+}
+
 void edr_local_evidence_cache_test_pmfe_query_cost(int result_query,
                                                   EdrEvidenceCacheQueryCost *out,
                                                   int reset) {
@@ -8456,84 +8567,256 @@ static int context_window_nominally_ended(const ContextWindowSlot *w,
              (uint64_t)w->until_ns - (uint64_t)w->from_ns;
 }
 
-static void mark_one_context_window(uint32_t pid,
-                                    const EvidenceProcessGeneration *generation,
-                                    const char *endpoint_id,
-                                    const char *tenant_id,
-                                    const char *candidate_id, int64_t from_ns,
-                                    int64_t until_ns) {
-  if (pid == 0u || !generation_bound(generation) || !candidate_id || !candidate_id[0]) {
-    return;
-  }
-  uint64_t mono_ns = edr_monotonic_ns();
-  size_t empty_i = EDR_EVIDENCE_CONTEXT_WINDOWS;
-  size_t ended_i = EDR_EVIDENCE_CONTEXT_WINDOWS;
-  for (size_t i = 0; i < EDR_EVIDENCE_CONTEXT_WINDOWS; i++) {
-    const ContextWindowSlot *existing = &s_context_windows[i];
-    if (existing->pid == 0u && empty_i == EDR_EVIDENCE_CONTEXT_WINDOWS) empty_i = i;
-    if (context_window_nominally_ended(existing, from_ns, mono_ns) &&
-        (ended_i == EDR_EVIDENCE_CONTEXT_WINDOWS ||
-         existing->until_ns < s_context_windows[ended_i].until_ns)) {
-      ended_i = i;
-    }
-    if (s_context_windows[i].pid == pid &&
-        generation_equal(&s_context_windows[i].generation, generation) &&
-        (!s_context_windows[i].endpoint_id[0] || !endpoint_id || !endpoint_id[0] ||
-         strcmp(s_context_windows[i].endpoint_id, endpoint_id) == 0) &&
-        strcmp(s_context_windows[i].tenant_id,
-               tenant_id ? tenant_id : "") == 0 &&
-        strncmp(s_context_windows[i].candidate_id, candidate_id,
-                sizeof(s_context_windows[i].candidate_id)) == 0) {
-      s_context_windows[i].until_ns = until_ns;
-      s_context_windows[i].from_ns = from_ns;
-      copy_s(s_context_windows[i].endpoint_id, sizeof(s_context_windows[i].endpoint_id), endpoint_id);
-      copy_s(s_context_windows[i].tenant_id, sizeof(s_context_windows[i].tenant_id),
-             tenant_id);
-      return;
-    }
-  }
-  size_t replace_i = empty_i != EDR_EVIDENCE_CONTEXT_WINDOWS ? empty_i
-      : ended_i != EDR_EVIDENCE_CONTEXT_WINDOWS ? ended_i
-      : s_context_window_next % EDR_EVIDENCE_CONTEXT_WINDOWS;
-  s_context_window_next = (uint32_t)((replace_i + 1u) % EDR_EVIDENCE_CONTEXT_WINDOWS);
-  ContextWindowSlot *w = &s_context_windows[replace_i];
-  if (w->pid != 0u) {
-    s_status.context_window_evictions++;
-    if (context_window_nominally_ended(w, from_ns, mono_ns)) {
-      s_status.context_window_nominal_ended_replacements++;
-    } else {
-      s_status.context_window_protected_replacements++;
-    }
-  }
-  memset(w, 0, sizeof(*w));
-  w->pid = pid;
-  w->from_ns = from_ns;
-  w->until_ns = until_ns;
-  w->created_mono_ns = mono_ns;
-  w->generation = *generation;
-  copy_s(w->endpoint_id, sizeof(w->endpoint_id), endpoint_id);
-  copy_s(w->tenant_id, sizeof(w->tenant_id), tenant_id);
-  copy_s(w->candidate_id, sizeof(w->candidate_id), candidate_id);
-}
-
 static int64_t context_window_until(int64_t now_ns) {
   uint32_t win_s = evidence_context_window_s();
-  return now_ns + (int64_t)win_s * 1000000000LL;
+  return now_ns > INT64_MAX - (int64_t)win_s * 1000000000LL ? INT64_MAX :
+      now_ns + (int64_t)win_s * 1000000000LL;
 }
 
-static void mark_context_window(const EdrBehaviorRecord *r, int64_t until_ns,
-                                const char *candidate_id) {
-  EvidenceProcessGeneration generation;
-  int64_t from_ns = record_time_ns(r);
-  if (record_process_generation(r, &generation)) {
-    mark_one_context_window(r->pid, &generation, r->endpoint_id, r->tenant_id,
-                            candidate_id, from_ns, until_ns);
+#if defined(EDR_HAVE_SQLITE)
+/* Queryable owner metadata is bounded by one candidate and two exact process
+ * tuples. No payload copy, extra queue, or automatic upload is introduced. */
+static int window_metadata_set(const char *id, const char *state,
+                               const char *spec, const char *gap) {
+  sqlite3_stmt *st = NULL;
+  if (sqlite3_prepare_v2(s_db, "UPDATE p0_candidates SET context_window_state=?1,"
+      "context_window_spec=CASE WHEN ?2 IS NULL THEN context_window_spec ELSE ?2 END,"
+      "context_window_gap_reason=CASE WHEN ?3<>'' THEN ?3 "
+      "ELSE context_window_gap_reason END WHERE candidate_id=?4;", -1, &st, NULL) != SQLITE_OK) return -1;
+  bind_text(st, 1, state);
+  if (spec) bind_text(st, 2, spec); else sqlite3_bind_null(st, 2);
+  bind_text(st, 3, gap); bind_text(st, 4, id);
+  int rc = sqlite3_step(st);
+  sqlite3_finalize(st);
+  return rc == SQLITE_DONE && sqlite3_changes(s_db) == 1 ? 0 : -1;
+}
+
+static int window_plan_has_victim(const ContextWindowPlan *plan, const char *id) {
+  for (unsigned i = 0; i < plan->victim_count; ++i)
+    if (!strcmp(plan->victims[i], id)) return 1;
+  return 0;
+}
+
+static int plan_context_window_slots(ContextWindowPlan *plan) {
+  for (unsigned n = 0; n < plan->count; ++n) {
+    size_t empty = EDR_EVIDENCE_CONTEXT_WINDOWS, ended = EDR_EVIDENCE_CONTEXT_WINDOWS;
+    for (size_t i = 0; i < EDR_EVIDENCE_CONTEXT_WINDOWS; ++i) {
+      if (n && i == plan->indexes[0]) continue;
+      const ContextWindowSlot *w = &s_context_windows[i];
+      if ((!w->pid || window_plan_has_victim(plan, w->candidate_id)) && empty == EDR_EVIDENCE_CONTEXT_WINDOWS) empty = i;
+      if (w->pid && context_window_nominally_ended(w, plan->slots[n].from_ns, edr_monotonic_ns()) &&
+          (ended == EDR_EVIDENCE_CONTEXT_WINDOWS || w->until_ns < s_context_windows[ended].until_ns)) ended = i;
+    }
+    size_t index = empty != EDR_EVIDENCE_CONTEXT_WINDOWS ? empty :
+        ended != EDR_EVIDENCE_CONTEXT_WINDOWS ? ended : s_context_window_next % EDR_EVIDENCE_CONTEXT_WINDOWS;
+    if (n && index == plan->indexes[0]) index = (index + 1u) % EDR_EVIDENCE_CONTEXT_WINDOWS;
+    const ContextWindowSlot *victim = &s_context_windows[index];
+    if (victim->pid && !window_plan_has_victim(plan, victim->candidate_id)) {
+      copy_s(plan->victims[plan->victim_count++], sizeof(plan->victims[0]), victim->candidate_id);
+      if (window_metadata_set(victim->candidate_id, "interrupted", NULL, "window_capacity_replaced") != 0) return -1;
+    }
+    plan->indexes[n] = index;
   }
-  if (record_parent_generation(r, &generation)) {
-    mark_one_context_window(r->ppid, &generation, r->endpoint_id, r->tenant_id,
-                            candidate_id, from_ns, until_ns);
+  return 0;
+}
+
+static void publish_context_window_plan(const ContextWindowPlan *plan) {
+  for (unsigned i = 0; i < EDR_EVIDENCE_CONTEXT_WINDOWS; ++i) {
+    ContextWindowSlot *w = &s_context_windows[i];
+    if (!w->pid || !window_plan_has_victim(plan, w->candidate_id)) continue;
+    ++s_status.context_window_evictions;
+    if (context_window_nominally_ended(w, plan->slots[0].from_ns, edr_monotonic_ns()))
+      ++s_status.context_window_nominal_ended_replacements;
+    else ++s_status.context_window_protected_replacements;
+    memset(w, 0, sizeof(*w));
+  }
+  for (unsigned n = 0; n < plan->count; ++n) {
+    s_context_windows[plan->indexes[n]] = plan->slots[n];
+    s_context_window_next = (uint32_t)((plan->indexes[n] + 1u) % EDR_EVIDENCE_CONTEXT_WINDOWS);
   }
 }
+
+static int window_json_u64(const cJSON *root, const char *key, uint64_t *out) {
+  const cJSON *value = cJSON_GetObjectItemCaseSensitive(root, key);
+  if (!cJSON_IsString(value) || !value->valuestring || !value->valuestring[0]) return 0;
+  const char *p = value->valuestring; uint64_t result = 0;
+  for (; *p; ++p) {
+    if (*p < '0' || *p > '9' || result > (UINT64_MAX - (unsigned)(*p - '0')) / 10u) return 0;
+    result = result * 10u + (unsigned)(*p - '0');
+  }
+  *out = result; return 1;
+}
+
+static int window_spec_decode(const char *spec, const char *id, const char *endpoint,
+                              const char *tenant, ContextWindowPlan *plan) {
+  cJSON *root = cJSON_Parse(spec); uint64_t from = 0, until = 0, mono = 0;
+  cJSON *roles = root ? cJSON_GetObjectItemCaseSensitive(root, "roles") : NULL;
+  int ok = root && window_json_u64(root, "from_ns", &from) && from <= INT64_MAX && from > 0 &&
+      window_json_u64(root, "until_ns", &until) && until <= INT64_MAX && until >= from &&
+      window_json_u64(root, "created_mono_ns", &mono) &&
+      cJSON_IsArray(roles) && cJSON_GetArraySize(roles) > 0 && cJSON_GetArraySize(roles) <= 2;
+  for (int i = 0; ok && i < cJSON_GetArraySize(roles); ++i) {
+    cJSON *role = cJSON_GetArrayItem(roles, i); uint64_t pid, key, creation;
+    ok = window_json_u64(role, "pid", &pid) && pid > 0 && pid <= UINT32_MAX &&
+        window_json_u64(role, "start_key", &key) && key > 0 &&
+        window_json_u64(role, "creation", &creation) && creation > 0;
+    if (!ok) break;
+    ContextWindowSlot *w = &plan->slots[plan->count++];
+    memset(w, 0, sizeof(*w)); w->pid = (uint32_t)pid;
+    w->generation.process_start_key = key; w->generation.creation_filetime_100ns = creation;
+    w->from_ns = (int64_t)from; w->until_ns = (int64_t)until; w->created_mono_ns = mono;
+    copy_s(w->candidate_id, sizeof(w->candidate_id), id);
+    copy_s(w->endpoint_id, sizeof(w->endpoint_id), endpoint); copy_s(w->tenant_id, sizeof(w->tenant_id), tenant);
+  }
+  cJSON_Delete(root); return ok ? 0 : -1;
+}
+
+static int sqlite_prepare_context_window(const EdrBehaviorRecord *r, const char *id,
+                                         int existing, ContextWindowPlan *plan) {
+  sqlite3_stmt *st = NULL; char state[32]; int64_t from, until;
+  if (sqlite3_prepare_v2(s_db, "SELECT context_window_state,event_time_ns,context_post_until_ns "
+      "FROM p0_candidates WHERE candidate_id=? AND local_retention_state='retained';", -1, &st, NULL) != SQLITE_OK) return -1;
+  bind_text(st, 1, id);
+  if (sqlite3_step(st) != SQLITE_ROW) { sqlite3_finalize(st); return -1; }
+  copy_s(state, sizeof(state), (const char *)sqlite3_column_text(st, 0));
+  from = sqlite3_column_int64(st, 1); until = sqlite3_column_int64(st, 2); sqlite3_finalize(st);
+  /* Active, interrupted and expired obligations are terminal to replay. An
+   * active obligation was already published by its commit or startup restore. */
+  if (strcmp(state, "unknown") && strcmp(state, "identity_unresolved")) return 0;
+  if (from <= 0 || until < from) return window_metadata_set(id, "interrupted", NULL, "invalid_window_bounds");
+  if (existing && until < now_unix_ns()) return window_metadata_set(id, "expired", NULL, "legacy_window_expired");
+  cJSON *root = cJSON_CreateObject(), *roles = root ? cJSON_AddArrayToObject(root, "roles") : NULL;
+  int ok = roles && manifest_add_u64_text(root, "from_ns", (uint64_t)from) &&
+      manifest_add_u64_text(root, "until_ns", (uint64_t)until) &&
+      manifest_add_u64_text(root, "created_mono_ns", edr_monotonic_ns());
+  const char *identity_gap = "";
+  for (unsigned role = 0; ok && role < 2u; ++role) {
+    EvidenceProcessGeneration gen; uint32_t pid = role ? r->ppid : r->pid;
+    if (!(role ? record_parent_generation(r, &gen) : record_process_generation(r, &gen)) || !pid) {
+      if (!role) identity_gap = "process_generation_unresolved";
+      else if (!identity_gap[0] && edr_behavior_parent_pid_usable(r)) identity_gap = "parent_generation_unresolved";
+      continue;
+    }
+    if (role && plan->count && pid == plan->slots[0].pid && generation_equal(&gen, &plan->slots[0].generation)) continue;
+    cJSON *entry = cJSON_CreateObject();
+    ok = entry && manifest_add_u64_text(entry, "pid", pid) &&
+        manifest_add_u64_text(entry, "start_key", gen.process_start_key) &&
+        manifest_add_u64_text(entry, "creation", gen.creation_filetime_100ns) && cJSON_AddItemToArray(roles, entry);
+    if (!ok) { cJSON_Delete(entry); break; }
+    ContextWindowSlot *w = &plan->slots[plan->count++]; memset(w, 0, sizeof(*w));
+    w->pid = pid; w->generation = gen; w->from_ns = from; w->until_ns = until; w->created_mono_ns = edr_monotonic_ns();
+    copy_s(w->candidate_id, sizeof(w->candidate_id), id); copy_s(w->endpoint_id, sizeof(w->endpoint_id), r->endpoint_id);
+    copy_s(w->tenant_id, sizeof(w->tenant_id), r->tenant_id);
+  }
+  if (!ok) { cJSON_Delete(root); set_error("window obligation allocation failed"); return -1; }
+  if (!plan->count) { cJSON_Delete(root); return window_metadata_set(id, "identity_unresolved", NULL, "process_generation_unresolved"); }
+  char *spec = cJSON_PrintUnformatted(root); cJSON_Delete(root);
+  /* Reuse the durable active clock for the remaining window protection.
+   * Downtime or failed live verification cannot turn a wall-clock jump into
+   * permission to retire evidence before its original active duration. */
+  uint64_t duration_ms = ((uint64_t)until - (uint64_t)from) / 1000000u;
+  if (!duration_ms || s_retention_clock.pending_ms > (uint64_t)INT64_MAX - duration_ms ||
+      sqlite3_prepare_v2(s_db, "UPDATE p0_candidates SET context_window_protect_until_active_ms=?1 "
+      "WHERE candidate_id=?2 AND context_window_protect_until_active_ms=0;", -1, &st, NULL) != SQLITE_OK) {
+    cJSON_free(spec); return -1;
+  }
+  sqlite3_bind_int64(st, 1, (sqlite3_int64)(s_retention_clock.pending_ms + duration_ms)); bind_text(st, 2, id);
+  int floor_rc = sqlite3_step(st); sqlite3_finalize(st);
+  if (floor_rc != SQLITE_DONE) { cJSON_free(spec); return -1; }
+  int rc = spec && strlen(spec) <= 1024u ? window_metadata_set(id, "active", spec, identity_gap[0] ? identity_gap : existing ? "legacy_activation_gap" : "") : -1;
+  cJSON_free(spec);
+  return rc ? rc : plan_context_window_slots(plan);
+}
+
+/* A fresh verified handle to the exact generation is stronger than a boot
+ * timestamp guess. A restarted OS or reused PID cannot satisfy this tuple.
+ * Unsupported platforms preserve evidence and explicitly interrupt recovery. */
+static int window_live_generation_matches(const ContextWindowSlot *w) {
+#ifdef EDR_LOCAL_EVIDENCE_CACHE_TESTING
+  if (s_test_window_recovery_identity >= 0) return s_test_window_recovery_identity;
+#endif
+#if defined(_WIN32)
+  HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, w->pid);
+  if (!process) return 0;
+  EdrLiveProcessGeneration live;
+  FILETIME created, exited, kernel, user;
+  int ok = edr_process_generation_query_live(process, &live, NULL, 0) && live.pid == w->pid &&
+      live.process_start_key == w->generation.process_start_key &&
+      live.creation_filetime_100ns == w->generation.creation_filetime_100ns &&
+      GetProcessTimes(process, &created, &exited, &kernel, &user) &&
+      ((((uint64_t)created.dwHighDateTime << 32u) | created.dwLowDateTime) == live.creation_filetime_100ns);
+  CloseHandle(process); return ok;
+#else
+  (void)w; return 0;
+#endif
+}
+
+static int sqlite_window_recovery_checkpoint(void) {
+  if (!sqlite_database_write_allow(EDR_EVIDENCE_MANIFEST_MAX_BYTES)) return -1;
+  int rc = sqlite3_wal_checkpoint_v2(s_db, NULL, SQLITE_CHECKPOINT_TRUNCATE, NULL, NULL);
+  if (rc == SQLITE_BUSY) {
+    /* Recovery metadata is already committed. A pinned reader may keep its
+     * WAL, but must not make protected committed evidence unreadable. Runtime
+     * admission continues to account that WAL and can refuse optional writes. */
+    set_error("window recovery checkpoint deferred by active reader; committed evidence remains readable");
+    return 0;
+  }
+  return rc == SQLITE_OK ? 0 : sqlite_maintenance_error("window recovery checkpoint", rc);
+}
+
+static int sqlite_recover_context_windows(void) {
+  /* The active partial index is bounded by the existing 256-slot allocation.
+   * Load one row per short transaction; never hold a reader during live I/O. */
+  char cursor[160] = "";
+  int changed = 0;
+  for (unsigned n = 0; n < EDR_EVIDENCE_CONTEXT_WINDOWS; ++n) {
+    sqlite3_stmt *st = NULL; char id[160], endpoint[48], tenant[64], spec[1025];
+    if (sqlite3_prepare_v2(s_db, "SELECT candidate_id,endpoint_id,tenant_id,context_window_spec "
+        "FROM p0_candidates WHERE context_window_state='active' AND candidate_id>? "
+        "AND local_retention_state='retained' ORDER BY candidate_id LIMIT 1;", -1, &st, NULL) != SQLITE_OK) return -1;
+    bind_text(st, 1, cursor); int step = sqlite3_step(st);
+    if (step == SQLITE_DONE) {
+      sqlite3_finalize(st);
+      /* Do not let recovery-only WAL allocation falsely turn an otherwise
+       * full, compatible store into a new capacity retirement request. */
+      return changed ? sqlite_window_recovery_checkpoint() : 0;
+    }
+    if (step != SQLITE_ROW) { sqlite3_finalize(st); return -1; }
+    copy_s(id, sizeof(id), (const char *)sqlite3_column_text(st, 0));
+    copy_s(endpoint, sizeof(endpoint), (const char *)sqlite3_column_text(st, 1));
+    copy_s(tenant, sizeof(tenant), (const char *)sqlite3_column_text(st, 2));
+    const char *raw = (const char *)sqlite3_column_text(st, 3);
+    int bounded = raw && strlen(raw) <= 1024u;
+    copy_s(spec, sizeof(spec), bounded ? raw : ""); sqlite3_finalize(st);
+    copy_s(cursor, sizeof(cursor), id);
+    ContextWindowPlan plan = {0}; const char *state = "active", *gap = "service_restart_gap";
+    if (!bounded || window_spec_decode(spec, id, endpoint, tenant, &plan) != 0) {
+      state = "interrupted"; gap = "invalid_window_metadata";
+    } else {
+      for (unsigned i = 0; i < plan.count; ++i) {
+        if (edr_monotonic_ns() < plan.slots[i].created_mono_ns) { state = "interrupted"; gap = "monotonic_clock_reset"; break; }
+        if (context_window_nominally_ended(&plan.slots[i], now_unix_ns(), edr_monotonic_ns())) { state = "expired"; gap = "restart_after_window"; break; }
+        if (!window_live_generation_matches(&plan.slots[i])) { state = "interrupted"; gap = "live_generation_unverified"; break; }
+      }
+    }
+    if (!sqlite_database_write_allow(16384u) || exec_sql("BEGIN IMMEDIATE;") != 0) {
+      set_error("window recovery metadata capacity unavailable; owner preserved"); return -1;
+    }
+    if (window_metadata_set(id, state, NULL, gap) != 0 ||
+        (!strcmp(state, "active") && plan_context_window_slots(&plan) != 0) ||
+        exec_sql("COMMIT;") != 0) { sqlite_rollback_silent(); return -1; }
+    changed = 1;
+    if (!strcmp(state, "active")) publish_context_window_plan(&plan);
+  }
+  sqlite3_stmt *remaining = NULL;
+  int ok = sqlite3_prepare_v2(s_db, "SELECT 1 FROM p0_candidates WHERE context_window_state='active' "
+      "AND candidate_id>? LIMIT 1;", -1, &remaining, NULL) == SQLITE_OK;
+  if (ok) { bind_text(remaining, 1, cursor); ok = sqlite3_step(remaining) == SQLITE_DONE; }
+  sqlite3_finalize(remaining);
+  if (!ok) set_error("window recovery exceeded bounded owner set; evidence preserved");
+  return ok ? (changed ? sqlite_window_recovery_checkpoint() : 0) : -1;
+}
+#endif
 
 /* One post-context record can belong to several distinct committed candidates.
  * The fixed 256-slot table is intentionally multi-keyed by candidate+process
@@ -8676,6 +8959,18 @@ void edr_local_evidence_cache_record_behavior(const EdrBehaviorRecord *r) {
       ? 0u
       : context_window_matches(r, ts, context_candidate_ids,
                                EDR_EVIDENCE_CONTEXT_WINDOWS);
+  /* The trigger already owns its bundle. Replaying it through generic
+   * admission must not add a second occurrence as its own post-context. */
+  if (context_candidate_count) {
+    if (!candidate_id[0]) candidate_id_for(r, candidate_id, sizeof(candidate_id));
+    uint32_t kept = 0;
+    for (uint32_t i = 0; i < context_candidate_count; ++i) {
+      if (!strcmp(context_candidate_ids[i], candidate_id)) continue;
+      if (kept != i) copy_s(context_candidate_ids[kept], sizeof(context_candidate_ids[kept]), context_candidate_ids[i]);
+      ++kept;
+    }
+    context_candidate_count = kept;
+  }
   int store_context = context_candidate_count != 0u;
   EvidenceWriteClass context_write_class = evidence_context_write_class(r);
   uint32_t pre_count = 0;
@@ -8767,7 +9062,6 @@ void edr_local_evidence_cache_record_behavior(const EdrBehaviorRecord *r) {
     if (!candidate_existing) {
       s_status.candidate_admitted++;
       promote_context_before_window(r, ts);
-      mark_context_window(r, post_until_ns, candidate_id);
     }
     if (!candidate_reused) {
       candidate_dedupe_admit(r, ts, candidate_id);
@@ -8939,7 +9233,7 @@ int edr_local_evidence_cache_record_alert_context(const EdrBehaviorRecord *r,
     s_status.candidate_transaction_failures++; goto rejected;
   }
   command_failed |= context->command_dependency_missing;
-  if (!exists) s_status.candidate_admitted++;
+  if (!exists) { s_status.candidate_admitted++; promote_context_before_window(r, ts); }
   if (command_failed) {
     record_persistence_failure(r, ts, 0, EDR_EVIDENCE_FAILURE_STORAGE);
     set_error("alert snapshot retained but a complete command fact was refused");
@@ -9938,7 +10232,7 @@ int edr_local_evidence_cache_query_authorized_json(const char *command_id,
   }
   int rc = -1, partial = 0, matched = 0;
   unsigned scanned = 0, returned = 0;
-  size_t encoded_bytes = 256u; /* bounded result metadata and separators */
+  size_t encoded_bytes = 1536u; /* bounded recall manifest, metadata and separators */
   cJSON *result = cJSON_CreateObject(), *rows = result ? cJSON_AddArrayToObject(result, "rows") : NULL;
 #if defined(EDR_HAVE_SQLITE)
   sqlite3_stmt *st = NULL;
@@ -9988,7 +10282,7 @@ int edr_local_evidence_cache_query_authorized_json(const char *command_id,
       "AND p.event_time_ns=f.last_seen_ns AND p.local_retention_state='retained' AND (?7=0 OR p.type=?7)) ORDER BY f.last_seen_ns DESC LIMIT ?5;" :
       "SELECT event_time_ns,type,pid,ppid,endpoint_id,process_name,exe_path,cmdline,file_path,dns_query,net_dst,net_dport,"
       "reg_key_path,reg_value_name,reg_op,process_start_key,process_creation_filetime_100ns,process_generation_source,"
-      "source_completeness,source_truncated_fields,subject_command_fact_id FROM p0_candidates "
+      "source_completeness,source_truncated_fields,subject_command_fact_id,context_window_state,context_window_gap_reason FROM p0_candidates "
       "WHERE endpoint_id=?1 AND tenant_id=?2 AND event_time_ns>=?3 AND event_time_ns<=?4 AND local_retention_state='retained' "
       "ORDER BY event_time_ns DESC LIMIT ?5;";
   if (sqlite3_prepare_v2(s_db, sql, -1, &st, NULL) != SQLITE_OK ||
@@ -10039,6 +10333,13 @@ int edr_local_evidence_cache_query_authorized_json(const char *command_id,
       row = authorized_query_row(&filter, "p0_candidates", ts, type, pid, ppid, fields);
       free(complete_command);
       if (!row) goto allocation_failed;
+      const char *window_state = (const char *)sqlite3_column_text(st, 21);
+      const char *window_gap = (const char *)sqlite3_column_text(st, 22);
+      if (!edr_evidence_window_metadata_valid(window_state, window_gap) ||
+          !cJSON_AddStringToObject(row, "context_window_state", window_state) ||
+          !cJSON_AddStringToObject(row, "context_window_gap_reason", window_gap)) {
+        cJSON_Delete(row); copy_s(out, cap, "evidence query window metadata invalid"); goto finish;
+      }
     }
     matched = 1;
     char *encoded = cJSON_PrintUnformatted(row);
@@ -10090,6 +10391,10 @@ int edr_local_evidence_cache_query_authorized_json(const char *command_id,
   if (!cJSON_AddStringToObject(result, "source", "mixed") || !cJSON_AddBoolToObject(result, "partial", partial) ||
       !cJSON_AddStringToObject(result, "availability_reason", reason) || !cJSON_AddBoolToObject(result, "absence_is_evidence", 0) ||
       !cJSON_AddNumberToObject(result, "rows_scanned", scanned) || !cJSON_AddNumberToObject(result, "rows_returned", returned)) goto allocation_failed;
+  cJSON *manifest = edr_evidence_recall_manifest(rows, issued, window, partial);
+  if (!manifest || !cJSON_AddItemToObject(result, "manifest", manifest)) {
+    cJSON_Delete(manifest); goto allocation_failed;
+  }
   char *encoded = cJSON_PrintUnformatted(result);
   if (!encoded) goto allocation_failed;
   if (strlen(encoded) <= envelope) { copy_s(out, cap, encoded); rc = 0; }

@@ -464,6 +464,8 @@ typedef struct {
 } EdrEvidenceCacheQueryCost;
 /* Real PMFE selector statements only: result_query=0 leases, 1 result replay.
  * Test builds observe SQLite instruction counts before statement finalization. */
+/* Test-only live-generation boundary; -1 restores native verification. */
+void edr_local_evidence_cache_test_set_window_recovery_identity(int matches);
 void edr_local_evidence_cache_test_pmfe_query_cost(int result_query,
                                                   EdrEvidenceCacheQueryCost *out,
                                                   int reset);

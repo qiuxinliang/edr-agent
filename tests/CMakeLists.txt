@@ -1552,6 +1552,7 @@ edr_apply_test_warnings(test_parent_context_binding)
 add_test(NAME parent_context_binding COMMAND test_parent_context_binding WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 
 add_executable(test_local_evidence_cache_candidate ${CMAKE_CURRENT_SOURCE_DIR}/test_local_evidence_cache_candidate.c
+  ${CMAKE_SOURCE_DIR}/src/preprocess/process_generation.c
   ${CMAKE_SOURCE_DIR}/src/preprocess/detection_decision.c
   ${CMAKE_SOURCE_DIR}/src/preprocess/detection_profile.c
   ${CMAKE_SOURCE_DIR}/src/preprocess/behavior_from_slot.c
@@ -1592,6 +1593,32 @@ target_compile_definitions(test_local_evidence_cache_candidate PRIVATE EDR_HAVE_
 target_link_libraries(test_local_evidence_cache_candidate PRIVATE edr_egress_policy edr_validation_trace)
 edr_apply_test_warnings(test_local_evidence_cache_candidate)
 add_test(NAME local_evidence_cache_candidate COMMAND test_local_evidence_cache_candidate --suite context WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+if(SQLite3_FOUND)
+  # An explicitly requested diagnostic, not a passing CTest. Exit 1 reports
+  # the known identical-source replay gap after physical candidate retirement.
+  get_target_property(retired_replay_sources test_local_evidence_cache_candidate SOURCES)
+  list(REMOVE_ITEM retired_replay_sources ${CMAKE_CURRENT_SOURCE_DIR}/test_local_evidence_cache_candidate.c)
+  add_executable(evidence_cache_retired_replay_probe EXCLUDE_FROM_ALL
+    ${CMAKE_CURRENT_SOURCE_DIR}/evidence_cache_retired_replay_probe.c ${retired_replay_sources})
+  target_include_directories(evidence_cache_retired_replay_probe PRIVATE
+    $<TARGET_PROPERTY:test_local_evidence_cache_candidate,INCLUDE_DIRECTORIES>)
+  target_compile_definitions(evidence_cache_retired_replay_probe PRIVATE
+    $<TARGET_PROPERTY:test_local_evidence_cache_candidate,COMPILE_DEFINITIONS>)
+  target_link_libraries(evidence_cache_retired_replay_probe PRIVATE
+    $<TARGET_PROPERTY:test_local_evidence_cache_candidate,LINK_LIBRARIES>)
+  edr_apply_test_warnings(evidence_cache_retired_replay_probe)
+  add_executable(test_evidence_recall_contract
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_evidence_recall_contract.c ${retired_replay_sources})
+  target_include_directories(test_evidence_recall_contract PRIVATE
+    $<TARGET_PROPERTY:test_local_evidence_cache_candidate,INCLUDE_DIRECTORIES>)
+  target_compile_definitions(test_evidence_recall_contract PRIVATE
+    $<TARGET_PROPERTY:test_local_evidence_cache_candidate,COMPILE_DEFINITIONS>)
+  target_link_libraries(test_evidence_recall_contract PRIVATE
+    $<TARGET_PROPERTY:test_local_evidence_cache_candidate,LINK_LIBRARIES>)
+  edr_apply_test_warnings(test_evidence_recall_contract)
+  add_test(NAME evidence_recall_contract COMMAND test_evidence_recall_contract)
+  set_tests_properties(evidence_recall_contract PROPERTIES TIMEOUT 30)
+endif()
 add_test(NAME local_evidence_cache_migration COMMAND test_local_evidence_cache_candidate --suite migration WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 add_test(NAME local_evidence_cache_retention COMMAND test_local_evidence_cache_candidate --suite retention WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 add_test(NAME local_evidence_cache_context_layout COMMAND test_local_evidence_cache_candidate --compact-startup-contract WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
@@ -1612,6 +1639,7 @@ endif()
 if(SQLite3_FOUND)
   add_executable(test_command_fact_transport
     ${CMAKE_CURRENT_SOURCE_DIR}/test_command_fact_transport.c
+    ${CMAKE_SOURCE_DIR}/src/preprocess/process_generation.c
     ${CMAKE_SOURCE_DIR}/src/preprocess/p0_deferred_snapshot.c
     ${CMAKE_SOURCE_DIR}/src/storage/local_evidence_cache.c
     ${CMAKE_SOURCE_DIR}/src/storage/evidence_context_store.c

@@ -257,6 +257,7 @@ SOURCES = [
     'src/storage/local_evidence_cache.c', 'src/storage/evidence_context_store.c',
     'src/storage/evidence_cache_migration.c', 'src/forensic/process_tree_cache.c',
     'src/preprocess/behavior_record.c', 'src/preprocess/p0_rule_match.c',
+    'src/preprocess/process_generation.c',
     'src/preprocess/windows_event_policy.c', 'src/preprocess/windows_file_identity.c',
     'src/preprocess/p0_rule_ir_stub.c', 'src/command/sha256.c',
     'src/serialize/behavior_proto.c', 'third_party/nanopb/pb_encode.c',

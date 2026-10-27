@@ -223,6 +223,43 @@ static void test_enqueue_failures(void) {
   env("EDR_UPLOAD_OUTBOX_DIR", blocked);
   assert(edr_command_upload_outbox_write_legacy("cmd_blocked", bundle, sha, "") != 0);
 }
+/* Exercise the existing volume reserve without filling the host disk. */
+static void test_metadata_physical_admission(void) {
+  setup("physical-admission");
+  char path[1200], before[8192], after[8192];
+  pending_path(path, sizeof(path), "cmd_physical");
+  env("EDR_STORAGE_MIN_FREE_MB", "17592186044415");
+  int rc = edr_command_upload_outbox_write_legacy("cmd_physical", bundle, sha, "manifest");
+  printf("outbox_physical_admission blocked_enqueue_rc=%d pending_exists=%d temporary_files=%u\n",
+         rc, exists(path), temporary_files()); fflush(stdout);
+  assert(rc != 0 && !exists(path) && temporary_files() == 0u);
+  env("EDR_STORAGE_MIN_FREE_MB", "0");
+  assert(edr_command_upload_outbox_write_legacy("cmd_physical", bundle, sha, "manifest") == 0);
+  contents(path, before, sizeof(before));
+  env("EDR_STORAGE_MIN_FREE_MB", "17592186044415");
+  /* A no-write replay neither spends disk nor changes the committed record. */
+  assert(edr_command_upload_outbox_write_legacy("cmd_physical", bundle, sha, "manifest") == 0);
+  hashed_bytes = 0;
+  int attempted = 99;
+  assert(edr_command_upload_outbox_flush_one(path, &attempted) == -2);
+  assert(!attempted && !hashed_bytes && !upload_calls && !terminal_calls && temporary_files() == 0u);
+  contents(path, after, sizeof(after)); assert(!strcmp(before, after));
+  printf("outbox_physical_admission blocked_upload_attempts=%d blocked_hash_bytes=%zu pending_preserved=%d\n",
+         upload_calls, hashed_bytes, exists(path));
+  char hold[1300]; snprintf(hold, sizeof(hold), "%s.policy-held", path);
+  policy_result = EDR_EGRESS_REQUEST_DENIED;
+  assert(edr_command_upload_outbox_flush_one(path, &attempted) == EDR_EGRESS_LOCAL_STATE_FAILURE);
+  assert(!attempted && !hashed_bytes && !upload_calls && !exists(hold) && exists(bundle));
+  contents(path, after, sizeof(after)); assert(!strcmp(before, after));
+  env("EDR_STORAGE_MIN_FREE_MB", "0");
+  assert(edr_command_upload_outbox_flush_one(path, &attempted) == EDR_EGRESS_REQUEST_DENIED);
+  assert(!attempted && !hashed_bytes && !upload_calls && exists(hold));
+  policy_result = 0;
+  assert(edr_command_upload_outbox_flush_one(path, &attempted) == 1 && attempted == 1);
+  assert(upload_calls == 1 && !exists(path) && !exists(hold) && exists(bundle));
+  printf("outbox_physical_admission recovered_upload_attempts=%d artifact_preserved=%d\n",
+         upload_calls, exists(bundle));
+}
 static void test_legacy_upgrade(void) {
   setup("legacy"); char path[1200], done[1240], raw[8192]; int attempted;
   snprintf(path, sizeof(path), "%s/upload_cmd_old_123.pending", dir); legacy(path, "cmd_old", 0);
@@ -411,6 +448,11 @@ int main(int argc,char **argv) {
 #endif
   strcpy(meta.idempotency_key, "idempotency|retained"); strcpy(meta.soar_correlation_id, "correlation");
   strcpy(meta.playbook_run_id, "run"); strcpy(meta.playbook_step_id, "step");
+  if (argc == 2 && !strcmp(argv[1], "--physical-admission")) {
+    test_metadata_physical_admission();
+    puts("outbox physical admission contract passed"); return 0;
+  }
+  test_metadata_physical_admission();
   test_policy_hold_before_hash();
   test_enqueue_failures(); test_legacy_upgrade(); test_reopen_after_terminal_failure();
   test_rename_retry(); test_receipt_failure(); test_terminal_commit_before_receipt_failure();

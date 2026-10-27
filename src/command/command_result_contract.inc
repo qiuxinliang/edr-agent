@@ -2,6 +2,7 @@
  * This file is compiled only as part of command_state.c. */
 #include "edr/shell_session.h"
 #include "edr/rtq_contract.h"
+#include "edr/evidence_recall_manifest.h"
 static const char *result_text(const cJSON *o, const char *key) {
   const cJSON *v=cJSON_GetObjectItemCaseSensitive(o,key);
   return cJSON_IsString(v) && v->valuestring ? v->valuestring : "";
@@ -444,6 +445,13 @@ static cJSON *result_cached_row(const cJSON *q,const cJSON *row,const cJSON *con
       !result_filter_text(q,"file_path",row,"file_path",0))return NULL;
   cJSON *out=cJSON_CreateObject();if(!out)return NULL;
   int ok=result_copy_fields(out,row,"source|endpoint_id|process_name|exe_path|process_start_key|process_creation_filetime_100ns|process_generation_source|source_completeness|source_truncated_fields","type|pid|ppid","");
+  const cJSON *window_state=cJSON_GetObjectItemCaseSensitive(row,"context_window_state");
+  const cJSON *window_gap=cJSON_GetObjectItemCaseSensitive(row,"context_window_gap_reason");
+  if(ok && (window_state || window_gap)) {
+    ok=cJSON_IsString(window_state) && cJSON_IsString(window_gap) &&
+        edr_evidence_window_metadata_valid(window_state->valuestring,window_gap->valuestring) &&
+        result_copy_fields(out,row,"context_window_state|context_window_gap_reason","","");
+  }
   /* Nanosecond event time is an existing JSON double field. Preserve its
    * representation after checking the signed query time window above. */
   if(ok)ok=cJSON_AddItemToObject(out,"event_time_ns",cJSON_Duplicate(cJSON_GetObjectItemCaseSensitive(row,"event_time_ns"),1));
@@ -494,6 +502,14 @@ static cJSON *result_query(const cJSON *root,const cJSON *contract,const EdrComm
       }
       if (!cJSON_AddStringToObject(out,"availability_reason",availability->valuestring) ||
           !cJSON_AddBoolToObject(out,"absence_is_evidence",0)) { cJSON_Delete(out); return NULL; }
+    }
+    const cJSON *manifest=cJSON_GetObjectItemCaseSensitive(root,"manifest");
+    if(manifest) {
+      double issued,window;
+      if(!cJSON_IsObject(manifest) || !result_integer(contract,"issued_unix_ms",1,INT64_MAX/1000000LL-300000,&issued) ||
+          !result_integer(contract,"window_s",1,604800,&window)) { cJSON_Delete(out); return NULL; }
+      cJSON *bound=edr_evidence_recall_manifest(projected,(int64_t)issued,(int64_t)window,partial);
+      if(!bound || !cJSON_AddItemToObject(out,"manifest",bound)) { cJSON_Delete(bound); cJSON_Delete(out); return NULL; }
     }
   } else {
     cJSON_AddNumberToObject(out,"total",cJSON_GetArraySize(rows));

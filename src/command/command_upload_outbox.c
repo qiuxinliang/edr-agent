@@ -6,6 +6,7 @@
 #include "edr/response.h"
 #include "edr/response_utils.h"
 #include "edr/sha256.h"
+#include "edr/storage_physical_guard.h"
 #include "edr/transport_v2.h"
 #include <ctype.h>
 #include <errno.h>
@@ -37,6 +38,18 @@ typedef struct {
 } UploadRecord;
 
 static int read_record(const char *path, UploadRecord *record);
+
+static int metadata_space_available(const char *path) {
+  EdrStoragePhysicalSnapshot snapshot;
+  /* The current record is already included in volume usage. Budget the new
+   * bounded staging copy plus allocation/directory overhead. Outbox metadata
+   * has no durable completion reservation and cannot consume another owner's
+   * protected floor. This observation is not a reservation against writers. */
+  if (edr_storage_physical_admit(path, UPLOAD_RECORD_CAP + 4096u, 0, &snapshot) == 0)
+    return 1;
+  edr_command_audit_both("", snapshot.cause ? snapshot.cause : "forensic metadata space unavailable");
+  return 0;
+}
 
 void edr_command_upload_outbox_dir(char *out, size_t cap) {
   const char *dir = getenv("EDR_UPLOAD_OUTBOX_DIR");
@@ -100,6 +113,7 @@ static int move_record(const char *from, const char *to, int replace) {
 /* Publish complete metadata only after the file contents are flushed. A failed
  * replacement retains the previous pending record for recovery. */
 static int write_record(const char *path, const char *raw, int replace) {
+  if (!metadata_space_available(path)) return -1;
   char tmp[1240];
 #ifdef _WIN32
   static volatile LONG sequence;
@@ -338,13 +352,17 @@ int edr_command_upload_outbox_flush_one(const char *path, int *upload_attempted)
     uint64_t permitted_size=0;
     int admission=edr_egress_upload_preflight(r.command_id,r.command_id,r.bundle,r.sha,&permitted_size);
     if (edr_egress_is_policy_hold(admission)) {
-      int held=edr_hold_write(hold_path,r.command_id,admission);
+      int held=metadata_space_available(hold_path)
+          ? edr_hold_write(hold_path,r.command_id,admission) : EDR_EGRESS_LOCAL_STATE_FAILURE;
       edr_command_audit_both(r.command_id, held==EDR_EGRESS_LOCAL_STATE_FAILURE
           ? "forensic policy hold persistence failed; original pending and artifact retained"
           : "forensic upload policy held; original pending and artifact retained");
       return held;
     }
     if (admission || edr_hold_clear(hold_path)) return -2;
+    /* Do not start a remote upload when its local receipt cannot be staged.
+     * Recheck at publication because other writers may consume free space. */
+    if (!metadata_space_available(path)) return -2;
     char actual[65];
     int hash_rc = file_hash(r.bundle, actual);
     if (hash_rc != 0) {
@@ -370,7 +388,8 @@ int edr_command_upload_outbox_flush_one(const char *path, int *upload_attempted)
       int upload_rc=edr_transport_v2_upload_file(r.command_id, r.bundle, r.sha, r.object_key, sizeof(r.object_key));
       if (edr_egress_is_policy_hold(upload_rc)) {
         *upload_attempted=0;
-        int held=edr_hold_write(hold_path,r.command_id,upload_rc);
+        int held=metadata_space_available(hold_path)
+            ? edr_hold_write(hold_path,r.command_id,upload_rc) : EDR_EGRESS_LOCAL_STATE_FAILURE;
         if(held==EDR_EGRESS_LOCAL_STATE_FAILURE) edr_command_audit_both(r.command_id,"forensic policy hold persistence failed; pending retained");
         return held;
       }
