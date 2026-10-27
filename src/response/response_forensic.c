@@ -24,6 +24,7 @@
 
 #ifdef _WIN32
 #include <direct.h>
+#include <io.h>
 #include <process.h>
 #include <windows.h>
 #include <dbghelp.h>
