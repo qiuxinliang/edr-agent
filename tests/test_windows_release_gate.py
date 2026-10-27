@@ -132,6 +132,19 @@ class WindowsReleaseGateTests(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
         return result
 
+    def test_client_build_artifact_names_accept_slash_branch(self):
+        source = (ROOT / ".github/workflows/edr-agent-client-build.yml").read_text(encoding="utf-8")
+        names = [re.search(pattern, source).group(1) for pattern in (
+            r'\$zip = "([^"]+)"', r'\$src = "([^"]+)"',
+            r'name: (edr-agent-windows-[^\r\n]+)')]
+        for branch in ("codex/evidence-cache-io-lifecycle", "main"):
+            resolved = [name.replace("${{ github.ref_name }}", branch)
+                        .replace("${{ github.sha }}", "a" * 40) for name in names]
+            self.assertEqual(resolved[0], resolved[1], "archive producer and consumer must agree")
+            for name in resolved:
+                self.assertNotRegex(name, r'[\\/:*?"<>|\r\n]', "Windows path and artifact names must be single safe components")
+                self.assertNotIn("${{", name, "fixture must resolve every identity input")
+
     def test_packaging_powershell_launchers_isolate_inherited_module_path(self):
         """Exercise the launcher; the native gate runs each packaging fixture."""
         names = ("windows_release_collector_pe_closure",

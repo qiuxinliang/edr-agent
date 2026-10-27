@@ -363,7 +363,7 @@ jobs:
       - name: Package (setup exe + runtime zip)
         shell: pwsh
         run: |
-          $zip = "edr-agent-${{ github.ref_name }}-windows-amd64-exe.zip"
+          $zip = "edr-agent-${{ github.sha }}-windows-amd64-exe.zip"
           $outDir = $null
           $agentExe = $null
           foreach ($c in @("build\Release", "build")) {
@@ -611,7 +611,7 @@ jobs:
       - name: Move artifact to workspace
         shell: pwsh
         run: |
-          $src = "edr-agent-${{ github.ref_name }}-windows-amd64-exe.zip"
+          $src = "edr-agent-${{ github.sha }}-windows-amd64-exe.zip"
           if (-not (Test-Path -LiteralPath $src)) { throw "missing $src" }
           Copy-Item -Path $src -Destination (Join-Path $env:GITHUB_WORKSPACE "edr-agent-win-exe.zip") -Force
           if (-not (Test-Path -LiteralPath "edr_agent_setup.exe")) { throw "missing edr_agent_setup.exe" }
@@ -619,7 +619,7 @@ jobs:
 
       - uses: actions/upload-artifact@v6
         with:
-          name: edr-agent-windows-${{ github.ref_name }}
+          name: edr-agent-windows-${{ github.sha }}
           path: |
             edr-agent-win-exe.zip
             edr_agent_setup.exe
