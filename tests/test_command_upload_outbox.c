@@ -10,6 +10,7 @@
 #include "edr/forensic_path.h"
 #include "edr/forensic_worker.h"
 static size_t hash_operations;
+static void (*after_hash_hook)(void);
 static int fail_sync_worker;
 static unsigned sync_worker_calls;
 static const char *test_executable;
@@ -19,7 +20,9 @@ static int64_t fake_now_ms=1000000;
 static int measured_hash_worker(const EdrForensicIoRequest *request,EdrForensicIoResult *result,EdrResponseCancelCheck cancel,void *user) {
   if(request->operation==2)hash_operations++;
   if(request->operation==3) {sync_worker_calls++;if(fail_sync_worker)return -1;}
-  return edr_forensic_io_run(request,result,cancel,user);
+  int rc=edr_forensic_io_run(request,result,cancel,user);
+  if(!rc && request->operation==2 && after_hash_hook) {void (*hook)(void)=after_hash_hook;after_hash_hook=NULL;hook();}
+  return rc;
 }
 int edr_egress_is_policy_hold(int rc) {return rc==-3||rc==-4||rc==-7;}
 int edr_egress_upload_preflight(const char *id,const char *upload,const char *path,const char *sha,uint64_t *size) {(void)id;(void)upload;(void)path;(void)sha;if(size)*size=24;return policy_result;}
@@ -305,6 +308,29 @@ static void test_enqueue_failures(void) {
   assert(edr_command_upload_outbox_write_legacy("cmd_blocked", bundle, sha, "") != 0);
 }
 #ifdef _WIN32
+static char checked_artifact_directory[1000];
+static void probe_artifact_directory_locked(void) {
+  HANDLE h=CreateFileA(checked_artifact_directory,FILE_WRITE_DATA,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,
+      NULL,OPEN_EXISTING,FILE_FLAG_BACKUP_SEMANTICS|FILE_FLAG_OPEN_REPARSE_POINT,NULL);
+  assert(h==INVALID_HANDLE_VALUE && GetLastError()==ERROR_SHARING_VIOLATION);
+}
+static void test_windows_artifact_guard_survives_hash_worker(void) {
+  setup("artifact-consumer-guard");
+  snprintf(checked_artifact_directory,sizeof(checked_artifact_directory),"%s/artifact-sibling",root);
+  make_dir(checked_artifact_directory);
+  snprintf(bundle,sizeof(bundle),"%s/bundle.tgz",checked_artifact_directory);put(bundle,"bounded forensic fixture");
+  HANDLE writable=CreateFileA(checked_artifact_directory,FILE_WRITE_DATA,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,
+      NULL,OPEN_EXISTING,FILE_FLAG_BACKUP_SEMANTICS|FILE_FLAG_OPEN_REPARSE_POINT,NULL);
+  assert(writable!=INVALID_HANDLE_VALUE);CloseHandle(writable);
+  assert(edr_command_upload_outbox_write_legacy("cmd_guard",bundle,sha,"")==0);
+  char path[1200];pending_path(path,sizeof(path),"cmd_guard");int attempted=0;
+  after_hash_hook=probe_artifact_directory_locked;
+  assert(edr_command_upload_outbox_flush_one(path,&attempted)==1 && attempted && !after_hash_hook);
+  writable=CreateFileA(checked_artifact_directory,FILE_WRITE_DATA,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,
+      NULL,OPEN_EXISTING,FILE_FLAG_BACKUP_SEMANTICS|FILE_FLAG_OPEN_REPARSE_POINT,NULL);
+  assert(writable!=INVALID_HANDLE_VALUE);CloseHandle(writable);
+  puts("PASS: artifact directory write access allowed before/after flush, denied after hash child exit through delivery");
+}
 static void test_windows_readable_metadata_requires_durability(void) {
   setup("windows-readable-not-durable");char path[1200];
   pending_path(path,sizeof(path),"cmd_flush");
@@ -926,6 +952,7 @@ int main(int argc,char **argv) {
 #ifdef _WIN32
   test_windows_bounded_metadata_publication();
   test_windows_readable_metadata_requires_durability();
+  test_windows_artifact_guard_survives_hash_worker();
 #endif
   test_enqueue_failures(); test_legacy_upgrade(); test_reopen_after_terminal_failure();
   test_rename_retry(); test_receipt_failure(); test_terminal_commit_before_receipt_failure();

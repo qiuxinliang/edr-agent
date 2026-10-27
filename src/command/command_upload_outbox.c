@@ -310,20 +310,20 @@ int edr_command_queue_forensic_upload(const char *command_id, const char *comman
 /* Called only with the existing command owner lock held. It performs no
  * command-state calls; wake workers after handoff releases that lock. */
 static int publish_stage_locked(const EdrCommandArtifactStage *stage,uint64_t credit) {
-  EdrForensicPath *staging=NULL;uint64_t bytes=0;
-  if(edr_forensic_path_acquire(stage->staging,0,&staging))return -1;
-  int present=edr_forensic_path_size(staging,&bytes);edr_forensic_path_release(staging);
-  if(present<0)return -1;
-  if(bytes) {
-    if(move_record(stage->staging,stage->artifact,0)) {
-      /* A prior crash may have completed the no-replace publication. Exact
-       * content is required; a conflicting artifact is never overwritten. */
-      char actual[65];
-      if(file_hash(stage->artifact,actual) || strcmp(actual,stage->sha256))return -1;
-    }
+  EdrForensicPath *staging=NULL,*artifact=NULL;uint64_t bytes=0;int rc=-1;
+  if(edr_forensic_path_acquire(stage->staging,0,&staging) ||
+     edr_forensic_path_acquire(stage->artifact,0,&artifact))goto done;
+  int present=edr_forensic_path_size(staging,&bytes);
+  if(present<0)goto done;
+  if(bytes && move_guarded(staging,artifact,0)) {
+    /* Keep both directory chains through recovery hash and durable handoff. */
+    char actual[65];
+    if(file_hash(stage->artifact,actual) || strcmp(actual,stage->sha256))goto done;
   }
-  return queue_upload(stage->command_id,stage->command_type,&stage->meta,
+  rc=queue_upload(stage->command_id,stage->command_type,&stage->meta,
        stage->artifact,stage->sha256,"","builtin",0,credit);
+done:
+  edr_forensic_path_release(artifact);edr_forensic_path_release(staging);return rc;
 }
 
 int edr_command_upload_outbox_publish_stage(const EdrCommandArtifactStage *stage) {
@@ -477,7 +477,7 @@ static int retire_record(const char *path, const char *command_id, const char *s
   return !strcmp(suffix, "done") ? 1 : 0;
 }
 
-static int flush_guarded(const char *path, int *upload_attempted) {
+static int flush_guarded(const char *path, int *upload_attempted, EdrForensicPath **artifact_guard) {
   *upload_attempted = 0;
   UploadRecord r;
   int rc = read_record(path, &r);
@@ -530,6 +530,11 @@ static int flush_guarded(const char *path, int *upload_attempted) {
     /* Do not start a remote upload when its local receipt cannot be staged.
      * Recheck at publication because other writers may consume free space. */
     if (!metadata_space_available(path)) return -2;
+    /* The worker's hash guard ends with its process. Retain the same artifact
+     * directory chain in this owner through transport and receipt publication. */
+    if(edr_forensic_path_acquire(r.bundle,0,artifact_guard)) {
+      edr_command_audit_both(r.command_id,"forensic artifact directory unsafe or unavailable; pending retained");return -2;
+    }
     char actual[65];
     int hash_rc = file_hash(r.bundle, actual);
     if (hash_rc != 0) {
@@ -604,6 +609,7 @@ int edr_command_upload_outbox_flush_one(const char *path,int *upload_attempted) 
   if(edr_forensic_path_acquire(path,0,&guard)) {
     edr_command_audit_both("","forensic outbox directory unsafe or unavailable; pending retained");return -2;
   }
-  int rc=flush_guarded(path,upload_attempted);
-  edr_forensic_path_release(guard);return rc;
+  EdrForensicPath *artifact_guard=NULL;
+  int rc=flush_guarded(path,upload_attempted,&artifact_guard);
+  edr_forensic_path_release(artifact_guard);edr_forensic_path_release(guard);return rc;
 }
