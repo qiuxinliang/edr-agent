@@ -145,6 +145,15 @@ class WindowsReleaseGateTests(unittest.TestCase):
                 self.assertNotRegex(name, r'[\\/:*?"<>|\r\n]', "Windows path and artifact names must be single safe components")
                 self.assertNotIn("${{", name, "fixture must resolve every identity input")
 
+    def test_client_build_supplies_setup_ui_signature_expectation(self):
+        source = (ROOT / ".github/workflows/edr-agent-client-build.yml").read_text(encoding="utf-8")
+        calls = [line for line in source.splitlines() if '& ".\\install\\windows-setup-ui\\Build-SetupUi.ps1"' in line]
+        self.assertEqual(len(calls), 1)
+        # The build-only workflow has no signing identity. Its UI package must
+        # explicitly declare that contract; the packager still verifies the
+        # actual executable signatures and rejects mixed/mismatched closures.
+        self.assertRegex(calls[0], r"-ExpectedSignatureStatus\s+unsigned(?:\s|$)")
+
     def test_packaging_powershell_launchers_isolate_inherited_module_path(self):
         """Exercise the launcher; the native gate runs each packaging fixture."""
         names = ("windows_release_collector_pe_closure",
