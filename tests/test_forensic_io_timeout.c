@@ -38,7 +38,17 @@ int main(int argc,char **argv) {
     if(!phase){assert(rc==0 && strlen(result.sha256)==64);continue;}
     assert(rc==EDR_DC_ERR_TIMEOUT && elapsed>=1900 && elapsed<3500);
     char marker[900];snprintf(marker,sizeof(marker),"%s/blocked",q.workspace);
-    FILE *f=fopen(marker,"rb");assert(f);assert(fgetc(f)==(int)('0'+phase));assert(!fclose(f));
+    FILE *f=fopen(marker,"rb");assert(f);
+    unsigned observed=0;unsigned long descendant=0;
+    assert(fscanf(f,"%u %lu",&observed,&descendant)==2 && observed==phase);assert(!fclose(f));
+#ifdef _WIN32
+    if(phase==3) {
+      assert(descendant!=0);HANDLE child=OpenProcess(SYNCHRONIZE,FALSE,descendant);
+      if(child){assert(WaitForSingleObject(child,0)==WAIT_OBJECT_0);CloseHandle(child);}
+      else assert(GetLastError()==ERROR_INVALID_PARAMETER);
+      puts("PASS: blocked descendant exited before the supervisor returned");
+    }
+#endif
   }
   q.operation=1;assert(edr_forensic_io_run(&q,&result,cancel_now,NULL)==EDR_DC_ERR_CANCELLED);
   q.timeout_ms=0;assert(edr_forensic_io_run(&q,&result,NULL,NULL)==EDR_DC_ERR_TIMEOUT);

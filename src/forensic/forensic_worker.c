@@ -33,15 +33,7 @@ static uint64_t io_clock(void) {
 #endif
 }
 #ifdef EDR_FORENSIC_IO_TESTING
-static void io_block_test(const EdrForensicIoRequest *q,unsigned phase) {
-  if((q->operation>>8)!=phase)return;
-  char path[900];snprintf(path,sizeof(path),"%s/blocked",q->workspace);
-  EdrForensicPath *guard=NULL;
-  if(edr_forensic_path_acquire(path,1,&guard))abort();
-  FILE *f=edr_forensic_path_file(guard,"wbx");if(!f)abort();
-  if(fprintf(f,"%u",phase)<0 || fclose(f))abort();edr_forensic_path_release(guard);
-  /* Actual synchronous kernel read, with a live writer and no data. Only the
-   * outside process supervisor can end this deliberately blocked test I/O. */
+static void io_test_block_read(void) {
 #ifdef _WIN32
   HANDLE reader,writer;DWORD n;char byte;
   if(!CreatePipe(&reader,&writer,NULL,0))abort();
@@ -50,6 +42,28 @@ static void io_block_test(const EdrForensicIoRequest *q,unsigned phase) {
   int pipes[2];char byte;if(pipe(pipes))abort();
   (void)read(pipes[0],&byte,1);close(pipes[0]);close(pipes[1]);
 #endif
+}
+static void io_block_test(const EdrForensicIoRequest *q,unsigned phase) {
+  if((q->operation>>8)!=phase)return;
+  unsigned long descendant=0;
+#ifdef _WIN32
+  if(phase==3) {
+    wchar_t binary[32768],command[32880];
+    DWORD length=GetModuleFileNameW(NULL,binary,32768);
+    if(!length || length>=32768)abort();
+    if(swprintf(command,32880,L"\"%ls\" --forensic-io-worker-v1 blocked-descendant",binary)<0)abort();
+    STARTUPINFOW startup={0};PROCESS_INFORMATION child={0};startup.cb=sizeof(startup);
+    if(!CreateProcessW(binary,command,NULL,NULL,FALSE,CREATE_NO_WINDOW,NULL,NULL,&startup,&child))abort();
+    descendant=child.dwProcessId;CloseHandle(child.hThread);CloseHandle(child.hProcess);
+  }
+#endif
+  char path[900];snprintf(path,sizeof(path),"%s/blocked",q->workspace);
+  EdrForensicPath *guard=NULL;
+  if(edr_forensic_path_acquire(path,1,&guard))abort();
+  FILE *f=edr_forensic_path_file(guard,"wbx");if(!f)abort();
+  if(fprintf(f,"%u %lu",phase,descendant)<0 || fclose(f))abort();edr_forensic_path_release(guard);
+  /* A live writer and no bytes cause a real synchronous kernel read. */
+  io_test_block_read();
 }
 #else
 #define io_block_test(q,phase) ((void)0)
@@ -98,6 +112,9 @@ done:
 
 int edr_forensic_io_worker_main(const char *endpoint) {
   if(!endpoint || !*endpoint)return 2;
+#ifdef EDR_FORENSIC_IO_TESTING
+  if(!strcmp(endpoint,"blocked-descendant")){io_test_block_read();return 2;}
+#endif
   char *end=NULL;errno=0;unsigned long long value=strtoull(endpoint,&end,10);
   if(errno || !end || *end || !value)return 2;
 #ifdef _WIN32
@@ -174,9 +191,20 @@ int edr_forensic_io_run(const EdrForensicIoRequest *q,EdrForensicIoResult *out,
     if(wait!=WAIT_TIMEOUT)break;
   }
 stop:
-  if(!finished) {
-    (void)TerminateJobObject(job,1);(void)TerminateProcess(process.hProcess,1);
-    if(WaitForSingleObject(process.hProcess,1000)!=WAIT_OBJECT_0)result=EDR_RESPONSE_WRITER_UNCONFIRMED;
+  /* A signalled worker does not prove tar/other descendants have exited.
+   * Confirm the whole job before allowing the owner to release growth credit. */
+  if(process.hProcess) {
+    (void)TerminateJobObject(job,1);
+    if(!finished)(void)TerminateProcess(process.hProcess,1);
+    uint64_t stop=io_clock();int stopped=0;
+    for(unsigned attempt=0;attempt<100u;attempt++) {
+      JOBOBJECT_BASIC_ACCOUNTING_INFORMATION accounting={0};
+      if(QueryInformationJobObject(job,JobObjectBasicAccountingInformation,&accounting,sizeof(accounting),NULL) &&
+          !accounting.ActiveProcesses && WaitForSingleObject(process.hProcess,0)==WAIT_OBJECT_0){stopped=1;break;}
+      uint64_t now=io_clock();if(stop==UINT64_MAX || now==UINT64_MAX || now-stop>=1000u)break;
+      Sleep(10);
+    }
+    if(!stopped)result=EDR_RESPONSE_WRITER_UNCONFIRMED;
   }
 done:
   if(process.hThread)CloseHandle(process.hThread);if(process.hProcess)CloseHandle(process.hProcess);
@@ -236,16 +264,19 @@ done:
     if(waited<0 && errno!=EINTR)break;
     struct timespec delay={0,1000000};nanosleep(&delay,NULL);
   }
-  if(!finished) {
-    (void)kill(-child,SIGKILL);(void)kill(child,SIGKILL);
-    uint64_t stop=io_clock();
+  if(!finished || kill(-child,0)==0 || errno!=ESRCH) {
+    (void)kill(-child,SIGKILL);if(!finished)(void)kill(child,SIGKILL);
+    uint64_t stop=io_clock();int group_stopped=0;
     for(unsigned attempt=0;attempt<1000u;attempt++) {
+      if(!finished) {
+        pid_t waited=waitpid(child,&status,WNOHANG);if(waited==child)finished=1;
+        else if(waited<0 && errno!=EINTR)break;
+      }
+      if(finished && kill(-child,0)<0 && errno==ESRCH){group_stopped=1;break;}
       uint64_t now=io_clock();if(now==UINT64_MAX || stop==UINT64_MAX || now-stop>=1000u)break;
-      pid_t waited=waitpid(child,&status,WNOHANG);if(waited==child){finished=1;break;}
-      if(waited<0 && errno!=EINTR)break;
       struct timespec delay={0,1000000};nanosleep(&delay,NULL);
     }
-    if(!finished)result=EDR_RESPONSE_WRITER_UNCONFIRMED;
+    if(!group_stopped)result=EDR_RESPONSE_WRITER_UNCONFIRMED;
   }
   close(sockets[0]);
 #endif
