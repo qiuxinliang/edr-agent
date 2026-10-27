@@ -496,10 +496,11 @@ static void test_capacity_health_producer_and_projection(void) {
   st.db_open = 1; st.storage_format = 2; st.accounting_generation = 7;
   st.candidate_requests = 100; st.candidate_admitted = 60;
   st.candidate_reused = 10; st.candidate_rejected = 30;
+  st.context_facts_written = 31; st.context_refs_written = 62;
   st.wal_bytes = 4096; st.shm_bytes = 32768; st.maintenance_state = 2;
   st.maintenance_pending = 1; st.db_capacity_evicted = 11;
   snprintf(st.path, sizeof(st.path), "PRIVATE_PATH");
-  const char *accounting = "{\"local_retention\":{\"recent_hours\":72,\"selected_hours\":72},\"private_fact\":\"PRIVATE_FACT\"}";
+  const char *accounting = "{\"scope\":\"current_process\",\"local_retention\":{\"recent_hours\":72,\"selected_hours\":72},\"private_fact\":\"PRIVATE_FACT\"}";
   char cache[EDR_EVIDENCE_HEALTH_JSON_BYTES], exact[EDR_EVIDENCE_HEALTH_JSON_BYTES];
   assert(edr_evidence_cache_health_json(&st, accounting, "{\"PRIVATE_OWNER\":1}", cache, sizeof(cache)) == 0);
   assert(!strstr(cache, "PRIVATE_PATH"));
@@ -523,12 +524,81 @@ static void test_capacity_health_producer_and_projection(void) {
     assert(cJSON_GetObjectItemCaseSensitive(value, "accounting_generation")->valuedouble == 7);
     assert(cJSON_GetObjectItemCaseSensitive(value, "candidate_requests")->valuedouble == 100);
     assert(cJSON_GetObjectItemCaseSensitive(value, "candidate_rejected")->valuedouble == 30);
+    assert(cJSON_GetObjectItemCaseSensitive(value, "context_facts_written")->valuedouble == 31);
+    assert(cJSON_GetObjectItemCaseSensitive(value, "context_refs_written")->valuedouble == 62);
+    assert(!strcmp(cJSON_GetObjectItemCaseSensitive(cJSON_GetObjectItemCaseSensitive(value,
+        "accounting"), "scope")->valuestring, "current_process"));
     assert(cJSON_GetObjectItemCaseSensitive(value, "wal_bytes")->valuedouble == 4096);
     cJSON *maintenance = cJSON_GetObjectItemCaseSensitive(value, "maintenance");
     assert(cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(maintenance, "pending")));
     assert(cJSON_GetObjectItemCaseSensitive(maintenance, "capacity_evicted")->valuedouble == 11);
     check_health_routes(root, 1);
     cJSON_Delete(root); free(wire);
+  }
+}
+
+static void test_complete_cache_accounting_projection(void) {
+  /* Exercise the exact safe-integer boundary before cJSON's decimal printer
+   * can round it while building the full/delta fixtures below. */
+  const char *unsafe = "{\"endpoint_id\":\"ep\",\"agent_version\":\"test\",\"policy_version\":\"p\","
+      "\"engine_health\":{\"p0_acceptance\":{\"evidence_cache\":{\"context_facts_written\":9007199254740992}}}}";
+  assert(check("POST", "ingest/engine-health", unsafe) != 0);
+  char reason[128];
+  char *safe = edr_egress_health_project(unsafe, reason, sizeof(reason));
+  assert(!safe || !strstr(safe, "context_facts_written")); free(safe);
+  const char *owners[] = {"candidate", "context"};
+  const char *causes[] = {"no_database", "capacity_refused", "write_budget_refused",
+      "resource_failed", "invalid", "storage_failed", "unclassified_failure"};
+  const char *invalid[] = {"-1", "1.5", "100000000000000000", "true", "null", "{}", "[]", "\"PRIVATE_ERROR\""};
+  for (unsigned profile = 0; profile < 2; ++profile) {
+    cJSON *root = cJSON_Parse("{\"endpoint_id\":\"ep\",\"agent_version\":\"test\",\"policy_version\":\"p\","
+        "\"engine_health\":{\"monitor\":{},\"p0_acceptance\":{\"evidence_cache\":{\"accounting\":{}}}}}");
+    assert(root);
+    cJSON *health = cJSON_GetObjectItemCaseSensitive(root, "engine_health");
+    cJSON_AddStringToObject(cJSON_GetObjectItemCaseSensitive(health, "monitor"), "profile", profile ? "diagnostic" : "basic");
+    cJSON *cache = cJSON_GetObjectItemCaseSensitive(cJSON_GetObjectItemCaseSensitive(health, "p0_acceptance"), "evidence_cache");
+    cJSON *accounting = cJSON_GetObjectItemCaseSensitive(cache, "accounting");
+    /* Older producers remain valid and projection must not invent zeros. */
+    char *body = cJSON_PrintUnformatted(root), reason[128]; assert(body);
+    char *wire = edr_egress_health_project(body, reason, sizeof(reason)); assert(wire);
+    assert(!strstr(wire, "context_facts_written") && !strstr(wire, "scope"));
+    free(body); free(wire);
+    cJSON_AddStringToObject(accounting, "scope", "current_process");
+    cJSON *parents[16]; const char *keys[16]; char names[14][64]; unsigned count = 0;
+    parents[count] = cache; keys[count++] = "context_facts_written";
+    parents[count] = cache; keys[count++] = "context_refs_written";
+    for (unsigned owner = 0; owner < 2; ++owner) {
+      char tree[32]; snprintf(tree, sizeof(tree), "%s_failures", owners[owner]);
+      cJSON *failures = cJSON_AddObjectToObject(accounting, tree); assert(failures);
+      for (unsigned cause = 0; cause < 7; ++cause) {
+        snprintf(names[count - 2], sizeof(names[0]), "%s_%s", owners[owner], causes[cause]);
+        parents[count] = failures; keys[count] = names[count - 2]; ++count;
+      }
+    }
+    for (unsigned i = 0; i < count; ++i) assert(cJSON_AddNumberToObject(parents[i], keys[i], i % 2 ? 5 : 0));
+    check_health_routes(root, 1);
+    body = cJSON_PrintUnformatted(root); wire = edr_egress_health_project(body, reason, sizeof(reason)); assert(wire);
+    cJSON *projected = cJSON_Parse(wire); assert(projected && cJSON_Compare(root, projected, 1));
+    free(body); free(wire); cJSON_Delete(projected);
+    for (unsigned i = 0; i < count; ++i) {
+      for (unsigned j = 0; j < sizeof(invalid)/sizeof(invalid[0]); ++j) {
+        assert(cJSON_ReplaceItemInObjectCaseSensitive(parents[i], keys[i], cJSON_Parse(invalid[j])));
+        check_health_routes(root, 0);
+        body = cJSON_PrintUnformatted(root); wire = edr_egress_health_project(body, reason, sizeof(reason)); assert(wire);
+        assert(!strstr(wire, keys[i]) && !strstr(wire, "PRIVATE_ERROR"));
+        projected = cJSON_Parse(wire); assert(projected); check_health_routes(projected, 1);
+        free(body); free(wire); cJSON_Delete(projected);
+      }
+      assert(cJSON_ReplaceItemInObjectCaseSensitive(parents[i], keys[i], cJSON_CreateNumber(i % 2 ? 5 : 0)));
+    }
+    const char *bad_scope[] = {"\"PRIVATE_SCOPE\"", "\"\"", "0", "null", "true"};
+    for (unsigned j = 0; j < sizeof(bad_scope)/sizeof(bad_scope[0]); ++j) {
+      assert(cJSON_ReplaceItemInObjectCaseSensitive(accounting, "scope", cJSON_Parse(bad_scope[j])));
+      check_health_routes(root, 0);
+      body = cJSON_PrintUnformatted(root); wire = edr_egress_health_project(body, reason, sizeof(reason)); assert(wire);
+      assert(!strstr(wire, "scope")); free(body); free(wire);
+    }
+    cJSON_Delete(root);
   }
 }
 
@@ -635,6 +705,7 @@ static void test_storage_health_is_numeric_and_bounded(void) {
 }
 
 int main(void) {
+  test_complete_cache_accounting_projection();
   test_capacity_health_producer_and_projection();
   test_capacity_instance_health_projection();
   test_evidence_pressure_health_projection();

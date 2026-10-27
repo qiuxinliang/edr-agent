@@ -65,7 +65,7 @@ int edr_egress_upload_preflight(const char *command_id, const char *upload_id,
 
 typedef enum { H_NUMBER, H_BOOL, H_TOKEN, H_STATUS, H_REASON, H_PROFILE,
   H_PROTOCOL, H_UINT, H_UPDATE_PROTOCOL, H_UPDATE_SOURCE, H_UPDATE_VERSION,
-  H_SHA256, H_UPDATE_ERROR, H_INSTALLER_REASON } HealthType;
+  H_SHA256, H_UPDATE_ERROR, H_INSTALLER_REASON, H_ACCOUNTING_SCOPE } HealthType;
 typedef struct { const char *path; HealthType type; } HealthField;
 #define N(p) {"engine_health." p, H_NUMBER}
 #define B(p) {"engine_health." p, H_BOOL}
@@ -144,9 +144,19 @@ static const HealthField health_fields[] = {
   N("p0_acceptance.evidence_cache.candidate_requests"),
   N("p0_acceptance.evidence_cache.candidate_reused"),
   N("p0_acceptance.evidence_cache.candidate_admitted"), N("p0_acceptance.evidence_cache.candidate_rejected"),
+  N("p0_acceptance.evidence_cache.context_facts_written"), N("p0_acceptance.evidence_cache.context_refs_written"),
+  {"engine_health.p0_acceptance.evidence_cache.accounting.scope", H_ACCOUNTING_SCOPE},
   /* Numeric persistence diagnostics only; detailed errors and evidence remain local. */
-  N("p0_acceptance.evidence_cache.accounting.candidate_failures.candidate_capacity_refused"),
-  N("p0_acceptance.evidence_cache.accounting.context_failures.context_capacity_refused"),
+#define FAILURE_COUNTS(owner) \
+  N("p0_acceptance.evidence_cache.accounting." owner "_failures." owner "_no_database"), \
+  N("p0_acceptance.evidence_cache.accounting." owner "_failures." owner "_capacity_refused"), \
+  N("p0_acceptance.evidence_cache.accounting." owner "_failures." owner "_write_budget_refused"), \
+  N("p0_acceptance.evidence_cache.accounting." owner "_failures." owner "_resource_failed"), \
+  N("p0_acceptance.evidence_cache.accounting." owner "_failures." owner "_invalid"), \
+  N("p0_acceptance.evidence_cache.accounting." owner "_failures." owner "_storage_failed"), \
+  N("p0_acceptance.evidence_cache.accounting." owner "_failures." owner "_unclassified_failure")
+  FAILURE_COUNTS("candidate"), FAILURE_COUNTS("context"),
+#undef FAILURE_COUNTS
 #define CAPACITY_COUNTS(owner) \
   N("p0_acceptance.evidence_cache.accounting.capacity_failures." owner ".unknown"), \
   N("p0_acceptance.evidence_cache.accounting.capacity_failures." owner ".db_wal_limit"), \
@@ -460,6 +470,7 @@ static int valid_value(const cJSON *v, HealthType type) {
   if (type == H_TOKEN) return token(v, 160u);
   if (type == H_UPDATE_VERSION) return token(v, 64u);
   if (!cJSON_IsString(v) || !v->valuestring) return 0;
+  if (type == H_ACCOUNTING_SCOPE) return !strcmp(v->valuestring, "current_process");
   if (type == H_PROTOCOL) return !strcmp(v->valuestring, "h2") ||
       !strcmp(v->valuestring, "http/1.1") || !strcmp(v->valuestring, "");
   if (type == H_SHA256) {
