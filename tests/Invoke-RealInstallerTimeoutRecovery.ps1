@@ -149,7 +149,8 @@ $parameters = [ordered]@{
   MinFreeBytes=$InputBinding.min_free_bytes; RuntimeManifest=$package; RuntimeManifestSha256=$InputBinding.runtime_package_sha256
 }
 $entries = @($parameters.GetEnumerator() | ForEach-Object { "'{0}'='{1}'" -f $_.Key, ([string]$_.Value).Replace("'", "''") })
-$source = "`$ErrorActionPreference='Stop'; `$parameters=@{" + ($entries -join ';') + "}; & '" + $Updater.Replace("'", "''") + "' @parameters; exit `$LASTEXITCODE"
+# Use the Agent launcher's script-success contract, not a prior native exit.
+$source = "`$ErrorActionPreference='Stop'; `$parameters=@{" + ($entries -join ';') + "}; & '" + $Updater.Replace("'", "''") + "' @parameters; `$updaterSucceeded=`$?; if (`$updaterSucceeded) { exit 0 }; if ((Test-Path variable:LASTEXITCODE) -and `$LASTEXITCODE -is [int] -and `$LASTEXITCODE -ne 0) { exit `$LASTEXITCODE }; exit 1"
 $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($source))
 $journalPath = Join-Path $env:ProgramData ("FDSecurity\state\agent-update-{0}.journal.json" -f $commandId)
 $reportPath = Join-Path $env:ProgramData ("FDSecurity\logs\agent-update-{0}-report.json" -f $commandId)

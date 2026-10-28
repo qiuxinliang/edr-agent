@@ -443,7 +443,9 @@ function Invoke-BaselineUpdaterUpgrade($InputBinding) {
   $entries = @($parameters.GetEnumerator() | ForEach-Object {
     "'{0}'='{1}'" -f $_.Key, ([string]$_.Value).Replace("'", "''")
   })
-  $source = "`$ErrorActionPreference='Stop'; `$parameters=@{" + ($entries -join ';') + "}; & '" + $updater.Replace("'", "''") + "' @parameters; exit `$LASTEXITCODE"
+  # Match agent_update_command.c: a normal script return can retain robocopy's
+  # successful nonzero code; preserve explicit failed exits and exceptions.
+  $source = "`$ErrorActionPreference='Stop'; `$parameters=@{" + ($entries -join ';') + "}; & '" + $updater.Replace("'", "''") + "' @parameters; `$updaterSucceeded=`$?; if (`$updaterSucceeded) { exit 0 }; if ((Test-Path variable:LASTEXITCODE) -and `$LASTEXITCODE -is [int] -and `$LASTEXITCODE -ne 0) { exit `$LASTEXITCODE }; exit 1"
   $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($source))
   $reportPath = Join-Path $env:ProgramData ("FDSecurity\logs\agent-update-{0}-report.json" -f $commandId)
   Add-Evidence 'old-updater-upgrade' 'started' ("command_id={0} class={1} mode={2} baseline_updater_sha256={3}" -f $commandId, $InputBinding.upgrade_class, $InputBinding.deployment_mode, $InputBinding.baseline_updater_sha256)

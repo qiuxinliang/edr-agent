@@ -233,6 +233,20 @@ $report=@{status='succeeded';target_version=$TargetVersion;upgrade_class=$Upgrad
 [IO.File]::WriteAllText((Join-Path (Split-Path $StagedBinary -Parent) 'actual-arguments.json'),(@{class=$UpgradeClass;
  mode=$DeploymentMode;floor=$MinFreeBytes;health_ms=$HealthObserveMs;package=$RuntimeManifest;
  package_sha=$RuntimeManifestSha256;caller=$PSCommandPath}|ConvertTo-Json))
+if($UpgradeClass -eq 'installer_required') {
+  # Reproduce the original updater's successful native copy followed by return.
+  # Run the real Windows tool on fresh, isolated files; never stub its exit code.
+  $fixtureRoot=Split-Path $StagedBinary -Parent
+  $copySource=Join-Path $fixtureRoot ('robocopy-source-'+$CommandId)
+  $copyTarget=Join-Path $fixtureRoot ('robocopy-target-'+$CommandId)
+  [IO.Directory]::CreateDirectory($copySource)|Out-Null
+  [IO.File]::WriteAllText((Join-Path $copySource 'proof.txt'),'public copy fixture')
+  & (Join-Path $env:WINDIR 'System32\robocopy.exe') $copySource $copyTarget 'proof.txt' /R:0 /W:0 /NFL /NDL /NJH /NJS /NP | Out-Null
+  $copyExit=$LASTEXITCODE
+  if($copyExit -ne 1 -or [IO.File]::ReadAllText((Join-Path $copyTarget 'proof.txt')) -cne 'public copy fixture') {throw 'real robocopy fixture did not copy successfully with exit 1'}
+  [IO.File]::WriteAllText((Join-Path $fixtureRoot 'robocopy-return.json'),(@{native_exit=$copyExit;normal_return=$true}|ConvertTo-Json))
+  return
+}
 exit 0
 '@
   $oldPath=Join-Path $InstallDir ('edr_agent_inplace_update-'+$BaselineVersion+'.ps1'); Put $oldPath $oldScript
@@ -260,6 +274,9 @@ exit 0
     Check ((Hash $oldPath) -ceq $inputBinding.baseline_updater_sha256) 'old script unchanged'
     Check ((Hash $configPath) -ceq $configHash) 'configuration preserved through original updater invocation'
   }
+  $copyReceipt=Get-Content -LiteralPath (Join-Path $root 'robocopy-return.json') -Raw|ConvertFrom-Json
+  Check ($copyReceipt.native_exit -eq 1 -and $copyReceipt.normal_return -eq $true) 'real robocopy 1 plus normal script return accepted'
+  Write-Output ("real robocopy native_exit={0}; successful script return and strict release report passed" -f $copyReceipt.native_exit)
   function Get-AuthenticodeSignature {
     [CmdletBinding()]param([string]$LiteralPath)
     if($LiteralPath -ceq $script:rejectedInstaller){return [pscustomobject]@{Status='NotTrusted';SignerCertificate=$null}}
@@ -301,9 +318,14 @@ exit 0
   Must-Fail {Assert-LifecycleUpgradeResult $inputBinding $goodReport} '*mixed native runtime*'
   Put $oldPath "exit 7"; $inputBinding.baseline_updater_sha256=Hash $oldPath
   Must-Fail {Invoke-BaselineUpdaterUpgrade $inputBinding} '*failed with exit code 7*'
+  Put $oldPath "throw 'synthetic_updater_exception'"; $inputBinding.baseline_updater_sha256=Hash $oldPath
+  Must-Fail {Invoke-BaselineUpdaterUpgrade $inputBinding} '*failed with exit code 1*'
+  Check ((Get-Content -LiteralPath (Join-Path $EvidenceDir 'old-updater.stderr.log') -Raw) -match 'synthetic_updater_exception') 'updater exception retained'
+  Put $oldPath ($oldScript.Replace("status='succeeded'","status='failed_rolled_back'")); $inputBinding.baseline_updater_sha256=Hash $oldPath
+  Must-Fail {Invoke-BaselineUpdaterUpgrade $inputBinding} '*did not report*'
   Check (@($script:events|Where-Object{$_.status -eq 'verified'}).Count -eq 3) 'failures never counted as passed'
   Write-Output ("module environment: foreign counterfactual failed={0}; corrected child hash/ScheduledTasks and parent restoration passed" -f $counterfactualFailure)
-  Write-Output 'old updater lifecycle orchestration: offline configuration preservation and 5 rejection cases; 3 class executions, signed publisher binding and 17 negative controls passed'
+  Write-Output 'old updater lifecycle orchestration: offline configuration preservation and 5 rejection cases; 3 class executions, signed publisher binding and 19 negative controls passed'
 } finally {
   [Environment]::SetEnvironmentVariable('PSModulePath',$savedModulePath,[EnvironmentVariableTarget]::Process)
   $env:ProgramData=$savedProgramData
