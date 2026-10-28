@@ -97,6 +97,12 @@ own updater; a successful backend connection is not required. TLS verification
 and original script hashes remain enforced. Existing configuration is never
 overwritten, and Setup must preserve the prepared bytes. This is an offline
 local lifecycle check, not enrollment or platform connectivity validation.
+Both lifecycle updater invocations use `Start-LifecycleWindowsPowerShell.ps1`
+to let Windows PowerShell rebuild its own inbox module path. The sequential
+harness clears only its process `PSModulePath` during child creation and restores
+the original value in `finally`; system and user settings are unchanged. The
+preflight exercises real child hashing and ScheduledTasks command discovery
+under a foreign module path, including restoration after a launch failure.
 
 Validation-only additionally requests the CI-only installer timeout case. After
 the old updater installs the candidate, the candidate's original embedded updater

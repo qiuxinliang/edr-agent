@@ -19,6 +19,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 $repoRoot = Split-Path -Parent $PSScriptRoot
+. (Join-Path $PSScriptRoot 'Start-LifecycleWindowsPowerShell.ps1')
 $archVerifier = Join-Path $PSScriptRoot "Assert-WindowsPeArchitecture.ps1"
 $bootstrapVerifier = Join-Path $PSScriptRoot "Assert-WindowsInstallerBootstrapArchitecture.ps1"
 $BaselineSetupExe = (Resolve-Path -LiteralPath $BaselineSetupExe).Path
@@ -446,10 +447,9 @@ function Invoke-BaselineUpdaterUpgrade($InputBinding) {
   $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($source))
   $reportPath = Join-Path $env:ProgramData ("FDSecurity\logs\agent-update-{0}-report.json" -f $commandId)
   Add-Evidence 'old-updater-upgrade' 'started' ("command_id={0} class={1} mode={2} baseline_updater_sha256={3}" -f $commandId, $InputBinding.upgrade_class, $InputBinding.deployment_mode, $InputBinding.baseline_updater_sha256)
-  $process = Start-Process -FilePath (Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe') `
-    -ArgumentList @('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', $encoded) `
-    -RedirectStandardOutput (Join-Path $EvidenceDir 'old-updater.stdout.log') `
-    -RedirectStandardError (Join-Path $EvidenceDir 'old-updater.stderr.log') -PassThru
+  $process = Start-LifecycleWindowsPowerShell -EncodedCommand $encoded `
+    -StandardOutput (Join-Path $EvidenceDir 'old-updater.stdout.log') `
+    -StandardError (Join-Path $EvidenceDir 'old-updater.stderr.log')
   try {
     $null = $process.Handle
     if (-not $process.WaitForExit(600000)) {

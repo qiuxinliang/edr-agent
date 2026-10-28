@@ -12,6 +12,7 @@ $ErrorActionPreference = 'Stop'
 if ($env:GITHUB_ACTIONS -cne 'true' -or $env:OS -cne 'Windows_NT') {
   throw 'Real installer timeout recovery requires a disposable Windows Actions runner'
 }
+. (Join-Path (Split-Path -Parent $PSScriptRoot) 'scripts\Start-LifecycleWindowsPowerShell.ps1')
 if ($InputBinding.upgrade_class -cne 'installer_required' -or $InputBinding.deployment_mode -cne 'service') {
   throw 'Real installer timeout recovery requires the release-declared installer_required service path'
 }
@@ -167,9 +168,8 @@ try {
     throw 'Initial installed service process is not the expected runtime'
   }
   $receipt.initial_service = [ordered]@{ pid=$oldService.ProcessId; created_filetime=[LifecycleInstallerFault]::Created($oldRuntime) }
-  $process = Start-Process -FilePath (Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe') `
-    -ArgumentList @('-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-EncodedCommand',$encoded) `
-    -RedirectStandardOutput (Join-Path $stage 'updater.stdout.log') -RedirectStandardError (Join-Path $stage 'updater.stderr.log') -PassThru
+  $process = Start-LifecycleWindowsPowerShell -EncodedCommand $encoded `
+    -StandardOutput (Join-Path $stage 'updater.stdout.log') -StandardError (Join-Path $stage 'updater.stderr.log')
   $null = $process.Handle
   $clock = [Diagnostics.Stopwatch]::StartNew()
   $lastState = ''

@@ -8,6 +8,7 @@ param([string]$RepoRoot = (Split-Path -Parent $PSScriptRoot))
 $ErrorActionPreference = 'Stop'
 $root = Join-Path ([IO.Path]::GetTempPath()) ('edr-upgrade-stability-ci-' + [Guid]::NewGuid().ToString('N'))
 $savedProgramData = $env:ProgramData
+$savedModulePath = [Environment]::GetEnvironmentVariable('PSModulePath', [EnvironmentVariableTarget]::Process)
 New-Item -ItemType Directory -Path $root | Out-Null
 function Check([bool]$Condition, [string]$Name) { if (-not $Condition) { throw "failed: $Name" } }
 function Hash([string]$Path) { return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant() }
@@ -18,6 +19,7 @@ function Must-Fail([scriptblock]$Action, [string]$Expected) {
   Check $caught ('must reject: '+$Expected)
 }
 try {
+  . (Join-Path $RepoRoot 'scripts/Start-LifecycleWindowsPowerShell.ps1')
   $tokens=$null; $errors=$null
   $ast = [Management.Automation.Language.Parser]::ParseFile((Join-Path $RepoRoot 'scripts/windows_setup_exe_lifecycle_smoke.ps1'),[ref]$tokens,[ref]$errors)
   Check ($errors.Count -eq 0) 'native parser'
@@ -80,6 +82,96 @@ try {
   Add-Type -TypeDefinition 'public static class LifecycleUnsignedFixture { public static int Main() { return 0; } }' `
     -OutputAssembly $target -OutputType Library
   $setup=Join-Path $root 'FDSecuritySetup.exe';Copy-Item -LiteralPath $target -Destination $setup
+  # A real child must discover PS5.1 inbox modules, not merely run core cmdlets
+  # such as Copy-Item. No Get-FileHash or ScheduledTasks function is stubbed.
+  $null=Get-Command Start-Process,Get-AuthenticodeSignature,Get-FileHash
+  $foreignModules=Join-Path $root 'foreign-powershell-modules'
+  New-Item -ItemType Directory -Path $foreignModules | Out-Null
+  $probe=@'
+$ErrorActionPreference='Stop'
+$ProgressPreference='SilentlyContinue'
+$phase='hash_lookup'
+try {
+  # Match the existing cache-recovery child-environment contract: Desktop 5.1
+  # can expose the inbox hash command as a Function. ModuleBase is diagnostic,
+  # not a fixed directory-layout contract across Windows PowerShell hosts.
+  $command=Get-Command Get-FileHash -CommandType Cmdlet,Function -ErrorAction Stop
+  if($command.ModuleName -cne 'Microsoft.PowerShell.Utility'){throw "unexpected_hash_owner:$($command.ModuleName)"}
+  if($PSVersionTable.PSVersion.Major -ne 5){throw 'windows_powershell_5_required'}
+  $phase='hash_read'
+  $hash=(& $command -LiteralPath '__PROBE_FILE__' -Algorithm SHA256).Hash.ToLowerInvariant()
+  $phase='scheduled_tasks'
+  $taskCommand=Get-Command Get-ScheduledTask -CommandType Cmdlet,Function -ErrorAction Stop
+  if($taskCommand.ModuleName -cne 'ScheduledTasks' -or $hash -cne '__PROBE_HASH__'){throw 'probe_contract_failed'}
+  $modulePath='';$moduleBase='';$moduleVersion=''
+  if($null -ne $command.Module){
+    $modulePath=[string]$command.Module.Path;$moduleBase=[string]$command.Module.ModuleBase
+    if($null -ne $command.Module.Version){$moduleVersion=$command.Module.Version.ToString()}
+  }
+  [Console]::Out.WriteLine((@{status='ok';sha256=$hash;ps_major=$PSVersionTable.PSVersion.Major;
+    hash_command_type=[string]$command.CommandType;hash_module=$command.ModuleName;
+    hash_module_path=$modulePath;hash_module_base=$moduleBase;hash_module_version=$moduleVersion;ps_home=$PSHOME;
+    scheduled_tasks_module=$taskCommand.ModuleName}|ConvertTo-Json -Compress));exit 0
+} catch { [Console]::Out.WriteLine('probe-failed:'+ $phase+':'+ $_.Exception.GetType().Name+':'+$_.Exception.Message);exit 71 }
+'@
+  $probe=$probe.Replace('__PROBE_FILE__',$target.Replace("'","''")).Replace('__PROBE_HASH__',(Hash $target))
+  $encodedProbe=[Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($probe))
+  $counterfactualFailure=$false
+  foreach($isolated in @($false,$true)) {
+    $probeOut=Join-Path $root ("module-probe-{0}.out" -f $isolated)
+    $probeErr=Join-Path $root ("module-probe-{0}.err" -f $isolated)
+    $probeProcess=$null
+    try {
+      [Environment]::SetEnvironmentVariable('PSModulePath',$foreignModules,[EnvironmentVariableTarget]::Process)
+      try {
+        if($isolated) {
+          $probeProcess=Start-LifecycleWindowsPowerShell $encodedProbe $probeOut $probeErr
+        } else {
+          $probeProcess=Start-Process -FilePath (Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe') `
+            -ArgumentList @('-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-EncodedCommand',$encodedProbe) `
+            -RedirectStandardOutput $probeOut -RedirectStandardError $probeErr -PassThru
+        }
+        Check ($probeProcess -is [Diagnostics.Process]) 'launcher returns one owned Process object'
+        Check ([Environment]::GetEnvironmentVariable('PSModulePath',[EnvironmentVariableTarget]::Process) -ceq $foreignModules) 'launch restores parent module path'
+      } finally { [Environment]::SetEnvironmentVariable('PSModulePath',$savedModulePath,[EnvironmentVariableTarget]::Process) }
+      $null=$probeProcess.Handle
+      Check ($probeProcess.WaitForExit(10000)) 'bounded real module probe'
+      $probeProcess.WaitForExit()
+      $probeText=[IO.File]::ReadAllText($probeOut).Trim()
+      Write-Output ("Windows PowerShell module probe isolated={0} exit={1}: {2}" -f $isolated,$probeProcess.ExitCode,$probeText.Substring(0,[Math]::Min(4096,$probeText.Length)))
+      $probeError=[IO.File]::ReadAllText($probeErr)
+      Check ($probeError.Length -eq 0) ("module probe stderr empty (isolated={0}, exit={1}): {2}" -f $isolated,$probeProcess.ExitCode,$probeError.Substring(0,[Math]::Min(4096,$probeError.Length)))
+      $probeData=if($probeProcess.ExitCode -eq 0){$probeText|ConvertFrom-Json}else{$null}
+      $probeOk=$probeData -and $probeData.status -ceq 'ok' -and $probeData.sha256 -ceq (Hash $target) -and
+        $probeData.ps_major -eq 5 -and $probeData.hash_module -ceq 'Microsoft.PowerShell.Utility' -and
+        $probeData.hash_command_type -in @('Cmdlet','Function') -and $probeData.scheduled_tasks_module -ceq 'ScheduledTasks'
+      if($isolated) {
+        Check ($probeProcess.ExitCode -eq 0 -and $probeOk) 'isolated child hashes real bytes and discovers ScheduledTasks'
+      } else {
+        # OS versions may repair inherited module paths. Record that real
+        # result; the corrected launch must work on every supported host.
+        Check ($probeProcess.ExitCode -in @(0,71)) 'counterfactual child has known terminal result'
+        $counterfactualFailure=$probeProcess.ExitCode -eq 71 -and (
+          $probeText.StartsWith('probe-failed:hash_lookup:CommandNotFoundException:') -or
+          $probeText.StartsWith('probe-failed:scheduled_tasks:CommandNotFoundException:'))
+        Check ($counterfactualFailure -or $probeOk) 'counterfactual module discovery result'
+      }
+    } finally {
+      if($probeProcess) {
+        try { if(-not $probeProcess.HasExited){$probeProcess.Kill();Check ($probeProcess.WaitForExit(10000)) 'owned module probe cleanup'} }
+        finally { $probeProcess.Dispose() }
+      }
+    }
+  }
+  [Environment]::SetEnvironmentVariable('PSModulePath',$foreignModules,[EnvironmentVariableTarget]::Process)
+  function Start-Process { throw 'synthetic_launch_failure' }
+  try {
+    Must-Fail {Start-LifecycleWindowsPowerShell $encodedProbe (Join-Path $root 'unused.out') (Join-Path $root 'unused.err')} 'synthetic_launch_failure'
+    Check ([Environment]::GetEnvironmentVariable('PSModulePath',[EnvironmentVariableTarget]::Process) -ceq $foreignModules) 'failed launch restores parent module path'
+  } finally {
+    Remove-Item Function:\Start-Process
+    [Environment]::SetEnvironmentVariable('PSModulePath',$savedModulePath,[EnvironmentVariableTarget]::Process)
+  }
   $newUpdater='throw "candidate updater must never execute the first hop"'
   Put (Join-Path $root 'new-updater.txt') $newUpdater
   Put (Join-Path $InstallDir 'uninstall.exe') 'synthetic uninstaller'
@@ -92,6 +184,8 @@ param($InstallDir,$StagedBinary,$ExpectedSha256,$TargetVersion,$ExpectedArchitec
   $HealthObserveMs,$StartupTimeoutSeconds,$MinCurrentVersion,$MaxCurrentVersion,$MinFreeBytes,
   $RuntimeManifest,$RuntimeManifestSha256)
 $ErrorActionPreference='Stop'
+if((Get-FileHash -LiteralPath $StagedBinary -Algorithm SHA256).Hash.ToLowerInvariant() -cne $ExpectedSha256){throw 'synthetic child hash mismatch'}
+$null=Get-Command Get-ScheduledTask -ErrorAction Stop
 Copy-Item -LiteralPath $StagedBinary -Destination (Join-Path $InstallDir 'FDSensor.exe') -Force
 Copy-Item -LiteralPath (Join-Path (Split-Path $StagedBinary -Parent) 'new-updater.txt') -Destination (Join-Path $InstallDir ("edr_agent_inplace_update-{0}.ps1" -f $TargetVersion)) -Force
 $report=@{status='succeeded';target_version=$TargetVersion;upgrade_class=$UpgradeClass;operation=$Operation;
@@ -114,7 +208,11 @@ exit 0
   foreach($class in @('binary_hot','runtime_bundle','installer_required')) {
     $inputBinding.upgrade_class=$class
     $inputBinding.runtime_package=if($class -eq 'binary_hot'){''}else{Join-Path $root 'original-runtime.zip'}
-    Invoke-BaselineUpdaterUpgrade $inputBinding
+    [Environment]::SetEnvironmentVariable('PSModulePath',$foreignModules,[EnvironmentVariableTarget]::Process)
+    try {
+      Invoke-BaselineUpdaterUpgrade $inputBinding
+      Check ([Environment]::GetEnvironmentVariable('PSModulePath',[EnvironmentVariableTarget]::Process) -ceq $foreignModules) 'first hop restores parent module path'
+    } finally { [Environment]::SetEnvironmentVariable('PSModulePath',$savedModulePath,[EnvironmentVariableTarget]::Process) }
     $actual=Get-Content -LiteralPath (Join-Path $root 'actual-arguments.json') -Raw|ConvertFrom-Json
     Check ($actual.class -ceq $class -and $actual.mode -ceq 'service') ('manifest class/mode '+$class)
     Check ($actual.caller -ceq $oldPath) ('old script actually invoked '+$class)
@@ -165,8 +263,10 @@ exit 0
   Put $oldPath "exit 7"; $inputBinding.baseline_updater_sha256=Hash $oldPath
   Must-Fail {Invoke-BaselineUpdaterUpgrade $inputBinding} '*failed with exit code 7*'
   Check (@($script:events|Where-Object{$_.status -eq 'verified'}).Count -eq 3) 'failures never counted as passed'
+  Write-Output ("module environment: foreign counterfactual failed={0}; corrected child hash/ScheduledTasks and parent restoration passed" -f $counterfactualFailure)
   Write-Output 'old updater lifecycle orchestration: offline configuration preservation and 5 rejection cases; 3 class executions, signed publisher binding and 17 negative controls passed'
 } finally {
+  [Environment]::SetEnvironmentVariable('PSModulePath',$savedModulePath,[EnvironmentVariableTarget]::Process)
   $env:ProgramData=$savedProgramData
   Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction Stop
 }

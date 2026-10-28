@@ -246,6 +246,17 @@ class WindowsLifecycleWorkflowTests(unittest.TestCase):
         self.assertIn('$clock.Elapsed.TotalSeconds -lt 60', owner)
         self.assertIn('Wait-LifecycleEmbeddedUpdater $BaselineVersion $InputBinding.baseline_updater_sha256', owner)
 
+    def test_both_updater_invocations_use_the_same_windows_powershell_boundary(self):
+        for name in ('scripts/windows_setup_exe_lifecycle_smoke.ps1',
+                     'tests/Invoke-RealInstallerTimeoutRecovery.ps1'):
+            with self.subTest(consumer=name):
+                text = (ROOT / name).read_text(encoding='utf-8')
+                self.assertIn('Start-LifecycleWindowsPowerShell.ps1', text)
+                self.assertEqual(text.count('$process = Start-LifecycleWindowsPowerShell -EncodedCommand $encoded'), 1)
+                self.assertNotIn("Start-Process -FilePath (Join-Path $env:WINDIR 'System32\\WindowsPowerShell\\v1.0\\powershell.exe')", text)
+        parser = (ROOT / 'scripts/validate_windows_powershell_syntax.ps1').read_text(encoding='utf-8')
+        self.assertIn('scripts\\Start-LifecycleWindowsPowerShell.ps1', parser)
+
     def test_real_installer_fault_is_opt_in_and_uses_installed_candidate_after_first_hop(self):
         call, dispatch = self.text.split('  workflow_dispatch:\n', 1)
         for inputs in (call, dispatch):
