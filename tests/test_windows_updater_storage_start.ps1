@@ -29,6 +29,7 @@ $root=Join-Path $env:TEMP ('edr-updater-storage-'+[Guid]::NewGuid().ToString('N'
 [void][IO.Directory]::CreateDirectory($root)
 $currentPath=Join-Path $root 'PublicStorageProbe.exe'
 $config=Join-Path $root 'agent.toml'
+try {
 # External process is synthetic. The production CLI, schema compatibility and
 # immutable evidence are independently exercised by the C/old-owner tests.
 Add-Type -TypeDefinition @'
@@ -45,7 +46,18 @@ public class PublicStorageProbe {
   }
 }
 '@ -OutputAssembly $currentPath -OutputType ConsoleApplication
-try {
+Add-Type -TypeDefinition @'
+using System; using System.Runtime.InteropServices;
+public static class StorageFixtureClock {
+  [DllImport("kernel32.dll")]
+  static extern bool QueryUnbiasedInterruptTime(out ulong time);
+  public static ulong Read100ns() {
+    ulong time;
+    if(!QueryUnbiasedInterruptTime(out time))throw new InvalidOperationException("fixture_interrupt_clock_unavailable");
+    return time;
+  }
+}
+'@
   foreach($mode in @('service','scheduled_task')) {
     foreach($fixtureInput in @('reject','absent','bad')) {
       [IO.File]::WriteAllText($config,$fixtureInput);$script:starts=0;$caught=$false
@@ -89,10 +101,20 @@ try {
     Check ($report.rollback -eq 'succeeded' -and $report.status -eq 'failed_rolled_back' -and $script:starts -eq 1) ('compatible_rollback_succeeds_'+$operationKind)
   }
   [IO.File]::WriteAllText($config,'timeout');$watch=[Diagnostics.Stopwatch]::StartNew();$caught=$false
+  # Relative waits are scheduled from the interrupt clock's latest tick.
+  # Use that same clock domain for the unchanged 20-second minimum instead of
+  # comparing its tick phase against the independent high-resolution counter.
+  # https://learn.microsoft.com/windows/win32/api/realtimeapiset/nf-realtimeapiset-queryunbiasedinterrupttime
+  $interruptStarted=[StorageFixtureClock]::Read100ns()
   try{Assert-AgentStorageStartup $currentPath}catch{$caught=$true;Check ($_.Exception.Message -like '*timed out*') 'timeout_cause'}
-  Check ($caught -and $watch.ElapsedMilliseconds -ge 20000 -and $watch.ElapsedMilliseconds -lt 28000) 'probe_deadline_enforced'
+  $interruptEnded=[StorageFixtureClock]::Read100ns()
+  Check ($interruptEnded -ge $interruptStarted) 'interrupt_clock_is_monotonic'
+  $interruptElapsedMilliseconds=($interruptEnded-$interruptStarted)/10000.0
+  $elapsedMilliseconds=$watch.Elapsed.TotalMilliseconds
+  Check ($caught -and $interruptElapsedMilliseconds -ge 20000 -and $elapsedMilliseconds -lt 28000) (
+    'probe_deadline_enforced elapsed_ms={0:F3} interrupt_elapsed_ms={1:F3}' -f $elapsedMilliseconds,$interruptElapsedMilliseconds)
   Check (@(Get-ChildItem $root -Directory -Filter '.storage-preflight-*').Count -eq 0) 'timeout_output_cleanup'
-  @{schema='edr.test.updater_storage_start.v1';checks=$script:checks;passed=$true;runtime_effects='stubbed';probe_process='synthetic'}|ConvertTo-Json -Compress
+  @{schema='edr.test.updater_storage_start.v1';checks=$script:checks;passed=$true;runtime_effects='stubbed';probe_process='synthetic';timeout_elapsed_ms=$elapsedMilliseconds;timeout_interrupt_elapsed_ms=$interruptElapsedMilliseconds}|ConvertTo-Json -Compress
 } finally {
   Remove-Item -LiteralPath $root -Recurse -Force
 }
