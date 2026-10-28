@@ -1160,7 +1160,8 @@ int edr_response_forensic_async_active(void) {
 
 
 static void forensic_collect_owned(const char *cmd_id, const uint8_t *pl, size_t len,
-                                    const EdrSoarCommandMeta *sm,EdrForensicPath **publication_guard) {
+                                    const EdrSoarCommandMeta *sm,EdrForensicPath **publication_guard,
+                                    const char *endpoint_id,const char *tenant_id) {
   if (!edr_command_dangerous_enabled()) {
     edr_cmd_inc_rejected();
     edr_command_audit_both(cmd_id, "reject forensic: 设置 EDR_CMD_ENABLED=1 或 TOML [command] allow_dangerous=true");
@@ -1287,10 +1288,9 @@ static void forensic_collect_owned(const char *cmd_id, const uint8_t *pl, size_t
   const char *platform="posix";
 #endif
   hostname[sizeof(hostname)-1]=0;
-  const EdrConfig *cfg=edr_command_get_config();
   int manifest_len=snprintf(request->manifest,sizeof(request->manifest),
       "command_id=%s\npayload_len=%zu\npayload_sha256=%s\nplatform=%s\nhostname=%s\nendpoint_id=%s\ntenant_id=%s\n",
-      cmd_id,len,payload_sha,platform,hostname,cfg?cfg->agent.endpoint_id:"",cfg?cfg->agent.tenant_id:"");
+      cmd_id,len,payload_sha,platform,hostname,endpoint_id,tenant_id);
   EdrStoragePhysicalSnapshot space;EdrForensicIoResult receipt={0};
   int io_rc=manifest_len<0 || (size_t)manifest_len>=sizeof(request->manifest) ||
       edr_storage_physical_admit_owned(stage.staging,stage.peak_bytes,0,stage.peak_bytes,&space)
@@ -1324,6 +1324,7 @@ static void forensic_collect_owned(const char *cmd_id, const uint8_t *pl, size_t
 
 static int forensic_command_worker(const EdrForensicIoRequest *q,EdrForensicIoResult *r) {
   if(!memchr(q->command_id,0,sizeof(q->command_id)) || !q->command_id[0] ||
+      !memchr(q->endpoint_id,0,sizeof(q->endpoint_id)) || !memchr(q->tenant_id,0,sizeof(q->tenant_id)) ||
       q->allow_dangerous>1 || q->report_pending>1)return -1;
   /* The complete already-admitted command stays inside one killable job:
    * audit, owner reservation, content, sealing, outbox and terminal persistence.
@@ -1336,7 +1337,7 @@ static int forensic_command_worker(const EdrForensicIoRequest *q,EdrForensicIoRe
       q->preflight_failure==EDR_DC_ERR_TIMEOUT ? "baseline forensic I/O deadline exceeded; local evidence retained" :
       "baseline forensic request exceeds bounded limit";
     edr_command_emit_always(q->command_id,&q->meta,EdrCmdExecFailed,2,cause);
-  } else forensic_collect_owned(q->command_id,q->payload,q->payload_len,&q->meta,&guard);
+  } else forensic_collect_owned(q->command_id,q->payload,q->payload_len,&q->meta,&guard,q->endpoint_id,q->tenant_id);
   edr_forensic_path_release(guard);
   r->command_failed=(uint32_t)g_cmd_exec_fail;r->command_rejected=(uint32_t)g_cmd_rejected;return 0;
 }
@@ -1354,6 +1355,9 @@ void edr_response_collect_forensic(const char *cmd_id,const uint8_t *pl,size_t l
   if(sm)q->meta=*sm;
   q->allow_dangerous=edr_command_dangerous_enabled()!=0;
   q->report_pending=edr_ingest_http_configured()!=0;
+  const EdrConfig *cfg=edr_command_get_config();
+  if(cfg && (forensic_copy_exact(q->endpoint_id,sizeof(q->endpoint_id),cfg->agent.endpoint_id) ||
+             forensic_copy_exact(q->tenant_id,sizeof(q->tenant_id),cfg->agent.tenant_id)))q->preflight_failure=-1;
   if(sm && sm->issued_at_unix_ms>0 && sm->deadline_ms>0 && sm->issued_at_unix_ms<=INT64_MAX-sm->deadline_ms) {
     int64_t remaining=sm->issued_at_unix_ms+sm->deadline_ms-(int64_t)time(NULL)*1000LL;
     q->timeout_ms=remaining<=0 ? 0u : remaining<300000 ? (uint32_t)remaining : 300000u;

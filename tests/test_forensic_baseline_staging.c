@@ -6,6 +6,8 @@
 #include "edr/command_state.h"
 #include "edr/command_executor.h"
 #include "edr/command_cancel.h"
+#include "edr/command_util.h"
+#include "edr/config.h"
 #include "edr/storage_reservation.h"
 #include "edr/storage_physical_guard.h"
 #include <assert.h>
@@ -120,11 +122,21 @@ int main(int argc,char **argv) {
   test_blocked_audit(root,path);
 #endif
   EdrSoarCommandMeta meta;start_owner("bounded",&meta);
+  EdrConfig *config=calloc(1,sizeof(*config));assert(config);
+  strcpy(config->agent.endpoint_id,"synthetic-manifest-endpoint");
+  strcpy(config->agent.tenant_id,"synthetic-manifest-tenant");
+  edr_command_bind_config(config);
   edr_response_collect_forensic("bounded",(const uint8_t *)path,strlen(path),&meta);
+  edr_command_bind_config(NULL);free(config);
   edr_command_executor_shutdown();
   assert(edr_command_state_get_capacity_stats(&stats)==0 && !stats.artifact_reserved_bytes);
   char artifact[1000];snprintf(artifact,sizeof(artifact),"%s/bounded.tgz",root);
   uint64_t bytes=edr_storage_file_size(artifact);assert(bytes>0 && bytes<64u*1024u*1024u);
+  snprintf(artifact,sizeof(artifact),"%s/bounded.work/manifest.txt",root);
+  file=fopen(artifact,"rb");assert(file);char manifest[4096]={0};
+  size_t manifest_size=fread(manifest,1,sizeof(manifest)-1,file);assert(!ferror(file) && !fclose(file));
+  assert(manifest_size>0 && strstr(manifest,"endpoint_id=synthetic-manifest-endpoint\n") &&
+         strstr(manifest,"tenant_id=synthetic-manifest-tenant\n"));
   snprintf(artifact,sizeof(artifact),"%s/bounded.tgz.staging",root);assert(edr_storage_file_size(artifact)==0);
   assert(edr_command_state_has_final("bounded",&meta)==0); /* no false upload success */
   EdrSoarCommandMeta owned;assert(edr_command_state_artifact_meta("bounded","collect_forensic",&owned)==1);

@@ -7,12 +7,13 @@
  * is no network or background Agent initialization. Version mismatch fails
  * closed (including an executable replaced during an upgrade). */
 #define EDR_FORENSIC_WORKER_ARG "--forensic-io-worker-v1"
-#define EDR_FORENSIC_IO_VERSION 2u
+#define EDR_FORENSIC_IO_VERSION 3u
 typedef struct {
   uint32_t version, operation, timeout_ms, payload_len;
   char workspace[700], staging[1024], manifest[4096];
   unsigned char payload[8192];
   char command_id[128];
+  char endpoint_id[128], tenant_id[128];
   char expected_parent[65];
   EdrSoarCommandMeta meta;
   uint32_t allow_dangerous, report_pending;
