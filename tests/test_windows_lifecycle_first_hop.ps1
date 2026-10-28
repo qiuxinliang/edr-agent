@@ -18,6 +18,17 @@ function Must-Fail([scriptblock]$Action, [string]$Expected) {
   try { & $Action } catch { $caught = $true; Check ($_.Exception.Message -like $Expected) ('cause: '+$Expected) }
   Check $caught ('must reject: '+$Expected)
 }
+function Read-ModuleProbeDiagnostic([string]$Path) {
+  if (-not [IO.File]::Exists($Path)) { return '<not-created>' }
+  $stream=[IO.File]::Open($Path,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::ReadWrite)
+  try {
+    $bytes=New-Object byte[] 4096
+    $count=$stream.Read($bytes,0,$bytes.Length)
+    $text=[Text.Encoding]::UTF8.GetString($bytes,0,$count)
+    if($stream.Length -gt $count){$text+=' <truncated>'}
+    return $text
+  } finally { $stream.Dispose() }
+}
 try {
   . (Join-Path $RepoRoot 'scripts/Start-LifecycleWindowsPowerShell.ps1')
   $tokens=$null; $errors=$null
@@ -90,17 +101,24 @@ try {
   $probe=@'
 $ErrorActionPreference='Stop'
 $ProgressPreference='SilentlyContinue'
-$phase='hash_lookup'
+$phase='starting'
+function Set-ProbePhase([string]$Name) {
+  $script:phase=$Name
+  # Synchronous .NET writes preserve progress even when command discovery never
+  # returns. This trace uses no PowerShell module or backend connection.
+  [IO.File]::AppendAllText('__PROBE_TRACE__',$Name+[Environment]::NewLine,[Text.UTF8Encoding]::new($false))
+}
 try {
+  Set-ProbePhase 'hash_lookup'
   # Match the existing cache-recovery child-environment contract: Desktop 5.1
   # can expose the inbox hash command as a Function. ModuleBase is diagnostic,
   # not a fixed directory-layout contract across Windows PowerShell hosts.
   $command=Get-Command Get-FileHash -CommandType Cmdlet,Function -ErrorAction Stop
   if($command.ModuleName -cne 'Microsoft.PowerShell.Utility'){throw "unexpected_hash_owner:$($command.ModuleName)"}
   if($PSVersionTable.PSVersion.Major -ne 5){throw 'windows_powershell_5_required'}
-  $phase='hash_read'
+  Set-ProbePhase 'hash_read'
   $hash=(& $command -LiteralPath '__PROBE_FILE__' -Algorithm SHA256).Hash.ToLowerInvariant()
-  $phase='scheduled_tasks'
+  Set-ProbePhase 'scheduled_tasks'
   $taskCommand=Get-Command Get-ScheduledTask -CommandType Cmdlet,Function -ErrorAction Stop
   if($taskCommand.ModuleName -cne 'ScheduledTasks' -or $hash -cne '__PROBE_HASH__'){throw 'probe_contract_failed'}
   $modulePath='';$moduleBase='';$moduleVersion=''
@@ -108,6 +126,7 @@ try {
     $modulePath=[string]$command.Module.Path;$moduleBase=[string]$command.Module.ModuleBase
     if($null -ne $command.Module.Version){$moduleVersion=$command.Module.Version.ToString()}
   }
+  Set-ProbePhase 'result_serialization'
   [Console]::Out.WriteLine((@{status='ok';sha256=$hash;ps_major=$PSVersionTable.PSVersion.Major;
     hash_command_type=[string]$command.CommandType;hash_module=$command.ModuleName;
     hash_module_path=$modulePath;hash_module_base=$moduleBase;hash_module_version=$moduleVersion;ps_home=$PSHOME;
@@ -115,12 +134,14 @@ try {
 } catch { [Console]::Out.WriteLine('probe-failed:'+ $phase+':'+ $_.Exception.GetType().Name+':'+$_.Exception.Message);exit 71 }
 '@
   $probe=$probe.Replace('__PROBE_FILE__',$target.Replace("'","''")).Replace('__PROBE_HASH__',(Hash $target))
-  $encodedProbe=[Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($probe))
   $counterfactualFailure=$false
   foreach($isolated in @($false,$true)) {
     $probeOut=Join-Path $root ("module-probe-{0}.out" -f $isolated)
     $probeErr=Join-Path $root ("module-probe-{0}.err" -f $isolated)
-    $probeProcess=$null
+    $probeTrace=Join-Path $root ("module-probe-{0}.phases" -f $isolated)
+    $encodedProbe=[Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($probe.Replace('__PROBE_TRACE__',$probeTrace.Replace("'","''"))))
+    $probeProcess=$null;$probeFailure=$null
+    $probeClock=[Diagnostics.Stopwatch]::StartNew()
     try {
       [Environment]::SetEnvironmentVariable('PSModulePath',$foreignModules,[EnvironmentVariableTarget]::Process)
       try {
@@ -135,8 +156,13 @@ try {
         Check ([Environment]::GetEnvironmentVariable('PSModulePath',[EnvironmentVariableTarget]::Process) -ceq $foreignModules) 'launch restores parent module path'
       } finally { [Environment]::SetEnvironmentVariable('PSModulePath',$savedModulePath,[EnvironmentVariableTarget]::Process) }
       $null=$probeProcess.Handle
-      Check ($probeProcess.WaitForExit(10000)) 'bounded real module probe'
+      # This is a diagnostic cold-start window, not a product deadline. The
+      # earlier 10-second probe timed out before emitting its command result.
+      # A 60-second timeout still fails, including the counterfactual launch.
+      Write-Output ("Windows PowerShell module probe started isolated={0} pid={1} wait_seconds=60" -f $isolated,$probeProcess.Id)
+      Check ($probeProcess.WaitForExit(60000)) 'bounded real module probe'
       $probeProcess.WaitForExit()
+      Write-Output ("Windows PowerShell module probe phases isolated={0}: {1}" -f $isolated,(Read-ModuleProbeDiagnostic $probeTrace))
       $probeText=[IO.File]::ReadAllText($probeOut).Trim()
       Write-Output ("Windows PowerShell module probe isolated={0} exit={1}: {2}" -f $isolated,$probeProcess.ExitCode,$probeText.Substring(0,[Math]::Min(4096,$probeText.Length)))
       $probeError=[IO.File]::ReadAllText($probeErr)
@@ -156,11 +182,24 @@ try {
           $probeText.StartsWith('probe-failed:scheduled_tasks:CommandNotFoundException:'))
         Check ($counterfactualFailure -or $probeOk) 'counterfactual module discovery result'
       }
-    } finally {
+    } catch { $probeFailure=$_;throw } finally {
+      $cleanupFailure=$null
       if($probeProcess) {
         try { if(-not $probeProcess.HasExited){$probeProcess.Kill();Check ($probeProcess.WaitForExit(10000)) 'owned module probe cleanup'} }
-        finally { $probeProcess.Dispose() }
+        catch { $cleanupFailure=$_ }
       }
+      if($probeFailure -or $cleanupFailure) {
+        # Preserve the original failure. Only these bounded, public synthetic
+        # child logs are captured; no process environment is emitted.
+        try {
+          Write-Output ("Windows PowerShell module probe failure isolated={0} elapsed_ms={1} cleanup_error={2}" -f $isolated,$probeClock.ElapsedMilliseconds,([string]$cleanupFailure))
+          foreach($entry in @(@('phases',$probeTrace),@('stdout',$probeOut),@('stderr',$probeErr))) {
+            Write-Output ("module probe {0}: {1}" -f $entry[0],(Read-ModuleProbeDiagnostic $entry[1]))
+          }
+        } catch { Write-Warning ("module probe diagnostic capture failed: " + $_.Exception.GetType().Name) }
+      }
+      if($probeProcess){$probeProcess.Dispose()}
+      if(-not $probeFailure -and $cleanupFailure){throw $cleanupFailure}
     }
   }
   [Environment]::SetEnvironmentVariable('PSModulePath',$foreignModules,[EnvironmentVariableTarget]::Process)
