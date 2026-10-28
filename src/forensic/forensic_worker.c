@@ -319,6 +319,10 @@ done:
   }
   close(sockets[0]);
 #endif
+#ifdef EDR_FORENSIC_IO_TESTING
+  /* Simulate unavailable process/job termination confirmation after execution. */
+  if((q->operation>>8)==7u)result=EDR_RESPONSE_WRITER_UNCONFIRMED;
+#endif
   return result;
 }
 
@@ -356,7 +360,10 @@ static void *io_launch(void *arg)
 {
   IoLaunch *job=arg;
   job->rc=io_run_process(&job->request,&job->result,io_launch_cancel,job);
-  io_store(&job->done,1);io_store(&launcher_busy,0);io_launch_release(job);
+  /* Finishing the launcher does not establish that its writer exited. Keep
+   * admission closed for this service lifetime when that proof is missing. */
+  if(job->rc!=EDR_RESPONSE_WRITER_UNCONFIRMED)io_store(&launcher_busy,0);
+  io_store(&job->done,1);io_launch_release(job);
   return 0;
 }
 
