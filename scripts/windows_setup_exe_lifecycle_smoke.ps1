@@ -420,9 +420,17 @@ function Invoke-BaselineUpdaterUpgrade($InputBinding) {
   $updater = Wait-LifecycleEmbeddedUpdater $BaselineVersion $InputBinding.baseline_updater_sha256
   $publisher = Get-LifecycleTrustedPublisher $InputBinding
   $commandId = 'ci-old-updater-' + [Guid]::NewGuid().ToString('N')
+  # The original updater consumes StagedBinary on success. Keep the immutable
+  # transition input for subsequent repair checks, while preserving its parent
+  # directory for runtime-package resolution and installer extraction.
+  $stagedBinary = Join-Path (Split-Path -Parent $InputBinding.binary_path) ($commandId + '.exe')
+  Copy-Item -LiteralPath $InputBinding.binary_path -Destination $stagedBinary -ErrorAction Stop
+  if ((Get-FileHash -LiteralPath $stagedBinary -Algorithm SHA256).Hash.ToLowerInvariant() -cne $InputBinding.binary_sha256) {
+    throw 'old updater staging copy differs from the immutable release'
+  }
   $issued = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
   $parameters = [ordered]@{
-    InstallDir = $InstallDir; StagedBinary = $InputBinding.binary_path
+    InstallDir = $InstallDir; StagedBinary = $stagedBinary
     ExpectedSha256 = $InputBinding.binary_sha256; TargetVersion = $TargetVersion
     ExpectedArchitecture = $(if ($Architecture -eq 'amd64') { 'x64' } else { 'arm64' })
     TrustedPublisherThumbprint = $publisher.Thumbprint; TrustedPublisherSubject = $publisher.Subject

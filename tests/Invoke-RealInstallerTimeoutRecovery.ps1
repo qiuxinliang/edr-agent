@@ -102,6 +102,51 @@ function Assert-RecoveryFiles($Expected) {
     }
   }
 }
+function Copy-RecoveryInstallerEvidence($Report, $Journal, [string]$CommandId, [string]$Destination) {
+  # Retain the updater's existing bounded, redacted evidence before uninstall
+  # removes ProgramData. Never substitute raw logs or regenerate their digest.
+  $safe = (("$CommandId-$CommandId") -replace '[^A-Za-z0-9._-]', '_')
+  if ($safe.Length -gt 120) { $safe = $safe.Substring(0,120) }
+  $expectedName = "agent-update-$safe-installer.log.redacted"
+  $hash = [string]$Report.installer_log_sha256
+  if ([string]$Journal.installer_log_file -cne $expectedName -or
+      $hash -cnotmatch '^[0-9a-f]{64}$' -or [string]$Journal.installer_log_sha256 -cne $hash -or
+      $null -eq $Report.installer_log_size -or $null -eq $Journal.installer_log_size -or
+      $Report.installer_log_size -lt 1 -or $Report.installer_log_size -gt 4096 -or
+      $Report.installer_log_size -ne $Journal.installer_log_size -or
+      $null -eq $Report.installer_log_original_size -or $null -eq $Journal.installer_log_original_size -or
+      $Report.installer_log_original_size -lt 0 -or
+      $Report.installer_log_original_size -ne $Journal.installer_log_original_size -or
+      [string]$Report.installer_log_status -cnotin @('ready','missing','too_large')) {
+    throw 'Installer failure evidence identity, bounds or report/journal agreement is invalid'
+  }
+  if (($Report.installer_log_status -ceq 'ready' -and ($Report.installer_log_original_size -lt 1 -or $Report.installer_log_original_size -gt 1MB)) -or
+      ($Report.installer_log_status -ceq 'missing' -and $Report.installer_log_original_size -ne 0) -or
+      ($Report.installer_log_status -ceq 'too_large' -and $Report.installer_log_original_size -le 1MB)) {
+    throw 'Installer failure evidence status does not match its original size'
+  }
+  if ([string]::IsNullOrWhiteSpace([string]$Report.first_error) -or
+      [string]$Report.first_error -cne [string]$Journal.first_error -or
+      [string]$Report.error_code -cne [string]$Journal.error_code -or
+      [string]$Report.failed_stage -cne [string]$Journal.failed_stage) {
+    throw 'Installer first failure was not preserved separately from recovery'
+  }
+  $path = Join-Path (Join-Path $env:ProgramData 'FDSecurity\logs') $expectedName
+  $item = Get-Item -LiteralPath $path -Force -ErrorAction Stop
+  if ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or
+      $item.Length -ne $Report.installer_log_size) {
+    throw 'Installer failure evidence is not a regular file of the reported size'
+  }
+  $copy = Join-Path $Destination 'installer.log.redacted'
+  if (Test-Path -LiteralPath $copy) { throw 'Installer failure evidence destination already exists' }
+  Copy-Item -LiteralPath $path -Destination $copy -ErrorAction Stop
+  if ((Get-Item -LiteralPath $copy -Force).Length -ne $Report.installer_log_size -or
+      (Get-FileHash -LiteralPath $copy -Algorithm SHA256).Hash.ToLowerInvariant() -cne $hash) {
+    throw 'Retained installer failure evidence differs from the updater report'
+  }
+  return [ordered]@{ file='installer.log.redacted'; source_file=$expectedName; status=$Report.installer_log_status;
+    sha256=$hash; size=$Report.installer_log_size; original_size=$Report.installer_log_original_size }
+}
 $stage = Join-Path $EvidenceDir 'candidate-installer-timeout'
 New-Item -ItemType Directory -Path $stage -ErrorAction Stop | Out-Null
 $stage = [IO.Path]::GetFullPath($stage)
@@ -259,6 +304,9 @@ try {
   if ($service.State -cne 'Running' -or -not [LifecycleInstallerFault]::Exited($delegatedRuntime)) {
     throw 'Recovery did not stop the installer-created SCM runtime and start a healthy recovered owner'
   }
+  $receipt.first_failure = [ordered]@{ error_code=$report.error_code; stage=$report.failed_stage; first_error=$report.first_error }
+  $receipt.recovery = [ordered]@{ status=$report.status; rollback=$report.rollback; installed_sha256=$report.installed_sha256 }
+  $receipt.installer_evidence = Copy-RecoveryInstallerEvidence $report $journal $commandId $stage
   $receipt.status = 'succeeded'; $receipt.owner_after = ($afterOwner | ConvertFrom-Json)
   $receipt.recovered_service_pid = $service.ProcessId
   $receipt.installer_quiesced = $true

@@ -45,6 +45,57 @@ try {
   foreach($path in @($InstallDir,$EvidenceDir,(Join-Path $env:ProgramData 'FDSecurity\logs'))) {
     New-Item -ItemType Directory -Path $path -Force | Out-Null
   }
+  $faultAst=[Management.Automation.Language.Parser]::ParseFile((Join-Path $RepoRoot 'tests/Invoke-RealInstallerTimeoutRecovery.ps1'),[ref]$tokens,[ref]$errors)
+  Check ($errors.Count -eq 0) 'recovery evidence native parser'
+  $copyOwner=@($faultAst.FindAll({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Copy-RecoveryInstallerEvidence'},$true))
+  Check ($copyOwner.Count -eq 1) 'unique recovery evidence owner'
+  . ([scriptblock]::Create($copyOwner[0].Extent.Text))
+  $evidenceCommand='ci-installer-timeout-'+[Guid]::NewGuid().ToString('N')
+  $evidenceLeaf="agent-update-$evidenceCommand-$evidenceCommand-installer.log.redacted"
+  $evidenceSource=Join-Path (Join-Path $env:ProgramData 'FDSecurity\logs') $evidenceLeaf
+  $evidenceCopy=Join-Path $EvidenceDir 'installer.log.redacted'
+  foreach($logStatus in @('ready','missing','too_large')) {
+    $originalSize=switch($logStatus){ready {512} missing {0} too_large {1048577}}
+    $logText=if($logStatus -ceq 'ready'){'Authorization: [REDACTED]'}else{@{status=$logStatus;original_size=$originalSize}|ConvertTo-Json -Compress}
+    Put $evidenceSource $logText
+    $logReport=[pscustomobject]@{installer_log_sha256=(Hash $evidenceSource);installer_log_size=(Get-Item $evidenceSource).Length;
+      installer_log_original_size=$originalSize;installer_log_status=$logStatus;first_error='INSTALL_TIMEOUT|execution_deadline_exceeded';
+      error_code='INSTALL_TIMEOUT';failed_stage='full_installer_upgrade'}
+    $logJournal=$logReport.PSObject.Copy();$logJournal|Add-Member -NotePropertyName installer_log_file -NotePropertyValue $evidenceLeaf
+    $retained=Copy-RecoveryInstallerEvidence $logReport $logJournal $evidenceCommand $EvidenceDir
+    Check ($retained.status -ceq $logStatus -and (Hash $evidenceCopy) -ceq $logReport.installer_log_sha256) ('exact bounded evidence retained '+$logStatus)
+    Must-Fail {Copy-RecoveryInstallerEvidence $logReport $logJournal $evidenceCommand $EvidenceDir} '*destination already exists*'
+    Remove-Item -LiteralPath $evidenceCopy
+  }
+  foreach($change in @(
+      @{installer_log_file='../outside.log'},@{installer_log_sha256=('b'*64)},
+      @{installer_log_size=1},@{installer_log_original_size=0})) {
+    $badJournal=$logJournal.PSObject.Copy()
+    foreach($key in $change.Keys){$badJournal.$key=$change[$key]}
+    Must-Fail {Copy-RecoveryInstallerEvidence $logReport $badJournal $evidenceCommand $EvidenceDir} '*identity, bounds or report/journal agreement*'
+  }
+  $badReport=$logReport.PSObject.Copy();$badJournal=$logJournal.PSObject.Copy()
+  $badReport.installer_log_size=4097;$badJournal.installer_log_size=4097
+  Must-Fail {Copy-RecoveryInstallerEvidence $badReport $badJournal $evidenceCommand $EvidenceDir} '*identity, bounds or report/journal agreement*'
+  $badReport=$logReport.PSObject.Copy();$badReport.installer_log_status='ready'
+  Must-Fail {Copy-RecoveryInstallerEvidence $badReport $logJournal $evidenceCommand $EvidenceDir} '*status does not match*'
+  foreach($field in @('first_error','error_code','failed_stage')) {
+    $badJournal=$logJournal.PSObject.Copy();$badJournal.$field='changed'
+    Must-Fail {Copy-RecoveryInstallerEvidence $logReport $badJournal $evidenceCommand $EvidenceDir} '*first failure was not preserved*'
+  }
+  Put $evidenceSource 'wrong size'
+  Must-Fail {Copy-RecoveryInstallerEvidence $logReport $logJournal $evidenceCommand $EvidenceDir} '*not a regular file of the reported size*'
+  Put $evidenceSource ('x'*[int]$logReport.installer_log_size)
+  Must-Fail {Copy-RecoveryInstallerEvidence $logReport $logJournal $evidenceCommand $EvidenceDir} '*differs from the updater report*'
+  Remove-Item -LiteralPath $evidenceCopy,$evidenceSource
+  New-Item -ItemType Directory -Path $evidenceSource | Out-Null
+  Must-Fail {Copy-RecoveryInstallerEvidence $logReport $logJournal $evidenceCommand $EvidenceDir} '*not a regular file of the reported size*'
+  Remove-Item -LiteralPath $evidenceSource
+  $linkTarget=Join-Path $root 'evidence-link-target.txt';Put $linkTarget $logText
+  New-Item -ItemType SymbolicLink -Path $evidenceSource -Target $linkTarget | Out-Null
+  Must-Fail {Copy-RecoveryInstallerEvidence $logReport $logJournal $evidenceCommand $EvidenceDir} '*not a regular file of the reported size*'
+  Remove-Item -LiteralPath $evidenceSource,$linkTarget
+  Write-Output 'recovery installer evidence: 3 bounded status cases and 16 rejection cases passed'
   $script:events=@()
   function Add-Evidence([string]$Stage,[string]$Status,[string]$Detail) { $script:events+=@{stage=$Stage;status=$Status;detail=$Detail} }
   $templatePath=Join-Path $root 'baseline-template.toml'
@@ -232,7 +283,9 @@ $report=@{status='succeeded';target_version=$TargetVersion;upgrade_class=$Upgrad
 [IO.File]::WriteAllText((Join-Path $env:ProgramData ("FDSecurity\logs\agent-update-{0}-report.json" -f $CommandId)),($report|ConvertTo-Json))
 [IO.File]::WriteAllText((Join-Path (Split-Path $StagedBinary -Parent) 'actual-arguments.json'),(@{class=$UpgradeClass;
  mode=$DeploymentMode;floor=$MinFreeBytes;health_ms=$HealthObserveMs;package=$RuntimeManifest;
- package_sha=$RuntimeManifestSha256;caller=$PSCommandPath}|ConvertTo-Json))
+ package_sha=$RuntimeManifestSha256;caller=$PSCommandPath;staged_binary=$StagedBinary;staged_sha=$ExpectedSha256}|ConvertTo-Json))
+# Match the original updater's successful consumption of its disposable input.
+Remove-Item -LiteralPath $StagedBinary -Force -ErrorAction Stop
 if($UpgradeClass -eq 'installer_required') {
   # Reproduce the original updater's successful native copy followed by return.
   # Run the real Windows tool on fresh, isolated files; never stub its exit code.
@@ -271,12 +324,26 @@ exit 0
     Check ($actual.caller -ceq $oldPath) ('old script actually invoked '+$class)
     Check ([uint64]$actual.floor -eq 268435456 -and [uint64]$actual.health_ms -eq 30000) 'floor/observation preserved'
     Check ([string]$actual.package -ceq $inputBinding.runtime_package) ('package forwarding '+$class)
+    Check ($actual.staged_binary -cne $target -and (Split-Path $actual.staged_binary -Parent) -ceq (Split-Path $target -Parent)) ('disposable sibling staging '+$class)
+    Check ($actual.staged_sha -ceq $inputBinding.binary_sha256 -and -not (Test-Path -LiteralPath $actual.staged_binary)) ('verified staged binary consumed '+$class)
+    Check ((Hash $target) -ceq $inputBinding.binary_sha256) ('immutable transition binary preserved '+$class)
+    $retainedPublisher=Get-LifecycleTrustedPublisher $inputBinding
+    Check ($retainedPublisher.Thumbprint -ceq 'SHA256_ONLY_UNSIGNED') ('repair publisher validation still available '+$class)
     Check ((Hash $oldPath) -ceq $inputBinding.baseline_updater_sha256) 'old script unchanged'
     Check ((Hash $configPath) -ceq $configHash) 'configuration preserved through original updater invocation'
   }
   $copyReceipt=Get-Content -LiteralPath (Join-Path $root 'robocopy-return.json') -Raw|ConvertFrom-Json
   Check ($copyReceipt.native_exit -eq 1 -and $copyReceipt.normal_return -eq $true) 'real robocopy 1 plus normal script return accepted'
   Write-Output ("real robocopy native_exit={0}; successful script return and strict release report passed" -f $copyReceipt.native_exit)
+  function Copy-Item {
+    [CmdletBinding()]param([string]$LiteralPath,[string]$Destination)
+    Microsoft.PowerShell.Management\Copy-Item -LiteralPath $LiteralPath -Destination $Destination -ErrorAction Stop
+    [IO.File]::WriteAllText($Destination,'corrupted disposable copy')
+  }
+  try {
+    Must-Fail {Invoke-BaselineUpdaterUpgrade $inputBinding} '*staging copy differs from the immutable release*'
+    Check ((Hash $target) -ceq $inputBinding.binary_sha256) 'rejected copy preserves immutable transition binary'
+  } finally { Remove-Item -LiteralPath Function:Copy-Item }
   function Get-AuthenticodeSignature {
     [CmdletBinding()]param([string]$LiteralPath)
     if($LiteralPath -ceq $script:rejectedInstaller){return [pscustomobject]@{Status='NotTrusted';SignerCertificate=$null}}
@@ -325,7 +392,7 @@ exit 0
   Must-Fail {Invoke-BaselineUpdaterUpgrade $inputBinding} '*did not report*'
   Check (@($script:events|Where-Object{$_.status -eq 'verified'}).Count -eq 3) 'failures never counted as passed'
   Write-Output ("module environment: foreign counterfactual failed={0}; corrected child hash/ScheduledTasks and parent restoration passed" -f $counterfactualFailure)
-  Write-Output 'old updater lifecycle orchestration: offline configuration preservation and 5 rejection cases; 3 class executions, signed publisher binding and 19 negative controls passed'
+  Write-Output 'old updater lifecycle orchestration: offline configuration preservation and 5 rejection cases; 3 class executions, consumed staging preservation, signed publisher binding and 20 negative controls passed'
 } finally {
   [Environment]::SetEnvironmentVariable('PSModulePath',$savedModulePath,[EnvironmentVariableTarget]::Process)
   $env:ProgramData=$savedProgramData
