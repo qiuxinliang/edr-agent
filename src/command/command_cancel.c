@@ -104,3 +104,7 @@ int edr_command_cancel_requested(const char *command_id) {
   cancel_unlock();
   return requested;
 }
+
+int edr_command_cancel_active(const char *command_id) {
+  cancel_lock();int active=active_index(command_id)>=0;cancel_unlock();return active;
+}

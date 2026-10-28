@@ -27,7 +27,7 @@ int main(int argc,char **argv) {
 #else
   strcpy(root,"/tmp/edr-io-deadline.XXXXXX");assert(mkdtemp(root));
 #endif
-  EdrForensicIoRequest q={0};EdrForensicIoResult result={0};q.version=1;q.operation=1;q.timeout_ms=2000;
+  EdrForensicIoRequest q={0};EdrForensicIoResult result={0};q.version=EDR_FORENSIC_IO_VERSION;q.operation=1;q.timeout_ms=2000;
   strcpy(q.manifest,"synthetic evidence; hard deadline contract\n");
   for(unsigned phase=0;phase<=5;phase++) {
     snprintf(q.workspace,sizeof(q.workspace),"%s/phase-%u",root,phase);
@@ -52,5 +52,16 @@ int main(int argc,char **argv) {
   }
   q.operation=1;assert(edr_forensic_io_run(&q,&result,cancel_now,NULL)==EDR_DC_ERR_CANCELLED);
   q.timeout_ms=0;assert(edr_forensic_io_run(&q,&result,NULL,NULL)==EDR_DC_ERR_TIMEOUT);
+  /* The launcher, before a process exists, is also a blocking-I/O boundary.
+   * Leave its pipe blocked until this test process exits: further submissions
+   * must refuse immediately, never accumulate abandoned launcher threads. */
+  q.timeout_ms=1000;q.operation=1u|(6u<<8);
+  snprintf(q.workspace,sizeof(q.workspace),"%s/launch-blocked",root);
+  uint64_t started=now_ms();
+  assert(edr_forensic_io_run(&q,&result,NULL,NULL)==EDR_RESPONSE_WRITER_UNCONFIRMED);
+  uint64_t elapsed=now_ms()-started;assert(elapsed>=1900 && elapsed<2800);
+  started=now_ms();q.operation=1;
+  assert(edr_forensic_io_run(&q,&result,NULL,NULL)==EDR_RESPONSE_WRITER_UNCONFIRMED && now_ms()-started<100);
+  printf("launcher blocked elapsed_ms=%llu abandoned_slots=1 subsequent_admission_refused=1\n",(unsigned long long)elapsed);
   puts("PASS: real worker archive; synchronous blocked reads at five phases terminate within deadline+bounded confirmation; cancel/expired never spawn");return 0;
 }

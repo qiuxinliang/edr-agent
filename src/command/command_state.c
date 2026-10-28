@@ -1,3 +1,4 @@
+#include "edr/command_cancel.h"
 #include "edr/command_state.h"
 #include "edr/local_evidence_cache.h"
 #include "edr/sha256.h"
@@ -3737,11 +3738,15 @@ done:
   cJSON_Delete(root);state_lock_release(lock);return rc;
 }
 
-static int artifact_transition(const char *id,const char *sha,int abandon) {
+static int artifact_transition(const char *id,const char *sha,const char *directory_identity,int abandon) {
   if(!id || !*id)return -1;
   if(!abandon) {
     if(!sha || strlen(sha)!=64)return -1;
     for(size_t i=0;i<64;i++)if(!isxdigit((unsigned char)sha[i]))return -1;
+    if(directory_identity) {
+      if(strlen(directory_identity)!=64)return -1;
+      for(size_t i=0;i<64;i++)if(!isxdigit((unsigned char)directory_identity[i]))return -1;
+    }
   }
   FILE *lock=artifact_owner_lock();if(!lock)return -1;
   cJSON *root=artifact_latest_locked(id);cJSON *a=cJSON_GetObjectItemCaseSensitive(root,"artifact_stage");
@@ -3754,18 +3759,23 @@ static int artifact_transition(const char *id,const char *sha,int abandon) {
     if(!renewal_number(a,"phase",3))goto done;
     if(!renewal_text(a,"publication_state","aborted_writer_closed"))goto done;
   } else {
-    if(phase->valueint==2){rc=!strcmp(result_text(a,"sha256"),sha)?0:-1;goto done;}
+    if(phase->valueint==2){rc=!strcmp(result_text(a,"sha256"),sha) &&
+        (!directory_identity || !strcmp(result_text(a,"directory_identity"),directory_identity))?0:-1;goto done;}
     if(phase->valueint!=1)goto done;
     uint64_t bytes=edr_storage_file_size(result_text(a,"staging"));
     if(!bytes || bytes==UINT64_MAX || bytes>EDR_FORENSIC_BASELINE_MAX_BYTES)goto done;
     if(!renewal_number(a,"phase",2) || !renewal_text(a,"sha256",sha))goto done;
+    if(directory_identity && !renewal_text(a,"directory_identity",directory_identity))goto done;
   }
   rc=artifact_append_locked(root);
 done:
   cJSON_Delete(root);state_lock_release(lock);return rc;
 }
-int edr_command_state_artifact_ready(const char *id,const char *sha) {return artifact_transition(id,sha,0);}
-int edr_command_state_artifact_abandon(const char *id) {return artifact_transition(id,NULL,1);}
+int edr_command_state_artifact_ready(const char *id,const char *sha) {return artifact_transition(id,sha,NULL,0);}
+int edr_command_state_artifact_ready_at(const char *id,const char *sha,const char *identity) {
+  return identity ? artifact_transition(id,sha,identity,0) : -1;
+}
+int edr_command_state_artifact_abandon(const char *id) {return artifact_transition(id,NULL,NULL,1);}
 
 static int artifact_fill(const cJSON *root,EdrCommandArtifactStage *out) {
   memset(out,0,sizeof(*out));
@@ -3781,6 +3791,9 @@ static int artifact_fill(const cJSON *root,EdrCommandArtifactStage *out) {
   char boot[64];state_boot_id(boot,sizeof(boot));
   out->interrupted=out->phase==1 && strcmp(result_text(a,"writer_boot"),boot)!=0;
   if(out->phase==2 && !scope_string(a,"sha256",out->sha256,sizeof(out->sha256)))return -1;
+  const cJSON *identity=cJSON_GetObjectItemCaseSensitive(a,"directory_identity");
+  if(identity && (!cJSON_IsString(identity) || !identity->valuestring || strlen(identity->valuestring)!=64))return -1;
+  if(identity)snprintf(out->directory_identity,sizeof(out->directory_identity),"%s",identity->valuestring);
   char *raw=cJSON_PrintUnformatted(root);if(!raw)return -1;
   EdrCommandStateRecord *record=malloc(sizeof(*record));
   if(!record){cJSON_free(raw);return -1;}
@@ -3809,7 +3822,7 @@ int edr_command_state_artifact_next(size_t *cursor,EdrCommandArtifactStage *out)
     const cJSON *phase=cJSON_GetObjectItemCaseSensitive(a,"phase");
     char boot[64];state_boot_id(boot,sizeof(boot));
     int publish=cJSON_IsNumber(phase) && (phase->valueint==2 ||
-        (phase->valueint==1 && strcmp(result_text(a,"writer_boot"),boot) &&
+        (phase->valueint==1 && !edr_command_cancel_active(owner->command_id) && strcmp(result_text(a,"writer_boot"),boot) &&
          strcmp(result_text(a,"recovery"),"interrupted_protected")));cJSON_Delete(a);
     if(!publish)continue;
     cJSON *root=artifact_latest_locked(owner->command_id);
@@ -3837,6 +3850,7 @@ static int artifact_stage_matches(const cJSON *root,const EdrCommandArtifactStag
       !strcmp(result_text(a,"artifact"),stage->artifact) &&
       !strcmp(result_text(a,"staging"),stage->staging) &&
       !strcmp(result_text(a,"workspace"),stage->workspace) &&
+      !strcmp(result_text(a,"directory_identity"),stage->directory_identity) &&
       !strcmp(result_text(a,"sha256"),stage->sha256);
 }
 

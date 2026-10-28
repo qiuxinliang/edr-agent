@@ -12,6 +12,7 @@ int edr_command_cancel_request(const char *command_id);
 int edr_command_cancel_request_all(void);
 void edr_command_cancel_reset_all(void);
 int edr_command_cancel_requested(const char *command_id);
+int edr_command_cancel_active(const char *command_id);
 
 #ifdef __cplusplus
 }

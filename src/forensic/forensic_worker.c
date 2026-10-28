@@ -9,18 +9,32 @@
 #include <wchar.h>
 #ifdef _WIN32
 #include <windows.h>
+#include <process.h>
 #include <io.h>
 #else
+#include <pthread.h>
+#include <stdatomic.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <signal.h>
 #include <spawn.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
+#include <sys/time.h>
 #ifdef __APPLE__
 #include <mach-o/dyld.h>
 #endif
 extern char **environ;
+#endif
+
+static EdrForensicCommandWorker command_worker;
+static int in_worker;
+void edr_forensic_io_set_command_worker(EdrForensicCommandWorker worker) { command_worker=worker; }
+int edr_forensic_io_in_worker(void) { return in_worker; }
+#ifndef _WIN32
+static void io_expired_group(int signal_number) {
+  (void)signal_number;(void)kill(0,SIGKILL);_exit(2);
+}
 #endif
 
 typedef struct { EdrForensicIoRequest request; EdrForensicIoResult result; } IoExchange;
@@ -69,22 +83,34 @@ static void io_block_test(const EdrForensicIoRequest *q,unsigned phase) {
 #define io_block_test(q,phase) ((void)0)
 #endif
 static void io_work(const EdrForensicIoRequest *q,EdrForensicIoResult *r) {
-  memset(r,0,sizeof(*r));r->version=1;r->rc=-1;
-  if(q->version!=1 || q->payload_len>=sizeof(q->payload) || !q->timeout_ms || q->timeout_ms>300000u ||
+  memset(r,0,sizeof(*r));r->version=EDR_FORENSIC_IO_VERSION;r->rc=-1;
+  if(q->version!=EDR_FORENSIC_IO_VERSION || q->payload_len>=sizeof(q->payload) || !q->timeout_ms || q->timeout_ms>300000u ||
      !memchr(q->workspace,0,sizeof(q->workspace)) || !memchr(q->staging,0,sizeof(q->staging)) ||
      !memchr(q->manifest,0,sizeof(q->manifest)))return;
   uint32_t operation=q->operation;
 #ifdef EDR_FORENSIC_IO_TESTING
   operation&=255u;
 #endif
-  if(operation==2) {r->phase=5;r->rc=edr_forensic_path_hash(q->staging,r->sha256);return;}
-  if(operation==3) {r->phase=4;io_block_test(q,4);r->rc=edr_forensic_path_sync_file(q->staging);return;}
+  if(operation==4) {r->phase=6;if(command_worker)r->rc=command_worker(q,r);return;}
+  if(operation==2 || operation==3) {
+    EdrForensicPath *guard=NULL;char identity[65];
+    if(!memchr(q->expected_parent,0,sizeof(q->expected_parent)) ||
+       edr_forensic_path_acquire(q->staging,0,&guard))return;
+    if(edr_forensic_path_identity(guard,identity) ||
+       (q->expected_parent[0] && strcmp(identity,q->expected_parent))) {edr_forensic_path_release(guard);return;}
+    edr_forensic_path_pin(guard);
+    if(operation==2) {r->phase=5;r->rc=edr_forensic_path_hash(q->staging,r->sha256);}
+    else {r->phase=4;io_block_test(q,4);r->rc=edr_forensic_path_sync_file(q->staging);}
+    edr_forensic_path_release(guard);return;
+  }
   if(operation!=1)return;
   uint64_t started=io_clock();uint32_t remaining=q->timeout_ms;
   EdrForensicPath *manifest=NULL,*staging=NULL;char path[800];
   r->phase=1;io_block_test(q,1);
   if(snprintf(path,sizeof(path),"%s/manifest.txt",q->workspace)>=(int)sizeof(path) ||
      edr_forensic_path_acquire(path,1,&manifest) || edr_forensic_path_acquire(q->staging,0,&staging))goto done;
+  edr_forensic_path_pin(manifest);edr_forensic_path_pin(staging);
+  if(edr_forensic_path_identity(staging,r->directory_identity))goto done;
   FILE *f=edr_forensic_path_file(manifest,"wbx");if(!f)goto done;
   size_t size=strlen(q->manifest);int ok=fwrite(q->manifest,1,size,f)==size;
   if(fclose(f))ok=0;
@@ -112,6 +138,7 @@ done:
 
 int edr_forensic_io_worker_main(const char *endpoint) {
   if(!endpoint || !*endpoint)return 2;
+  in_worker=1;
 #ifdef EDR_FORENSIC_IO_TESTING
   if(!strcmp(endpoint,"blocked-descendant")){io_test_block_read();return 2;}
 #endif
@@ -133,6 +160,14 @@ int edr_forensic_io_worker_main(const char *endpoint) {
   /* tar stays in this worker's process group, so the supervisor kills the
    * complete finite job. No inherited endpoint may keep a receipt alive. */
   if(fcntl(3,F_SETFD,FD_CLOEXEC)<0)return 2;
+  /* A crashed supervisor must not leave a permanently blocked POSIX writer.
+   * The private worker owns this process group; its timer kills descendants
+   * too. Recovery still retains evidence/credit until quiescence is proven. */
+  if(getpgrp()!=getpid() || !shared.request.timeout_ms || shared.request.timeout_ms>300000u)return 2;
+  struct sigaction expire={0};expire.sa_handler=io_expired_group;sigemptyset(&expire.sa_mask);
+  struct itimerval timer={0};uint64_t budget=(uint64_t)shared.request.timeout_ms+1000u;
+  timer.it_value.tv_sec=(time_t)(budget/1000u);timer.it_value.tv_usec=(suseconds_t)(budget%1000u)*1000;
+  if(sigaction(SIGALRM,&expire,NULL) || setitimer(ITIMER_REAL,&timer,NULL))return 2;
   response_tar_set_worker_group();
   io_work(&shared.request,&shared.result);used=0;
   while(used<sizeof(shared.result)) {
@@ -144,14 +179,17 @@ int edr_forensic_io_worker_main(const char *endpoint) {
   return 0;
 }
 
-int edr_forensic_io_run(const EdrForensicIoRequest *q,EdrForensicIoResult *out,
+static int io_run_process(const EdrForensicIoRequest *q,EdrForensicIoResult *out,
                        EdrResponseCancelCheck cancel,void *user) {
   if(!q || !out)return -1;
   memset(out,0,sizeof(*out));out->rc=-1;
   if(!q->timeout_ms || q->timeout_ms>300000u)return EDR_DC_ERR_TIMEOUT;
   if(cancel && cancel(user))return EDR_DC_ERR_CANCELLED;
+  if(in_worker) {io_work(q,out);return out->rc;}
   uint64_t started=io_clock();if(started==UINT64_MAX)return -1;
   int result=-1,finished=0;
+  io_block_test(q,6); /* Actual blocking I/O before process creation, tests only. */
+  if(cancel && cancel(user))return EDR_DC_ERR_CANCELLED;
 #ifdef _WIN32
   HANDLE mapping=NULL,job=NULL;IoExchange *shared=NULL;
   PROCESS_INFORMATION process={0};STARTUPINFOEXW startup={0};
@@ -179,13 +217,14 @@ int edr_forensic_io_run(const EdrForensicIoRequest *q,EdrForensicIoResult *out,
   if(n<0 || n>=32880)goto done;
   if(!CreateProcessW(binary,command,NULL,NULL,TRUE,CREATE_SUSPENDED|CREATE_NO_WINDOW|EXTENDED_STARTUPINFO_PRESENT,
       NULL,NULL,&startup.StartupInfo,&process))goto done;
+  if(cancel && cancel(user)){result=EDR_DC_ERR_CANCELLED;goto stop;}
   if(!AssignProcessToJobObject(job,process.hProcess) || ResumeThread(process.hThread)==(DWORD)-1)goto stop;
   for(;;) {
     if(cancel && cancel(user)){result=EDR_DC_ERR_CANCELLED;break;}
     uint64_t now=io_clock();if(now==UINT64_MAX || now-started>=q->timeout_ms){result=EDR_DC_ERR_TIMEOUT;break;}
     DWORD wait=WaitForSingleObject(process.hProcess,10);
     if(wait==WAIT_OBJECT_0) {DWORD code=1;finished=1;
-      if(GetExitCodeProcess(process.hProcess,&code) && !code && shared->result.version==1) {*out=shared->result;result=out->rc;}
+      if(GetExitCodeProcess(process.hProcess,&code) && !code && shared->result.version==EDR_FORENSIC_IO_VERSION) {*out=shared->result;result=out->rc;}
       break;
     }
     if(wait!=WAIT_TIMEOUT)break;
@@ -258,7 +297,7 @@ done:
         ssize_t n=recv(sockets[0],(char *)out+received,sizeof(*out)-received,0);
         if(n>0)received+=(size_t)n;
       }
-      if(received==sizeof(*out) && WIFEXITED(status) && WEXITSTATUS(status)==0 && out->version==1)result=out->rc;
+      if(received==sizeof(*out) && WIFEXITED(status) && WEXITSTATUS(status)==0 && out->version==EDR_FORENSIC_IO_VERSION)result=out->rc;
       break;
     }
     if(waited<0 && errno!=EINTR)break;
@@ -281,4 +320,85 @@ done:
   close(sockets[0]);
 #endif
   return result;
+}
+
+/* Process creation itself can block on an image/volume/filter. One on-demand
+ * launcher slot bounds that boundary too. If it cannot retire, later requests
+ * fail closed instead of accumulating threads or starting untracked writers.
+ * It owns copied input and never touches caller memory after the caller exits. */
+#ifdef _WIN32
+typedef volatile LONG IoAtomic;
+static int io_load(IoAtomic *p) {return (int)InterlockedCompareExchange(p,0,0);}
+static void io_store(IoAtomic *p,int value) {InterlockedExchange(p,value);}
+static int io_take(IoAtomic *p) {return InterlockedCompareExchange(p,1,0)==0;}
+static int io_drop(IoAtomic *p) {return (int)InterlockedDecrement(p);}
+#else
+typedef _Atomic int IoAtomic;
+static int io_load(IoAtomic *p) {return atomic_load(p);}
+static void io_store(IoAtomic *p,int value) {atomic_store(p,value);}
+static int io_take(IoAtomic *p) {int zero=0;return atomic_compare_exchange_strong(p,&zero,1);}
+static int io_drop(IoAtomic *p) {return atomic_fetch_sub(p,1)-1;}
+#endif
+static IoAtomic launcher_busy;
+typedef struct {
+  EdrForensicIoRequest request;
+  EdrForensicIoResult result;
+  IoAtomic references,done,abort;
+  int rc;
+} IoLaunch;
+static int io_launch_cancel(void *arg) {return io_load(&((IoLaunch *)arg)->abort);}
+static void io_launch_release(IoLaunch *job) {if(!io_drop(&job->references))free(job);}
+#ifdef _WIN32
+static unsigned __stdcall io_launch(void *arg)
+#else
+static void *io_launch(void *arg)
+#endif
+{
+  IoLaunch *job=arg;
+  job->rc=io_run_process(&job->request,&job->result,io_launch_cancel,job);
+  io_store(&job->done,1);io_store(&launcher_busy,0);io_launch_release(job);
+  return 0;
+}
+
+int edr_forensic_io_run(const EdrForensicIoRequest *q,EdrForensicIoResult *out,
+                       EdrResponseCancelCheck cancel,void *user) {
+  if(!q || !out)return -1;
+  memset(out,0,sizeof(*out));out->rc=-1;
+  if(!q->timeout_ms || q->timeout_ms>300000u)return EDR_DC_ERR_TIMEOUT;
+  if(cancel && cancel(user))return EDR_DC_ERR_CANCELLED;
+  if(in_worker){io_work(q,out);return out->rc;}
+  uint64_t start=io_clock();if(start==UINT64_MAX)return -1;
+  if(!io_take(&launcher_busy))return EDR_RESPONSE_WRITER_UNCONFIRMED;
+  IoLaunch *job=calloc(1,sizeof(*job));
+  if(!job){io_store(&launcher_busy,0);return -1;}
+  job->request=*q;io_store(&job->references,2);
+#ifdef _WIN32
+  uintptr_t thread=_beginthreadex(NULL,0,io_launch,job,0,NULL);
+  int launched=thread!=0;if(thread)CloseHandle((HANDLE)thread);
+#else
+  pthread_t thread;int launched=pthread_create(&thread,NULL,io_launch,job)==0;
+  if(launched)pthread_detach(thread);
+#endif
+  if(!launched){free(job);io_store(&launcher_busy,0);return -1;}
+  int failure=0,rc=-1;uint64_t stopping=0;
+  for(;;) {
+    if(io_load(&job->done)) {
+      *out=job->result;rc=failure ? (job->rc==EDR_RESPONSE_WRITER_UNCONFIRMED ? job->rc : failure) : job->rc;break;
+    }
+    uint64_t now=io_clock();
+    if(!failure) {
+      if(cancel && cancel(user))failure=EDR_DC_ERR_CANCELLED;
+      else if(now==UINT64_MAX || now-start>=q->timeout_ms)failure=EDR_DC_ERR_TIMEOUT;
+      if(failure){stopping=now;io_store(&job->abort,1);}
+    }
+    if(failure && (now==UINT64_MAX || stopping==UINT64_MAX || now-stopping>=1000u)) {
+      rc=EDR_RESPONSE_WRITER_UNCONFIRMED;break;
+    }
+#ifdef _WIN32
+    Sleep(10);
+#else
+    struct timespec delay={0,10000000};nanosleep(&delay,NULL);
+#endif
+  }
+  io_launch_release(job);return rc;
 }

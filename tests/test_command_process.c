@@ -41,6 +41,7 @@ void edr_command_on_internal_envelope(const char *id, const char *type, const ui
   metas[queued] = *meta;
   queued++;
 }
+int edr_command_cancel_active(const char *command_id) { (void)command_id; return 0; }
 int edr_command_cancel_requested(const char *id) { (void)id; return cancelled; }
 int edr_ingest_http_configured(void) { return 1; }
 const char *edr_command_normalize_forensic_result(const char *type, EdrCommandExecutionStatus status,

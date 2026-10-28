@@ -12,6 +12,8 @@ extern "C" {
 struct EdrConfig;
 
 void edr_command_bind_config(const struct EdrConfig *cfg);
+/* Frozen policy/reporting intent for the isolated local worker; no transport init. */
+void edr_command_bind_worker_context(int allow_dangerous,int report_pending);
 const struct EdrConfig *edr_command_get_config(void);
 
 int edr_command_dangerous_enabled(void);

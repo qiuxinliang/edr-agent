@@ -25,18 +25,30 @@ int main(void) {
   FILE *f=edr_forensic_path_file(a,"wbx");assert(f);assert(fputs("synthetic manifest",f)>=0);assert(!fclose(f));
   assert(!edr_forensic_path_file(a,"wbx")); /* Preserve prior content. */
   assert(!edr_forensic_path_acquire(final,0,&b));
+  char original_identity[65];assert(!edr_forensic_path_identity(a,original_identity));
+  edr_forensic_path_pin(a);
 #ifdef _WIN32
   assert(!MoveFileExA(parent,moved,0));assert(GetLastError()==ERROR_SHARING_VIOLATION);
 #else
   assert(!rename(parent,moved));assert(!mkdir(parent,0700));
   char replacement[1000];snprintf(replacement,sizeof(replacement),"%s/manifest",parent);
   f=fopen(replacement,"wb");assert(f);assert(fputs("unrelated replacement",f)>=0);assert(!fclose(f));
+  EdrForensicPath *replacement_guard=NULL;
+  assert(edr_forensic_path_acquire(replacement,0,&replacement_guard)!=0 && !replacement_guard);
+  char rejected_hash[65];assert(edr_forensic_path_hash(replacement,rejected_hash)!=0);
+  char nested[1100];snprintf(nested,sizeof(nested),"%s/new/leaf",parent);
+  assert(edr_forensic_path_acquire(nested,1,&replacement_guard)!=0 && !replacement_guard);
+  snprintf(nested,sizeof(nested),"%s/new",parent);struct stat absent;assert(stat(nested,&absent)!=0);
 #endif
   assert(!edr_forensic_path_move(a,b,0)); /* Anchored source and destination. */
   uint64_t bytes=0;assert(!edr_forensic_path_size(b,&bytes) && bytes==18);
   assert(!edr_forensic_path_file(b,"wbx"));
   edr_forensic_path_release(b);edr_forensic_path_release(a);
 #ifndef _WIN32
+  /* Recovery can compare persisted identity even after the live pin closes. */
+  assert(!edr_forensic_path_acquire(replacement,0,&replacement_guard));
+  char replacement_identity[65];assert(!edr_forensic_path_identity(replacement_guard,replacement_identity));
+  assert(strcmp(original_identity,replacement_identity));edr_forensic_path_release(replacement_guard);
   assert(!remove(replacement));assert(!rmdir(parent));assert(!rename(moved,parent));
 #endif
   char sha[65];assert(!edr_forensic_path_hash(final,sha));

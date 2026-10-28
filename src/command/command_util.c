@@ -19,6 +19,13 @@ unsigned long g_cmd_exec_ok;
 unsigned long g_cmd_exec_fail;
 
 static const EdrConfig *s_bound_cfg;
+static int s_worker_reporting = -1, s_worker_dangerous = -1;
+void edr_command_bind_worker_context(int allow_dangerous,int report_pending) {
+  s_worker_dangerous=allow_dangerous!=0;s_worker_reporting=report_pending!=0;
+}
+static int command_report_configured(void) {
+  return s_worker_reporting<0 ? edr_ingest_http_configured() : s_worker_reporting;
+}
 #ifdef _MSC_VER
 static __declspec(thread) char s_active_command_type[64];
 #else
@@ -66,6 +73,7 @@ int edr_command_terminal_allows_cancel_override(
 }
 
 int edr_command_dangerous_enabled(void) {
+  if(s_worker_dangerous>=0)return s_worker_dangerous;
   const char *e = getenv("EDR_CMD_ENABLED");
   if (e && e[0] == '1') {
     return 1;
@@ -189,7 +197,7 @@ void edr_command_soar_emit(const char *cmd_id, const EdrSoarCommandMeta *sm,
   if (edr_command_state_finish(cmd_id, s_active_command_type, sm,
                                response_status ? response_status : command_response_status_label(st),
                                (int)st, exit_code, detail ? detail : "", "",
-                               should_report && edr_ingest_http_configured()) == 0) {
+                               should_report && command_report_configured()) == 0) {
     edr_command_state_delete_inbox(cmd_id);
   }
 }
@@ -234,7 +242,7 @@ static int command_emit_always_typed_status(const char *cmd_id, const char *comm
                                    ? response_status
                                    : command_response_status_label(st),
                                (int)st, exit_code,
-                               detail ? detail : "", "", edr_ingest_http_configured());
+                               detail ? detail : "", "", command_report_configured());
   if (state_rc >= 0) {
     edr_command_state_delete_inbox(cmd_id);
   } else {

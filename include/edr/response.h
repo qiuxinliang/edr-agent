@@ -17,6 +17,8 @@ void edr_response_put_file(const char *cmd_id, const uint8_t *pl, size_t len,
 
 void edr_response_collect_forensic(const char *cmd_id, const uint8_t *pl, size_t len,
                                    const EdrSoarCommandMeta *sm);
+/* Installs the private bounded command worker before self-exec dispatch. */
+void edr_response_forensic_register_worker(void);
 void edr_response_targeted_forensic(const char *cmd_id, const uint8_t *pl, size_t len,
                                     const EdrSoarCommandMeta *sm);
 void edr_response_deep_forensic(const char *cmd_id, const uint8_t *pl, size_t len,

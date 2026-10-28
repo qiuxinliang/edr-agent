@@ -51,7 +51,7 @@ static void (*missing_terminal_record_hook)(void);
 static FILE *injected_path_file(EdrForensicPath *guard,const char *mode) {
   FILE *f=edr_forensic_path_file(guard,mode);
   const char *path=edr_forensic_path_text(guard);
-  if(!f && !strcmp(mode,"rb") && strstr(path,"upload_cmd_concurrent_A_") &&
+  if(!f && !strcmp(mode,"rb") && (strstr(path,"upload_cmd_concurrent_A_") || strstr(path,"upload_cmd_metadata_directory_")) &&
       strstr(path,".pending.failed") && missing_terminal_record_hook) {
     void (*hook)(void)=missing_terminal_record_hook;missing_terminal_record_hook=NULL;hook();
   }
@@ -873,9 +873,65 @@ static void test_ancestor_outbox(void) {
 #endif
 }
 
+static void test_persisted_directory_identity(void) {
+  setup("directory-identity");char ledger_dir[800],evidence_dir[800],moved[900];
+  snprintf(ledger_dir,sizeof(ledger_dir),"%s",dir);
+  snprintf(evidence_dir,sizeof(evidence_dir),"%s/evidence",dir);make_dir(evidence_dir);
+  snprintf(dir,sizeof(dir),"%s",evidence_dir);
+  EdrCommandArtifactStage stage;create_stage_fixture(&stage,"cmd_directory_identity",0);
+  snprintf(dir,sizeof(dir),"%s",ledger_dir);
+  EdrForensicPath *guard=NULL;assert(!edr_forensic_path_acquire(stage.staging,0,&guard));
+  assert(!edr_forensic_path_identity(guard,stage.directory_identity));edr_forensic_path_release(guard);
+  assert(!edr_command_state_artifact_ready_at(stage.command_id,sha,stage.directory_identity));
+  snprintf(moved,sizeof(moved),"%s.moved",evidence_dir);assert(!rename(evidence_dir,moved));make_dir(evidence_dir);
+  put(stage.staging,"bounded forensic fixture"); /* Identical bytes do not prove the original directory. */
+#ifdef _WIN32
+  assert(_spawnl(_P_WAIT,test_executable,test_executable,"--identity-restart",stage.command_id,NULL)==0);
+#else
+  pid_t child=fork();assert(child>=0);
+  if(!child){execl(test_executable,test_executable,"--identity-restart",stage.command_id,(char *)NULL);_exit(127);}
+  int status=0;assert(waitpid(child,&status,0)==child && WIFEXITED(status) && !WEXITSTATUS(status));
+#endif
+  assert(!exists(stage.artifact) && exists(stage.staging));
+  char original[1100];snprintf(original,sizeof(original),"%s/cmd_directory_identity.tgz.staging",moved);assert(exists(original));
+  assert(edr_storage_artifact_reserved()==2u*EDR_COMMAND_STATE_LINE_CAP+12288u);
+  puts("reopened directory identity: equal-content replacement refused, both evidence copies and owner credit retained");
+}
+
+#ifndef _WIN32
+static char swapped_outbox[1000],moved_outbox[1000];
+static void swap_outbox_directory(void) {
+  assert(!rename(swapped_outbox,moved_outbox));make_dir(swapped_outbox);
+}
+static void test_metadata_directory_continuity(void) {
+  setup("metadata-directory");EdrCommandArtifactStage stage;
+  create_stage_fixture(&stage,"cmd_metadata_directory",1);
+  snprintf(swapped_outbox,sizeof(swapped_outbox),"%s/outbox",dir);make_dir(swapped_outbox);
+  snprintf(moved_outbox,sizeof(moved_outbox),"%s/moved-outbox",dir);
+  env("EDR_UPLOAD_OUTBOX_DIR",swapped_outbox);
+  uint64_t reserved=edr_storage_artifact_reserved();unsigned writes=metadata_flushes;
+  missing_terminal_record_hook=swap_outbox_directory;
+  assert(edr_command_upload_outbox_publish_stage(&stage)!=0 && !missing_terminal_record_hook);
+  assert(metadata_flushes==writes && edr_storage_artifact_reserved()==reserved && exists(stage.artifact));
+  assert(!rmdir(swapped_outbox) && !rename(moved_outbox,swapped_outbox));
+  assert(!edr_command_upload_outbox_publish_stage(&stage) && !edr_storage_artifact_reserved());
+  puts("outbox directory replacement between read and write refused; owner retained; original-directory retry passed");
+}
+#endif
+
 int main(int argc,char **argv) {
   if(argc==3 && !strcmp(argv[1],EDR_FORENSIC_WORKER_ARG))return edr_forensic_io_worker_main(argv[2]);
   test_executable=argv[0];
+  if(argc==3 && !strcmp(argv[1],"--identity-restart")) {
+    EdrCommandStateCapacityStats stats;assert(!edr_command_state_get_capacity_stats(&stats));
+    size_t cursor=0;EdrCommandArtifactStage stage;
+    assert(edr_command_state_artifact_next(&cursor,&stage)==1 && !strcmp(stage.command_id,argv[2]));
+    assert(strlen(stage.directory_identity)==64 && stage.phase==2);
+    assert(edr_command_upload_outbox_publish_stage(&stage)!=0);
+    fprintf(stderr,"directory-restart reserved=%llu expected=%llu uploads=%d metadata_flushes=%u\n",
+        (unsigned long long)edr_storage_artifact_reserved(),(unsigned long long)(2u*EDR_COMMAND_STATE_LINE_CAP+12288u),upload_calls,metadata_flushes);
+    assert(edr_storage_artifact_reserved()==2u*EDR_COMMAND_STATE_LINE_CAP+12288u && !upload_calls && !metadata_flushes);return 0;
+  }
   if(argc==4 && !strcmp(argv[1],"--concurrent-publish")) {
     put(argv[3],"started");
     EdrCommandStateCapacityStats stats;assert(edr_command_state_get_capacity_stats(&stats)==0);
@@ -889,6 +945,9 @@ int main(int argc,char **argv) {
   if(argc==3 && !strcmp(argv[1],"--stage-interrupted")) {
     EdrCommandStateCapacityStats stats;assert(edr_command_state_get_capacity_stats(&stats)==0);
     size_t cursor=0;EdrCommandArtifactStage stage;
+    assert(edr_command_cancel_begin(argv[2]));
+    assert(edr_command_state_artifact_next(&cursor,&stage)==0);
+    edr_command_cancel_end(argv[2]);cursor=0;
     assert(edr_command_state_artifact_next(&cursor,&stage)==1 && !strcmp(stage.command_id,argv[2]));
     assert(stage.phase==1 && stage.interrupted && edr_command_state_artifact_abandon(stage.command_id)==-1);
     assert(edr_command_upload_outbox_publish_stage(&stage)==0);
@@ -941,6 +1000,10 @@ int main(int argc,char **argv) {
     puts("outbox physical admission contract passed"); return 0;
   }
   test_ancestor_outbox();
+  test_persisted_directory_identity();
+#ifndef _WIN32
+  test_metadata_directory_continuity();
+#endif
   test_metadata_physical_admission();
   test_concurrent_handoff_credit();
   test_durable_retry_and_deadline();test_retry_persist_failure_and_unknown_deadline();test_owner_final_preserved();

@@ -85,6 +85,7 @@ add_test(NAME shell_policy_and_json_parser COMMAND test_shell_policy WORKING_DIR
 
 add_executable(test_command_inbox ${CMAKE_CURRENT_SOURCE_DIR}/test_command_inbox.c
   ${CMAKE_SOURCE_DIR}/src/command/command_state.c
+  ${CMAKE_SOURCE_DIR}/src/command/command_cancel.c
   ${CMAKE_SOURCE_DIR}/src/command/sha256.c
   ${CMAKE_SOURCE_DIR}/third_party/cjson/cJSON.c)
 target_include_directories(test_command_inbox PRIVATE
@@ -100,6 +101,7 @@ endif()
 # Embed the production I/O boundary for bounded CRT failure injection.
 add_executable(test_command_upload_outbox
   ${CMAKE_CURRENT_SOURCE_DIR}/test_command_upload_outbox.c
+  ${CMAKE_SOURCE_DIR}/src/command/command_cancel.c
   ${CMAKE_SOURCE_DIR}/src/forensic/forensic_worker.c
   ${CMAKE_SOURCE_DIR}/src/command/sha256.c
   ${CMAKE_SOURCE_DIR}/src/response/response_utils.c
@@ -122,6 +124,7 @@ add_executable(test_forensic_io_timeout
   ${CMAKE_SOURCE_DIR}/src/command/sha256.c
   ${CMAKE_SOURCE_DIR}/third_party/cjson/cJSON.c)
 target_include_directories(test_forensic_io_timeout PRIVATE ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/third_party/cjson)
+target_link_libraries(test_forensic_io_timeout PRIVATE Threads::Threads)
 target_compile_definitions(test_forensic_io_timeout PRIVATE EDR_FORENSIC_IO_TESTING=1)
 edr_apply_test_warnings(test_forensic_io_timeout)
 if(WIN32)
@@ -2126,6 +2129,7 @@ add_test(NAME egress_request_policy COMMAND test_egress_request_policy)
 add_executable(test_command_result_egress test_command_result_egress.c
   ${CMAKE_SOURCE_DIR}/src/command/forensic_result_contract.c
   ${CMAKE_SOURCE_DIR}/src/command/command_state.c
+  ${CMAKE_SOURCE_DIR}/src/command/command_cancel.c
   ${CMAKE_SOURCE_DIR}/src/command/sha256.c
   ${CMAKE_SOURCE_DIR}/src/transport/command_result_json.c)
 target_link_libraries(test_command_result_egress PRIVATE edr_egress_policy Threads::Threads)
@@ -2136,6 +2140,7 @@ edr_apply_test_warnings(test_command_result_egress)
 add_test(NAME command_result_egress COMMAND test_command_result_egress)
 add_executable(test_command_result_compaction test_command_result_compaction.c
   ${CMAKE_SOURCE_DIR}/src/command/command_state.c
+  ${CMAKE_SOURCE_DIR}/src/command/command_cancel.c
   ${CMAKE_SOURCE_DIR}/src/command/sha256.c
   ${CMAKE_SOURCE_DIR}/src/transport/command_result_json.c)
 target_link_libraries(test_command_result_compaction PRIVATE edr_egress_policy Threads::Threads)
@@ -2457,6 +2462,7 @@ add_executable(storage_space_preflight_client storage_space_preflight_client.c
   ${CMAKE_SOURCE_DIR}/src/config/config.c
   ${CMAKE_SOURCE_DIR}/third_party/tomlc99/toml.c
   ${CMAKE_SOURCE_DIR}/src/command/command_state.c
+  ${CMAKE_SOURCE_DIR}/src/command/command_cancel.c
   ${CMAKE_SOURCE_DIR}/src/command/sha256.c
   ${CMAKE_SOURCE_DIR}/src/transport/command_result_json.c)
 target_include_directories(storage_space_preflight_client PRIVATE

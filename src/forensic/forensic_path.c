@@ -17,6 +17,8 @@
 struct EdrForensicPath {
   char text[4096], leaf[1024];
   size_t count;
+  struct EdrForensicPath *pin_next;
+  int pinned;
 #ifdef _WIN32
   HANDLE parents[256];
   wchar_t wide[1024];
@@ -25,8 +27,66 @@ struct EdrForensicPath {
 #endif
 };
 
+#ifdef _WIN32
+static __declspec(thread) EdrForensicPath *path_pins;
+#else
+static _Thread_local EdrForensicPath *path_pins;
+#endif
+
+void edr_forensic_path_pin(EdrForensicPath *p) {
+  if(!p || p->pinned)return;
+  p->pinned=1;p->pin_next=path_pins;path_pins=p;
+}
+
+static int path_parent_identity(const EdrForensicPath *p,size_t count,char sha[65]) {
+  if(!p || !count || count>p->count || !sha)return -1;
+  EdrSha256Ctx ctx;edr_sha256_init(&ctx);
+  for(size_t i=0;i<count;i++) {
+    char identity[100];
+#ifdef _WIN32
+    BY_HANDLE_FILE_INFORMATION st;
+    if(!GetFileInformationByHandle(p->parents[i],&st))return -1;
+    int n=snprintf(identity,sizeof(identity),"%lu:%lu:%lu;",(unsigned long)st.dwVolumeSerialNumber,
+                   (unsigned long)st.nFileIndexHigh,(unsigned long)st.nFileIndexLow);
+#else
+    struct stat st;if(fstat(p->parents[i],&st))return -1;
+    int n=snprintf(identity,sizeof(identity),"%llu:%llu;",(unsigned long long)st.st_dev,(unsigned long long)st.st_ino);
+#endif
+    if(n<0 || (size_t)n>=sizeof(identity))return -1;
+    edr_sha256_update(&ctx,(const unsigned char *)identity,(size_t)n);
+  }
+  unsigned char digest[EDR_SHA256_DIGEST_LEN];edr_sha256_final(&ctx,digest);
+  for(size_t i=0;i<sizeof(digest);i++)snprintf(sha+2*i,3,"%02x",digest[i]);
+  return 0;
+}
+int edr_forensic_path_identity(const EdrForensicPath *p,char sha[65]) {
+  return path_parent_identity(p,p ? p->count : 0,sha);
+}
+
+static int path_check_pins(const EdrForensicPath *p) {
+  for(const EdrForensicPath *pin=path_pins;pin;pin=pin->pin_next) {
+#ifdef _WIN32
+    const char *end=strrchr(pin->text,'\\');
+    if(!end || _strnicmp(pin->text,p->text,(size_t)(end-pin->text+1)))continue;
+#else
+    const char *end=strrchr(pin->text,'/');
+    if(!end || strncmp(pin->text,p->text,(size_t)(end-pin->text+1)))continue;
+#endif
+    char expected[65],actual[65];
+    size_t count=p->count<pin->count ? p->count : pin->count;
+    if(path_parent_identity(pin,count,expected) ||
+       path_parent_identity(p,count,actual) || strcmp(expected,actual))return -1;
+  }
+  return 0;
+}
+
 void edr_forensic_path_release(EdrForensicPath *p) {
   if (!p) return;
+  if(p->pinned) {
+    EdrForensicPath **link=&path_pins;
+    while(*link && *link!=p)link=&(*link)->pin_next;
+    if(*link)*link=p->pin_next;
+  }
   while (p->count) {
 #ifdef _WIN32
     CloseHandle(p->parents[--p->count]);
@@ -122,6 +182,8 @@ int edr_forensic_path_acquire(const char *path, int create_parents, EdrForensicP
     if (!*part || !strcmp(part, ".") || !strcmp(part, "..") || strlen(part) >= sizeof(p->leaf)) goto failed;
     if (!slash) { strcpy(p->leaf, part); break; }
     if (p->count == 256) goto failed;
+    /* Check opened ancestors before mkdirat can modify a replacement tree. */
+    if(path_check_pins(p))goto failed;
     int next = openat(current, part, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
     if (next < 0 && errno == ENOENT && create_parents) {
       if (!mkdirat(current, part, 0700) || errno == EEXIST)
@@ -132,6 +194,7 @@ int edr_forensic_path_acquire(const char *path, int create_parents, EdrForensicP
     part = slash + 1;
   }
 #endif
+  if(path_check_pins(p))goto failed;
   *out = p; return 0;
 failed:
   edr_forensic_path_release(p); return -1;

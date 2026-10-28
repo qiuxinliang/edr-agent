@@ -106,11 +106,15 @@ static int flush_file(FILE *f) {
 static int sync_parent(const char *path) {
 #ifdef _WIN32
   EdrForensicIoRequest *q=calloc(1,sizeof(*q));if(!q)return -1;
-  q->version=1;q->operation=3;q->timeout_ms=300000u;
+  q->version=EDR_FORENSIC_IO_VERSION;q->operation=3;q->timeout_ms=300000u;
   int n=snprintf(q->staging,sizeof(q->staging),"%s",path);
+  EdrForensicPath *guard=NULL;
+  if(edr_forensic_path_acquire(path,0,&guard) || edr_forensic_path_identity(guard,q->expected_parent)) {
+    edr_forensic_path_release(guard);free(q);return -1;
+  }
   EdrForensicIoResult receipt={0};
   int rc=n<0 || (size_t)n>=sizeof(q->staging) ? -1 : edr_forensic_io_run(q,&receipt,NULL,NULL);
-  free(q);return rc;
+  edr_forensic_path_release(guard);free(q);return rc;
 #else
   EdrForensicPath *guard=NULL;
   if(edr_forensic_path_acquire(path,0,&guard))return -1;
@@ -146,6 +150,7 @@ static int write_record_owned(const char *path, const char *raw, int replace,uin
   char tmp[1240];
   EdrForensicPath *target=NULL,*scratch=NULL;
   if(edr_forensic_path_acquire(path,1,&target))return -1;
+  edr_forensic_path_pin(target);
   if(!metadata_space_available_owned(path,credit)) {edr_forensic_path_release(target);return -1;}
 #ifdef _WIN32
   static volatile LONG sequence;
@@ -211,9 +216,14 @@ static int remove_metadata(const char *path) {
 static int file_hash(const char *path, char sha[65]) {
   if(!path || strlen(path)>=sizeof(((EdrForensicIoRequest *)0)->staging))return -1;
   EdrForensicIoRequest *request=calloc(1,sizeof(*request));if(!request)return -1;
-  request->version=1;request->operation=2;request->timeout_ms=300000u;
+  request->version=EDR_FORENSIC_IO_VERSION;request->operation=2;request->timeout_ms=300000u;
   snprintf(request->staging,sizeof(request->staging),"%s",path);
+  EdrForensicPath *guard=NULL;
+  if(edr_forensic_path_acquire(path,0,&guard) || edr_forensic_path_identity(guard,request->expected_parent)) {
+    edr_forensic_path_release(guard);free(request);return -1;
+  }
   EdrForensicIoResult receipt={0};int rc=edr_forensic_io_run(request,&receipt,NULL,NULL);free(request);
+  edr_forensic_path_release(guard);
   if(!rc)snprintf(sha,65,"%s",receipt.sha256);
   return rc;
 }
@@ -258,23 +268,26 @@ static int queue_upload(const char *command_id, const char *type, const EdrSoarC
   /* Command id and content identify an idempotent enqueue across process restarts. */
   n = snprintf(path, sizeof(path), "%s/upload_%s_%s.pending", dir, safe, actual);
   if (n < 0 || (size_t)n >= sizeof(path)) return -1;
+  EdrForensicPath *record_scope=NULL;int rc=-1;
+  if(edr_forensic_path_acquire(path,1,&record_scope))return -1;
+  edr_forensic_path_pin(record_scope);
   UploadRecord prior;
   char prior_path[1240];snprintf(prior_path,sizeof(prior_path),"%s",path);
   int prior_rc = read_record(path, &prior);
   if (prior_rc != 0) {
     char done[1240];
-    if (snprintf(done, sizeof(done), "%s.done", path) >= (int)sizeof(done)) return -1;
+    if (snprintf(done, sizeof(done), "%s.done", path) >= (int)sizeof(done)) goto queue_done;
     snprintf(prior_path,sizeof(prior_path),"%s",done);
     prior_rc = read_record(done, &prior);
     if (prior_rc != 0) {
-      if (snprintf(done, sizeof(done), "%s.failed", path) >= (int)sizeof(done)) return -1;
+      if (snprintf(done, sizeof(done), "%s.failed", path) >= (int)sizeof(done)) goto queue_done;
       snprintf(prior_path,sizeof(prior_path),"%s",done);
       prior_rc = read_record(done, &prior);
     }
   }
   if (prior_rc != 0 && write_record_owned(path, raw, 0, artifact_credit) == 0) {
     if(!artifact_credit)edr_command_executor_wake();
-    return 0;
+    rc=0;goto queue_done;
   }
   /* A repeated enqueue preserves the uploaded receipt and SOAR metadata.
    * Re-read after a competing publisher wins the no-replace operation. */
@@ -287,12 +300,14 @@ static int queue_upload(const char *command_id, const char *type, const EdrSoarC
       prior.partial != !!partial || strcmp(prior.meta.idempotency_key, meta->idempotency_key) ||
       strcmp(prior.meta.soar_correlation_id, meta->soar_correlation_id) ||
       strcmp(prior.meta.playbook_run_id, meta->playbook_run_id) ||
-      strcmp(prior.meta.playbook_step_id, meta->playbook_step_id)) return -1;
+      strcmp(prior.meta.playbook_step_id, meta->playbook_step_id)) goto queue_done;
   /* A previous rename may be readable after its final durability flush
    * failed. Re-confirm durability before accepting an idempotent record. */
-  if (sync_parent(prior_path) != 0) return -1;
+  if (sync_parent(prior_path) != 0) goto queue_done;
   if(!artifact_credit)edr_command_executor_wake();
-  return 0;
+  rc=0;goto queue_done;
+queue_done:
+  edr_forensic_path_release(record_scope);return rc;
 }
 
 int edr_command_upload_outbox_write_legacy(const char *command_id, const char *bundle,
@@ -313,6 +328,12 @@ static int publish_stage_locked(const EdrCommandArtifactStage *stage,uint64_t cr
   EdrForensicPath *staging=NULL,*artifact=NULL;uint64_t bytes=0;int rc=-1;
   if(edr_forensic_path_acquire(stage->staging,0,&staging) ||
      edr_forensic_path_acquire(stage->artifact,0,&artifact))goto done;
+  if(stage->directory_identity[0]) {
+    char identity[65];
+    if(edr_forensic_path_identity(staging,identity) || strcmp(identity,stage->directory_identity) ||
+       edr_forensic_path_identity(artifact,identity) || strcmp(identity,stage->directory_identity))goto done;
+  }
+  edr_forensic_path_pin(staging);edr_forensic_path_pin(artifact);
   int present=edr_forensic_path_size(staging,&bytes);
   if(present<0)goto done;
   if(bytes && move_guarded(staging,artifact,0)) {
@@ -333,12 +354,12 @@ int edr_command_upload_outbox_publish_stage(const EdrCommandArtifactStage *stage
     if(final<0)return -1;
     if(!final && edr_response_forensic_complete_queued_upload(stage->command_id,stage->command_type,
         &stage->meta,stage->staging,"","","builtin",0,0,
-        "collection interrupted by service restart; prior writer unknown; local evidence and reservation retained"))return -1;
+        "collection writer interrupted or restarted; prior writer unknown; local evidence and reservation retained"))return -1;
     return edr_command_state_artifact_mark_interrupted(stage->command_id);
   }
   if(stage->phase!=2 || !hash_valid(stage->sha256))return -1;
   int rc=edr_command_state_artifact_handoff(stage,publish_stage_locked);
-  if(!rc)edr_command_executor_wake();
+  if(!rc && !edr_forensic_io_in_worker())edr_command_executor_wake();
   return rc;
 }
 

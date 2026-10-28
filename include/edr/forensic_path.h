@@ -9,6 +9,11 @@
 typedef struct EdrForensicPath EdrForensicPath;
 int edr_forensic_path_acquire(const char *path, int create_parents, EdrForensicPath **out);
 void edr_forensic_path_release(EdrForensicPath *path);
+/* Pin this parent chain for subsequent acquisitions on the current job thread.
+ * Release removes the pin. A renamed/replaced directory fails closed, while
+ * existing descriptor-relative operations remain on the original directory. */
+void edr_forensic_path_pin(EdrForensicPath *path);
+int edr_forensic_path_identity(const EdrForensicPath *path, char sha[65]);
 FILE *edr_forensic_path_file(EdrForensicPath *path, const char *mode);
 int edr_forensic_path_size(EdrForensicPath *path, uint64_t *bytes);
 int edr_forensic_path_sync_file(const char *path);

@@ -43,6 +43,7 @@
 #include "edr/response_utils.h"
 #include "edr/forensic_path.h"
 #include "edr/forensic_worker.h"
+#include "edr/command_executor.h"
 #include "../command/command_upload_outbox.h"
 #include "edr/storage_physical_guard.h"
 
@@ -1158,8 +1159,8 @@ int edr_response_forensic_async_active(void) {
 }
 
 
-void edr_response_collect_forensic(const char *cmd_id, const uint8_t *pl, size_t len,
-                                    const EdrSoarCommandMeta *sm) {
+static void forensic_collect_owned(const char *cmd_id, const uint8_t *pl, size_t len,
+                                    const EdrSoarCommandMeta *sm,EdrForensicPath **publication_guard) {
   if (!edr_command_dangerous_enabled()) {
     edr_cmd_inc_rejected();
     edr_command_audit_both(cmd_id, "reject forensic: 设置 EDR_CMD_ENABLED=1 或 TOML [command] allow_dangerous=true");
@@ -1258,12 +1259,17 @@ void edr_response_collect_forensic(const char *cmd_id, const uint8_t *pl, size_t
   if(stage_begin<0) {
     edr_command_emit_always(cmd_id,sm,EdrCmdExecFailed,2,"forensic staging reservation unavailable");return;
   }
+  if(edr_forensic_path_acquire(stage.staging,1,publication_guard)) {
+    (void)edr_command_state_artifact_abandon(cmd_id);
+    edr_command_emit_always(cmd_id,sm,EdrCmdExecFailed,2,"forensic directory unavailable; local evidence retained");return;
+  }
+  edr_forensic_path_pin(*publication_guard);
   EdrForensicIoRequest *request=calloc(1,sizeof(*request));
   if(!request || len>=sizeof(request->payload)) {
     free(request);(void)edr_command_state_artifact_abandon(cmd_id);
     edr_command_emit_always(cmd_id,sm,EdrCmdExecFailed,2,"baseline forensic request exceeds bounded limit");return;
   }
-  request->version=1;request->operation=1;request->timeout_ms=300000u;
+  request->version=EDR_FORENSIC_IO_VERSION;request->operation=1;request->timeout_ms=300000u;
   if(sm && sm->issued_at_unix_ms>0 && sm->deadline_ms>0 && sm->issued_at_unix_ms<=INT64_MAX-sm->deadline_ms) {
     int64_t remaining=sm->issued_at_unix_ms+sm->deadline_ms-(int64_t)time(NULL)*1000LL;
     request->timeout_ms=remaining<=0 ? 0u : remaining<300000 ? (uint32_t)remaining : 300000u;
@@ -1304,15 +1310,71 @@ void edr_response_collect_forensic(const char *cmd_id, const uint8_t *pl, size_t
     edr_command_audit_both(cmd_id,cause);edr_command_emit_always(cmd_id,sm,EdrCmdExecFailed,2,cause);return;
   }
   snprintf(stage.sha256,sizeof(stage.sha256),"%s",receipt.sha256);
-  if(edr_command_state_artifact_ready(cmd_id,stage.sha256)) {
+  if(edr_command_state_artifact_ready_at(cmd_id,stage.sha256,receipt.directory_identity)) {
     (void)edr_command_state_artifact_abandon(cmd_id);
     edr_command_emit_always(cmd_id,sm,EdrCmdExecFailed,2,"forensic publication intent failed; local evidence retained");return;
   }
   stage.phase=2;
+  snprintf(stage.directory_identity,sizeof(stage.directory_identity),"%s",receipt.directory_identity);
   if(edr_command_upload_outbox_publish_stage(&stage)) {
     edr_command_audit_both(cmd_id,"forensic publication deferred; durable intent and evidence retained");return;
   }
   edr_command_audit_both(cmd_id,"forensic artifact published to existing durable outbox; delivery pending");
+}
+
+static int forensic_command_worker(const EdrForensicIoRequest *q,EdrForensicIoResult *r) {
+  if(!memchr(q->command_id,0,sizeof(q->command_id)) || !q->command_id[0] ||
+      q->allow_dangerous>1 || q->report_pending>1)return -1;
+  /* The complete already-admitted command stays inside one killable job:
+   * audit, owner reservation, content, sealing, outbox and terminal persistence.
+   * No transport or executor is initialized in this process. */
+  edr_command_bind_worker_context(q->allow_dangerous,q->report_pending);
+  edr_command_set_active_type("collect_forensic");
+  EdrForensicPath *guard=NULL;
+  if(q->preflight_failure) {
+    const char *cause=q->preflight_failure==EDR_DC_ERR_CANCELLED ? "baseline forensic copy cancelled; local evidence retained" :
+      q->preflight_failure==EDR_DC_ERR_TIMEOUT ? "baseline forensic I/O deadline exceeded; local evidence retained" :
+      "baseline forensic request exceeds bounded limit";
+    edr_command_emit_always(q->command_id,&q->meta,EdrCmdExecFailed,2,cause);
+  } else forensic_collect_owned(q->command_id,q->payload,q->payload_len,&q->meta,&guard);
+  edr_forensic_path_release(guard);
+  r->command_failed=(uint32_t)g_cmd_exec_fail;r->command_rejected=(uint32_t)g_cmd_rejected;return 0;
+}
+
+void edr_response_forensic_register_worker(void) {
+  edr_forensic_io_set_command_worker(forensic_command_worker);
+}
+
+void edr_response_collect_forensic(const char *cmd_id,const uint8_t *pl,size_t len,
+                                  const EdrSoarCommandMeta *sm) {
+  if(!cmd_id || !*cmd_id || strlen(cmd_id)>=128u)return;
+  EdrForensicIoRequest *q=calloc(1,sizeof(*q));if(!q){edr_cmd_inc_exec_fail();return;}
+  q->version=EDR_FORENSIC_IO_VERSION;q->operation=4;q->timeout_ms=300000u;
+  snprintf(q->command_id,sizeof(q->command_id),"%s",cmd_id);
+  if(sm)q->meta=*sm;
+  q->allow_dangerous=edr_command_dangerous_enabled()!=0;
+  q->report_pending=edr_ingest_http_configured()!=0;
+  if(sm && sm->issued_at_unix_ms>0 && sm->deadline_ms>0 && sm->issued_at_unix_ms<=INT64_MAX-sm->deadline_ms) {
+    int64_t remaining=sm->issued_at_unix_ms+sm->deadline_ms-(int64_t)time(NULL)*1000LL;
+    q->timeout_ms=remaining<=0 ? 0u : remaining<300000 ? (uint32_t)remaining : 300000u;
+  }
+  if(!q->timeout_ms)q->preflight_failure=EDR_DC_ERR_TIMEOUT;
+  if(edr_command_cancel_requested(cmd_id))q->preflight_failure=EDR_DC_ERR_CANCELLED;
+  if(len>=sizeof(q->payload) || (len && !pl))q->preflight_failure=-1;
+  else {if(len)memcpy(q->payload,pl,len);q->payload_len=(uint32_t)len;}
+  /* A rejected/expired operation may only persist its terminal result, in a
+   * bounded one-second completion interval; it never starts a content writer. */
+  if(q->preflight_failure)q->timeout_ms=1000u;
+  int registered=edr_command_cancel_begin(cmd_id);
+  if(!registered && !edr_command_cancel_active(cmd_id)){free(q);edr_cmd_inc_exec_fail();return;}
+  EdrForensicIoResult receipt={0};
+  int rc=edr_forensic_io_run(q,&receipt,q->preflight_failure ? NULL : forensic_cancel_check,(void *)cmd_id);
+  free(q);if(registered)edr_command_cancel_end(cmd_id);
+  /* Never do synchronous filesystem/audit I/O after the deadline. Existing
+   * durable inbox/owner recovery reports interruption when storage is usable;
+   * an unconfirmed writer retains its complete reservation. */
+  if(rc)edr_cmd_inc_exec_fail();
+  else {g_cmd_exec_fail+=receipt.command_failed;g_cmd_rejected+=receipt.command_rejected;}
 }
 
 void edr_response_pmfe_scan(const char *cmd_id, const uint8_t *pl, size_t len, const EdrSoarCommandMeta *sm) {
