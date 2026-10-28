@@ -236,7 +236,9 @@ jobs:
               throw "cannot resolve immutable release '$Tag': $($releaseOutput -join ' ')"
             }
             $release = ($releaseOutput -join "`n") | ConvertFrom-Json -NoEnumerate -ErrorAction Stop
-            if ($release -isnot [pscustomobject] -or $release.tag_name -cne $Tag) {
+            # [pscustomobject] aliases PSObject and also matches wrapped arrays.
+            if ($null -eq $release -or $release.GetType() -ne [System.Management.Automation.PSCustomObject] -or
+                $release.tag_name -isnot [string] -or $release.tag_name -cne $Tag) {
               throw "invalid immutable release identity for '$Tag'"
             }
             $script:immutableReleases[$Tag] = $release

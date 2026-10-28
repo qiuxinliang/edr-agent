@@ -34,6 +34,12 @@ try {
     @{name='invalid-json';exit=0;output='{';ok=$false;cause=''},
     @{name='null';exit=0;output='null';ok=$false;cause='invalid immutable release identity'},
     @{name='array';exit=0;output='[{"tag_name":"win_3.2.723"}]';ok=$false;cause='invalid immutable release identity'},
+    @{name='empty-array';exit=0;output='[]';ok=$false;cause='invalid immutable release identity'},
+    @{name='multi-array';exit=0;output='[{"tag_name":"win_3.2.723"},{"tag_name":"win_3.2.723"}]';ok=$false;cause='invalid immutable release identity'},
+    @{name='string';exit=0;output='"win_3.2.723"';ok=$false;cause='invalid immutable release identity'},
+    @{name='number';exit=0;output='723';ok=$false;cause='invalid immutable release identity'},
+    @{name='boolean';exit=0;output='true';ok=$false;cause='invalid immutable release identity'},
+    @{name='array-tag';exit=0;output='{"tag_name":["win_3.2.723"]}';ok=$false;cause='invalid immutable release identity'},
     @{name='wrong-tag';exit=0;output='{"tag_name":"win_3.2.724"}';ok=$false;cause='invalid immutable release identity'}
   )
   foreach ($script:releaseCase in $releaseCases) {
