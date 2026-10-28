@@ -1422,6 +1422,116 @@ static void test_post_context_exact_replay_charges_only_durable_changes(void) {
   (void)remove("local_evidence_cache_post_context_replay.sqlite-shm");
 }
 
+static void test_context_fanout_owner_set_is_atomic(void) {
+  const char *db = "local_evidence_cache_owner_set.sqlite";
+  for (unsigned fault = 0; fault < 5u; ++fault) {
+    EdrBehaviorRecord candidate, context;
+    EdrEvidenceCacheStatus before, after;
+    char ids[2][160];
+    struct timespec ts; assert(timespec_get(&ts, TIME_UTC) == TIME_UTC);
+    int64_t now = (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+    (void)remove(db); (void)remove("local_evidence_cache_owner_set.sqlite-wal");
+    (void)remove("local_evidence_cache_owner_set.sqlite-shm");
+    assert(edr_local_evidence_cache_open(db, 16u, 24u) == 0);
+    init_record(&candidate, EDR_EVENT_NET_CONNECT);
+    candidate.pid = 74501u; candidate.ppid = 74500u;
+    candidate.process_start_key = 74501u;
+    candidate.process_creation_filetime_100ns = UINT64_C(133700000000074501);
+    candidate.parent_process_start_key = 74500u;
+    candidate.parent_process_creation_filetime_100ns = UINT64_C(133700000000074500);
+    candidate.parent_pid_state = EDR_PARENT_PID_KNOWN;
+    strcpy(candidate.parent_resolution_source, "live_parent_generation");
+    strcpy(candidate.parent_name, "owner-parent.exe");
+    strcpy(candidate.endpoint_id, "ep-owner-set"); strcpy(candidate.tenant_id, "owner-tenant");
+    strcpy(candidate.process_name, "owner-child.exe");
+    candidate.net_dport = 445u;
+    for (unsigned i = 0; i < 2u; ++i) {
+      candidate.event_time_ns = now + (int64_t)i;
+      snprintf(candidate.event_id, sizeof(candidate.event_id), "owner-candidate-%u", i);
+      snprintf(candidate.net_dst, sizeof(candidate.net_dst), "192.0.2.%u", i + 1u);
+      edr_behavior_bind_parent_context(&candidate);
+      edr_local_evidence_cache_record_behavior(&candidate);
+      sqlite_candidate_id_for_source_event(db, candidate.event_id, ids[i], sizeof(ids[i]));
+    }
+    edr_local_evidence_cache_get_status(&before);
+    /* Both the child and parent roles match each candidate. The public
+     * producer must de-duplicate those IDs before validating the owner set. */
+    assert(before.context_windows_used == 4u);
+    sqlite3 *raw = NULL; assert(sqlite3_open(db, &raw) == SQLITE_OK);
+    /* Corrupt only this disposable fixture after the RAM windows were
+     * published, to exercise the transaction's independent owner check. The
+     * normal floor/identity guards otherwise reject these mutations first. */
+    if (fault > 0u && fault < 4u)
+      assert(sqlite3_exec(raw, "DROP TRIGGER alert_context_floor_v1_update;", NULL, NULL, NULL) == SQLITE_OK);
+    if (fault == 4u)
+      assert(sqlite3_exec(raw, "DROP TRIGGER context_window_floor_v1_eligible;"
+          "DROP TRIGGER alert_context_floor_v1_eligible;", NULL, NULL, NULL) == SQLITE_OK);
+    char *sql = NULL;
+    if (fault == 1u) sql = sqlite3_mprintf("UPDATE p0_candidates SET endpoint_id='other-endpoint' WHERE candidate_id=%Q", ids[1]);
+    else if (fault == 2u) sql = sqlite3_mprintf("UPDATE p0_candidates SET tenant_id='other-tenant' WHERE candidate_id=%Q", ids[1]);
+    else if (fault == 3u) sql = sqlite3_mprintf("UPDATE p0_candidates SET candidate_id='missing-owner-fixture' WHERE candidate_id=%Q", ids[1]);
+    else if (fault == 4u) sql = sqlite3_mprintf("INSERT INTO context_retirement_progress(candidate_id,phase,reason) VALUES(%Q,2,1);"
+        "UPDATE p0_candidates SET local_retention_state='retirement_eligible' WHERE candidate_id=%Q", ids[1], ids[1]);
+    if (sql) { assert(sqlite3_exec(raw, sql, NULL, NULL, NULL) == SQLITE_OK); sqlite3_free(sql); }
+    uint64_t facts = sqlite_table_count(db, "context_facts");
+    uint64_t refs = sqlite_table_count(db, "context_reference_projection");
+    context = candidate; context.type = EDR_EVENT_PROCESS_CREATE;
+    context.event_time_ns = now + 1000; context.net_dst[0] = '\0'; context.net_dport = 0;
+    strcpy(context.event_id, "owner-context"); strcpy(context.cmdline, "owner-child.exe --ordinary");
+    edr_behavior_bind_parent_context(&context);
+    assert(!edr_local_evidence_cache_is_candidate(&context));
+    edr_local_evidence_cache_record_behavior(&context);
+    edr_local_evidence_cache_get_status(&after);
+    assert(sqlite_table_count(db, "context_facts") == facts + (fault ? 0u : 1u));
+    assert(sqlite_table_count(db, "context_reference_projection") == refs + (fault ? 0u : 2u));
+    for (unsigned i = 0; i < 2u; ++i)
+      assert(sqlite_post_artifact_count(db, ids[i], "owner-context") == (fault ? 0u : 1u));
+    if (fault) {
+      assert(after.context_failure_reasons[EDR_EVIDENCE_FAILURE_INVALID] ==
+          before.context_failure_reasons[EDR_EVIDENCE_FAILURE_INVALID] + 1u);
+      assert(after.context_refs_written == before.context_refs_written);
+    }
+    assert(sqlite3_close(raw) == SQLITE_OK); edr_local_evidence_cache_close();
+    (void)remove(db); (void)remove("local_evidence_cache_owner_set.sqlite-wal");
+    (void)remove("local_evidence_cache_owner_set.sqlite-shm");
+  }
+  puts("context_owner_set roles_deduplicated=1 missing_owner=1 endpoint_scope=1 tenant_scope=1 retired_owner=1 atomic=1");
+}
+
+static void test_context_fanout_owner_set_maximum(void) {
+  const char *db = "local_evidence_cache_owner_maximum.sqlite";
+  EdrBehaviorRecord r; struct timespec ts;
+  (void)remove(db); (void)remove("local_evidence_cache_owner_maximum.sqlite-wal");
+  (void)remove("local_evidence_cache_owner_maximum.sqlite-shm");
+  assert(timespec_get(&ts, TIME_UTC) == TIME_UTC);
+  int64_t now = (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+  assert(edr_local_evidence_cache_open(db, 64u, 24u) == 0);
+  init_record(&r, EDR_EVENT_NET_CONNECT); r.pid=74601u; r.ppid=0;
+  r.parent_pid_state=EDR_PARENT_PID_EXPLICIT_ZERO;
+  r.process_start_key=74601u; r.process_creation_filetime_100ns=UINT64_C(133700000000074601);
+  strcpy(r.endpoint_id,"ep-owner-maximum"); strcpy(r.tenant_id,"owner-tenant");
+  strcpy(r.process_name,"owner-maximum.exe"); strcpy(r.net_dst,"192.0.2.1"); r.net_dport=445u;
+  for(unsigned i=0;i<256u;++i) {
+    r.event_time_ns=now+(int64_t)i;
+    snprintf(r.event_id,sizeof(r.event_id),"maximum-owner-%u",i);
+    edr_local_evidence_cache_record_behavior(&r);
+  }
+  EdrEvidenceCacheStatus before,after; edr_local_evidence_cache_get_status(&before);
+  assert(before.candidate_admitted==256u && before.context_windows_used==256u);
+  uint64_t refs=sqlite_table_count(db,"context_reference_projection"),facts=sqlite_table_count(db,"context_facts");
+  r.type=EDR_EVENT_PROCESS_CREATE; r.net_dst[0]='\0'; r.net_dport=0; r.event_time_ns=now+1000;
+  strcpy(r.event_id,"maximum-owner-context"); strcpy(r.cmdline,"owner-maximum.exe --ordinary");
+  assert(!edr_local_evidence_cache_is_candidate(&r)); edr_local_evidence_cache_record_behavior(&r);
+  edr_local_evidence_cache_get_status(&after);
+  assert(after.context_refs_written==before.context_refs_written+256u);
+  assert(sqlite_table_count(db,"context_reference_projection")==refs+256u);
+  assert(sqlite_table_count(db,"context_facts")==facts+1u);
+  edr_local_evidence_cache_close();
+  (void)remove(db); (void)remove("local_evidence_cache_owner_maximum.sqlite-wal");
+  (void)remove("local_evidence_cache_owner_maximum.sqlite-shm");
+  puts("context_owner_set maximum_owners=256 complete_fanout=1");
+}
+
 static void test_critical_context_high_fanout_is_atomically_bounded(void) {
   const char *db = "local_evidence_cache_shared_context_fanout.sqlite";
   struct timespec ts;
@@ -7539,6 +7649,11 @@ static void test_authorized_query_scope_and_absence(void) {
   assert(sqlite3_open(path,&db)==SQLITE_OK);
   retention_group_fixture(db,"query-right",1,now-1,now-1,now-1);
   retention_group_fixture(db,"query-other",1,now-1,now-1,now-1);
+  /* This query now consumes retained context too. The generic retirement
+   * fixture's opaque placeholder is not a valid production context bundle. */
+  compact_exec(db,"UPDATE artifacts SET manifest_json=json_object('schema','p0_context_bundle.v1',"
+      "'candidate_id',candidate_id,'endpoint_id',endpoint_id,'context',json('[]')) "
+      "WHERE candidate_id IN ('query-right','query-other');");
   compact_exec(db,"UPDATE p0_candidates SET tenant_id='other-tenant',process_name='must-not-export' WHERE candidate_id='query-other';"
       "UPDATE p0_candidates SET cmdline='private-unnecessary-command',process_name='visible' WHERE candidate_id='query-right';");
   assert(edr_local_evidence_cache_query_authorized_json("query-task",&meta,out,sizeof(out))==0);
@@ -15232,7 +15347,20 @@ static void test_window_entry_order_and_recovery(int enforce) {
 }
 #endif
 
+#include "retained_context_recall_cases.h"
+
 int main(int argc, char **argv) {
+#if defined(EDR_HAVE_SQLITE)
+  if(argc==2 && (!strcmp(argv[1],"--retained-context-recall") || !strcmp(argv[1],"--retained-context-probe"))) {
+    int enforce=!strcmp(argv[1],"--retained-context-recall");
+    test_retained_context_recall(enforce);
+    if(enforce) {
+      test_retained_context_unknown_actor(); test_retained_context_adjacent_ns();
+      test_retained_context_scientific_time();
+    }
+    return 0;
+  }
+#endif
 #if defined(EDR_HAVE_SQLITE)
   if (argc == 2 && !strcmp(argv[1], "--window-activation-benchmark")) { test_window_activation_benchmark(); return 0; }
 #if defined(_WIN32)
@@ -15264,6 +15392,8 @@ int main(int argc, char **argv) {
   }
   if (argc == 2 && !strcmp(argv[1], "--context-writer-reuse")) {
     test_context_writer_transaction_reuse();
+    test_context_fanout_owner_set_is_atomic();
+    test_context_fanout_owner_set_maximum();
     test_post_context_exact_replay_charges_only_durable_changes();
     test_critical_context_high_fanout_is_atomically_bounded();
     test_candidate_commit_failure_leaves_no_dedupe_or_context_state();
@@ -15504,6 +15634,10 @@ int main(int argc, char **argv) {
   RUN_CACHE_CASE("context", test_metrics_commit_failure_close_and_retention_boundary());
   RUN_CACHE_CASE("retention", test_selected_window_and_command_fact_dependencies());
   RUN_CACHE_CASE("retention", test_authorized_query_scope_and_absence());
+  RUN_CACHE_CASE("retention", test_retained_context_recall(1));
+  RUN_CACHE_CASE("retention", test_retained_context_unknown_actor());
+  RUN_CACHE_CASE("retention", test_retained_context_adjacent_ns());
+  RUN_CACHE_CASE("retention", test_retained_context_scientific_time());
   RUN_CACHE_CASE("retention", test_physical_floor_rejects_evidence_copy());
   RUN_CACHE_CASE("retention", test_maintenance_query_copy_slices());
   RUN_CACHE_CASE("retention", test_physical_floor_holds_maintenance_and_startup());
@@ -15574,6 +15708,8 @@ int main(int argc, char **argv) {
   RUN_CACHE_CASE("context", test_invalid_legacy_post_context_rolls_back_normalization());
   RUN_CACHE_CASE("retention", test_context_write_budget_cannot_starve_later_candidate());
   RUN_CACHE_CASE("retention", test_post_context_exact_replay_charges_only_durable_changes());
+  RUN_CACHE_CASE("retention", test_context_fanout_owner_set_is_atomic());
+  RUN_CACHE_CASE("retention", test_context_fanout_owner_set_maximum());
   RUN_CACHE_CASE("retention", test_critical_context_high_fanout_is_atomically_bounded());
   RUN_CACHE_CASE("migration", test_incremental_cache_migration_recovers_from_blockers());
   RUN_CACHE_CASE("context", test_startup_cache_context_filter_preserves_risk_and_boundaries());

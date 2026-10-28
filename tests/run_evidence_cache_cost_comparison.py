@@ -105,9 +105,10 @@ def main():
         identities={(s['input_sha256'],s['input_count'],s['sqlite_version']) for rows in variants.values() for s in rows}
         if len(identities)!=1:raise RuntimeError('Input/runtime differs between variants')
         medians={variant:{k:statistics.median(float(s[k]) for s in rows) for k in rows[0]
-                         if k not in ('profile','input_sha256','sqlite_version')} for variant,rows in variants.items()}
-        correctness=('candidates','refs','rejected','recall_rows','dangling_refs')
-        equal=all(medians['baseline'][k]==medians['current'][k] for k in correctness)
+                         if k not in ('profile','input_sha256','sqlite_version','post_inventory_sha256')} for variant,rows in variants.items()}
+        correctness=('candidates','post_refs','rejected','recall_rows','dangling_refs')
+        post_identities={s['post_inventory_sha256'] for rows in variants.values() for s in rows}
+        equal=len(post_identities)==1 and all(medians['baseline'][k]==medians['current'][k] for k in correctness)
         cost=('cpu_seconds','wall_seconds','entry_p95_us','entry_p99_us','recall_p95_us','recall_p99_us',
               'producer_cpu_seconds','producer_wall_seconds','lock_wait_p95_ns','lock_wait_p99_ns',
               'lock_hold_p95_ns','lock_hold_p99_ns','sqlite_read_bytes','sqlite_write_bytes',
@@ -118,6 +119,7 @@ def main():
                     'ratio':medians['current'][k]/medians['baseline'][k] if medians['baseline'][k] else None}
                  for k in cost}
         summary[profile]={'input_sha256':next(iter(identities))[0],'medians':medians,
+            'post_inventory_sha256':sorted(post_identities),
             'same_observable_inventory':equal,'costs':changes,
             'sqlite_io_by_phase':{phase:{counter:changes[phase+'_'+counter] for counter in IO_COUNTERS}
                                   for phase in IO_PHASES},

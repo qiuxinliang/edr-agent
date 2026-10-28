@@ -19,6 +19,13 @@ find_package(Python3 REQUIRED COMPONENTS Interpreter)
 add_test(NAME evidence_storage_inventory
   COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/test_evidence_storage_inventory.py)
 set_tests_properties(evidence_storage_inventory PROPERTIES TIMEOUT 30)
+if(APPLE OR WIN32)
+  # The frozen-copy tool requires macOS descriptor paths or Windows pinned
+  # handles. Other SQLite VFS implementations fail closed until validated.
+  add_test(NAME evidence_legacy_archive
+    COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/test_evidence_legacy_archive.py)
+  set_tests_properties(evidence_legacy_archive PROPERTIES TIMEOUT 30)
+endif()
 add_test(NAME evidence_ownership_contract
   COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/test_evidence_ownership_contract.py)
 set_tests_properties(evidence_ownership_contract PROPERTIES TIMEOUT 30)

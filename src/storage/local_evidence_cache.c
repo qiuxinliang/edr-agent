@@ -4932,14 +4932,23 @@ static int sqlite_record_context_artifacts(const EdrBehaviorRecord *r,
    * An old retained candidate is still a valid owner; this does not promote
    * its retention policy. Reject the complete fanout if any owner is missing. */
   sqlite3_stmt *owner = NULL;
-  if (sqlite3_prepare_v2(s_db,
-      "SELECT 1 FROM p0_candidates WHERE candidate_id=?1 "
-      "AND local_retention_state='retained' AND endpoint_id=?2 AND tenant_id=?3;",
-      -1, &owner, NULL) != SQLITE_OK) {
-    set_error("prepare context retained-owner validation failed");
+  char owner_sql[256u + EDR_EVIDENCE_CONTEXT_WINDOWS * 7u];
+  size_t owner_sql_used = 0u;
+  /* Each changed edge must name a distinct retained owner. Validate the
+   * bounded set in one indexed query, inside this write transaction, instead
+   * of stepping the same owner lookup once per edge. COUNT also rejects a
+   * duplicate ID in the prepared set; it can never hide a missing owner. */
+  if (prepared->ref_count > EDR_EVIDENCE_CONTEXT_WINDOWS) {
+    s_persistence_failure = EDR_EVIDENCE_FAILURE_INVALID;
+    set_error("context retained-owner set exceeds window bound; fanout rejected");
     sqlite_rollback_silent();
     return -1;
   }
+  int owner_sql_bytes = snprintf(owner_sql, sizeof(owner_sql),
+      "SELECT COUNT(*) FROM p0_candidates WHERE local_retention_state='retained' "
+      "AND endpoint_id=?1 AND tenant_id=?2 AND candidate_id IN (");
+  if (owner_sql_bytes < 0 || (size_t)owner_sql_bytes >= sizeof(owner_sql)) goto owner_prepare_failed;
+  owner_sql_used = (size_t)owner_sql_bytes;
   for (uint32_t i = 0u; i < prepared->ref_count; ++i) {
     const PreparedContextRef *ref = &prepared->refs[i];
     if (ref->candidate_index >= EDR_EVIDENCE_CONTEXT_WINDOWS ||
@@ -4950,25 +4959,38 @@ static int sqlite_record_context_artifacts(const EdrBehaviorRecord *r,
       sqlite_rollback_silent();
       return -1;
     }
-    int rc = sqlite3_bind_text(owner, 1, candidate_ids[ref->candidate_index], -1, SQLITE_TRANSIENT);
-    if (rc == SQLITE_OK) rc = sqlite3_bind_text(owner, 2, r->endpoint_id, -1, SQLITE_TRANSIENT);
-    if (rc == SQLITE_OK) rc = sqlite3_bind_text(owner, 3, r->tenant_id, -1, SQLITE_TRANSIENT);
-    if (rc == SQLITE_OK) rc = sqlite3_step(owner);
+    owner_sql_bytes = snprintf(owner_sql + owner_sql_used, sizeof(owner_sql) - owner_sql_used,
+        "%s?%u", i ? "," : "", i + 3u);
+    if (owner_sql_bytes < 0 || (size_t)owner_sql_bytes >= sizeof(owner_sql) - owner_sql_used)
+      goto owner_prepare_failed;
+    owner_sql_used += (size_t)owner_sql_bytes;
+  }
+  if (owner_sql_used + 3u > sizeof(owner_sql)) goto owner_prepare_failed;
+  memcpy(owner_sql + owner_sql_used, ");", 3u);
+  if (prepared->ref_count &&
+      (sqlite3_prepare_v2(s_db, owner_sql, -1, &owner, NULL) != SQLITE_OK ||
+       sqlite3_bind_text(owner, 1, r->endpoint_id, -1, SQLITE_TRANSIENT) != SQLITE_OK ||
+       sqlite3_bind_text(owner, 2, r->tenant_id, -1, SQLITE_TRANSIENT) != SQLITE_OK))
+    goto owner_prepare_failed;
+  for (uint32_t i = 0u; i < prepared->ref_count; ++i)
+    if (sqlite3_bind_text(owner, (int)i + 3, candidate_ids[prepared->refs[i].candidate_index],
+        -1, SQLITE_TRANSIENT) != SQLITE_OK) goto owner_prepare_failed;
+  if (prepared->ref_count) {
+    int rc = sqlite3_step(owner);
     if (rc != SQLITE_ROW) {
-      if (rc == SQLITE_DONE) {
-        s_persistence_failure = EDR_EVIDENCE_FAILURE_INVALID;
-        set_error("context candidate retired or scope changed; fanout rejected");
-      } else set_error("read context retained-owner validation failed");
+      set_error("read context retained-owner validation failed");
       sqlite3_finalize(owner);
       sqlite_rollback_silent();
       return -1;
     }
-    if (sqlite3_reset(owner) != SQLITE_OK || sqlite3_clear_bindings(owner) != SQLITE_OK) {
-      set_error("reset context retained-owner validation failed");
+    if (sqlite3_column_int64(owner, 0) != (sqlite3_int64)prepared->ref_count) {
+      s_persistence_failure = EDR_EVIDENCE_FAILURE_INVALID;
+      set_error("context candidate missing, retired, duplicated or scope changed; fanout rejected");
       sqlite3_finalize(owner);
       sqlite_rollback_silent();
       return -1;
     }
+    if (sqlite3_step(owner) != SQLITE_DONE) goto owner_prepare_failed;
   }
   sqlite3_finalize(owner);
   written_ns = (sqlite3_int64)now_unix_ns();
@@ -5019,6 +5041,11 @@ static int sqlite_record_context_artifacts(const EdrBehaviorRecord *r,
     return -1;
   }
   return 0;
+owner_prepare_failed:
+  set_error("prepare context retained-owner validation failed");
+  sqlite3_finalize(owner);
+  sqlite_rollback_silent();
+  return -1;
 }
 
 static int sqlite_record_budgeted_context_artifacts(const EdrBehaviorRecord *r,
@@ -10260,6 +10287,259 @@ done:
   cJSON_free(encoded); cJSON_Delete(row); free(event); free(decoded); return result;
 }
 
+/* The existing signed cached query is the only consumer. Reading retained
+ * context adds no producer work, new upload purpose, index, or background scan.
+ * A request shares its result/deadline limits across candidates and context. */
+static const char *authorized_context_text(const cJSON *object, const char *name) {
+  const cJSON *value = cJSON_GetObjectItemCaseSensitive(object, name);
+  return !value ? "" : cJSON_IsString(value) ? value->valuestring : NULL;
+}
+
+/* Two-path json_extract returns JSON text and preserves the original number
+ * token. Older bundle rewrites used scientific notation; a single-path REAL
+ * extraction would round nearby nanoseconds before authorization filtering.
+ * Accept only a positive, exactly integral int64, including decimal exponents. */
+static int authorized_context_timestamp(sqlite3_stmt *st, int column, int64_t *out) {
+  const char *raw = (const char *)sqlite3_column_text(st, column);
+  if (!raw || raw[0] != '[') return 0;
+  const char *end = strchr(raw + 1, ',');
+  if (!end || end == raw + 1 || end - raw > 64) return 0;
+  const char *p = raw + 1;
+  char digits[64]; unsigned count = 0, fraction = 0;
+  int point = 0, exponent = 0, sign = 1;
+  while (p < end && *p != 'e' && *p != 'E') {
+    if (*p == '.' && !point && count) { point = 1; ++p; continue; }
+    if (*p < '0' || *p > '9') return 0;
+    digits[count++] = *p++; if (point) ++fraction;
+  }
+  if (!count || (point && !fraction)) return 0;
+  if (p < end) {
+    ++p;
+    if (p < end && (*p == '+' || *p == '-')) { if (*p == '-') sign = -1; ++p; }
+    if (p == end) return 0;
+    while (p < end) {
+      if (*p < '0' || *p > '9' || exponent > 1000) return 0;
+      exponent = exponent * 10 + (*p++ - '0');
+    }
+  }
+  int scale = exponent * sign - (int)fraction;
+  unsigned first = 0;
+  while (first < count && digits[first] == '0') ++first;
+  if (first == count) return 0;
+  while (scale < 0 && count > first && digits[count - 1] == '0') { --count; ++scale; }
+  if (scale < 0 || scale > 19 || count - first + (unsigned)scale > 19u) return 0;
+  uint64_t value = 0;
+  for (unsigned i = first; i < count + (unsigned)scale; ++i) {
+    unsigned digit = i < count ? (unsigned)(digits[i] - '0') : 0u;
+    if (value > ((uint64_t)INT64_MAX - digit) / 10u) return 0;
+    value = value * 10u + digit;
+  }
+  *out = (int64_t)value; return 1;
+}
+
+static int authorized_context_row(EvidenceQueueQuery *q, const cJSON *event,
+    const char *endpoint, int pre, int64_t ts) {
+  const RtqFilter *f = q->filter;
+  int64_t type, pid, ppid, port = 0;
+  uint64_t start = 0, birth = 0;
+  if (ts <= 0 || !authorized_query_number(event, "type", 1, UINT32_MAX, &type) ||
+      !authorized_query_number(event, "pid", 0, UINT32_MAX, &pid) ||
+      !authorized_query_number(event, "ppid", 0, UINT32_MAX, &ppid)) goto invalid;
+  const cJSON *port_value = cJSON_GetObjectItemCaseSensitive(event, "remote_port");
+  if (port_value && !authorized_query_number(event, "remote_port", 0, 65535, &port)) goto invalid;
+  const char *start_text = authorized_context_text(event, "process_start_key");
+  const char *birth_text = authorized_context_text(event, "process_creation_filetime_100ns");
+  if (!start_text || !birth_text) goto invalid;
+  /* A child can be related through a verified parent while its own generation
+   * remains unknown. Preserve that explicit zero tuple without inventing an
+   * actor identity; signed generation filters still cannot match it. */
+  if (strcmp(start_text, "0") || strcmp(birth_text, "0")) {
+    if (!sqlite_decimal_u64(start_text, &start) ||
+        !sqlite_decimal_u64(birth_text, &birth)) goto invalid;
+  }
+  const char *path = authorized_context_text(event, pre ? "file_path" : "path");
+  char port_text[16]; snprintf(port_text, sizeof(port_text), "%u", (unsigned)port);
+  const char *fields[16] = {endpoint, authorized_context_text(event, "process_name"),
+      !pre && !evidence_is_file_event((EdrEventType)type) ? path : "", "",
+      pre || evidence_is_file_event((EdrEventType)type) ? path : "",
+      authorized_context_text(event, "dns_query"), authorized_context_text(event, "remote_ip"),
+      authorized_context_text(event, "registry_key"), authorized_context_text(event, "registry_value"),
+      authorized_context_text(event, "registry_op"), start_text, birth_text,
+      authorized_context_text(event, "process_generation_source"),
+      authorized_context_text(event, "source_completeness"),
+      authorized_context_text(event, "source_truncated_fields"), port_text};
+  for (unsigned i = 0; i < 16; ++i)
+    if (!fields[i] || strlen(fields[i]) > 8192u || !manifest_utf8_valid(fields[i])) goto invalid;
+  if (pre) {
+    const char *captured_endpoint = authorized_context_text(event, "endpoint_id");
+    if (!captured_endpoint || strcmp(captured_endpoint, endpoint)) goto invalid;
+  }
+  if (!rtq_match_common(f, (uint32_t)type, (uint32_t)pid, ts, endpoint, fields[1],
+        fields[3], fields[2], fields[4], fields[6], (uint32_t)port, fields[7], start, birth)) return 1;
+  cJSON *row = authorized_query_row(f, pre ? "context_pre" : "context_post", ts,
+      (uint32_t)type, (uint32_t)pid, (uint32_t)ppid, fields);
+  if (row) {
+    cJSON_DeleteItemFromObjectCaseSensitive(row, "event_time_ns");
+    if (!manifest_add_i64(row, "event_time_ns", ts)) { cJSON_Delete(row); row=NULL; }
+  }
+  char *encoded = row ? cJSON_PrintUnformatted(row) : NULL;
+  if (!encoded) { cJSON_Delete(row); q->error = "evidence query context allocation failed"; return -1; }
+  size_t bytes = strlen(encoded)+1u; cJSON_free(encoded); *q->matched = 1;
+  if (*q->returned >= f->limit || *q->encoded_bytes > q->envelope || bytes > q->envelope-*q->encoded_bytes) {
+    cJSON_Delete(row); *q->partial = 1; return 0;
+  }
+  if (!cJSON_AddItemToArray(q->rows, row)) {
+    cJSON_Delete(row); q->error = "evidence query context allocation failed"; return -1;
+  }
+  *q->encoded_bytes += bytes; ++*q->returned;
+  if (*q->returned == f->limit) { *q->partial = 1; return 0; }
+  return 1;
+invalid:
+  q->error = "evidence query retained context identity or fields invalid"; return -1;
+}
+
+static int authorized_retained_context(EvidenceQueueQuery *q,
+    const EdrCommandResultAuthorization *authorization, unsigned *scanned) {
+  sqlite3_stmt *st = NULL;
+  unsigned char (*seen)[32] = NULL;
+  unsigned examined = 0, scan_limit = q->filter->limit*20u+100u;
+  int rc = -1, step = SQLITE_DONE;
+  const char *post_sql =
+      "SELECT f.fact_id,f.manifest_template_json,"
+      "(SELECT r.artifact_id FROM context_reference_projection r JOIN p0_candidates p "
+      "ON p.candidate_id=r.candidate_id WHERE r.fact_id=f.fact_id AND p.endpoint_id=?1 "
+      "AND p.tenant_id=?2 AND p.local_retention_state='retained' AND r.upload_status='local_manifest' "
+      "AND instr(r.artifact_id,':post_context:')>0 LIMIT 1), "
+      "CASE WHEN json_valid(f.manifest_template_json) THEN json_extract(f.manifest_template_json,'$.event_time_ns','$.event_time_ns') END "
+      "FROM context_facts f WHERE f.endpoint_id=?1 AND f.tenant_id=?2 "
+      "ORDER BY f.updated_ns DESC LIMIT ?3;";
+  if (sqlite3_prepare_v2(s_db, post_sql, -1, &st, NULL) != SQLITE_OK ||
+      sqlite3_bind_text(st, 1, authorization->endpoint_id, -1, SQLITE_TRANSIENT) != SQLITE_OK ||
+      sqlite3_bind_text(st, 2, authorization->tenant_id, -1, SQLITE_TRANSIENT) != SQLITE_OK ||
+      sqlite3_bind_int(st, 3, (int)scan_limit) != SQLITE_OK) goto storage;
+  while ((step = sqlite3_step(st)) == SQLITE_ROW) {
+    ++examined; ++*scanned;
+    if (authorized_query_interrupted(q->deadline)) goto deadline;
+    const char *artifact = (const char *)sqlite3_column_text(st, 2);
+    if (!artifact) continue; /* Orphan/retired/pre/parent facts are not post events. */
+    int artifact_bytes = sqlite3_column_bytes(st, 2);
+    if (artifact_bytes <= 0 || memchr(artifact, 0, (size_t)artifact_bytes)) goto integrity;
+    const char *identity = legacy_context_source_identity(artifact);
+    const char *id = (const char *)sqlite3_column_text(st, 0);
+    const char *raw = (const char *)sqlite3_column_text(st, 1);
+    int bytes = sqlite3_column_bytes(st, 1); char expected[65];
+    cJSON *event = NULL;
+    if (!identity || !id || sqlite3_column_bytes(st, 0) != 64 || !raw || bytes <= 0 ||
+        bytes > (int)EDR_EVIDENCE_MANIFEST_MAX_BYTES || memchr(raw, 0, (size_t)bytes) ||
+        context_fact_id_for_identity(authorization->endpoint_id, authorization->tenant_id,
+          identity, raw, expected) || strcmp(id, expected) ||
+        !(event = edr_egress_parse_purpose_object(raw, (size_t)bytes))) goto integrity;
+    const char *schema = authorized_context_text(event, "schema");
+    if (!schema || strcmp(schema, "p0_post_context_event.v1")) { cJSON_Delete(event); goto integrity; }
+    int64_t ts;
+    if (!authorized_context_timestamp(st, 3, &ts)) { cJSON_Delete(event); goto integrity; }
+    rc = authorized_context_row(q, event, authorization->endpoint_id, 0, ts); cJSON_Delete(event);
+    if (rc <= 0) goto done;
+  }
+  if (step != SQLITE_DONE) goto storage;
+  sqlite3_finalize(st); st = NULL;
+  if (examined == scan_limit) { *q->partial = 1; return 0; }
+  const char *pre_sql =
+      "SELECT a.candidate_id,a.manifest_json FROM p0_candidates p "
+      "JOIN artifacts a ON a.candidate_id=p.candidate_id AND a.artifact_type='p0_context_bundle' "
+      "WHERE p.endpoint_id=?1 AND p.tenant_id=?2 AND p.local_retention_state='retained' "
+      "AND a.endpoint_id=?1 AND a.tenant_id=?2 AND a.upload_status='local_manifest' "
+      "AND p.event_time_ns>=?3 AND p.event_time_ns<=?4 ORDER BY p.event_time_ns DESC LIMIT ?5;";
+  if (sqlite3_prepare_v2(s_db, pre_sql, -1, &st, NULL) != SQLITE_OK ||
+      sqlite3_bind_text(st, 1, authorization->endpoint_id, -1, SQLITE_TRANSIENT) != SQLITE_OK ||
+      sqlite3_bind_text(st, 2, authorization->tenant_id, -1, SQLITE_TRANSIENT) != SQLITE_OK ||
+      sqlite3_bind_int64(st, 3, q->filter->from_ns) != SQLITE_OK ||
+      sqlite3_bind_int64(st, 4, q->filter->until_ns > INT64_MAX-INT64_C(120000000000) ?
+        INT64_MAX : q->filter->until_ns+INT64_C(120000000000)) != SQLITE_OK ||
+      sqlite3_bind_int(st, 5, (int)(scan_limit-examined)) != SQLITE_OK) goto storage;
+  /* At most the signed output row limit of returned pre-event identities.
+   * Whole retained objects are deduplicated; independent post occurrences are
+   * never collapsed merely because their projected fields look alike. */
+  seen = calloc(q->filter->limit, 32u); unsigned seen_count = 0;
+  if (!seen) { q->error = "evidence query context allocation failed"; goto done; }
+  while ((step = sqlite3_step(st)) == SQLITE_ROW) {
+    if (examined++ >= scan_limit) { *q->partial = 1; rc = 0; break; }
+    ++*scanned;
+    if (authorized_query_interrupted(q->deadline)) { q->error = "evidence query deadline reached"; rc = -1; break; }
+    const char *candidate = (const char *)sqlite3_column_text(st, 0);
+    const char *raw = (const char *)sqlite3_column_text(st, 1);
+    int bytes = sqlite3_column_bytes(st, 1);
+    cJSON *bundle = NULL;
+    if (!candidate || !raw || bytes <= 0 || bytes > (int)EDR_EVIDENCE_MANIFEST_MAX_BYTES ||
+        memchr(raw, 0, (size_t)bytes) ||
+        !(bundle = edr_egress_parse_purpose_object(raw, (size_t)bytes))) {
+      q->error = "evidence query pre-context integrity failed"; rc = -1; break;
+    }
+    const char *schema = authorized_context_text(bundle, "schema");
+    const char *owner = authorized_context_text(bundle, "candidate_id");
+    const char *endpoint = authorized_context_text(bundle, "endpoint_id");
+    const cJSON *events = cJSON_GetObjectItemCaseSensitive(bundle, "context");
+    if (!schema || strcmp(schema, "p0_context_bundle.v1") || !owner || strcmp(owner, candidate) ||
+        !endpoint || strcmp(endpoint, authorization->endpoint_id) || !cJSON_IsArray(events) || cJSON_GetArraySize(events)>32) {
+      cJSON_Delete(bundle); q->error = "evidence query pre-context identity invalid"; rc = -1; break;
+    }
+    rc = 1;
+    sqlite3_stmt *items = NULL;
+    if (sqlite3_prepare_v2(s_db,
+        "SELECT value,json_extract(value,'$.event_time_ns','$.event_time_ns') FROM json_each(?1,'$.context');",
+        -1, &items, NULL) != SQLITE_OK ||
+        sqlite3_bind_text(items,1,raw,-1,SQLITE_TRANSIENT) != SQLITE_OK) {
+      sqlite3_finalize(items); cJSON_Delete(bundle); goto storage;
+    }
+    int item_step = SQLITE_DONE;
+    while ((item_step=sqlite3_step(items))==SQLITE_ROW) {
+      if (examined++ >= scan_limit) { *q->partial = 1; rc = 0; break; }
+      ++*scanned;
+      if (authorized_query_interrupted(q->deadline)) { q->error = "evidence query deadline reached"; rc = -1; break; }
+      /* SQLite's integer JSON token keeps nanoseconds exact. Parsing/printing
+       * a cJSON double first would collapse distinct nearby occurrences. */
+      const char *item_raw=(const char *)sqlite3_column_text(items,0);
+      int item_bytes=sqlite3_column_bytes(items,0); unsigned char digest[32]; int64_t ts;
+      cJSON *item = NULL;
+      if (!item_raw || item_bytes<=0 || item_bytes>(int)EDR_EVIDENCE_MANIFEST_MAX_BYTES ||
+          memchr(item_raw,0,(size_t)item_bytes) || !authorized_context_timestamp(items,1,&ts) ||
+          !(item=edr_egress_parse_purpose_object(item_raw,(size_t)item_bytes))) {
+        q->error="evidence query pre-context event invalid"; rc=-1; break;
+      }
+      EdrSha256Ctx hash; edr_sha256_init(&hash); edr_sha256_update(&hash,(const uint8_t *)item_raw,(size_t)item_bytes); edr_sha256_final(&hash,digest);
+      int duplicate = 0;
+      for (unsigned i=0; i<seen_count; ++i) if (!memcmp(digest,seen[i],32u)) { duplicate=1; break; }
+      if (duplicate) { cJSON_Delete(item); continue; }
+      unsigned before = *q->returned;
+      rc = authorized_context_row(q, item, authorization->endpoint_id, 1, ts);
+      cJSON_Delete(item);
+      if (*q->returned > before && seen_count<q->filter->limit) memcpy(seen[seen_count++],digest,32u);
+      if (rc<=0) break;
+    }
+    sqlite3_finalize(items);
+    if (item_step!=SQLITE_DONE && item_step!=SQLITE_ROW) {
+      cJSON_Delete(bundle); goto storage;
+    }
+    cJSON_Delete(bundle);
+    if (rc<=0) break;
+  }
+  if (step != SQLITE_DONE && step != SQLITE_ROW) goto storage;
+  if (examined>=scan_limit) *q->partial=1;
+  if (rc>0 || (step==SQLITE_DONE && !q->error)) rc=0;
+  goto done;
+integrity:
+  q->error = "evidence query post-context hash or identity invalid"; goto done;
+deadline:
+  q->error = "evidence query deadline reached"; goto done;
+storage:
+  q->error = authorized_query_interrupted(q->deadline) ? "evidence query deadline reached" :
+      "evidence query retained context storage failure";
+done:
+  free(seen);
+  sqlite3_finalize(st);
+  return q->error ? -1 : rc;
+}
+
 #endif
 
 int edr_local_evidence_cache_query_authorized_json(const char *command_id,
@@ -10440,6 +10720,13 @@ int edr_local_evidence_cache_query_authorized_json(const char *command_id,
   if (step != SQLITE_DONE && step != SQLITE_ROW) { copy_s(out, cap, "evidence query snapshot failed or deadline reached"); goto finish; }
   if (returned == filter.limit || scanned >= filter.limit*20u+100u) partial = 1;
   sqlite3_finalize(st); st = NULL;
+  if (!filter.file_sha256[0] && returned < filter.limit && !partial) {
+    EvidenceQueueQuery context = {&filter, &deadline, rows, envelope, &encoded_bytes,
+        &returned, &matched, &partial, NULL};
+    if (authorized_retained_context(&context, a, &scanned) < 0) {
+      copy_s(out, cap, context.error ? context.error : "evidence query retained context failed"); goto finish;
+    }
+  }
   if (authorized_query_interrupted(&deadline)) { copy_s(out, cap, "evidence query deadline reached"); goto finish; }
   if (exec_sql("COMMIT;") != 0) { copy_s(out, cap, "evidence query snapshot close failed"); goto finish; }
   transaction = 0;

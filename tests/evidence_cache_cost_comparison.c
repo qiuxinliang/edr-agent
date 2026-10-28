@@ -28,6 +28,48 @@ static CostIoSnapshot cost_io_difference(CostIoSnapshot end, CostIoSnapshot begi
   return value;
 }
 
+static void cost_hash_column(EdrSha256Ctx *hash, sqlite3_stmt *st, int column) {
+  int n=sqlite3_column_bytes(st,column);
+  const unsigned char *value=sqlite3_column_text(st,column);
+  assert(n>=0 && value);
+  unsigned char length[8]; uint64_t bytes=(uint64_t)n;
+  for(unsigned i=0;i<8u;++i)length[i]=(unsigned char)(bytes>>(56u-8u*i));
+  edr_sha256_update(hash,length,sizeof(length));
+  edr_sha256_update(hash,value,(size_t)n);
+}
+
+/* Normalize historical and compact layouts before comparing owner/fact
+ * attribution. Counting only the legacy table silently measured zero compact
+ * edges. Compare post-context owner/fact attribution independently of layout,
+ * and report the full physical reference count separately. */
+static int64_t cost_context_inventory(sqlite3 *db, int64_t *references,
+                                      int64_t *dangling, char digest[65]) {
+  const char *relation=compact_scalar(db,"SELECT COUNT(*) FROM sqlite_master WHERE type='view' AND name='context_reference_projection'")
+      ? "context_reference_projection" : "candidate_context_refs";
+  char sql[768];
+  snprintf(sql,sizeof(sql),"SELECT COUNT(*) FROM %s",relation);
+  *references=compact_scalar(db,sql);
+  int64_t physical_refs=compact_scalar(db,"SELECT COUNT(*) FROM candidate_context_refs");
+  if(compact_scalar(db,"SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='compact_context_refs'"))
+    physical_refs+=compact_scalar(db,"SELECT COUNT(*) FROM compact_context_refs");
+  assert(*references==physical_refs);
+  snprintf(sql,sizeof(sql),"SELECT COUNT(*) FROM %s r LEFT JOIN p0_candidates p ON p.candidate_id=r.candidate_id "
+      "LEFT JOIN context_facts f ON f.fact_id=r.fact_id WHERE p.candidate_id IS NULL OR f.fact_id IS NULL",relation);
+  *dangling=compact_scalar(db,sql);
+  snprintf(sql,sizeof(sql),"SELECT r.candidate_id,f.manifest_template_json FROM %s r "
+      "JOIN context_facts f ON f.fact_id=r.fact_id WHERE json_extract(f.manifest_template_json,'$.schema')='p0_post_context_event.v1' "
+      "ORDER BY r.candidate_id,f.fact_id",relation);
+  sqlite3_stmt *st=NULL; assert(sqlite3_prepare_v2(db,sql,-1,&st,NULL)==SQLITE_OK);
+  EdrSha256Ctx hash; edr_sha256_init(&hash); int64_t rows=0; int rc;
+  while((rc=sqlite3_step(st))==SQLITE_ROW) {
+    cost_hash_column(&hash,st,0); cost_hash_column(&hash,st,1); ++rows;
+  }
+  assert(rc==SQLITE_DONE); sqlite3_finalize(st);
+  uint8_t value[32]; edr_sha256_final(&hash,value);
+  for(unsigned i=0;i<32u;++i)snprintf(digest+2u*i,3,"%02x",value[i]);
+  return rows;
+}
+
 int main(int argc, char **argv) {
   assert(argc==2);
   const char *profile=argv[1];
@@ -118,8 +160,8 @@ int main(int argc, char **argv) {
   assert(sqlite3_step(check)==SQLITE_ROW && !strcmp((const char *)sqlite3_column_text(check,0),"ok"));
   sqlite3_finalize(check);
   int64_t candidates=compact_scalar(db,"SELECT COUNT(*) FROM p0_candidates");
-  int64_t references=compact_scalar(db,"SELECT COUNT(*) FROM candidate_context_refs");
-  int64_t dangling=compact_scalar(db,"SELECT COUNT(*) FROM candidate_context_refs r LEFT JOIN p0_candidates p ON p.candidate_id=r.candidate_id LEFT JOIN context_facts f ON f.fact_id=r.fact_id WHERE p.candidate_id IS NULL OR f.fact_id IS NULL");
+  int64_t references=0,dangling=0; char post_inventory_sha[65];
+  int64_t post_refs=cost_context_inventory(db,&references,&dangling,post_inventory_sha);
   assert(dangling==0);sqlite3_close(db);
   uint8_t hash[32];char input_sha[65];edr_sha256_final(&benchmark_input_hash,hash);
   for(unsigned i=0;i<32;++i)snprintf(input_sha+2*i,3,"%02x",hash[i]);
@@ -140,7 +182,7 @@ int main(int argc, char **argv) {
       "producer_sqlite_read_bytes=%llu producer_sqlite_write_bytes=%llu producer_sqlite_syncs=%llu "
       "recall_sqlite_read_bytes=%llu recall_sqlite_write_bytes=%llu recall_sqlite_syncs=%llu "
       "close_sqlite_read_bytes=%llu close_sqlite_write_bytes=%llu close_sqlite_syncs=%llu "
-      "candidates=%lld refs=%lld rejected=%llu recall_rows=%u response_bytes=%zu dangling_refs=%lld sqlite_version=%s\n",
+      "candidates=%lld refs=%lld post_refs=%lld post_inventory_sha256=%s rejected=%llu recall_rows=%u response_bytes=%zu dangling_refs=%lld sqlite_version=%s\n",
       profile,inputs,input_sha,finished.user_seconds+finished.system_seconds-started.user_seconds-started.system_seconds,
       finished.wall_seconds-started.wall_seconds,
       producer_end.user_seconds+producer_end.system_seconds-producer_start.user_seconds-producer_start.system_seconds,
@@ -155,7 +197,7 @@ int main(int argc, char **argv) {
       (unsigned long long)producer_io.reads,(unsigned long long)producer_io.writes,(unsigned long long)producer_io.syncs,
       (unsigned long long)recall_io.reads,(unsigned long long)recall_io.writes,(unsigned long long)recall_io.syncs,
       (unsigned long long)close_io.reads,(unsigned long long)close_io.writes,(unsigned long long)close_io.syncs,
-      (long long)candidates,(long long)references,
+      (long long)candidates,(long long)references,(long long)post_refs,post_inventory_sha,
       (unsigned long long)status.candidate_rejected,rows,response_bytes,(long long)dangling,sqlite3_libversion());
   cleanup_test_sqlite_path(path);cleanup_test_sqlite_path(queue_path);free(r);free(entry);
 #ifdef BENCH_HAS_STORAGE_RESERVATION
