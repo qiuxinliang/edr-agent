@@ -21,7 +21,7 @@ try {
   $tokens=$null; $errors=$null
   $ast = [Management.Automation.Language.Parser]::ParseFile((Join-Path $RepoRoot 'scripts/windows_setup_exe_lifecycle_smoke.ps1'),[ref]$tokens,[ref]$errors)
   Check ($errors.Count -eq 0) 'native parser'
-  foreach ($name in @('Wait-LifecycleEmbeddedUpdater','Assert-LifecycleUpgradeResult','Get-LifecycleTrustedPublisher','Invoke-BaselineUpdaterUpgrade')) {
+  foreach ($name in @('Initialize-LifecycleOfflineConfig','Wait-LifecycleEmbeddedUpdater','Assert-LifecycleUpgradeResult','Get-LifecycleTrustedPublisher','Invoke-BaselineUpdaterUpgrade')) {
     $functions=@($ast.FindAll({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq $name},$true))
     Check ($functions.Count -eq 1) ('unique owner '+$name)
     . ([scriptblock]::Create($functions[0].Extent.Text))
@@ -34,6 +34,44 @@ try {
   }
   $script:events=@()
   function Add-Evidence([string]$Stage,[string]$Status,[string]$Detail) { $script:events+=@{stage=$Stage;status=$Status;detail=$Detail} }
+  $templatePath=Join-Path $root 'baseline-template.toml'
+  $templateText=[IO.File]::ReadAllText((Join-Path $RepoRoot 'config/agent_windows_production.example.toml'))
+  # Published baseline templates use CRLF even when the host checkout uses LF.
+  $templateText=$templateText.Replace("`r`n","`n").Replace("`n","`r`n")
+  Put $templatePath $templateText
+  $templateHash=Hash $templatePath
+  $configHash=Initialize-LifecycleOfflineConfig $templatePath
+  $configPath=Join-Path $InstallDir 'agent.toml'
+  $configured=[IO.File]::ReadAllText($configPath)
+  Check ((Hash $templatePath) -ceq $templateHash) 'baseline template remains immutable'
+  Check ((Hash $configPath) -ceq $configHash) 'prepared configuration digest'
+  foreach($pattern in @('(?m)^endpoint_id = "ci-setup-lifecycle-[a-f0-9]{32}"\r?$',
+      '(?m)^tenant_id = "ci-lifecycle"\r?$', '(?m)^rest_base_url = "https://127\.0\.0\.1:9/api/v1"\r?$',
+      '(?m)^proxy_mode = "off"\r?$', '(?m)^proxy_url = ""\r?$', '(?m)^relay_url = ""\r?$')) {
+    Check ([regex]::Matches($configured,$pattern).Count -eq 1) ('active config field '+$pattern)
+  }
+  Check ($configured.Contains($InstallDir.Replace('\','\\')+'\\certs\\ca.pem')) 'TLS paths stay in isolated install root'
+  $normalizeConfig={param($text)
+    $text=[regex]::Replace($text,'(?m)^(endpoint_id|tenant_id|rest_base_url|proxy_mode|proxy_url|relay_url)\s*=\s*"[^"\r\n]*"','$1 = "<fixture>"')
+    return $text.Replace($InstallDir.Replace('\','\\'),'C:\\Program Files\\FDSecurity')
+  }
+  Check ((& $normalizeConfig $configured) -ceq (& $normalizeConfig $templateText)) 'all other configuration and TLS fields preserved'
+  Must-Fail {Initialize-LifecycleOfflineConfig $templatePath} '*configuration already exists*'
+  Check ((Hash $configPath) -ceq $configHash) 'repeated preparation never overwrites configuration'
+  Remove-Item -LiteralPath $configPath
+  foreach($badTemplate in @(
+      $templateText.Replace('[platform]','# [platform]'),
+      ([regex]::Replace($templateText,'(?m)^rest_base_url','# rest_base_url')),
+      ($templateText+"`nrest_base_url = `"https://127.0.0.1:9/api/v1`"`n"))) {
+    Put $templatePath $badTemplate
+    Must-Fail {Initialize-LifecycleOfflineConfig $templatePath} '*requires one active*'
+    Check (-not(Test-Path -LiteralPath $configPath)) 'invalid template writes no configuration'
+  }
+  Put $templatePath ''
+  Must-Fail {Initialize-LifecycleOfflineConfig $templatePath} '*bounded nonempty file*'
+  Check (-not(Test-Path -LiteralPath $configPath)) 'empty template writes no configuration'
+  Put $templatePath $templateText
+  $configHash=Initialize-LifecycleOfflineConfig $templatePath
   $target=Join-Path $root 'FDSensor.next.exe'
   # An unsigned PE library is data for hash, copy and native NotSigned checks;
   # it is never executed as an Agent. Library output works in the workflow's
@@ -83,6 +121,7 @@ exit 0
     Check ([uint64]$actual.floor -eq 268435456 -and [uint64]$actual.health_ms -eq 30000) 'floor/observation preserved'
     Check ([string]$actual.package -ceq $inputBinding.runtime_package) ('package forwarding '+$class)
     Check ((Hash $oldPath) -ceq $inputBinding.baseline_updater_sha256) 'old script unchanged'
+    Check ((Hash $configPath) -ceq $configHash) 'configuration preserved through original updater invocation'
   }
   function Get-AuthenticodeSignature {
     [CmdletBinding()]param([string]$LiteralPath)
@@ -126,7 +165,7 @@ exit 0
   Put $oldPath "exit 7"; $inputBinding.baseline_updater_sha256=Hash $oldPath
   Must-Fail {Invoke-BaselineUpdaterUpgrade $inputBinding} '*failed with exit code 7*'
   Check (@($script:events|Where-Object{$_.status -eq 'verified'}).Count -eq 3) 'failures never counted as passed'
-  Write-Output 'old updater lifecycle orchestration: 3 class executions, signed publisher binding and 17 negative controls passed'
+  Write-Output 'old updater lifecycle orchestration: offline configuration preservation and 5 rejection cases; 3 class executions, signed publisher binding and 17 negative controls passed'
 } finally {
   $env:ProgramData=$savedProgramData
   Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction Stop

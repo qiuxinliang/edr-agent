@@ -458,6 +458,7 @@ jobs:
             Architecture = '${{ matrix.arch }}'
             EvidenceDir = 'setup-exe-evidence'
             UpgradeInput = 'release-metadata\lifecycle-upgrade\transition.json'
+            BaselineConfigTemplate = 'packages\baseline\agent_windows_production.example.toml'
             ExerciseInstallerTimeout = $env:LIFECYCLE_INSTALLER_TIMEOUT -ceq 'true'
           }
           if ($env:BASELINE_SETUP_ROLLBACK_SUPPORTED -ne 'true') {

@@ -12,6 +12,7 @@ param(
   [string] $ServiceName = "FDSecurityAgent",
   [string] $EvidenceDir = "setup-exe-evidence",
   [Parameter(Mandatory = $true)] [string] $UpgradeInput,
+  [Parameter(Mandatory = $true)] [string] $BaselineConfigTemplate,
   [switch] $ExerciseInstallerTimeout,
   [switch] $SkipSetupRollback
 )
@@ -291,6 +292,44 @@ function Invoke-UninstallerAndAssertCleanup([string] $Stage) {
   Add-Evidence $Stage "verified" "service_removed=true process_stopped=true product_residue=none"
 }
 
+function Initialize-LifecycleOfflineConfig([string] $TemplatePath) {
+  # The baseline only materializes its embedded updater while building its
+  # capability manifest or handling an update command. A configured loopback
+  # HTTPS endpoint enables that normal local capability path without a backend.
+  # Prepare this before Setup starts the Agent; transport is not hot-reloaded.
+  $configPath = Join-Path $InstallDir 'agent.toml'
+  if (Test-Path -LiteralPath $configPath) { throw 'offline lifecycle configuration already exists' }
+  $template = Get-Item -LiteralPath $TemplatePath -ErrorAction Stop
+  if ($template.PSIsContainer -or $template.Length -le 0 -or $template.Length -gt 131072) {
+    throw 'offline lifecycle configuration template must be a bounded nonempty file'
+  }
+  $config = [IO.File]::ReadAllText($template.FullName)
+  $templateHash = (Get-FileHash -LiteralPath $template.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+  foreach ($section in @('agent', 'platform')) {
+    if ([regex]::Matches($config, ('(?m)^\[' + $section + '\]\s*(?:#.*)?$')).Count -ne 1) {
+      throw "offline lifecycle configuration requires one active $section section"
+    }
+  }
+  $endpoint = 'ci-setup-lifecycle-' + [Guid]::NewGuid().ToString('N')
+  foreach ($pair in @(@('endpoint_id', $endpoint), @('tenant_id', 'ci-lifecycle'),
+      @('rest_base_url', 'https://127.0.0.1:9/api/v1'), @('proxy_mode', 'off'),
+      @('proxy_url', ''), @('relay_url', ''))) {
+    $pattern = '(?m)^' + [regex]::Escape($pair[0]) + '\s*=\s*"[^"\r\n]*"'
+    if ([regex]::Matches($config, $pattern).Count -ne 1) {
+      throw "offline lifecycle configuration requires one active $($pair[0]) field"
+    }
+    $config = [regex]::Replace($config, $pattern, ($pair[0] + ' = "' + $pair[1] + '"'))
+  }
+  $config = $config.Replace('C:\\Program Files\\FDSecurity', $InstallDir.Replace('\', '\\'))
+  New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
+  $bytes = [Text.UTF8Encoding]::new($false).GetBytes($config)
+  $stream = [IO.File]::Open($configPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+  try { $stream.Write($bytes, 0, $bytes.Length) } finally { $stream.Dispose() }
+  $configHash = (Get-FileHash -LiteralPath $configPath -Algorithm SHA256).Hash.ToLowerInvariant()
+  Add-Evidence 'old-updater-offline-config' 'prepared' ("template_sha256={0} config_sha256={1} rest_base_url=https://127.0.0.1:9/api/v1 proxy_mode=off" -f $templateHash, $configHash)
+  return $configHash
+}
+
 function Wait-LifecycleEmbeddedUpdater([string] $Version, [string] $ExpectedSha256) {
   $path = Join-Path $InstallDir ("edr_agent_inplace_update-{0}.ps1" -f $Version)
   $clock = [Diagnostics.Stopwatch]::StartNew()
@@ -451,8 +490,12 @@ try {
   # Start with the immutable old Setup and the updater materialized by that
   # actual old Agent. Keep the separate direct-Setup path below unchanged.
   $upgradeBinding = Get-Content -LiteralPath $UpgradeInput -Raw | ConvertFrom-Json
+  $offlineConfigHash = Initialize-LifecycleOfflineConfig $BaselineConfigTemplate
   Invoke-Installer $BaselineSetupExe 'install-old-updater-baseline' $false
   Assert-InstalledRuntime $BaselineVersion 'install-old-updater-baseline' (-not $SkipSetupRollback)
+  if ((Get-FileHash -LiteralPath (Join-Path $InstallDir 'agent.toml') -Algorithm SHA256).Hash.ToLowerInvariant() -cne $offlineConfigHash) {
+    throw 'baseline Setup changed the prepared offline lifecycle configuration'
+  }
   Invoke-BaselineUpdaterUpgrade $upgradeBinding
   Assert-InstalledRuntime $TargetVersion 'old-updater-upgrade' $true $true
   if ($ExerciseInstallerTimeout) {

@@ -231,6 +231,21 @@ class WindowsLifecycleWorkflowTests(unittest.TestCase):
         self.assertIn('run: ./tests/test_windows_lifecycle_first_hop.ps1',regression)
         self.assertLess(self.text.index('- name: Verify old updater lifecycle orchestration'),self.text.index('- name: '+DOWNLOAD_STEP))
 
+    def test_old_agent_receives_offline_configuration_before_setup_starts_it(self):
+        setup = step(self.text, SETUP_STEP)
+        self.assertIn("BaselineConfigTemplate = 'packages\\baseline\\agent_windows_production.example.toml'", setup)
+        owner = (ROOT / 'scripts/windows_setup_exe_lifecycle_smoke.ps1').read_text(encoding='utf-8')
+        preparation = owner.index('  $offlineConfigHash = Initialize-LifecycleOfflineConfig $BaselineConfigTemplate')
+        baseline = owner.index("  Invoke-Installer $BaselineSetupExe 'install-old-updater-baseline'")
+        preservation = owner.index("    throw 'baseline Setup changed the prepared offline lifecycle configuration'")
+        invocation = owner.index('  Invoke-BaselineUpdaterUpgrade $upgradeBinding')
+        self.assertLess(owner.index('  Invoke-UninstallerAndAssertCleanup "uninstall-target-fresh"'), preparation)
+        self.assertLess(preparation, baseline)
+        self.assertLess(baseline, preservation)
+        self.assertLess(preservation, invocation)
+        self.assertIn('$clock.Elapsed.TotalSeconds -lt 60', owner)
+        self.assertIn('Wait-LifecycleEmbeddedUpdater $BaselineVersion $InputBinding.baseline_updater_sha256', owner)
+
     def test_real_installer_fault_is_opt_in_and_uses_installed_candidate_after_first_hop(self):
         call, dispatch = self.text.split('  workflow_dispatch:\n', 1)
         for inputs in (call, dispatch):

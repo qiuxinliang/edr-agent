@@ -84,11 +84,19 @@ gate covers the existing service installation on a clean runner; it does not cer
 task mode, populated endpoint storage, authenticated platform command delivery
 or backend health observation.
 
-Direct calls to `windows_setup_exe_lifecycle_smoke.ps1` now require `-UpgradeInput`:
+Direct calls to `windows_setup_exe_lifecycle_smoke.ps1` require `-UpgradeInput`:
 first run the checkpoint owner's `prepare-lifecycle-upgrade` command against
 the downloaded target/baseline releases, and pass its `transition.json`. The
 release workflow supplies this required input automatically. Missing input is
 an error; the new first-hop check is never silently counted as passed.
+Also pass `-BaselineConfigTemplate` from the verified baseline runtime package's
+`agent_windows_production.example.toml`. Before the old Setup starts its Agent,
+the harness prepares a unique CI identity and loopback HTTPS endpoint with proxy
+disabled. This enables the old Agent's normal capability path to materialize its
+own updater; a successful backend connection is not required. TLS verification
+and original script hashes remain enforced. Existing configuration is never
+overwritten, and Setup must preserve the prepared bytes. This is an offline
+local lifecycle check, not enrollment or platform connectivity validation.
 
 Validation-only additionally requests the CI-only installer timeout case. After
 the old updater installs the candidate, the candidate's original embedded updater
