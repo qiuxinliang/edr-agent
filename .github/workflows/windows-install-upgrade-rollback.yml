@@ -27,6 +27,11 @@ on:
         required: false
         default: 1
         type: number
+      installer_timeout_recovery:
+        description: Exercise candidate's original installer timeout and rollback on the disposable native runner
+        required: false
+        default: false
+        type: boolean
   workflow_dispatch:
     inputs:
       target_tag:
@@ -62,6 +67,11 @@ on:
         type: number
       cache_recovery_subset:
         description: 'Manual disposable exact 692-to-695 or closed 697/698/699/701/702/703 cache subset, or installed 704 repair rollback; default keeps the existing lifecycle gate'
+        required: false
+        default: false
+        type: boolean
+      installer_timeout_recovery:
+        description: Exercise candidate's original installer timeout and rollback on the disposable native runner
         required: false
         default: false
         type: boolean
@@ -159,6 +169,23 @@ jobs:
       - name: Verify old updater lifecycle orchestration
         shell: pwsh
         run: ./tests/test_windows_lifecycle_first_hop.ps1
+
+      - name: Record native runner identity
+        shell: pwsh
+        env:
+          LIFECYCLE_MATRIX_ARCH: ${{ matrix.arch }}
+        run: |
+          $native = [Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString().ToLowerInvariant()
+          $expected = if ($env:LIFECYCLE_MATRIX_ARCH -eq 'amd64') { 'x64' } else { 'arm64' }
+          if ($native -cne $expected) { throw "Lifecycle must execute on the requested native OS: $native != $expected" }
+          $windowsPowerShell = & "$env:WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -NonInteractive -Command '$PSVersionTable.PSVersion.ToString()'
+          if ($LASTEXITCODE -ne 0 -or $windowsPowerShell -notmatch '^5\.1\.') { throw 'Installed updater requires native Windows PowerShell 5.1' }
+          New-Item -ItemType Directory -Path runner-evidence -ErrorAction Stop | Out-Null
+          $os = Get-CimInstance Win32_OperatingSystem
+          [ordered]@{ source_commit=$env:GITHUB_SHA; run_id=$env:GITHUB_RUN_ID; runner=$env:RUNNER_NAME;
+            os=$os.Caption; os_version=$os.Version; native_architecture=$native;
+            harness_powershell=$PSVersionTable.PSVersion.ToString(); updater_powershell=$windowsPowerShell } |
+            ConvertTo-Json | Set-Content -LiteralPath runner-evidence\identity.json -Encoding utf8
 
       - name: Resolve release tags
         shell: pwsh
@@ -406,6 +433,7 @@ jobs:
         shell: pwsh
         env:
           LIFECYCLE_PACKAGE_SCOPE: ${{ inputs.package_scope }}
+          LIFECYCLE_INSTALLER_TIMEOUT: ${{ inputs.installer_timeout_recovery }}
         run: |
           if ($env:LIFECYCLE_PACKAGE_SCOPE -ceq 'headless') {
             $targetSetupPath = $env:TARGET_SETUP_EXE
@@ -430,6 +458,7 @@ jobs:
             Architecture = '${{ matrix.arch }}'
             EvidenceDir = 'setup-exe-evidence'
             UpgradeInput = 'release-metadata\lifecycle-upgrade\transition.json'
+            ExerciseInstallerTimeout = $env:LIFECYCLE_INSTALLER_TIMEOUT -ceq 'true'
           }
           if ($env:BASELINE_SETUP_ROLLBACK_SUPPORTED -ne 'true') {
             $lifecycleParams.SkipSetupRollback = $true
@@ -595,6 +624,7 @@ jobs:
             setup-exe-evidence
             runtime-evidence
             release-metadata
+            runner-evidence
           if-no-files-found: warn
           retention-days: 7
 

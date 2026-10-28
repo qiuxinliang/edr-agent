@@ -22,6 +22,7 @@ import zipfile
 CHECKPOINT = "release-checkpoint.json"
 MARKER = re.compile(r"<!-- edr-release-source:(.*?) -->")
 SCOPE_MARKER = re.compile(r"<!-- edr-release-package-scope:(.*?) -->")
+VALIDATION_MARKER = re.compile(r"<!-- edr-release-validation-only:(.*?) -->", re.S)
 UNSIGNED = ("WARNING: This Windows build is unsigned. Windows may show an unknown-publisher "
             "warning. Use only where the platform explicitly permits optional-signature "
             "installation/update with verified SHA-256 artifact hashes. "
@@ -49,10 +50,31 @@ def package_scope(env=os.environ):
 
 def validate_scope(env=os.environ):
     scope = package_scope(env)
+    if validation_only(env) and env.get("EDR_RELEASE_CANDIDATE") != "true":
+        raise ValueError("Validation-only requires candidate=true and cannot publish a release")
     if scope == "headless" and (env.get("WINDOWS_RELEASE_MODE") != "unsigned" or
                                env.get("EDR_RELEASE_CANDIDATE") != "true"):
         raise ValueError("Headless scope requires unsigned mode and candidate=true")
     return scope
+
+
+def validation_only(env=os.environ):
+    value = env.get("EDR_RELEASE_VALIDATION_ONLY", "false")
+    if value not in ("true", "false"):
+        raise ValueError("Invalid validation-only mode; expected true or false")
+    return value == "true"
+
+
+def marker_validation_only(info):
+    body = info.get("body") or ""
+    values = VALIDATION_MARKER.findall(body)
+    if body.count("<!-- edr-release-validation-only:") != len(values):
+        raise ValueError("Release has a malformed validation-only binding")
+    if not values:
+        return False
+    if len(values) != 1 or values[0] not in ("true", "false"):
+        raise ValueError("Release has an invalid or ambiguous validation-only binding")
+    return values[0] == "true"
 
 
 def marker_scope(info):
@@ -75,6 +97,8 @@ def baseline_rejection(info, target_version, *, package_scope="full"):
         raise ValueError("Unsupported release package scope")
     if info.get("draft") is not False:
         return "release is a draft or has no published state"
+    if marker_validation_only(info):
+        return "validation-only drafts are not eligible published baselines"
     try:
         version = windows_release_version(info.get("tag_name"))
     except ValueError:
@@ -312,7 +336,7 @@ class GitHub:
         self.call("release", "upload", tag, str(path), "--repo", self.repository)
 
 
-def require_owner(info, expected, *, published=False, package_scope="full"):
+def require_owner(info, expected, *, published=False, package_scope="full", validation_only=False):
     if info is None:
         raise ValueError("Release draft is missing; rerun the original prepare job")
     matches = MARKER.findall(info.get("body") or "")
@@ -321,12 +345,16 @@ def require_owner(info, expected, *, published=False, package_scope="full"):
     actual = json.loads(matches[0])
     if marker_scope(info) != package_scope:
         raise ValueError("Release belongs to another package scope")
+    if marker_validation_only(info) != validation_only:
+        raise ValueError("Release belongs to another validation-only mode; use a new version")
+    if validation_only and info.get("draft") is not True:
+        raise ValueError("Validation-only release must remain a draft")
     keys = set(expected) - ({"run_id"} if published else set())
     if any(actual.get(key) != expected[key] for key in keys):
         raise ValueError("Release belongs to another commit, mode or run; rerun failed jobs of the original run or use a new version")
 
 
-def prepare(api, expected, *, package_scope="full"):
+def prepare(api, expected, *, package_scope="full", validation_only=False):
     asset_names(expected, "amd64", package_scope=package_scope)
     tag = expected["tag"]
     commit = api.tag_commit(tag)
@@ -338,6 +366,8 @@ def prepare(api, expected, *, package_scope="full"):
         body += "<!-- edr-release-source:" + json.dumps(expected, sort_keys=True) + " -->"
         if package_scope == "headless":
             body += "\n<!-- edr-release-package-scope:headless -->"
+        if validation_only:
+            body += "\n<!-- edr-release-validation-only:true -->"
         api.call("release", "create", tag, "--repo", api.repository, "--draft",
                  "--target", expected["commit"], "--title", f"edr-agent {tag}", "--notes", body)
         for attempt in range(3):
@@ -349,7 +379,8 @@ def prepare(api, expected, *, package_scope="full"):
         if info is None:
             raise RuntimeError("Draft creation succeeded but the release is not visible after 3 checks; "
                                "check repository permissions and rerun the original prepare job")
-    require_owner(info, expected, published=not info["draft"], package_scope=package_scope)
+    require_owner(info, expected, published=not info["draft"], package_scope=package_scope,
+                  validation_only=validation_only)
     verify_tag_target(api, info, expected)
     if package_scope == "headless":
         if not info["draft"] and info.get("prerelease") is not True:
@@ -368,11 +399,11 @@ def verify_tag_target(api, info, expected):
         raise ValueError("Release tag no longer matches the verified source")
 
 
-def verify_owner(api, expected, *, package_scope="full"):
+def verify_owner(api, expected, *, package_scope="full", validation_only=False):
     info = api.release(expected["tag"])
     if info is None:
         raise ValueError("Release draft is missing")
-    require_owner(info, expected, package_scope=package_scope)
+    require_owner(info, expected, package_scope=package_scope, validation_only=validation_only)
     if not info["draft"]:
         raise ValueError("Already published and immutable; mutation refused")
     verify_tag_target(api, info, expected)
@@ -489,11 +520,11 @@ def restore_usb_final(api, directory, expected):
     return True
 
 
-def upload(api, directory, expected, arch, *, package_scope="full"):
+def upload(api, directory, expected, arch, *, package_scope="full", validation_only=False):
     record = verify_checkpoint(directory, expected, arch, package_scope=package_scope)
     for attempt in range(3):
         try:
-            info = verify_owner(api, expected, package_scope=package_scope)
+            info = verify_owner(api, expected, package_scope=package_scope, validation_only=validation_only)
             missing = []
             # Reconcile the full set before writing; detect conflicts up front.
             for name in sorted(record["files"]):
@@ -508,7 +539,7 @@ def upload(api, directory, expected, arch, *, package_scope="full"):
             for name in missing:
                 api.upload(expected["tag"], Path(directory) / name)
             # Verify the complete remote set, including after ambiguous timeouts.
-            info = verify_owner(api, expected, package_scope=package_scope)
+            info = verify_owner(api, expected, package_scope=package_scope, validation_only=validation_only)
             for name in record["files"]:
                 matches = [a for a in info["assets"] if a["name"] == name]
                 if len(matches) != 1 or not remote_matches(api, expected["tag"], matches[0], Path(directory) / name):
@@ -553,8 +584,8 @@ def cleanup_published_checkpoints(api, expected, *, package_scope="full"):
     return len(selected)
 
 
-def verify_assets(api, expected, *, package_scope="full"):
-    info = verify_owner(api, expected, package_scope=package_scope)
+def verify_assets(api, expected, *, package_scope="full", validation_only=False):
+    info = verify_owner(api, expected, package_scope=package_scope, validation_only=validation_only)
     required = set.union(*(asset_names(expected, arch, package_scope=package_scope)
                            for arch in ("amd64", "arm64")))
     names = [asset["name"] for asset in info["assets"]]
@@ -655,12 +686,14 @@ def stage_headless(directory, destination, metadata, tag, arch, tag_commit, repo
     scope = marker_scope(info)
     if published_baseline:
         if (info["draft"] is not False or not target_tag or
-                windows_release_version(tag) >= windows_release_version(target_tag)):
+                windows_release_version(tag) >= windows_release_version(target_tag) or
+                marker_validation_only(info)):
             raise ValueError("Baseline must be published and strictly older than target")
         if expected_source_commit or expected_run_id:
             raise ValueError("A baseline cannot borrow the current target's source identity")
     elif (scope != "headless" or expected_source_commit != tag_commit or
           str(expected_run_id) != provenance["run_id"] or
+          (marker_validation_only(info) and not info["draft"]) or
           (not info["draft"] and info.get("prerelease") is not True)):
         raise ValueError("Target must match this Headless candidate source/run")
     prefix = f"edr-agent-{tag}-windows-{arch}-"
@@ -883,6 +916,8 @@ def prepare_lifecycle_upgrade(directory, baseline_directory, destination, tag, b
     result = dict(schema="edr.windows.lifecycle-upgrade.v1", baseline_version=baseline_version,
         target_version=version, architecture=arch, deployment_mode=update["deployment_mode"],
         service_name=update["service_name"], upgrade_class=upgrade_class,
+        target_runtime_zip_sha256=digest(archive_path), baseline_runtime_zip_sha256=digest(baseline_archive),
+        target_manifest_sha256=digest(directory / (prefix + "artifact-manifest.json")),
         min_free_bytes=min_free_bytes,
         signature_status=signature_status, publisher_thumbprint=publisher_thumbprint, publisher_subject=publisher_subject,
         binary_path=str(binary_path), binary_sha256=agent["sha256"],
@@ -958,17 +993,20 @@ def main():
         print(json.dumps(selected, sort_keys=True))
         return
     expected = source(env)
+    validation = validation_only(env)
     api = GitHub(expected["repository"])
     if args.command == "source":
         print(json.dumps(expected, sort_keys=True))
     elif args.command == "verify-owner":
-        verify_owner(api, expected, package_scope=scope)
+        verify_owner(api, expected, package_scope=scope, validation_only=validation)
     elif args.command == "verify-assets":
-        verify_assets(api, expected, package_scope=scope)
+        verify_assets(api, expected, package_scope=scope, validation_only=validation)
     elif args.command == "cleanup-published":
+        if validation:
+            raise ValueError("Validation-only cannot retire publication checkpoints")
         print(f"Removed {cleanup_published_checkpoints(api, expected, package_scope=scope)} published-run CI checkpoints")
     elif args.command == "prepare":
-        published = prepare(api, expected, package_scope=scope)
+        published = prepare(api, expected, package_scope=scope, validation_only=validation)
         with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as stream:
             stream.write(f"published={str(published).lower()}\n")
         print("Already published from this source; no duplicate build" if published else "Draft source identity verified")
@@ -981,7 +1019,7 @@ def main():
     elif args.command in ("seal", "seal-input"):
         seal(args.directory, expected, args.arch, candidate=args.command == "seal-input", package_scope=scope)
     else:
-        upload(api, args.directory, expected, args.arch, package_scope=scope)
+        upload(api, args.directory, expected, args.arch, package_scope=scope, validation_only=validation)
 
 
 if __name__ == "__main__":

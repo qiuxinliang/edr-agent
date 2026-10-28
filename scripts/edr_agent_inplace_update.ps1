@@ -246,6 +246,255 @@ function New-InstallerDiagnosticEvidence {
   return [pscustomobject]@{ Path=$snapshotPath; Size=[UInt64]$snapshot.Length; Sha256=(Get-Sha256 -Path $snapshotPath) }
 }
 
+function Initialize-InstallerJobType {
+  if ('FDSecurity.InstallerJob' -as [type]) { return }
+  # Keep the owner inside the embedded updater: installed sidecars can belong
+  # to either version during replacement. No handles are inherited by Setup.
+  Add-Type -ErrorAction Stop -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Diagnostics;
+using System.Runtime.InteropServices;
+using System.Text;
+using System.Threading;
+namespace FDSecurity {
+  public sealed class InstallerJob : IDisposable {
+    [StructLayout(LayoutKind.Sequential)] struct SECURITY_ATTRIBUTES {
+      public int Length; public IntPtr Descriptor; public int Inherit;
+    }
+    [StructLayout(LayoutKind.Sequential)] struct BASIC_LIMIT {
+      public long ProcessTime, JobTime; public uint Flags;
+      public UIntPtr MinimumWorkingSet, MaximumWorkingSet;
+      public uint ActiveLimit; public UIntPtr Affinity; public uint Priority, Scheduling;
+    }
+    [StructLayout(LayoutKind.Sequential)] struct IO_COUNTERS {
+      public ulong ReadOps, WriteOps, OtherOps, ReadBytes, WriteBytes, OtherBytes;
+    }
+    [StructLayout(LayoutKind.Sequential)] struct EXTENDED_LIMIT {
+      public BASIC_LIMIT Basic; public IO_COUNTERS Io;
+      public UIntPtr ProcessMemory, JobMemory, PeakProcessMemory, PeakJobMemory;
+    }
+    [StructLayout(LayoutKind.Sequential)] struct ACCOUNTING {
+      public long User, Kernel, PeriodUser, PeriodKernel;
+      public uint Faults, Total, Active, Terminated;
+    }
+    [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Unicode)] struct STARTUPINFO {
+      public int Size; public string Reserved, Desktop, Title;
+      public uint X, Y, XSize, YSize, XCount, YCount, Fill, Flags;
+      public ushort Show, ReservedSize; public IntPtr ReservedBytes, Input, Output, Error;
+    }
+    [StructLayout(LayoutKind.Sequential)] struct STARTUPINFOEX {
+      public STARTUPINFO Startup; public IntPtr Attributes;
+    }
+    [StructLayout(LayoutKind.Sequential)] struct PROCESS_INFORMATION {
+      public IntPtr Process, Thread; public uint ProcessId, ThreadId;
+    }
+    [DllImport("advapi32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+    static extern bool ConvertStringSecurityDescriptorToSecurityDescriptor(string value, uint revision, out IntPtr descriptor, out uint size);
+    [DllImport("kernel32.dll")] static extern IntPtr LocalFree(IntPtr value);
+    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+    static extern IntPtr CreateJobObject(ref SECURITY_ATTRIBUTES security, string name);
+    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+    static extern IntPtr OpenJobObject(uint access, bool inherit, string name);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    static extern bool SetInformationJobObject(IntPtr job, int kind, ref EXTENDED_LIMIT limits, uint size);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    static extern bool QueryInformationJobObject(IntPtr job, int kind, out ACCOUNTING info, uint size, IntPtr returned);
+    [DllImport("kernel32.dll", SetLastError=true)] static extern bool TerminateJobObject(IntPtr job, uint code);
+    [DllImport("kernel32.dll", SetLastError=true)] static extern bool CloseHandle(IntPtr handle);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    static extern bool InitializeProcThreadAttributeList(IntPtr list, int count, uint flags, ref IntPtr size);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    static extern bool UpdateProcThreadAttribute(IntPtr list, uint flags, IntPtr attribute, IntPtr value, IntPtr size, IntPtr previous, IntPtr returned);
+    [DllImport("kernel32.dll")] static extern void DeleteProcThreadAttributeList(IntPtr list);
+    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+    static extern bool CreateProcess(string application, StringBuilder command, IntPtr processSecurity, IntPtr threadSecurity,
+      bool inherit, uint flags, IntPtr environment, string directory, ref STARTUPINFOEX startup, out PROCESS_INFORMATION process);
+    [DllImport("kernel32.dll", SetLastError=true)] static extern uint WaitForSingleObject(IntPtr handle, uint milliseconds);
+    [DllImport("kernel32.dll", SetLastError=true)] static extern bool GetExitCodeProcess(IntPtr process, out uint code);
+    [DllImport("kernel32.dll")] public static extern ulong GetTickCount64();
+    IntPtr job, process, attributes, jobList;
+    bool attributesInitialized;
+    public string Name { get; private set; }
+    InstallerJob() { }
+    static void Error(string operation) { throw new Win32Exception(Marshal.GetLastWin32Error(), operation); }
+    public static InstallerJob Create(string name) {
+      var owner = new InstallerJob(); owner.Name = name;
+      IntPtr descriptor = IntPtr.Zero; uint size;
+      try {
+        if (!ConvertStringSecurityDescriptorToSecurityDescriptor("D:P(A;;GA;;;SY)(A;;GA;;;BA)", 1, out descriptor, out size)) Error("installer_job_acl");
+        var security = new SECURITY_ATTRIBUTES { Length=Marshal.SizeOf(typeof(SECURITY_ATTRIBUTES)), Descriptor=descriptor };
+        owner.job = CreateJobObject(ref security, name);
+        int error = Marshal.GetLastWin32Error();
+        if (owner.job == IntPtr.Zero) throw new Win32Exception(error, "installer_job_create");
+        // Never adopt or terminate an existing object, even on a GUID collision.
+        if (error == 183) throw new InvalidOperationException("installer_job_name_collision");
+        var limits = new EXTENDED_LIMIT(); limits.Basic.Flags = 0x2000; // KILL_ON_JOB_CLOSE; no breakaway
+        if (!SetInformationJobObject(owner.job, 9, ref limits, (uint)Marshal.SizeOf(typeof(EXTENDED_LIMIT)))) Error("installer_job_limits");
+        IntPtr length = IntPtr.Zero;
+        InitializeProcThreadAttributeList(IntPtr.Zero, 1, 0, ref length);
+        if (length == IntPtr.Zero) Error("installer_job_attribute_size");
+        owner.attributes = Marshal.AllocHGlobal(length);
+        if (!InitializeProcThreadAttributeList(owner.attributes, 1, 0, ref length)) Error("installer_job_attributes");
+        owner.attributesInitialized = true;
+        owner.jobList = Marshal.AllocHGlobal(IntPtr.Size); Marshal.WriteIntPtr(owner.jobList, owner.job);
+        // Atomic creation in the job avoids the crash gap between suspended
+        // CreateProcess and AssignProcessToJobObject. Probe before runtime stop.
+        if (!UpdateProcThreadAttribute(owner.attributes, 0, new IntPtr(0x2000D), owner.jobList, new IntPtr(IntPtr.Size), IntPtr.Zero, IntPtr.Zero)) Error("installer_job_atomic_launch_unsupported");
+        return owner;
+      } catch { owner.Dispose(); throw; }
+      finally { if (descriptor != IntPtr.Zero) LocalFree(descriptor); }
+    }
+    public static InstallerJob Open(string name) {
+      IntPtr handle = OpenJobObject(0x0C, false, name); // QUERY | TERMINATE
+      if (handle == IntPtr.Zero) {
+        int error = Marshal.GetLastWin32Error();
+        if (error == 2) return null; // Absence is NOT evidence that writers exited.
+        throw new Win32Exception(error, "installer_job_open");
+      }
+      return new InstallerJob { job=handle, Name=name };
+    }
+    public void Launch(string executable, string arguments, string directory) {
+      if (process != IntPtr.Zero || !attributesInitialized) throw new InvalidOperationException("installer_job_launch_state");
+      var startup = new STARTUPINFOEX(); startup.Startup.Size = Marshal.SizeOf(typeof(STARTUPINFOEX)); startup.Attributes = attributes;
+      PROCESS_INFORMATION created;
+      if (!CreateProcess(executable, new StringBuilder("\"" + executable + "\" " + arguments), IntPtr.Zero, IntPtr.Zero, false,
+          0x00080000, IntPtr.Zero, directory, ref startup, out created)) Error("installer_job_launch");
+      process = created.Process; CloseHandle(created.Thread);
+    }
+    public uint ActiveProcesses() {
+      ACCOUNTING info;
+      if (!QueryInformationJobObject(job, 1, out info, (uint)Marshal.SizeOf(typeof(ACCOUNTING)), IntPtr.Zero)) Error("installer_job_query");
+      return info.Active;
+    }
+    bool RootExited() {
+      if (process == IntPtr.Zero) return true;
+      uint result = WaitForSingleObject(process, 0);
+      if (result == 0xFFFFFFFF) Error("installer_root_wait");
+      return result == 0;
+    }
+    public bool WaitForEmpty(long timeoutMilliseconds) {
+      var clock = Stopwatch.StartNew();
+      do {
+        if (ActiveProcesses() == 0 && RootExited()) return true;
+        if (clock.ElapsedMilliseconds >= timeoutMilliseconds) return false;
+        Thread.Sleep(50);
+      } while (true);
+    }
+    public void StopAndDrain(int timeoutMilliseconds) {
+      if (ActiveProcesses() == 0 && RootExited()) return;
+      if (!TerminateJobObject(job, 1460)) Error("installer_job_terminate");
+      if (!WaitForEmpty(timeoutMilliseconds)) throw new TimeoutException("installer_job_writers_unconfirmed");
+    }
+    public int ExitCode() {
+      uint code;
+      if (process == IntPtr.Zero || !RootExited()) throw new InvalidOperationException("installer_root_not_exited");
+      if (!GetExitCodeProcess(process, out code)) Error("installer_root_exit_code");
+      return unchecked((int)code);
+    }
+    public void Dispose() {
+      if (attributesInitialized) { DeleteProcThreadAttributeList(attributes); attributesInitialized=false; }
+      if (attributes != IntPtr.Zero) { Marshal.FreeHGlobal(attributes); attributes=IntPtr.Zero; }
+      if (jobList != IntPtr.Zero) { Marshal.FreeHGlobal(jobList); jobList=IntPtr.Zero; }
+      if (process != IntPtr.Zero) { CloseHandle(process); process=IntPtr.Zero; }
+      if (job != IntPtr.Zero) { CloseHandle(job); job=IntPtr.Zero; }
+    }
+  }
+}
+'@
+}
+
+function Get-InstallerUptimeMilliseconds {
+  Initialize-InstallerJobType
+  return [FDSecurity.InstallerJob]::GetTickCount64()
+}
+
+function Test-InstallerOwnerBeforeBoot {
+  param($RecordedUptime, [UInt64]$CurrentUptime)
+  if ($null -eq $RecordedUptime) { return $false }
+  if ($RecordedUptime.GetType().FullName -notin @('System.Int32','System.Int64','System.UInt32','System.UInt64') -or $RecordedUptime -lt 0) {
+    throw 'INSTALL_OWNER_GENERATION_INVALID'
+  }
+  # A strict monotonic counter decrease is sufficient evidence of a reboot.
+  # UTC/LastBootUpTime can move with wall-clock corrections and prove nothing.
+  # A later boot with an already larger uptime remains conservatively blocked.
+  return $CurrentUptime -lt [UInt64]$RecordedUptime
+}
+
+function Confirm-FullInstallerQuiesced {
+  # This is the mandatory barrier before touching runtime files or SCM/task.
+  # A missing job name is insufficient: Windows can remove the name while
+  # process references still exist. Only a live zero count, its durable receipt,
+  # or an intervening OS boot proves this installation cannot keep writing.
+  if ($journal['installer_quiesced'] -isnot [bool]) { throw 'INSTALL_OWNER_RECEIPT_INVALID' }
+  $name = [string]$journal['installer_job_name']
+  if ($name -and $name -cnotmatch '^Global\\FDSecurity\.Installer\.[0-9a-f]{32}$') { throw 'INSTALL_OWNER_IDENTITY_INVALID' }
+  if ($journal['installer_quiesced']) {
+    if (-not $name) { throw 'INSTALL_OWNER_RECEIPT_UNBOUND' }
+    return
+  }
+  if ($fullInstallerLegacyWaitCompleted) { return }
+  $recoveredOwner = $null
+  try {
+    $owner = $fullInstallerOwner
+    if ($owner -and $owner.Name -cne $name) { throw 'INSTALL_OWNER_IDENTITY_MISMATCH' }
+    if (-not $owner -and $name) {
+      Initialize-InstallerJobType
+      $recoveredOwner = [FDSecurity.InstallerJob]::Open($name)
+      $owner = $recoveredOwner
+    }
+    if ($owner) { $owner.StopAndDrain(30000) }
+    else {
+      $uptime = Get-InstallerUptimeMilliseconds
+      if (-not (Test-InstallerOwnerBeforeBoot -RecordedUptime $journal['installer_owner_uptime_ms'] -CurrentUptime $uptime)) {
+        # Old journals have no monotonic generation. Checkpoint the uncertainty
+        # now so the existing AtStartup task can prove a later reboot. Updating
+        # this checkpoint never launches another installer or blesses absence.
+        if ($null -eq $journal['installer_owner_uptime_ms']) {
+          $journal['installer_owner_uptime_ms'] = $uptime
+          Write-AtomicJson -Path $journalPath -Value $journal
+        }
+        throw 'INSTALL_WRITERS_UNCONFIRMED|restart_windows_then_resume_update'
+      }
+    }
+    if ($name) {
+      $journal['installer_quiesced'] = $true
+      Write-AtomicJson -Path $journalPath -Value $journal
+    }
+  } finally { if ($recoveredOwner) { $recoveredOwner.Dispose() } }
+}
+
+function Save-FullInstallerFailureLog {
+  # Called only after the writer barrier. Diagnostic I/O must not prevent a
+  # safe rollback or replace its first cause when the installer timed out.
+  try {
+    $path = Get-InstallerLogPath -TaskId $TaskId -CommandId $CommandId
+    $evidence = Get-InstallerLogEvidence -Path $path
+    $status = $evidence.Status
+    [UInt64]$originalSize = if ($status -eq 'ready') { $evidence.OriginalSize } else { $evidence.Size }
+    if ($status -ne 'ready') { $evidence = New-InstallerDiagnosticEvidence -Path $path -Status $status -OriginalSize $originalSize }
+    $id = Get-InstallerEvidenceId -TaskId $TaskId -CommandId $CommandId
+    $key = "evidence/$id/$($evidence.Sha256).log"
+    $report['installer_log_sha256'] = $evidence.Sha256
+    $report['installer_log_size'] = $evidence.Size
+    $report['installer_log_original_size'] = $originalSize
+    $report['installer_log_status'] = $status
+    $report['installer_log_evidence_id'] = $id
+    $report['installer_log_storage_key'] = $key
+    $journal['installer_log_file'] = Split-Path -Leaf $evidence.Path
+    $journal['installer_log_sha256'] = $evidence.Sha256
+    $journal['installer_log_size'] = [UInt64]$evidence.Size
+    $journal['installer_log_original_size'] = $originalSize
+    $journal['installer_log_evidence_id'] = $id
+    $journal['installer_log_storage_key'] = $key
+    $journal['installer_evidence_status'] = 'pending_upload'
+    Write-AtomicJson -Path $journalPath -Value $journal
+  } catch {
+    $report['installer_log_status'] = 'collection_failed'
+    Write-Warning ('installer failure log collection failed: ' + $_.Exception.GetType().Name)
+  }
+}
+
 function Invoke-FullInstallerUpgrade {
   param([Parameter(Mandatory = $true)][string]$SetupPath,
         [Parameter(Mandatory = $true)][string]$Mode,
@@ -280,14 +529,26 @@ function Invoke-FullInstallerUpgrade {
     $arguments += '/EDR_REPAIR_BASELINE=1'
     $arguments += ("/EDR_REPAIR_BACKUP_DIR=`"$RuntimeBackupPath`"")
   }
-  # Admission expiry does not bound this transaction after runtime stop.
-  # A root-process timeout/kill would not prove Setup descendants stopped;
-  # establish that ownership before adding a timeout that can enter rollback.
-  try { $process = Start-Process -FilePath $SetupPath -ArgumentList $arguments -Wait -PassThru }
+  # The signed deadline supplies the execution budget; manual legacy callers
+  # retain the former recovery wait's 300 second bound. Recovery has a separate
+  # drain bound and must not abandon restoration because this budget expired.
+  [long]$budget = 300000
+  if ($updateDeadlineProvided) { $budget = [long]$DeadlineUnixMs - [long](Get-UnixTimeMilliseconds) }
+  if ($budget -le 0) { throw 'INSTALL_TIMEOUT|installer_not_started' }
+  try { $fullInstallerOwner.Launch($SetupPath, ($arguments -join ' '), $InstallDir) }
   catch {
     $diagnostic = New-InstallerDiagnosticEvidence -Path $logPath -Status 'start_failed' -OriginalSize 0
-    throw "INSTALL_LOG_UNAVAILABLE|installer_exit_code=-1|log_sha256=$($diagnostic.Sha256)|log_size=$($diagnostic.Size)|original_size=0"
+    $cause = $_.Exception.GetBaseException()
+    $nativeCode = if ($cause -is [ComponentModel.Win32Exception]) { $cause.NativeErrorCode } else { -1 }
+    throw "INSTALL_START_FAILED|native_error=$nativeCode|installer_exit_code=-1|log_sha256=$($diagnostic.Sha256)|log_size=$($diagnostic.Size)|original_size=0"
   }
+  if (-not $fullInstallerOwner.WaitForEmpty($budget)) {
+    # The catch path passes the same mandatory quiescence barrier as every
+    # other installer failure. Never restore while termination is in flight.
+    throw 'INSTALL_TIMEOUT|execution_deadline_exceeded'
+  }
+  $process = [pscustomobject]@{ ExitCode=$fullInstallerOwner.ExitCode() }
+  Confirm-FullInstallerQuiesced
   $evidence = Get-InstallerLogEvidence -Path $logPath
   if ($evidence.Status -eq 'missing') {
     $diagnostic = New-InstallerDiagnosticEvidence -Path $logPath -Status 'missing' -OriginalSize 0
@@ -307,23 +568,6 @@ function Invoke-FullInstallerUpgrade {
     throw "INSTALL_BASELINE_REPAIR_INCOMPLETE|installer_exit_code=$($process.ExitCode)|log_sha256=$($evidence.Sha256)|log_size=$($evidence.Size)"
   }
   return [pscustomobject]@{ ExitCode=$process.ExitCode; LogPath=$logPath; Evidence=$evidence; ErrorCode=''; BaselineMode=$baselineMode; EvidenceId=(Get-InstallerEvidenceId -TaskId $TaskId -CommandId $CommandId); StorageKey=("evidence/{0}/{1}.log" -f (Get-InstallerEvidenceId -TaskId $TaskId -CommandId $CommandId), $evidence.Sha256) }
-}
-
-function Wait-FullInstallerProcess {
-  param([Parameter(Mandatory = $true)][string]$SetupPath, [int]$TimeoutSeconds = 300)
-  $expected = [System.IO.Path]::GetFullPath($SetupPath)
-  $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
-  do {
-    $running = @(Get-CimInstance Win32_Process -Filter "Name='FDSecuritySetup.exe'" -ErrorAction SilentlyContinue |
-      Where-Object {
-        $actual = [string]$_.ExecutablePath
-        if (-not $actual) { return $false }
-        try { return [System.IO.Path]::GetFullPath($actual) -ieq $expected } catch { return $false }
-      })
-    if ($running.Count -eq 0) { return }
-    Start-Sleep -Seconds 1
-  } while ((Get-Date) -lt $deadline)
-  throw 'timed out waiting for the recovered full installer process to finish'
 }
 
 function Invoke-FullInstallerRuntimeMirror {
@@ -1221,6 +1465,9 @@ $fullInstallerBackupPath = Join-Path (Split-Path -Parent $stagedPath) 'full-inst
 $fullInstallerConfigBackupPath = Join-Path (Split-Path -Parent $stagedPath) 'full-installer-agent.toml.backup'
 $fullInstallerTaskBackupPath = Join-Path (Split-Path -Parent $stagedPath) 'full-installer-task.backup.json'
 $fullInstallerStarted = $false
+$fullInstallerOwner = $null
+$fullInstallerRecoveryBlocked = $false
+$fullInstallerLegacyWaitCompleted = $false
 $fullInstallerExpectedRuntimeIdentity = ''
 $replacementCommitted = $false
 $failureMessage = ""
@@ -1264,6 +1511,10 @@ $journal = [ordered]@{
   installer_log_evidence_id = $null
   installer_log_storage_key = $null
   installer_evidence_status = $null
+  installer_job_name = $null
+  installer_owner_started_at = $null
+  installer_owner_uptime_ms = $null
+  installer_quiesced = $false
   last_event_seq = 2
   events = @()
   error = $null
@@ -1389,12 +1640,16 @@ $resumeHealthObservation = $false
 $resumeHealthObservationPassed = $false
 $priorLastStatus = ''
 $recoveringUpdate = $false
+$journalRecoveryUnverified = $true
 
 try {
+  # Until an existing journal's identity is read and verified, none of its
+  # recovery obligations can be replaced by the new in-memory defaults.
+  $journalRecoveryUnverified = Test-Path -LiteralPath $journalPath -PathType Leaf -ErrorAction Stop
   if ($DeadlineUnixMs -le $IssuedAtUnixMs) {
     throw 'deadline_unix_ms must be after issued_at_unix_ms'
   }
-  if (Test-Path -LiteralPath $journalPath -PathType Leaf) {
+  if ($journalRecoveryUnverified) {
     $prior = Get-Content -LiteralPath $journalPath -Raw | ConvertFrom-Json
     if ([int]$prior.schema_version -ne 2 -or [string]$prior.task_id -ne $TaskId -or
         [string]$prior.command_id -ne $CommandId -or [string]$prior.operation -ne $Operation -or
@@ -1403,15 +1658,33 @@ try {
         [string]$prior.version -ne $TargetVersion) {
       throw 'recovered update journal identity does not match launch arguments'
     }
-    if ([string]$prior.status -in @('succeeded','failed_rolled_back','failed_recovered','failed')) {
+    if ($prior.status -isnot [string] -or $prior.status -notin @('running','succeeded','failed_rolled_back','failed_recovered','failed')) {
+      throw 'recovered update journal status is invalid'
+    }
+    $priorStatus = [string]$prior.status
+    $journalRecoveryUnverified = $false
+    if ($priorStatus -in @('succeeded','failed_rolled_back','failed_recovered','failed')) {
       $prior | ConvertTo-Json -Depth 10 -Compress
       if ([string]$prior.status -eq 'succeeded') { exit 0 }
       exit 1
     }
+    $priorProperties = @($prior.PSObject.Properties.Name)
+    if ($UpgradeClass -eq 'installer_required' -and
+        ($priorProperties -notcontains 'stop_intent' -or $prior.stop_intent -isnot [bool] -or $prior.stop_intent)) {
+      # Establish the rollback barrier before parsing any other recovered
+      # fields or hashing a file that an interrupted installer may be writing.
+      # Even corrupt optional metadata must never fall into generic Start.
+      $fullInstallerStarted = $true
+      $journal['stop_intent'] = $true
+      foreach ($ownerField in @('installer_job_name','installer_quiesced','installer_owner_started_at','installer_owner_uptime_ms','resolved_deployment_mode')) {
+        if ($priorProperties -contains $ownerField) { $journal[$ownerField] = $prior.$ownerField }
+      }
+      if (-not $journal['installer_owner_started_at']) { $journal['installer_owner_started_at'] = [string]$prior.updated_at }
+      $resolvedDeploymentMode = [string]$journal['resolved_deployment_mode']
+    }
     # Recovery itself rewrites stage, so stage cannot prove that the runtime
     # was never stopped. Preserve stop intent through every subsequent write.
     # Legacy journals lack that proof: retain their original recovery behavior.
-    $priorProperties = @($prior.PSObject.Properties.Name)
     if ($priorProperties -contains 'stop_intent') {
       if ($prior.stop_intent -isnot [bool]) { throw 'recovered update journal stop intent is invalid' }
       $recoveringUpdate = $prior.stop_intent
@@ -1428,9 +1701,11 @@ try {
     foreach ($field in @('backup_path','failed_path','resolved_deployment_mode','previous_sha256',
         'health_observation_clock_version','health_observation_started_at_unix_ms','health_observation_deadline_unix_ms',
         'health_observation_utc_deadline_unix_ms','health_last_checked_unix_ms',
-        'expected_runtime_identity_sha256','full_installer_task_backup_sha256','failed_stage','error_code','first_error')) {
+        'expected_runtime_identity_sha256','full_installer_task_backup_sha256','failed_stage','error_code','first_error',
+        'installer_job_name','installer_owner_started_at','installer_owner_uptime_ms','installer_quiesced')) {
       if ($priorProperties -contains $field) { $journal[$field] = $prior.$field }
     }
+    if ($journal['installer_quiesced'] -isnot [bool]) { throw 'recovered installer quiescence receipt is invalid' }
 	if ($priorProperties -contains 'expected_runtime_identity_sha256') {
 	  $fullInstallerExpectedRuntimeIdentity = ([string]$prior.expected_runtime_identity_sha256).ToLowerInvariant()
 	}
@@ -1448,18 +1723,28 @@ try {
       $priorLastStatus = [string]@($journal['events'])[-1].status
     }
     $runtimeCommitDetected = @($runtimePlan | Where-Object { $_.Committed }).Count -gt 0
-    $currentHash = if (Test-Path -LiteralPath $currentPath -PathType Leaf) { Get-Sha256 -Path $currentPath } else { '' }
-	$interruptedFullInstaller = $UpgradeClass -eq 'installer_required' -and
-	  [string]$prior.stage -in @('full_installer_upgrade','full_installer_recovery')
+    # Only these legacy checkpoints establish the old synchronous Wait already
+    # completed. A recovery-written validate_identity is not such evidence,
+    # even when FDSensor already happens to match the candidate hash.
+    $fullInstallerLegacyWaitCompleted = $UpgradeClass -eq 'installer_required' -and
+      $priorProperties -notcontains 'installer_quiesced' -and -not $journal['installer_job_name'] -and
+      [string]$prior.stage -in @('health_observation','resume_after_commit')
+    $interruptedFullInstaller = $UpgradeClass -eq 'installer_required' -and $recoveringUpdate -and -not $fullInstallerLegacyWaitCompleted
 	if ($interruptedFullInstaller) {
 	  $fullInstallerStarted = $true
+      # Preserve the original local diagnostic timestamp across recovery.
+      if (-not $journal['installer_owner_started_at']) { $journal['installer_owner_started_at'] = [string]$prior.updated_at }
 	  $resolvedDeploymentMode = [string]$journal['resolved_deployment_mode']
 	  if ([string]::IsNullOrWhiteSpace($resolvedDeploymentMode)) {
 		$resolvedDeploymentMode = Resolve-DeploymentMode -Mode $DeploymentMode -TaskName $ScheduledTaskName -TaskPath $ScheduledTaskPath -WindowsServiceName $ServiceName
 		$journal['resolved_deployment_mode'] = $resolvedDeploymentMode
 	  }
 	  Set-UpdateStage -Stage 'full_installer_recovery'
-	  Wait-FullInstallerProcess -SetupPath (Join-Path (Split-Path -Parent $stagedPath) 'FDSecuritySetup.exe')
+      Confirm-FullInstallerQuiesced
+      if ([string]$prior.stage -eq 'full_installer_recovery_blocked' -or
+          $priorProperties -notcontains 'installer_quiesced' -or -not [bool]$prior.installer_quiesced) {
+        throw 'INSTALL_INTERRUPTED|resuming_full_installer_rollback'
+      }
 	  $currentHash = if (Test-Path -LiteralPath $currentPath -PathType Leaf) { Get-Sha256 -Path $currentPath } else { '' }
 	  if ($currentHash -ne $expectedHash) {
 		throw 'recovered full installer did not complete the task-pinned Agent replacement'
@@ -1468,11 +1753,13 @@ try {
 		Assert-InstalledRuntimeIdentity -InstallDirectory $installFull -ExpectedIdentitySha256 $fullInstallerExpectedRuntimeIdentity
 	  }
 	}
+    $currentHash = if (Test-Path -LiteralPath $currentPath -PathType Leaf) { Get-Sha256 -Path $currentPath } else { '' }
     $currentMatchesCandidate = $currentHash -eq $expectedHash
 	if ($UpgradeClass -eq 'installer_required' -and
         (($currentMatchesCandidate -and [string]$prior.stage -in @('full_installer_upgrade','full_installer_recovery','health_observation','resume_after_commit')) -or
          [string]$prior.stage -like 'rollback_*')) {
 	  $fullInstallerStarted = $true
+	  if (-not $journal['installer_owner_started_at']) { $journal['installer_owner_started_at'] = [string]$prior.updated_at }
 	}
     $replacementMayHaveStarted = [bool]$prior.replacement_committed -or $currentMatchesCandidate -or
       [string]$prior.stage -in @('replace_binary','replacement_committed','start_new_runtime','health_observation','resume_after_commit') -or
@@ -1634,6 +1921,15 @@ try {
 	$fullInstallerExpectedRuntimeIdentity = ([string]$setupPackage.RuntimeIdentitySha256).ToLowerInvariant()
 	$journal['expected_runtime_identity_sha256'] = $fullInstallerExpectedRuntimeIdentity
     Assert-AuthenticodePublisher -Path $setupPath -Thumbprint $TrustedPublisherThumbprint -Subject $TrustedPublisherSubject
+    # Capability failures are rejected before stopping the working runtime.
+    # Do not fall back to a non-atomic launch on older Windows versions.
+    Initialize-InstallerJobType
+    $jobName = 'Global\FDSecurity.Installer.' + [Guid]::NewGuid().ToString('N')
+    $fullInstallerOwner = [FDSecurity.InstallerJob]::Create($jobName)
+    $journal['installer_job_name'] = $jobName
+    $journal['installer_owner_started_at'] = (Get-Date).ToUniversalTime().ToString('o')
+    $journal['installer_owner_uptime_ms'] = Get-InstallerUptimeMilliseconds
+    $journal['installer_quiesced'] = $false
     Add-UpdateEvent -Status $verifiedStatus -Progress 35 -Detail @{ stage = 'full_installer_verified'; upgrade_class = $UpgradeClass }
     Set-UpdateStage -Stage 'full_installer_verified'
     Set-UpdateStage -Stage 'full_installer_backup'
@@ -1771,6 +2067,15 @@ try {
   Remove-Item -LiteralPath $stagedPath -Force -ErrorAction SilentlyContinue
 } catch {
   $failureMessage = $_.Exception.Message
+  if ($journalRecoveryUnverified) {
+    # Report separately. Do not overwrite unreadable/mismatched recovery
+    # bytes, emit events into a guessed transaction, or touch its runtime.
+    $report['status'] = 'failed'
+    $report['rollback'] = 'recovery_blocked'
+    $report['error'] = $failureMessage
+    $report['error_type'] = $_.Exception.GetType().FullName
+    $report['stage'] = 'journal_recovery_unverified'
+  } else {
   if ($failureMessage -match '^(INSTALL_[A-Z_]+)\|') {
     $report['error_code'] = $Matches[1]
     if ($failureMessage -match 'installer_exit_code=([0-9-]+)') { $report['installer_exit_code'] = [int]$Matches[1] }
@@ -1818,6 +2123,12 @@ try {
   $runtimeCommitted = @($runtimePlan | Where-Object { $_.Committed }).Count -gt 0
   if ($UpgradeClass -eq 'installer_required' -and $fullInstallerStarted -and (Test-Path -LiteralPath $fullInstallerBackupPath -PathType Container)) {
     try {
+      # Installer descendants can start SCM/task runtimes. Seal that writer
+      # tree first, then stop the managed runtime, then restore the mirror.
+      $fullInstallerRecoveryBlocked = $true
+      Confirm-FullInstallerQuiesced
+      $fullInstallerRecoveryBlocked = $false
+      if ($report['error_code'] -in @('INSTALL_TIMEOUT','INSTALL_INTERRUPTED')) { Save-FullInstallerFailureLog }
       Set-UpdateStage -Stage 'rollback_full_installer_started'
       Stop-AgentRuntime -Mode $resolvedDeploymentMode -TaskName $ScheduledTaskName -TaskPath $ScheduledTaskPath -WindowsServiceName $ServiceName -ExecutablePath $currentPath
       Invoke-FullInstallerRuntimeMirror -Source $fullInstallerBackupPath -Destination $installFull -Stage 'restore'
@@ -1842,7 +2153,12 @@ try {
       $report['rollback'] = 'failed'
       $report['error'] = "$failureMessage; full installer rollback failed: $($_.Exception.Message)"
       Add-UpdateEvent -Status 'failed' -Progress 100 -Detail @{ stage = 'full_installer_rollback_failed'; rolled_back = $false; error = $report['error'] }
-      Set-UpdateStage -Stage 'rollback_failed' -Status 'failed'
+      if ($fullInstallerRecoveryBlocked) {
+        # Keep the existing AtStartup recovery task and original work. This
+        # remains reenterable after reboot; it is not a terminal rollback.
+        $journal['error'] = $report['error']
+        Set-UpdateStage -Stage 'full_installer_recovery_blocked'
+      } else { Set-UpdateStage -Stage 'rollback_failed' -Status 'failed' }
     }
 	} elseif ($UpgradeClass -eq 'installer_required' -and $fullInstallerStarted) {
 	  $report['rollback'] = 'failed'
@@ -1904,10 +2220,11 @@ try {
       }
       Set-UpdateStage -Stage "rollback_failed" -Status "failed"
     }
-  } elseif ($report['error_code'] -eq 'UPDATE_DEADLINE_EXPIRED' -and -not $recoveringUpdate) {
+  } elseif (($report['error_code'] -eq 'UPDATE_DEADLINE_EXPIRED' -and -not $recoveringUpdate) -or
+      ($UpgradeClass -eq 'installer_required' -and -not $journal['stop_intent'])) {
     # Deadline admission runs before stopping the old owner. A refusal must
     # not turn into a stop/start cycle through the generic recovery branch.
-    Add-UpdateEvent -Status 'failed' -Progress 100 -Detail @{ stage = 'failed_before_stop'; error = 'UPDATE_DEADLINE_EXPIRED' }
+    Add-UpdateEvent -Status 'failed' -Progress 100 -Detail @{ stage = 'failed_before_stop'; error = $report['error'] }
     Set-UpdateStage -Stage 'failed_before_stop' -Status 'failed'
   } elseif (Test-Path -LiteralPath $currentPath -PathType Leaf) {
     try {
@@ -1936,8 +2253,10 @@ try {
     }
     Set-UpdateStage -Stage "failed_before_stop" -Status "failed"
   }
+  }
 } finally {
-  Remove-Item -LiteralPath $candidatePath -Force -ErrorAction SilentlyContinue
+  if ($fullInstallerOwner) { $fullInstallerOwner.Dispose() }
+  if (-not $journalRecoveryUnverified) { Remove-Item -LiteralPath $candidatePath -Force -ErrorAction SilentlyContinue }
   if ($report['status'] -in @('succeeded','failed_rolled_back')) {
     Remove-Item -LiteralPath $fullInstallerConfigBackupPath -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $fullInstallerTaskBackupPath -Force -ErrorAction SilentlyContinue
@@ -1960,7 +2279,7 @@ try {
   } catch {
     Write-Error ("failed to persist Agent update report: " + $_.Exception.Message)
   }
-  if (-not [string]::IsNullOrWhiteSpace($UpdaterTaskName)) {
+  if (-not $journalRecoveryUnverified -and -not $fullInstallerRecoveryBlocked -and -not [string]::IsNullOrWhiteSpace($UpdaterTaskName)) {
     try {
       Unregister-ScheduledTask -TaskName $UpdaterTaskName -Confirm:$false -ErrorAction Stop
     } catch {

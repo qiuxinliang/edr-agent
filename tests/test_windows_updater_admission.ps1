@@ -71,8 +71,9 @@ foreach($stage in @('prepare_runtime','full_installer_upgrade','replacement_comm
 }
 
 # Execute the actual catch's cause capture before its recovery branch.
-$captureStatements=@()
-foreach($statement in $main[0].CatchClauses[0].Body.Statements) {
+$captureStatements=@($main[0].CatchClauses[0].Body.Statements[0].Extent.Text)
+$verifiedCatch=@($main[0].CatchClauses[0].Body.Statements|Where-Object {$_ -is [Management.Automation.Language.IfStatementAst] -and $_.Clauses[0].Item1.Extent.Text -eq '$journalRecoveryUnverified'})[0].ElseClause
+foreach($statement in $verifiedCatch.Statements) {
   if($statement -is [Management.Automation.Language.AssignmentStatementAst] -and $statement.Left.Extent.Text -eq '$runtimeCommitted'){break}
   $captureStatements+=@($statement.Extent.Text)
 }
@@ -151,7 +152,7 @@ foreach($deadline in @(999,1001)) {
 
 # Run the actual whole recovery dispatch after an admission refusal. Any
 # lifecycle I/O is a test failure, including the old generic restart branch.
-$dispatch=@($main[0].CatchClauses[0].Body.Statements|Where-Object {$_ -is [Management.Automation.Language.IfStatementAst] -and
+$dispatch=@($verifiedCatch.Statements|Where-Object {$_ -is [Management.Automation.Language.IfStatementAst] -and
   $_.Clauses[0].Item1.Extent.Text -like '$UpgradeClass -eq *$fullInstallerStarted*fullInstallerBackupPath*'})
 Check ($dispatch.Count -eq 1) 'unique_recovery_dispatch'
 $dispatchBody=[scriptblock]::Create($dispatch[0].Extent.Text)

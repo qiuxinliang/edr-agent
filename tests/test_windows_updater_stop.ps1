@@ -145,6 +145,24 @@ function Start-AgentRuntime {param($Mode,$TaskName,$TaskPath,$WindowsServiceName
 function Wait-AgentHealthObservation {param($Mode,$TaskName,$TaskPath,$WindowsServiceName,$ExecutablePath,$ObserveForMs);$script:healthChecks++}
 function Get-Sha256([string]$Path){return 'public-restored-hash'}
 function Add-UpdateEvent {param($Status,$Progress,$Detail)}
+# Job APIs are external I/O for this SCM fixture; the dedicated native Job
+# fixture executes the real atomic launch, tree drain, and recovery barrier.
+function Initialize-InstallerJobType {}
+Add-Type -TypeDefinition @'
+namespace FDSecurity {
+  public class InstallerJob {
+    public string Name;
+    public static InstallerJob Create(string name) { return new InstallerJob { Name=name }; }
+    public void Launch(string executable, string arguments, string directory) { }
+    public bool WaitForEmpty(long budget) { return true; }
+    public int ExitCode() { return 7; }
+    public void Dispose() { }
+  }
+}
+'@
+function Get-InstallerUptimeMilliseconds {return [UInt64]1000}
+$script:recoveryWaits=0
+function Confirm-FullInstallerQuiesced {$script:recoveryWaits++}
 $resolvedDeploymentMode='service';$ScheduledTaskName='fixture-task';$ScheduledTaskPath='\'
 $ServiceName='public-fixture';$currentPath='public-fixture.exe'
 $fullInstallerBackupPath='public-backup';$fullInstallerConfigBackupPath='public-config'
@@ -226,7 +244,6 @@ function Invoke-FullInstallerUpgrade {
   if($script:flowCase -eq 'inventory_failure'){throw 'fixture_inventory_unavailable'}
   return @{ExitCode=0;Evidence=@{Sha256='public-log';Size=1;OriginalSize=1;Status='ready';Path='C:\public\setup.log'};EvidenceId='public-id';StorageKey='public-key';BaselineMode='upgrade_existing'}
 }
-function Wait-FullInstallerProcess {param($SetupPath);$script:recoveryWaits++}
 $RuntimeManifest='C:\public\package.zip';$stagedPath='C:\public\FDSensor.exe';$expectedHash='target-hash'
 $TargetVersion='3.2.704';$TrustedPublisherThumbprint='';$TrustedPublisherSubject=''
 $UpgradeClass='installer_required';$Operation='upgrade';$verifiedStatus='verified';$journalPath='C:\public\journal.json'
@@ -247,6 +264,7 @@ foreach($mode in @('scheduled_task','service')){
     $script:installStops=0;$script:installerCalls=0;$script:restores=0;$script:starts=0;$script:healthChecks=0;$script:recoveryWaits=0
     $script:taskSnapshots=0;$script:taskRestores=0
     $fullInstallerStarted=$false;$fullInstallerExpectedRuntimeIdentity='public-identity'
+    $prior=[pscustomobject]@{stage='full_installer_upgrade';updated_at='2026-01-01T00:00:00Z'};$priorProperties=@($prior.PSObject.Properties.Name)
     $report=@{status='running'};$journal=@{resolved_deployment_mode=$mode;full_installer_task_backup_sha256=('a'*64)};$failure=$null
     try{
       if($flowCase -eq 'interrupted'){
@@ -266,7 +284,7 @@ foreach($mode in @('scheduled_task','service')){
       'deadline_expired'{Check ($failure -ceq 'UPDATE_DEADLINE_EXPIRED|runtime_stop_not_started' -and -not $fullInstallerStarted -and $script:installStops -eq 0 -and $script:installerCalls -eq 0 -and $script:restores -eq 0) 'expired_admission_keeps_owner_running'}
       'stop_failure'{Check ($failure -ceq 'fixture_stop_failed' -and $script:installerCalls -eq 0 -and $script:restores -eq 0 -and $script:starts -eq 0 -and $report.rollback -ceq 'failed') 'stop_failure_never_installs_or_restores'}
       'inventory_failure'{Check ($failure -ceq 'fixture_inventory_unavailable' -and $script:installerCalls -eq 1 -and $report.rollback -ceq 'succeeded' -and $script:restores -eq 1 -and $script:starts -eq 1 -and $script:healthChecks -eq 1) 'inventory_failure_restores_original_runtime'}
-      'interrupted'{Check ($failure -ceq 'recovered full installer did not complete the task-pinned Agent replacement' -and $script:recoveryWaits -eq 1 -and $script:installerCalls -eq 0 -and $report.rollback -ceq 'succeeded' -and $script:restores -eq 1 -and $script:starts -eq 1 -and $script:healthChecks -eq 1) 'interrupted_quiesce_uses_existing_recovery'}
+      'interrupted'{Check ($failure -ceq 'INSTALL_INTERRUPTED|resuming_full_installer_rollback' -and $script:recoveryWaits -eq 2 -and $script:installerCalls -eq 0 -and $report.rollback -ceq 'succeeded' -and $script:restores -eq 1 -and $script:starts -eq 1 -and $script:healthChecks -eq 1) 'interrupted_quiesce_uses_existing_recovery'}
     }
     [void]$installerResults.Add(@{mode=$mode;case=$flowCase;status=$report.status;installer_calls=$script:installerCalls;restores=$script:restores;starts=$script:starts;failure=$failure})
   }
@@ -279,7 +297,8 @@ Check ($invoke.Count -eq 1) 'unique_installer_invoke'
 Invoke-Expression $invoke[0].Extent.Text
 function Get-InstallerLogPath {param($TaskId,$CommandId);return 'C:\public\setup.log'}
 function Get-InstallerLogEvidence {param($Path);return @{Status='ready';Sha256='public-log';Size=1;Summary=$script:summary}}
-function Start-Process {param($FilePath,$ArgumentList,[switch]$Wait,[switch]$PassThru);return @{ExitCode=7}}
+$fullInstallerOwner=[FDSecurity.InstallerJob]::Create('fixture-installer-owner')
+$updateDeadlineProvided=$false
 $InstallDir='C:\public';$TaskId='public-task';$CommandId='public-command';$MinFreeBytes=[UInt64]64MB
 $errorResults=New-Object 'System.Collections.Generic.List[object]'
 foreach($item in @(

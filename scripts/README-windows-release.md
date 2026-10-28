@@ -10,6 +10,13 @@ and validates the returned signatures before lifecycle testing and publication.
 Unsigned output remains explicitly labelled. It does not relax platform/Agent
 trust policy or guarantee that a platform requiring signatures will accept the
 bundle. A manual candidate run publishes a prerelease with `--latest=false`.
+For validation without publication, dispatch the same release workflow with
+`candidate=true` and `validation_only=true`. It still builds both native
+architectures, verifies the immutable assets and runs the real lifecycle gates;
+the version remains a draft and its checkpoints are retained. The separate
+validation-only ownership marker prevents a publishing run from reusing that
+draft; use a new version for publication. Missing historical markers mean false.
+This marker does not change the platform's closed `build_provenance` schema.
 Native lifecycle tests, package hashes, policy/rule verification and
 published-release immutability remain required. Existing runs and tags retain
 their workflow snapshot; use a new version/ref for a changed release workflow.
@@ -82,6 +89,21 @@ first run the checkpoint owner's `prepare-lifecycle-upgrade` command against
 the downloaded target/baseline releases, and pass its `transition.json`. The
 release workflow supplies this required input automatically. Missing input is
 an error; the new first-hop check is never silently counted as passed.
+
+Validation-only additionally requests the CI-only installer timeout case. After
+the old updater installs the candidate, the candidate's original embedded updater
+runs a same-version `repair` against the unchanged full-installer payload. The
+disposable Windows runner verifies the real Setup process handle, creation time,
+Job membership, path and hash, then suspends its root after an Inno child exists.
+The child must actually start the SCM-owned Agent outside the installer Job.
+The updater must hit its existing deadline, prove the whole Job empty, stop that
+runtime and restore the candidate's native files, configuration and owner state.
+The later real uninstall remains mandatory. This test requires the authoritative
+`installer_required` service class; another class fails the requested test.
+Receipts record hashes, runner/source identity, process observations, first cause,
+service configuration and Inno registration. Queue/evidence markers prove file
+preservation only, not database readability. Scheduled-task installation and the
+platform's signed-command/reporting path are not covered by this service repair.
 
 After publication, the publish job removes only that run's large CI checkpoints;
 the immutable Release assets remain the installation and rollback source. Draft

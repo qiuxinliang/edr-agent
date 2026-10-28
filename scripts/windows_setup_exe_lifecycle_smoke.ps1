@@ -12,6 +12,7 @@ param(
   [string] $ServiceName = "FDSecurityAgent",
   [string] $EvidenceDir = "setup-exe-evidence",
   [Parameter(Mandatory = $true)] [string] $UpgradeInput,
+  [switch] $ExerciseInstallerTimeout,
   [switch] $SkipSetupRollback
 )
 
@@ -454,6 +455,16 @@ try {
   Assert-InstalledRuntime $BaselineVersion 'install-old-updater-baseline' (-not $SkipSetupRollback)
   Invoke-BaselineUpdaterUpgrade $upgradeBinding
   Assert-InstalledRuntime $TargetVersion 'old-updater-upgrade' $true $true
+  if ($ExerciseInstallerTimeout) {
+    $script:LastLifecycleStage = 'candidate-installer-timeout'
+    Add-Evidence 'candidate-installer-timeout' 'started' 'same-version repair with original candidate updater and Setup bytes'
+    $candidateUpdater = Wait-LifecycleEmbeddedUpdater $TargetVersion $upgradeBinding.target_updater_sha256
+    $candidatePublisher = Get-LifecycleTrustedPublisher $upgradeBinding
+    & (Join-Path $repoRoot 'tests\Invoke-RealInstallerTimeoutRecovery.ps1') -InputBinding $upgradeBinding `
+      -InstallDir $InstallDir -EvidenceDir $EvidenceDir -Updater $candidateUpdater -Publisher $candidatePublisher
+    Assert-InstalledRuntime $TargetVersion 'candidate-installer-timeout' $true $true
+    Add-Evidence 'candidate-installer-timeout' 'verified' 'original Setup timed out; Job empty; runtime/config/service/uninstall identity restored; queue/evidence marker bytes preserved'
+  }
   Invoke-UninstallerAndAssertCleanup 'uninstall-old-updater-target'
 
   # Then verify the cross-version compatibility path using a baseline that is
@@ -490,6 +501,7 @@ try {
     baseline_version = $BaselineVersion
     target_version = $TargetVersion
     setup_rollback_skipped = [bool]$SkipSetupRollback
+    installer_timeout_requested = [bool]$ExerciseInstallerTimeout
     install_dir = $InstallDir
     events = $eventArray
   }

@@ -203,7 +203,11 @@ int main(void) {
   contains(script, "Invoke-FullInstallerRuntimeMirror", "full installer has an immutable runtime backup and restore path");
   contains(script, "expected_runtime_identity_sha256", "full installer recovery journal binds the target Runtime identity");
   contains(script, "full_installer_recovery", "interrupted full installer recovery has an explicit durable stage");
-  contains(script, "Wait-FullInstallerProcess", "recovery waits for the already launched installer instead of starting a second copy");
+  contains(script, "Confirm-FullInstallerQuiesced", "installer recovery proves writers exited before changing the runtime");
+  contains(script, "installer_quiesced", "installer writer exit is durably receipted for recovery");
+  contains(script, "installer_owner_uptime_ms", "recovery records monotonic evidence without trusting wall-clock changes");
+  contains(script, "full_installer_recovery_blocked", "unknown writer state preserves the existing recovery obligation");
+  contains(script, "INSTALL_TIMEOUT", "installer execution has a terminal deadline failure");
   contains(script, "recovered full installer did not complete the task-pinned Agent replacement",
            "incomplete recovered installer execution enters rollback without overwriting the original backup");
   contains(script, "full installer rollback backup is unavailable; refusing to start an unverified mixed Runtime",

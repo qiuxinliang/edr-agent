@@ -32,6 +32,11 @@ on:
         required: true
         default: false
         type: boolean
+      validation_only:
+        description: Run all native build and lifecycle gates, retain the candidate draft without publishing
+        required: false
+        default: false
+        type: boolean
       package_scope:
         description: Headless publishes only runtime, Agent and manifest; currently requires unsigned candidate
         required: true
@@ -70,6 +75,7 @@ env:
   EDR_AGENT_RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && format('win_{0}', inputs.version) || github.ref_name }}
   WINDOWS_RELEASE_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.release_mode || vars.WINDOWS_RELEASE_MODE || 'unsigned' }}
   EDR_RELEASE_CANDIDATE: ${{ github.event_name == 'workflow_dispatch' && inputs.candidate || false }}
+  EDR_RELEASE_VALIDATION_ONLY: ${{ github.event_name == 'workflow_dispatch' && inputs.validation_only || false }}
   EDR_RELEASE_PACKAGE_SCOPE: ${{ github.event_name == 'workflow_dispatch' && inputs.package_scope || 'full' }}
   EDR_UPGRADE_CLASS_OVERRIDE: ${{ github.event_name == 'workflow_dispatch' && inputs.upgrade_class || 'auto' }}
   P0_TEST_INPUTS_REF: ${{ inputs.p0_test_inputs_ref || vars.P0_TEST_INPUTS_REF }}
@@ -1534,7 +1540,7 @@ jobs:
         run: python3 scripts/windows_release_checkpoint.py verify-assets
 
       - name: Publish signed Windows release
-        if: env.EDR_RELEASE_CANDIDATE != 'true' && (env.WINDOWS_RELEASE_MODE == 'signed' || env.WINDOWS_RELEASE_MODE == 'usb')
+        if: env.EDR_RELEASE_VALIDATION_ONLY != 'true' && env.EDR_RELEASE_CANDIDATE != 'true' && (env.WINDOWS_RELEASE_MODE == 'signed' || env.WINDOWS_RELEASE_MODE == 'usb')
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
@@ -1544,7 +1550,7 @@ jobs:
             --title "edr-agent ${EDR_AGENT_RELEASE_TAG} (Windows AMD64 + ARM64)"
 
       - name: Publish unsigned Windows release
-        if: env.EDR_RELEASE_CANDIDATE != 'true' && env.WINDOWS_RELEASE_MODE == 'unsigned'
+        if: env.EDR_RELEASE_VALIDATION_ONLY != 'true' && env.EDR_RELEASE_CANDIDATE != 'true' && env.WINDOWS_RELEASE_MODE == 'unsigned'
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
@@ -1554,7 +1560,7 @@ jobs:
             --title "edr-agent ${EDR_AGENT_RELEASE_TAG} (UNSIGNED Windows AMD64 + ARM64)"
 
       - name: Publish candidate without promoting latest
-        if: env.EDR_RELEASE_CANDIDATE == 'true'
+        if: env.EDR_RELEASE_VALIDATION_ONLY != 'true' && env.EDR_RELEASE_CANDIDATE == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
@@ -1564,9 +1570,16 @@ jobs:
             --title "edr-agent ${EDR_AGENT_RELEASE_TAG} (${WINDOWS_RELEASE_MODE} candidate AMD64 + ARM64)"
 
       - name: Retire published-run CI checkpoints
+        if: env.EDR_RELEASE_VALIDATION_ONLY != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: python3 scripts/windows_release_checkpoint.py cleanup-published
+
+      - name: Confirm validation candidate remains a draft
+        if: env.EDR_RELEASE_VALIDATION_ONLY == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/windows_release_checkpoint.py verify-owner
 
   windows-lifecycle:
     name: Validate Windows install, upgrade, rollback, and embedded updater
@@ -1579,3 +1592,4 @@ jobs:
       target_tag: ${{ github.event_name == 'workflow_dispatch' && format('win_{0}', inputs.version) || github.ref_name }}
       baseline_tag: ${{ needs.prepare-release.outputs.baseline_tag }}
       package_scope: ${{ github.event_name == 'workflow_dispatch' && inputs.package_scope || 'full' }}
+      installer_timeout_recovery: ${{ github.event_name == 'workflow_dispatch' && inputs.validation_only || false }}

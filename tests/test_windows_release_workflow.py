@@ -28,6 +28,25 @@ class WindowsReleaseWorkflowTests(unittest.TestCase):
         self.assertIn("vars.WINDOWS_RELEASE_MODE || 'unsigned'", self.text)
         self.assertIn('(UNSIGNED Windows AMD64 + ARM64)', self.jobs['publish-release'])
 
+    def test_validation_only_preserves_all_gates_and_blocks_publication_and_cleanup(self):
+        option = self.text.split('      validation_only:\n', 1)[1].split('      package_scope:', 1)[0]
+        self.assertIn('default: false', option)
+        self.assertIn('type: boolean', option)
+        self.assertIn("EDR_RELEASE_VALIDATION_ONLY: ${{ github.event_name == 'workflow_dispatch' && inputs.validation_only || false }}", self.text)
+        publish = self.jobs['publish-release']
+        for name in ('Recheck release ownership before publication', 'Verify combined AMD64/ARM64 asset set'):
+            step = publish.split(f'- name: {name}\n', 1)[1].split('\n      - ', 1)[0]
+            self.assertNotIn('if:', step)
+        for name in ('Publish signed Windows release', 'Publish unsigned Windows release',
+                     'Publish candidate without promoting latest', 'Retire published-run CI checkpoints'):
+            step = publish.split(f'- name: {name}\n', 1)[1].split('\n      - ', 1)[0]
+            self.assertIn("if: env.EDR_RELEASE_VALIDATION_ONLY != 'true'", step)
+        confirmation = publish.split('- name: Confirm validation candidate remains a draft\n', 1)[1]
+        self.assertIn("if: env.EDR_RELEASE_VALIDATION_ONLY == 'true'", confirmation)
+        self.assertIn('windows_release_checkpoint.py verify-owner', confirmation)
+        for name in ('prepare-release', 'windows-build', 'usb-finalize', 'windows-lifecycle'):
+            self.assertNotIn('EDR_RELEASE_VALIDATION_ONLY', self.jobs[name])
+
     def test_headless_scope_is_explicit_and_validated_before_release_operations(self):
         scope = self.text.split('      package_scope:', 1)[1].split('      upgrade_class:', 1)[0]
         self.assertEqual(re.findall(r'^          - (\w+)$', scope, re.M), ['full', 'headless'])
@@ -272,7 +291,14 @@ class WindowsReleaseWorkflowTests(unittest.TestCase):
         regression = step('Verify private P0 checkout ACL contract')
         checkout = step('Checkout canonical P0 test inputs')
         binding = step('Bind canonical P0 test input directory')
-        self.assertIn('P0_TEST_INPUTS_REF: ${{ vars.P0_TEST_INPUTS_REF }}', validation)
+        def pinned_ref_binding(section):
+            bindings = re.findall(r'^\s+P0_TEST_INPUTS_REF: (.+)$', section, re.M)
+            self.assertEqual(len(bindings), 1)
+            self.assertIn(bindings[0], ('${{ vars.P0_TEST_INPUTS_REF }}',
+                                       '${{ inputs.p0_test_inputs_ref || vars.P0_TEST_INPUTS_REF }}'))
+            return bindings[0]
+
+        ref_binding = pinned_ref_binding(validation)
         self.assertIn("-cnotmatch '^[0-9a-f]{40}$'", validation)
         self.assertIn('IsNullOrWhiteSpace($env:P0_TEST_INPUTS_SSH_KEY)', validation)
         self.assertNotIn('Write-Host $env:P0_TEST_INPUTS_SSH_KEY', validation)
@@ -280,7 +306,8 @@ class WindowsReleaseWorkflowTests(unittest.TestCase):
         self.assertIn('run: .\\tests\\test_private_p0_checkout.ps1', regression)
         self.assertNotIn('secrets.', regression)
         self.assertIn('shell: pwsh', checkout)
-        self.assertIn('P0_TEST_INPUTS_REF: ${{ vars.P0_TEST_INPUTS_REF }}', checkout)
+        self.assertEqual(pinned_ref_binding(checkout), ref_binding)
+        self.assertEqual(pinned_ref_binding(binding), ref_binding)
         self.assertIn('P0_TEST_INPUTS_SSH_KEY: ${{ secrets.P0_TEST_INPUTS_SSH_KEY }}', checkout)
         self.assertIn('run: .\\scripts\\checkout_private_p0_inputs.ps1 -Directory canonical-p0-test-inputs -Ref $env:P0_TEST_INPUTS_REF', checkout)
         self.assertNotIn('uses: actions/checkout', checkout)
@@ -328,6 +355,9 @@ class WindowsReleaseWorkflowTests(unittest.TestCase):
         build = dict(re.findall(r'^  ([\w-]+):\n(.*?)(?=^  [\w-]+:\n|\Z)',
                                text.split('\njobs:\n', 1)[1], re.M | re.S))['windows-build']
         changes = {
+            'moving default input': ('inputs.p0_test_inputs_ref || vars.P0_TEST_INPUTS_REF', "inputs.p0_test_inputs_ref || 'main'"),
+            'unbound input after validation': ('P0_TEST_INPUTS_REF: ${{ inputs.p0_test_inputs_ref || vars.P0_TEST_INPUTS_REF }}',
+                                              'P0_TEST_INPUTS_REF: ${{ vars.P0_TEST_INPUTS_REF }}'),
             'mutable ref': ('-Ref $env:P0_TEST_INPUTS_REF', '-Ref main'),
             'missing immutable check': ("-cnotmatch '^[0-9a-f]{40}$'", '-eq $null'),
             'unverified checkout owner': ('run: .\\scripts\\checkout_private_p0_inputs.ps1', 'run: git clone'),

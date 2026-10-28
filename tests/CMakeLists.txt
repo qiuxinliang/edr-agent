@@ -357,6 +357,12 @@ if(WIN32)
       -UpdaterPath "${CMAKE_SOURCE_DIR}/scripts/edr_agent_inplace_update.ps1")
   set_tests_properties(windows_updater_admission PROPERTIES TIMEOUT 30
     ENVIRONMENT "PSModulePath=${CMAKE_CURRENT_BINARY_DIR}/foreign-powershell-modules")
+  add_test(NAME windows_updater_installer_job
+    COMMAND "${CMAKE_COMMAND}" -E env --unset=PSModulePath powershell.exe -NoProfile -NonInteractive -File
+      "${CMAKE_CURRENT_SOURCE_DIR}/test_windows_updater_installer_job.ps1"
+      -UpdaterPath "${CMAKE_SOURCE_DIR}/scripts/edr_agent_inplace_update.ps1")
+  set_tests_properties(windows_updater_installer_job PROPERTIES TIMEOUT 120
+    ENVIRONMENT "PSModulePath=${CMAKE_CURRENT_BINARY_DIR}/foreign-powershell-modules")
   add_test(NAME windows_autorun_acl
     COMMAND "${CMAKE_COMMAND}" -E env --unset=PSModulePath powershell.exe -NoProfile -NonInteractive -File
       "${CMAKE_CURRENT_SOURCE_DIR}/test_windows_autorun_acl.ps1"

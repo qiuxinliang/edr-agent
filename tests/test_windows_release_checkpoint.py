@@ -235,6 +235,42 @@ class ReleaseCheckpointTests(unittest.TestCase):
         self.assertEqual(self.api.info["body"], original["body"])
         self.assertEqual(self.api.uploads, [])
 
+    def test_validation_only_binding_is_separate_and_cannot_cross_modes(self):
+        validation_api = FakeGitHub()
+        self.assertFalse(cp.prepare(validation_api, SOURCE, validation_only=True))
+        self.assertFalse(cp.prepare(validation_api, SOURCE, validation_only=True))
+        self.assertEqual(json.loads(cp.MARKER.findall(validation_api.info['body'])[0]), SOURCE)
+        self.assertTrue(cp.marker_validation_only(validation_api.info))
+        self.assertFalse(cp.marker_validation_only(self.api.info))
+        for api, mode in ((validation_api, False), (self.api, True)):
+            with self.subTest(mode=mode), self.assertRaisesRegex(ValueError, 'validation-only mode'):
+                cp.prepare(api, SOURCE, validation_only=mode)
+            with self.assertRaisesRegex(ValueError, 'validation-only mode'):
+                cp.verify_owner(api, SOURCE, validation_only=mode)
+        validation_api.info['draft'] = False
+        with self.assertRaisesRegex(ValueError, 'remain a draft'):
+            cp.prepare(validation_api, SOURCE, validation_only=True)
+        with self.assertRaisesRegex(ValueError, 'validation-only mode'):
+            cp.cleanup_published_checkpoints(validation_api, SOURCE)
+
+    def test_validation_only_rejects_ambiguous_marker_and_wrong_mode_before_upload(self):
+        self.bundle()
+        for marker in ('true', 'garbage', '\nfalse', 'false -->\n<!-- edr-release-validation-only:false'):
+            with self.subTest(marker=marker):
+                original = self.api.info['body']
+                self.api.info['body'] += '\n<!-- edr-release-validation-only:' + marker + ' -->'
+                with self.assertRaisesRegex(ValueError, 'validation-only'):
+                    cp.upload(self.api, self.directory, SOURCE, 'arm64')
+                self.assertEqual(self.api.uploads, [])
+                self.api.info['body'] = original
+        validation_api = FakeGitHub()
+        cp.prepare(validation_api, SOURCE, validation_only=True)
+        cp.upload(validation_api, self.directory, SOURCE, 'arm64', validation_only=True)
+        self.assertCountEqual(validation_api.uploads, cp.asset_names(SOURCE, 'arm64'))
+        with self.assertRaisesRegex(ValueError, 'incomplete'):
+            cp.verify_assets(validation_api, SOURCE, validation_only=True)
+        self.assertTrue(validation_api.info['draft'])
+
     def test_cleanup_only_retires_published_run_recovery_copies(self):
         self.api.info["draft"] = False
         names = ("release-checkpoint-amd64", "release-checkpoint-arm64",
@@ -711,6 +747,22 @@ class HeadlessReleaseTests(unittest.TestCase):
                        dict(EDR_RELEASE_CANDIDATE="false"), dict(EDR_RELEASE_PACKAGE_SCOPE="unknown")):
             with self.subTest(fields=fields), self.assertRaises(ValueError):
                 cp.source(self.environment(**fields))
+
+    def test_validation_only_keeps_closed_source_and_rejects_unsafe_requests_before_io(self):
+        self.assertEqual(cp.source(self.environment(EDR_RELEASE_VALIDATION_ONLY='true')), SOURCE)
+        for value, candidate in (('yes', 'true'), ('TRUE', 'true'), ('true', 'false')):
+            with self.subTest(value=value, candidate=candidate), \
+                    patch.dict(os.environ, self.environment(EDR_RELEASE_VALIDATION_ONLY=value,
+                                                           EDR_RELEASE_CANDIDATE=candidate), clear=True), \
+                    patch.object(sys, 'argv', ['checkpoint', 'prepare']), patch.object(cp, 'GitHub') as api:
+                with self.assertRaisesRegex(ValueError, '[Vv]alidation-only'):
+                    cp.main()
+                api.assert_not_called()
+        with patch.dict(os.environ, self.environment(EDR_RELEASE_VALIDATION_ONLY='true'), clear=True), \
+                patch.object(sys, 'argv', ['checkpoint', 'cleanup-published']), patch.object(cp, 'GitHub') as api:
+            with self.assertRaisesRegex(ValueError, 'cannot retire'):
+                cp.main()
+            api.return_value.call.assert_not_called()
 
     def test_unsupported_headless_request_fails_before_any_github_boundary(self):
         for change in (dict(EDR_RELEASE_CANDIDATE="false"),dict(WINDOWS_RELEASE_MODE="signed"),dict(WINDOWS_RELEASE_MODE="usb")):

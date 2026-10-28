@@ -192,6 +192,44 @@ class WindowsLifecycleWorkflowTests(unittest.TestCase):
         self.assertIn('run: ./tests/test_windows_lifecycle_first_hop.ps1',regression)
         self.assertLess(self.text.index('- name: Verify old updater lifecycle orchestration'),self.text.index('- name: '+DOWNLOAD_STEP))
 
+    def test_real_installer_fault_is_opt_in_and_uses_installed_candidate_after_first_hop(self):
+        call, dispatch = self.text.split('  workflow_dispatch:\n', 1)
+        for inputs in (call, dispatch):
+            option = re.split(r'\n {6}\S', inputs.split('      installer_timeout_recovery:\n', 1)[1], 1)[0]
+            self.assertIn('default: false', option)
+            self.assertIn('type: boolean', option)
+        invocation = step(self.text, SETUP_STEP)
+        self.assertIn('LIFECYCLE_INSTALLER_TIMEOUT: ${{ inputs.installer_timeout_recovery }}', invocation)
+        self.assertIn("ExerciseInstallerTimeout = $env:LIFECYCLE_INSTALLER_TIMEOUT -ceq 'true'", invocation)
+        owner = (ROOT / 'scripts/windows_setup_exe_lifecycle_smoke.ps1').read_text(encoding='utf-8')
+        self.assertLess(owner.index('  Invoke-BaselineUpdaterUpgrade $upgradeBinding'),
+                        owner.index("  if ($ExerciseInstallerTimeout) {"))
+        self.assertIn('Wait-LifecycleEmbeddedUpdater $TargetVersion $upgradeBinding.target_updater_sha256', owner)
+        self.assertIn('Get-LifecycleTrustedPublisher $upgradeBinding', owner)
+        self.assertLess(owner.index("tests\\Invoke-RealInstallerTimeoutRecovery.ps1"),
+                        owner.index("Invoke-UninstallerAndAssertCleanup 'uninstall-old-updater-target'"))
+        fixture = (ROOT / 'tests/Invoke-RealInstallerTimeoutRecovery.ps1').read_text(encoding='utf-8')
+        for required in ("$env:GITHUB_ACTIONS -cne 'true'", "Operation='repair'", "DeadlineUnixMs=$issued+120000",
+                         '$InputBinding.target_updater_sha256', '$InputBinding.installer_sha256',
+                         'IsProcessInJob', 'GetProcessTimes', 'QueryFullProcessImageNameW', 'NtSuspendProcess',
+                         '[LifecycleInstallerFault]::Exited($oldRuntime)', 'original_process_handle_signaled=$true',
+                         '$actualChildren.Count -lt 1', '$stopped = $true', '$delegatedRunning = $true',
+                         "$report.error_code -cne 'INSTALL_TIMEOUT'", "$report.status -cne 'failed_rolled_back'",
+                         "$report.rollback -cne 'succeeded'", '$journal.installer_quiesced -ne $true',
+                         'Assert-RecoveryFiles $files', '$beforeOwner -cne $afterOwner'):
+            self.assertIn(required, fixture)
+        for forbidden in ('Invoke-Expression', 'Set-Content -LiteralPath $Updater', 'Stop-Service',
+                          'Invoke-Uninstaller', 'Invoke-FullInstallerRuntimeMirror'):
+            self.assertNotIn(forbidden, fixture)
+
+    def test_native_runner_identity_and_manifest_hashes_are_retained(self):
+        identity = step(self.text, 'Record native runner identity')
+        for required in ('RuntimeInformation]::OSArchitecture', '$native -cne $expected',
+                         'source_commit=$env:GITHUB_SHA', 'run_id=$env:GITHUB_RUN_ID',
+                         'harness_powershell=', 'updater_powershell=', "'^5\\.1\\.'"):
+            self.assertIn(required, identity)
+        self.assertIn('runner-evidence', step(self.text, 'Upload Windows lifecycle evidence'))
+
 
 if __name__ == '__main__':
     unittest.main()
