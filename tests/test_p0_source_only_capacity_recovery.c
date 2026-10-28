@@ -676,6 +676,49 @@ static void stop_group_mixed_and_frozen(void) {
   puts("stop mixed: concurrent eighth normal owner, exact frozen command, real successor and ninth admission passed");
 }
 
+static void stop_group_collector_handoff(int fault) {
+  char path[256];snprintf(path,sizeof(path),"p0_stop_collector_%ld_%d.db",(long)TEST_PID,fault);
+  int64_t now=(int64_t)time(NULL);fixture_ir_ready=1;open_synthetic(path,now);fixture_ir_ready=0;
+  unsigned count=fault?2u:10u;
+  EdrBehaviorRecord *expected=calloc(count,sizeof(*expected)),*raw=calloc(1,sizeof(*raw)),*out=calloc(1,sizeof(*out));
+  assert(expected && raw && out);
+  sqlite3 *db=NULL;assert(sqlite3_open(path,&db)==SQLITE_OK);
+  edr_p0_rule_source_only_set_stop_group(1);
+  record(&expected[0],1300u,now);
+  assert(edr_p0_rule_emit_pre_evaluation_gate(&expected[0],"evidence_enrichment_timeout")==2);
+  if(fault==1) edr_storage_queue_test_fail_next_p0_latch_commits(1u);
+  if(fault==2) edr_storage_queue_test_fail_next_local_group_results(1u);
+  for(unsigned i=1;i<count;++i) {
+    record(raw,1300u+i,now);raw->type=EDR_EVENT_FILE_READ;
+    strcpy(raw->file_path,"C:\\synthetic\\canary.txt");
+    strcpy(raw->collector_evidence_gate,"P0_FILE_READ_METADATA_GATE");
+    strcpy(raw->collector_evidence_reason,"file_read_actor_image_unresolved");
+    assert(edr_p0_rule_test_build_source_only_collector_evidence_record(raw,&expected[i]));
+    /* The real collector accepts only return 1 as a durable callback. A
+     * grouped predecessor cannot turn healthy storage into retry overflow. */
+    assert(edr_p0_rule_emit_collector_evidence_gate(raw)==(fault?2:1));
+  }
+  EdrP0EmitMetrics m;edr_p0_rule_get_emit_metrics(&m);
+  assert(!m.source_only_loss_detected && !m.source_only_retry_capacity_exhausted);
+  if(fault) {
+    assert(edr_p0_rule_source_only_stop_group_failed() && m.source_only_retry_pending==2u);
+    assert(scalar(db,"SELECT COUNT(*) FROM event_queue")== (fault==2?1:0));
+    /* A failed or unconfirmed FULL never grants the collector a receipt.
+     * Both exact records remain recoverable via the existing retry owner. */
+    edr_p0_rule_source_only_set_stop_group(0);edr_p0_rule_test_set_monotonic_ms(1300u);
+    for(unsigned i=0;i<2u;++i) assert(edr_p0_rule_poll_source_only_durable_retry(out)==1);
+  } else {
+    assert(!edr_p0_rule_source_only_stop_group_failed() && !m.source_only_retry_pending);
+    assert(edr_p0_rule_source_only_flush_stop_group());
+  }
+  assert(scalar(db,"SELECT COUNT(*) FROM event_queue")==count);
+  for(unsigned i=0;i<count;++i) assert_exact_source(db,&expected[i]);
+  assert(!edr_storage_queue_p0_source_only_latch_is_set());assert_local_only(db);
+  assert(sqlite3_close(db)==SQLITE_OK);edr_storage_queue_close();assert(remove(path)==0);
+  free(expected);free(raw);free(out);fixture_ir_ready=1;
+  printf("stop collector handoff fault=%d: exact local owners, no overflow and no premature collector receipt\n",fault);
+}
+
 static void stop_group_first_prepare_failure(void) {
   char path[256];snprintf(path,sizeof(path),"p0_stop_prepare_%ld.db",(long)TEST_PID);
   int64_t now=(int64_t)time(NULL);fixture_ir_ready=1;open_synthetic(path,now);fixture_ir_ready=0;
@@ -772,6 +815,7 @@ int main(int argc,char **argv) {
   legacy_remote_owner_remains_protected();maximum_canonical_audit();
   stop_group_contract();
   stop_group_mixed_and_frozen();stop_group_first_prepare_failure();
+  stop_group_collector_handoff(0);stop_group_collector_handoff(1);stop_group_collector_handoff(2);
   stop_group_crash_restart(0);stop_group_crash_restart(1);
   puts("source-only capacity: exact retries, in-flight handoff and bounded loss-audit recovery converge without ACK/upload");
   return 0;

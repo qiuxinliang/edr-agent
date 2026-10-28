@@ -1666,6 +1666,17 @@ static int p0_source_only_submit_record_io_owned(const EdrBehaviorRecord *record
       return p0_source_only_store_retry(&durable,semantic_sha256,
           status==EDR_OK?&latch:NULL,status==EDR_OK,1);
     }
+    if(pending && reason && reason->stage==EDR_P0_SOURCE_ONLY_STAGE_COLLECTOR_EVIDENCE_GATE) {
+      /* Collector assertions need their individual durable callback. Flush
+       * the stopping thread's grouped predecessors before admitting one;
+       * otherwise healthy storage still fills the eight retry slots behind
+       * a deliberately deferred group. Never group away that callback. */
+      if(!p0_source_only_flush_stop_group_io_owned())
+        return p0_source_only_store_retry(&durable,semantic_sha256,NULL,0,0);
+      p0_state_lock();
+      pending=p0_source_only_retry_has_pending_locked();
+      p0_state_unlock();
+    }
   }
 
   /* A known failed assertion still owns the prepared tuple. A new prepare
