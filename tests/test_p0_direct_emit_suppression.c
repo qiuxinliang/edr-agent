@@ -2066,7 +2066,7 @@ static void test_ir_not_ready_durably_preserves_every_p0_event_group(void) {
    * families, and adding a rule claim cannot turn a gate into an alert. */
   {
     EdrBehaviorRecord invalid = g_last_record;
-    const EdrEventType rejected[] = {EDR_EVENT_CAPABILITY_AUDIT, EDR_EVENT_PROCESS_EXIT,
+    const EdrEventType rejected[] = {EDR_EVENT_CAPABILITY_AUDIT, EDR_EVENT_DLL_LOAD,
                                    EDR_EVENT_NET_DNS_QUERY, EDR_EVENT_REG_DELETE_KEY};
     for (size_t n = 0u; n < sizeof(rejected) / sizeof(rejected[0]); ++n) {
       invalid.type = rejected[n];
