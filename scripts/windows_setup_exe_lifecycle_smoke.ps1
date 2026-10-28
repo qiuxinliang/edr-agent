@@ -11,6 +11,7 @@ param(
   [string] $InstallDir = "C:\edr-agent-setup-lifecycle-smoke",
   [string] $ServiceName = "FDSecurityAgent",
   [string] $EvidenceDir = "setup-exe-evidence",
+  [Parameter(Mandatory = $true)] [string] $UpgradeInput,
   [switch] $SkipSetupRollback
 )
 
@@ -289,6 +290,153 @@ function Invoke-UninstallerAndAssertCleanup([string] $Stage) {
   Add-Evidence $Stage "verified" "service_removed=true process_stopped=true product_residue=none"
 }
 
+function Wait-LifecycleEmbeddedUpdater([string] $Version, [string] $ExpectedSha256) {
+  $path = Join-Path $InstallDir ("edr_agent_inplace_update-{0}.ps1" -f $Version)
+  $clock = [Diagnostics.Stopwatch]::StartNew()
+  while ($clock.Elapsed.TotalSeconds -lt 60) {
+    if (Test-Path -LiteralPath $path -PathType Leaf) {
+      if ((Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant() -cne $ExpectedSha256) {
+        throw "installed $Version embedded updater differs from its immutable release"
+      }
+      return $path
+    }
+    Start-Sleep -Milliseconds 500
+  }
+  throw "installed $Version did not materialize its original embedded updater within 60 seconds"
+}
+
+function Assert-LifecycleUpgradeResult($InputBinding, $Report) {
+  if ($Report.status -cne 'succeeded' -or $Report.target_version -cne $InputBinding.target_version -or
+      $Report.upgrade_class -cne $InputBinding.upgrade_class -or $Report.operation -cne 'upgrade' -or
+      $Report.expected_sha256 -cne $InputBinding.binary_sha256 -or
+      $Report.installed_sha256 -cne $InputBinding.binary_sha256) {
+    throw 'old embedded updater did not report the exact target upgrade as succeeded'
+  }
+  foreach ($item in @(
+      @{ Name = 'FDSensor.exe'; Sha256 = $InputBinding.binary_sha256 },
+      @{ Name = 'native-package-integrity.json'; Sha256 = $InputBinding.runtime_identity_sha256 }
+    )) {
+    $actual = (Get-FileHash -LiteralPath (Join-Path $InstallDir $item.Name) -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($actual -cne $item.Sha256) { throw "old updater installed an unexpected $($item.Name)" }
+  }
+  $native = Get-Content -LiteralPath (Join-Path $InstallDir 'native-package-integrity.json') -Raw | ConvertFrom-Json
+  foreach ($item in $native.files) {
+    $actual = (Get-FileHash -LiteralPath (Join-Path $InstallDir $item.name) -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($actual -cne $item.sha256) { throw "old updater left a mixed native runtime: $($item.name)" }
+  }
+}
+
+function Get-LifecycleTrustedPublisher($InputBinding) {
+  if ($InputBinding.signature_status -cnotin @('unsigned','signed')) {
+    throw 'lifecycle release signature policy is missing or unsupported'
+  }
+  if ($InputBinding.signature_status -ceq 'signed' -and
+      ($InputBinding.publisher_thumbprint -cnotmatch '^[A-F0-9]{40}$' -or
+       [string]::IsNullOrWhiteSpace($InputBinding.publisher_subject))) {
+    throw 'signed lifecycle release is missing its pinned publisher identity'
+  }
+  if ($InputBinding.signature_status -ceq 'unsigned' -and
+      ($InputBinding.publisher_thumbprint -or $InputBinding.publisher_subject)) {
+    throw 'unsigned lifecycle release contains a publisher identity'
+  }
+  $paths = @([pscustomobject]@{Path=$InputBinding.binary_path;Sha256=$InputBinding.binary_sha256})
+  if ($InputBinding.upgrade_class -ceq 'installer_required') {
+    if (-not $InputBinding.installer_path) { throw 'full-installer lifecycle signature input is missing' }
+    $paths += [pscustomobject]@{Path=$InputBinding.installer_path;Sha256=$InputBinding.installer_sha256}
+  }
+  foreach ($item in $paths) {
+    if ((Get-FileHash -LiteralPath $item.Path -Algorithm SHA256).Hash.ToLowerInvariant() -cne $item.Sha256) {
+      throw 'lifecycle signature input no longer matches the release hash'
+    }
+    $signature = Get-AuthenticodeSignature -LiteralPath $item.Path -ErrorAction Stop
+    if ($InputBinding.signature_status -ceq 'unsigned') {
+      if ([string]$signature.Status -cne 'NotSigned' -or $signature.SignerCertificate) {
+        throw "unsigned lifecycle release requires NotSigned, got $($signature.Status)"
+      }
+    } else {
+      if ([string]$signature.Status -cne 'Valid' -or -not $signature.SignerCertificate) {
+        throw "signed lifecycle release requires Valid, got $($signature.Status)"
+      }
+      $thumbprint = ($signature.SignerCertificate.Thumbprint -replace '\s','').ToUpperInvariant()
+      if ($thumbprint -cne $InputBinding.publisher_thumbprint -or
+          $signature.SignerCertificate.Subject -cne $InputBinding.publisher_subject) {
+        throw 'lifecycle Authenticode publisher differs from the release publisher'
+      }
+    }
+  }
+  if ($InputBinding.signature_status -ceq 'unsigned') {
+    return @{Thumbprint='SHA256_ONLY_UNSIGNED';Subject='Unsigned release; SHA-256 integrity only'}
+  }
+  return @{Thumbprint=$InputBinding.publisher_thumbprint;Subject=$InputBinding.publisher_subject}
+}
+
+function Invoke-BaselineUpdaterUpgrade($InputBinding) {
+  $script:LastLifecycleStage = 'old-updater-upgrade'
+  if ($InputBinding.schema -cne 'edr.windows.lifecycle-upgrade.v1' -or
+      $InputBinding.baseline_version -cne $BaselineVersion -or $InputBinding.target_version -cne $TargetVersion -or
+      $InputBinding.architecture -cne $Architecture -or $InputBinding.deployment_mode -cne 'service' -or
+      $InputBinding.service_name -cne $ServiceName) { throw 'old updater lifecycle input identity/mode mismatch' }
+  $updater = Wait-LifecycleEmbeddedUpdater $BaselineVersion $InputBinding.baseline_updater_sha256
+  $publisher = Get-LifecycleTrustedPublisher $InputBinding
+  $commandId = 'ci-old-updater-' + [Guid]::NewGuid().ToString('N')
+  $issued = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+  $parameters = [ordered]@{
+    InstallDir = $InstallDir; StagedBinary = $InputBinding.binary_path
+    ExpectedSha256 = $InputBinding.binary_sha256; TargetVersion = $TargetVersion
+    ExpectedArchitecture = $(if ($Architecture -eq 'amd64') { 'x64' } else { 'arm64' })
+    TrustedPublisherThumbprint = $publisher.Thumbprint; TrustedPublisherSubject = $publisher.Subject
+    DeploymentMode = $InputBinding.deployment_mode; ServiceName = $ServiceName
+    CommandId = $commandId; TaskId = $commandId; ArtifactId = "ci-$TargetVersion-$Architecture"
+    Operation = 'upgrade'; UpgradeClass = $InputBinding.upgrade_class
+    IssuedAtUnixMs = $issued; DeadlineUnixMs = $issued + 900000
+    HealthObserveMs = 30000; StartupTimeoutSeconds = 60
+    MinCurrentVersion = $InputBinding.min_current_version; MaxCurrentVersion = $InputBinding.max_current_version
+    MinFreeBytes = $InputBinding.min_free_bytes
+  }
+  if ($InputBinding.runtime_package) {
+    $parameters.RuntimeManifest = $InputBinding.runtime_package
+    $parameters.RuntimeManifestSha256 = $InputBinding.runtime_package_sha256
+  }
+  # Use Windows PowerShell 5.1, as the Agent's real detached updater does. No
+  # current-source script or patched baseline script enters this invocation.
+  $entries = @($parameters.GetEnumerator() | ForEach-Object {
+    "'{0}'='{1}'" -f $_.Key, ([string]$_.Value).Replace("'", "''")
+  })
+  $source = "`$ErrorActionPreference='Stop'; `$parameters=@{" + ($entries -join ';') + "}; & '" + $updater.Replace("'", "''") + "' @parameters; exit `$LASTEXITCODE"
+  $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($source))
+  $reportPath = Join-Path $env:ProgramData ("FDSecurity\logs\agent-update-{0}-report.json" -f $commandId)
+  Add-Evidence 'old-updater-upgrade' 'started' ("command_id={0} class={1} mode={2} baseline_updater_sha256={3}" -f $commandId, $InputBinding.upgrade_class, $InputBinding.deployment_mode, $InputBinding.baseline_updater_sha256)
+  $process = Start-Process -FilePath (Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe') `
+    -ArgumentList @('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', $encoded) `
+    -RedirectStandardOutput (Join-Path $EvidenceDir 'old-updater.stdout.log') `
+    -RedirectStandardError (Join-Path $EvidenceDir 'old-updater.stderr.log') -PassThru
+  try {
+    $null = $process.Handle
+    if (-not $process.WaitForExit(600000)) {
+      $process.Kill()
+      [void]$process.WaitForExit(5000)
+      throw 'old embedded updater exceeded the 600 second lifecycle budget'
+    }
+    $process.WaitForExit()
+    if ($null -eq $process.ExitCode -or $process.ExitCode -ne 0) { throw "old embedded updater failed with exit code $($process.ExitCode)" }
+    $report = Get-Content -LiteralPath $reportPath -Raw | ConvertFrom-Json
+    Assert-LifecycleUpgradeResult $InputBinding $report
+    $null = Wait-LifecycleEmbeddedUpdater $TargetVersion $InputBinding.target_updater_sha256
+    Add-Evidence 'old-updater-upgrade' 'verified' ("class={0} target_updater_sha256={1} native_runtime_verified=true" -f $InputBinding.upgrade_class, $InputBinding.target_updater_sha256)
+  } finally {
+    try {
+      if (Test-Path -LiteralPath $reportPath -PathType Leaf) {
+        Copy-Item -LiteralPath $reportPath -Destination (Join-Path $EvidenceDir 'old-updater-report.json')
+      }
+      $journalPath = Join-Path $env:ProgramData ("FDSecurity\state\agent-update-{0}.journal.json" -f $commandId)
+      if (Test-Path -LiteralPath $journalPath -PathType Leaf) {
+        Copy-Item -LiteralPath $journalPath -Destination (Join-Path $EvidenceDir 'old-updater-journal.json')
+      }
+    } catch { Write-Warning ("Unable to retain old updater report: " + $_.Exception.Message) }
+    $process.Dispose()
+  }
+}
+
 $status = "failed"
 $script:LastLifecycleStage = "lifecycle"
 $script:LastSetupLog = ""
@@ -298,6 +446,15 @@ try {
   Invoke-Installer $TargetSetupExe "install-target-fresh" $false
   Assert-InstalledRuntime $TargetVersion "install-target-fresh" $true $true
   Invoke-UninstallerAndAssertCleanup "uninstall-target-fresh"
+
+  # Start with the immutable old Setup and the updater materialized by that
+  # actual old Agent. Keep the separate direct-Setup path below unchanged.
+  $upgradeBinding = Get-Content -LiteralPath $UpgradeInput -Raw | ConvertFrom-Json
+  Invoke-Installer $BaselineSetupExe 'install-old-updater-baseline' $false
+  Assert-InstalledRuntime $BaselineVersion 'install-old-updater-baseline' (-not $SkipSetupRollback)
+  Invoke-BaselineUpdaterUpgrade $upgradeBinding
+  Assert-InstalledRuntime $TargetVersion 'old-updater-upgrade' $true $true
+  Invoke-UninstallerAndAssertCleanup 'uninstall-old-updater-target'
 
   # Then verify the cross-version compatibility path using a baseline that is
   # freshly installed and validated in this same native-runner job.

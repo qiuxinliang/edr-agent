@@ -156,6 +156,10 @@ jobs:
         shell: pwsh
         run: python tests/test_windows_lifecycle_workflow.py
 
+      - name: Verify old updater lifecycle orchestration
+        shell: pwsh
+        run: ./tests/test_windows_lifecycle_first_hop.ps1
+
       - name: Resolve release tags
         shell: pwsh
         env:
@@ -318,6 +322,7 @@ jobs:
             $baselineSetup = "edr-agent-$env:BASELINE_TAG-windows-${{ matrix.arch }}-setup.exe"
             Download-ImmutableAsset $env:TARGET_TAG $targetSetup downloads\target
             Download-ImmutableAsset $env:BASELINE_TAG $baselineSetup downloads\baseline
+            Download-ImmutableAsset $env:TARGET_TAG "edr-agent-$env:TARGET_TAG-windows-${{ matrix.arch }}-artifact-manifest.json" downloads\target
             $targetZip = @(Get-ChildItem downloads\target -Filter *.zip -File)
             $baselineZip = @(Get-ChildItem downloads\baseline -Filter *.zip -File)
             if ($targetZip.Count -ne 1 -or $baselineZip.Count -ne 1) {
@@ -388,6 +393,15 @@ jobs:
             throw 'package_scope must be full or headless'
           }
 
+      - name: Bind old updater transition to the target release manifest
+        shell: pwsh
+        run: |
+          python .\scripts\windows_release_checkpoint.py prepare-lifecycle-upgrade `
+            --directory downloads\target --baseline-directory downloads\baseline `
+            --tag $env:TARGET_TAG --baseline-tag $env:BASELINE_TAG --arch '${{ matrix.arch }}' `
+            --destination release-metadata\lifecycle-upgrade
+          if ($LASTEXITCODE -ne 0) { throw 'old updater lifecycle input binding failed' }
+
       - name: Execute real Setup EXE install, upgrade, rollback, and uninstall
         shell: pwsh
         env:
@@ -415,6 +429,7 @@ jobs:
             TargetVersion = $env:TARGET_VERSION
             Architecture = '${{ matrix.arch }}'
             EvidenceDir = 'setup-exe-evidence'
+            UpgradeInput = 'release-metadata\lifecycle-upgrade\transition.json'
           }
           if ($env:BASELINE_SETUP_ROLLBACK_SUPPORTED -ne 'true') {
             $lifecycleParams.SkipSetupRollback = $true

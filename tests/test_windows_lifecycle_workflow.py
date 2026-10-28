@@ -45,9 +45,10 @@ class WindowsLifecycleWorkflowTests(unittest.TestCase):
         ])
         self.assertIn('$targetRuntime = "edr-agent-$env:TARGET_TAG-windows-${{ matrix.arch }}-exe.zip"', common)
         self.assertIn('$baselineRuntime = "edr-agent-$env:BASELINE_TAG-windows-${{ matrix.arch }}-exe.zip"', common)
-        self.assertEqual(len(re.findall(r'^            Download-ImmutableAsset ', full, re.M)), 2)
+        self.assertEqual(len(re.findall(r'^            Download-ImmutableAsset ', full, re.M)), 3)
         self.assertIn('Download-ImmutableAsset $env:TARGET_TAG $targetSetup downloads\\target', full)
         self.assertIn('Download-ImmutableAsset $env:BASELINE_TAG $baselineSetup downloads\\baseline', full)
+        self.assertIn('Download-ImmutableAsset $env:TARGET_TAG "edr-agent-$env:TARGET_TAG-windows-${{ matrix.arch }}-artifact-manifest.json" downloads\\target', full)
         self.assertEqual(re.findall(r'^            Download-ImmutableAsset (.+)$', headless, re.M), [
             '$env:TARGET_TAG "edr-agent-$env:TARGET_TAG-windows-${{ matrix.arch }}-artifact-manifest.json" downloads\\target',
             '$env:BASELINE_TAG "edr-agent-$env:BASELINE_TAG-windows-${{ matrix.arch }}-artifact-manifest.json" downloads\\baseline',
@@ -172,6 +173,24 @@ class WindowsLifecycleWorkflowTests(unittest.TestCase):
         self.assertIn('if: always()', upload)
         for required in ('setup-exe-evidence', 'runtime-evidence', 'release-metadata', 'retention-days: 7'):
             self.assertIn(required, upload)
+
+    def test_old_updater_inputs_are_required_before_the_real_setup_lifecycle(self):
+        name = 'Bind old updater transition to the target release manifest'
+        binding = step(self.text, name)
+        self.assertNotIn('if:', binding)
+        for required in ('windows_release_checkpoint.py prepare-lifecycle-upgrade',
+                         '--directory downloads\\target --baseline-directory downloads\\baseline',
+                         '--tag $env:TARGET_TAG --baseline-tag $env:BASELINE_TAG',
+                         '--destination release-metadata\\lifecycle-upgrade',
+                         "if ($LASTEXITCODE -ne 0) { throw"):
+            self.assertIn(required, binding)
+        self.assertLess(self.text.index('- name: '+DOWNLOAD_STEP),self.text.index('- name: '+name))
+        self.assertLess(self.text.index('- name: '+name),self.text.index('- name: '+SETUP_STEP))
+        self.assertIn("UpgradeInput = 'release-metadata\\lifecycle-upgrade\\transition.json'",step(self.text,SETUP_STEP))
+        regression = step(self.text,'Verify old updater lifecycle orchestration')
+        self.assertNotIn('if:',regression)
+        self.assertIn('run: ./tests/test_windows_lifecycle_first_hop.ps1',regression)
+        self.assertLess(self.text.index('- name: Verify old updater lifecycle orchestration'),self.text.index('- name: '+DOWNLOAD_STEP))
 
 
 if __name__ == '__main__':

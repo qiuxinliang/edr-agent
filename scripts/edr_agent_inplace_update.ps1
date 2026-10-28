@@ -65,6 +65,16 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
 $AgentUpdateUpdaterProtocolVersion = 5
+$updateDeadlineProvided = $PSBoundParameters.ContainsKey('DeadlineUnixMs')
+
+function Assert-UpdateStartDeadline {
+  param([UInt64]$Deadline, [bool]$Provided, [bool]$Recovering)
+  # Legacy manual invocations did not supply a deadline. A journal recovery
+  # must finish restoring its runtime even after the original task expires.
+  if ($Provided -and -not $Recovering -and (Get-UnixTimeMilliseconds) -ge $Deadline) {
+    throw 'UPDATE_DEADLINE_EXPIRED|runtime_stop_not_started'
+  }
+}
 
 # MinFreeBytes is the Agent's independently configured volume safety floor.
 # Growth includes temporary copies; it must remain available in addition to the floor.
@@ -270,6 +280,9 @@ function Invoke-FullInstallerUpgrade {
     $arguments += '/EDR_REPAIR_BASELINE=1'
     $arguments += ("/EDR_REPAIR_BACKUP_DIR=`"$RuntimeBackupPath`"")
   }
+  # Admission expiry does not bound this transaction after runtime stop.
+  # A root-process timeout/kill would not prove Setup descendants stopped;
+  # establish that ownership before adding a timeout that can enter rollback.
   try { $process = Start-Process -FilePath $SetupPath -ArgumentList $arguments -Wait -PassThru }
   catch {
     $diagnostic = New-InstallerDiagnosticEvidence -Path $logPath -Status 'start_failed' -OriginalSize 0
@@ -1229,6 +1242,7 @@ $journal = [ordered]@{
   status = 'running'
   stage = 'initialized'
   replacement_committed = $false
+  stop_intent = $false
   backup_path = $backupPath
   failed_path = $failedPath
   resolved_deployment_mode = $null
@@ -1253,6 +1267,9 @@ $journal = [ordered]@{
   last_event_seq = 2
   events = @()
   error = $null
+  failed_stage = $null
+  error_code = $null
+  first_error = $null
   updated_at = (Get-Date).ToUniversalTime().ToString('o')
 }
 function Add-UpdateEvent {
@@ -1348,6 +1365,7 @@ $report = [ordered]@{
   status = "running"
   stage = "initialized"
   failed_stage = $null
+  first_error = $null
   target_version = $TargetVersion
   operation = $Operation
   upgrade_class = $UpgradeClass
@@ -1370,6 +1388,7 @@ $resumeRollback = $false
 $resumeHealthObservation = $false
 $resumeHealthObservationPassed = $false
 $priorLastStatus = ''
+$recoveringUpdate = $false
 
 try {
   if ($DeadlineUnixMs -le $IssuedAtUnixMs) {
@@ -1389,17 +1408,27 @@ try {
       if ([string]$prior.status -eq 'succeeded') { exit 0 }
       exit 1
     }
+    # Recovery itself rewrites stage, so stage cannot prove that the runtime
+    # was never stopped. Preserve stop intent through every subsequent write.
+    # Legacy journals lack that proof: retain their original recovery behavior.
+    $priorProperties = @($prior.PSObject.Properties.Name)
+    if ($priorProperties -contains 'stop_intent') {
+      if ($prior.stop_intent -isnot [bool]) { throw 'recovered update journal stop intent is invalid' }
+      $recoveringUpdate = $prior.stop_intent
+    } else {
+      $recoveringUpdate = $true
+    }
+    $journal['stop_intent'] = $recoveringUpdate
     $journal['last_event_seq'] = [UInt64]$prior.last_event_seq
     $journal['events'] = @($prior.events)
     $journal['status'] = [string]$prior.status
     $journal['stage'] = [string]$prior.stage
     $journal['replacement_committed'] = [bool]$prior.replacement_committed
     $journal['error'] = $prior.error
-    $priorProperties = @($prior.PSObject.Properties.Name)
     foreach ($field in @('backup_path','failed_path','resolved_deployment_mode','previous_sha256',
         'health_observation_clock_version','health_observation_started_at_unix_ms','health_observation_deadline_unix_ms',
         'health_observation_utc_deadline_unix_ms','health_last_checked_unix_ms',
-        'expected_runtime_identity_sha256','full_installer_task_backup_sha256')) {
+        'expected_runtime_identity_sha256','full_installer_task_backup_sha256','failed_stage','error_code','first_error')) {
       if ($priorProperties -contains $field) { $journal[$field] = $prior.$field }
     }
 	if ($priorProperties -contains 'expected_runtime_identity_sha256') {
@@ -1472,6 +1501,7 @@ try {
     $resumeCommitted = $binaryCommitDetected -or [string]$prior.stage -in @(
       'replacement_committed','start_new_runtime','health_observation','completed','resume_after_commit') -or $resumeRollback
   }
+  Assert-UpdateStartDeadline -Deadline $DeadlineUnixMs -Provided $updateDeadlineProvided -Recovering $recoveringUpdate
   Set-UpdateStage -Stage "validate_identity"
   $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
   $principal = New-Object Security.Principal.WindowsPrincipal($identity)
@@ -1614,7 +1644,9 @@ try {
       $journal['full_installer_task_backup_sha256'] = Save-AgentTaskDefinition `
         -TaskName $ScheduledTaskName -TaskPath $ScheduledTaskPath -Path $fullInstallerTaskBackupPath -AllowMissing:($Operation -eq 'repair')
     }
+    Assert-UpdateStartDeadline -Deadline $DeadlineUnixMs -Provided $updateDeadlineProvided -Recovering $recoveringUpdate
     Add-UpdateEvent -Status 'installing' -Progress 50 -Detail @{ stage = 'full_installer_upgrade'; preserves_identity = $true; preserves_queue = $true; preserves_evidence = $true }
+    $journal['stop_intent'] = $true
     Set-UpdateStage -Stage 'full_installer_upgrade'
     $fullInstallerStarted = $true
     # The installer calibrates command-state commitments under the owner's
@@ -1698,6 +1730,8 @@ try {
     Set-UpdateStage -Stage "drain"
     Start-Sleep -Seconds $DrainDelaySeconds
   }
+  Assert-UpdateStartDeadline -Deadline $DeadlineUnixMs -Provided $updateDeadlineProvided -Recovering $recoveringUpdate
+  $journal['stop_intent'] = $true
   Set-UpdateStage -Stage "prepare_runtime"
   Stop-AgentRuntime -Mode $resolvedDeploymentMode -TaskName $ScheduledTaskName `
     -TaskPath $ScheduledTaskPath -WindowsServiceName $ServiceName -ExecutablePath $currentPath
@@ -1761,8 +1795,20 @@ try {
       $journal['installer_evidence_status'] = [string]$report['installer_log_status']
     }
     $failureMessage = $report['error_code']
+  } elseif ($failureMessage -ceq 'UPDATE_DEADLINE_EXPIRED|runtime_stop_not_started') {
+    $report['error_code'] = 'UPDATE_DEADLINE_EXPIRED'
+    $failureMessage = $report['error_code']
   }
-  $report["failed_stage"] = $report["stage"]
+  if (-not $journal['failed_stage']) {
+    # Keep first-cause diagnostics local. Adding event-detail fields would
+    # make an older restored Agent reject the pending event projection.
+    $journal['failed_stage'] = $report['stage']
+    $journal['error_code'] = $report['error_code']
+    $journal['first_error'] = $failureMessage
+  }
+  $report['failed_stage'] = $journal['failed_stage']
+  $report['first_error'] = $journal['first_error']
+  if ($journal['error_code']) { $report['error_code'] = $journal['error_code'] }
   $report["error"] = $failureMessage
   $report["error_type"] = $_.Exception.GetType().FullName
   $report["error_position"] = $_.InvocationInfo.PositionMessage
@@ -1858,6 +1904,11 @@ try {
       }
       Set-UpdateStage -Stage "rollback_failed" -Status "failed"
     }
+  } elseif ($report['error_code'] -eq 'UPDATE_DEADLINE_EXPIRED' -and -not $recoveringUpdate) {
+    # Deadline admission runs before stopping the old owner. A refusal must
+    # not turn into a stop/start cycle through the generic recovery branch.
+    Add-UpdateEvent -Status 'failed' -Progress 100 -Detail @{ stage = 'failed_before_stop'; error = 'UPDATE_DEADLINE_EXPIRED' }
+    Set-UpdateStage -Stage 'failed_before_stop' -Status 'failed'
   } elseif (Test-Path -LiteralPath $currentPath -PathType Leaf) {
     try {
       Set-UpdateStage -Stage "recovery_start_runtime"

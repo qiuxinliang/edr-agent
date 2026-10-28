@@ -16,6 +16,7 @@ import re
 import subprocess
 import tempfile
 import time
+import zipfile
 
 
 CHECKPOINT = "release-checkpoint.json"
@@ -757,13 +758,155 @@ def stage_headless(directory, destination, metadata, tag, arch, tag_commit, repo
     return result
 
 
+def prepare_lifecycle_upgrade(directory, baseline_directory, destination, tag, baseline_tag, arch):
+    """Bind the existing native lifecycle to release bytes and the old updater.
+
+    This is a local test envelope, not platform admission or a signed command.
+    The full-installer wire member names are protocol-5's existing contract;
+    installer/manifest/signature bytes are copied unchanged from the release.
+    """
+    from verify_binary_hot_compatibility import runtime_identity
+
+    version = ".".join(map(str, windows_release_version(tag)))
+    baseline_version = ".".join(map(str, windows_release_version(baseline_tag)))
+    if windows_release_version(baseline_tag) >= windows_release_version(tag):
+        raise ValueError("Lifecycle baseline must be older than target")
+    if arch not in ("amd64", "arm64"):
+        raise ValueError("Lifecycle requires a native Windows architecture")
+    prefix = f"edr-agent-{tag}-windows-{arch}-"
+    archive_path = directory / (prefix + "exe.zip")
+    baseline_archive = baseline_directory / f"edr-agent-{baseline_tag}-windows-{arch}-exe.zip"
+    manifest = read_json(directory / (prefix + "artifact-manifest.json"))
+    if manifest.get("schema_version") != 1 or manifest.get("version") != version:
+        raise ValueError("Lifecycle artifact manifest version/schema mismatch")
+    signature = manifest.get("signature")
+    if not isinstance(signature, dict) or signature.get("status") not in ("signed", "unsigned"):
+        raise ValueError("Lifecycle release must declare an explicit signature policy")
+    signature_status = signature["status"]
+    provenance = manifest.get("build_provenance")
+    mode = provenance.get("mode") if isinstance(provenance, dict) else None
+    if mode not in ("unsigned", "signed", "usb") or (mode == "unsigned") != (signature_status == "unsigned"):
+        raise ValueError("Lifecycle release signature policy contradicts its build mode")
+    publisher_thumbprint = signature.get("signer_thumbprint", "")
+    publisher_subject = signature.get("signer_subject", "")
+    if not isinstance(publisher_thumbprint, str) or not isinstance(publisher_subject, str):
+        raise ValueError("Lifecycle publisher metadata must contain strings")
+    if signature_status == "signed":
+        if (signature.get("format") != "cms-detached-sha256" or not isinstance(publisher_thumbprint, str) or
+                not re.fullmatch(r"[A-Fa-f0-9]{40}", publisher_thumbprint) or
+                not isinstance(publisher_subject, str) or not publisher_subject.strip()):
+            raise ValueError("Signed lifecycle release requires its pinned publisher identity")
+        publisher_thumbprint = publisher_thumbprint.upper()
+    elif signature.get("format") != "none" or publisher_thumbprint or publisher_subject:
+        raise ValueError("Unsigned lifecycle release has inconsistent publisher metadata")
+    artifacts = manifest.get("artifacts")
+    if not isinstance(artifacts, list) or any(not isinstance(item, dict) for item in artifacts):
+        raise ValueError("Invalid lifecycle artifact entries")
+    def artifact(name):
+        found = [item for item in artifacts if item.get("name") == name]
+        if len(found) != 1:
+            raise ValueError("Lifecycle artifact must be unique: " + name)
+        return found[0]
+    package = artifact(archive_path.name)
+    if package.get("sha256") != digest(archive_path) or package.get("size") != archive_path.stat().st_size:
+        raise ValueError("Lifecycle runtime ZIP identity mismatch")
+    agent = artifact(prefix + "FDSensor.exe")
+    update = agent.get("update")
+    if (agent.get("version") != version or agent.get("platform") != "windows" or agent.get("arch") != arch or
+            not isinstance(update, dict) or update.get("internal_name") != "FDSensor" or
+            update.get("internal_version") != version):
+        raise ValueError("Lifecycle Agent update identity mismatch")
+    upgrade_class = update.get("upgrade_class")
+    if upgrade_class not in ("binary_hot", "runtime_bundle", "installer_required"):
+        raise ValueError("Lifecycle requires the release's resolved upgrade class")
+    if update.get("deployment_mode") != "service" or update.get("service_name") != "FDSecurityAgent":
+        raise ValueError("Existing Setup lifecycle covers the declared FDSecurityAgent service mode only")
+    min_free_bytes = update.get("min_free_bytes", 0)
+    if type(min_free_bytes) is not int or not 0 <= min_free_bytes <= 1099511627776:
+        raise ValueError("Invalid lifecycle free-space floor")
+    for key, compare in (("min_current_version", lambda a, b: a < b), ("max_current_version", lambda a, b: a > b)):
+        bound = update.get(key)
+        if bound and compare(windows_release_version(baseline_tag), windows_release_version("win_" + bound)):
+            raise ValueError("Lifecycle baseline violates manifest " + key)
+    target_identity = runtime_identity(archive_path)
+    baseline_identity = runtime_identity(baseline_archive)
+    if upgrade_class == "binary_hot" and target_identity != baseline_identity:
+        raise ValueError("binary_hot cannot change the baseline runtime components")
+    with zipfile.ZipFile(archive_path) as target, zipfile.ZipFile(baseline_archive) as baseline:
+        if (target.read("VERSION").decode("utf-8-sig").strip() != version or
+                baseline.read("VERSION").decode("utf-8-sig").strip() != baseline_version):
+            raise ValueError("Lifecycle archive version mismatch")
+        binary = target.read("FDSensor.exe")
+        native = target.read("native-package-integrity.json")
+        if (hashlib.sha256(binary).hexdigest() != agent.get("sha256") or len(binary) != agent.get("size") or
+                hashlib.sha256(native).hexdigest() != update.get("runtime_identity_sha256")):
+            raise ValueError("Lifecycle target binary/runtime does not match its manifest")
+        old_updater = baseline.read("edr_agent_inplace_update.ps1")
+        new_updater = target.read("edr_agent_inplace_update.ps1")
+        members = []
+        setup = None
+        if upgrade_class == "installer_required":
+            setup = target.read("edr_agent_setup.exe")
+            full_bytes = target.read("full-installer-manifest.json")
+            full = json.loads(full_bytes.decode("utf-8-sig"))
+            if (full.get("version") != version or full.get("target_arch") != arch or
+                    full.get("agent_binary_sha256") != agent["sha256"] or
+                    full.get("runtime_identity_sha256") != update["runtime_identity_sha256"] or
+                    full.get("setup_exe_sha256") != hashlib.sha256(setup).hexdigest() or
+                    full.get("upgrade_protocol") != "edr.windows.full-installer-upgrade.v1" or
+                    any(full.get(key) is not True for key in ("preserves_existing_identity", "preserves_offline_queue", "preserves_evidence_cache"))):
+                raise ValueError("Lifecycle full-installer identity/preservation mismatch")
+            has_cms = "full-installer-manifest.p7s" in target.namelist()
+            if (full.get("setup_exe_signed") is not (signature_status == "signed") or
+                    full.get("capabilities", {}).get("signature_status") != signature_status or
+                    str(full.get("publisher_thumbprint", "")).upper() != publisher_thumbprint or
+                    has_cms != (signature_status == "signed")):
+                raise ValueError("Lifecycle installer signature policy differs from its release")
+            members = [("FDSecuritySetup.exe", setup), ("setup-ui-manifest.json", full_bytes)]
+            if has_cms:
+                members.append(("setup-ui-manifest.p7s", target.read("full-installer-manifest.p7s")))
+    destination.mkdir(parents=True, exist_ok=False)
+    runtime_package = archive_path.resolve() if upgrade_class == "runtime_bundle" else None
+    if members:
+        runtime_package = destination.resolve() / "full-installer.zip"
+        with zipfile.ZipFile(runtime_package, "x", compression=zipfile.ZIP_STORED) as envelope:
+            for name, content in members:
+                envelope.writestr(zipfile.ZipInfo(name), content)
+        with zipfile.ZipFile(runtime_package) as envelope:
+            if any(envelope.read(name) != content for name, content in members):
+                raise ValueError("Lifecycle envelope changed release member bytes")
+    binary_path = destination.resolve() / "FDSensor.next.exe"
+    binary_path.write_bytes(binary)
+    installer_path = destination.resolve() / "FDSecuritySetup.exe" if setup is not None else None
+    if installer_path:
+        installer_path.write_bytes(setup)
+    result = dict(schema="edr.windows.lifecycle-upgrade.v1", baseline_version=baseline_version,
+        target_version=version, architecture=arch, deployment_mode=update["deployment_mode"],
+        service_name=update["service_name"], upgrade_class=upgrade_class,
+        min_free_bytes=min_free_bytes,
+        signature_status=signature_status, publisher_thumbprint=publisher_thumbprint, publisher_subject=publisher_subject,
+        binary_path=str(binary_path), binary_sha256=agent["sha256"],
+        installer_path=str(installer_path) if installer_path else "",
+        installer_sha256=hashlib.sha256(setup).hexdigest() if setup is not None else "",
+        runtime_identity_sha256=update["runtime_identity_sha256"],
+        baseline_updater_sha256=hashlib.sha256(old_updater).hexdigest(),
+        target_updater_sha256=hashlib.sha256(new_updater).hexdigest(),
+        runtime_package=str(runtime_package) if runtime_package else "",
+        runtime_package_sha256=digest(runtime_package) if runtime_package else "",
+        min_current_version=update.get("min_current_version", ""),
+        max_current_version=update.get("max_current_version", ""))
+    (destination / "transition.json").write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
+    return result
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("source", "validate-scope", "verify-assets", "stage-headless", "prepare", "verify-owner", "restore", "seal", "upload", "restore-input", "seal-input", "restore-usb-final", "select-baseline", "cleanup-published", "verify-p0-inputs"))
+    parser.add_argument("command", choices=("source", "validate-scope", "verify-assets", "stage-headless", "prepare-lifecycle-upgrade", "prepare", "verify-owner", "restore", "seal", "upload", "restore-input", "seal-input", "restore-usb-final", "select-baseline", "cleanup-published", "verify-p0-inputs"))
     parser.add_argument("--arch", choices=("amd64", "arm64"))
     parser.add_argument("--directory", type=Path, default=Path("dist"))
     parser.add_argument("--target-tag")
     parser.add_argument("--baseline-tag", default="")
+    parser.add_argument("--baseline-directory", type=Path)
     parser.add_argument("--package-scope", choices=("full", "headless"))
     parser.add_argument("--tag")
     parser.add_argument("--destination", type=Path)
@@ -777,6 +920,12 @@ def main():
     if args.package_scope:
         env["EDR_RELEASE_PACKAGE_SCOPE"] = args.package_scope
     scope = package_scope(env)
+    if args.command == "prepare-lifecycle-upgrade":
+        if not all((args.tag, args.baseline_tag, args.arch, args.destination, args.baseline_directory)):
+            parser.error("prepare-lifecycle-upgrade requires tag, baseline-tag, arch, destination and baseline-directory")
+        print(json.dumps(prepare_lifecycle_upgrade(args.directory, args.baseline_directory, args.destination,
+            args.tag, args.baseline_tag, args.arch), sort_keys=True))
+        return
     if args.command == "validate-scope":
         print(validate_scope(env))
         return

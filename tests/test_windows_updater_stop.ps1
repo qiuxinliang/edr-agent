@@ -198,7 +198,7 @@ function Save-AgentTaskDefinition {
 }
 function Restore-AgentTaskDefinition {param($TaskName,$TaskPath,$Path,$ExpectedSha256);$script:taskRestores++;Check ($ExpectedSha256 -ceq ('a'*64)) 'task_restore_bound_to_snapshot'}
 function Copy-Item { [CmdletBinding()]param($LiteralPath,$Destination,[switch]$Force);$script:configCopies++ }
-function Set-UpdateStage {param($Stage,$Status);$script:lastStage=$Stage;$report['stage']=$Stage}
+function Set-UpdateStage {param($Stage,$Status);$script:lastStage=$Stage;$report['stage']=$Stage;$script:checkpointStopIntent=$journal['stop_intent']}
 function Invoke-FullInstallerRuntimeMirror {
   param($Source,$Destination,$Stage)
   if($Stage -eq 'backup'){
@@ -214,6 +214,7 @@ function Stop-AgentRuntime {
   if($script:installStops -eq 1 -and $script:flowCase -ne 'interrupted'){
     Check ($script:backupReady -and $script:configCopies -eq 2 -and
       $script:lastStage -ceq 'full_installer_upgrade' -and $fullInstallerStarted) 'recovery_ready_before_quiesce'
+    Check ($script:checkpointStopIntent -eq $true) 'stop_intent_checkpoint_before_installer_stop'
     if($Mode -eq 'scheduled_task'){Check ($script:taskSnapshots -eq 1 -and $journal['full_installer_task_backup_sha256'] -ceq ('a'*64)) 'task_snapshot_ready_before_quiesce'}
   }
   $script:ownerBusy=$false
@@ -230,11 +231,18 @@ $RuntimeManifest='C:\public\package.zip';$stagedPath='C:\public\FDSensor.exe';$e
 $TargetVersion='3.2.704';$TrustedPublisherThumbprint='';$TrustedPublisherSubject=''
 $UpgradeClass='installer_required';$Operation='upgrade';$verifiedStatus='verified';$journalPath='C:\public\journal.json'
 $fullInstallerTaskBackupPath='C:\public\task-backup.json'
+foreach($name in @('Assert-UpdateStartDeadline','Get-UnixTimeMilliseconds')) {
+  $definition=@($ast.FindAll({param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name},$true))
+  Check ($definition.Count -eq 1) ('unique_admission_owner_'+$name)
+  Invoke-Expression $definition[0].Extent.Text
+}
+$DeadlineUnixMs=[UInt64]2;$updateDeadlineProvided=$false;$recoveringUpdate=$false
 $installerResults=New-Object 'System.Collections.Generic.List[object]'
 foreach($mode in @('scheduled_task','service')){
-  foreach($flowCase in @('success','backup_failure','task_backup_failure','stop_failure','inventory_failure','interrupted')){
+  foreach($flowCase in @('success','backup_failure','task_backup_failure','deadline_expired','stop_failure','inventory_failure','interrupted')){
     if($mode -eq 'service' -and $flowCase -eq 'task_backup_failure'){continue}
     $script:flowCase=$flowCase;$resolvedDeploymentMode=$mode
+    $updateDeadlineProvided=$flowCase -eq 'deadline_expired'
     $script:ownerBusy=$true;$script:backupReady=$false;$script:configCopies=0
     $script:installStops=0;$script:installerCalls=0;$script:restores=0;$script:starts=0;$script:healthChecks=0;$script:recoveryWaits=0
     $script:taskSnapshots=0;$script:taskRestores=0
@@ -255,6 +263,7 @@ foreach($mode in @('scheduled_task','service')){
       'success'{Check ($null -eq $failure -and $report.status -ceq 'succeeded' -and $script:installStops -eq 1 -and $script:installerCalls -eq 1 -and $script:healthChecks -eq 1 -and $script:restores -eq 0) 'quiesce_then_inventory_then_health'}
       'backup_failure'{Check ($failure -ceq 'fixture_backup_failed' -and $script:installStops -eq 0 -and $script:installerCalls -eq 0 -and $script:restores -eq 0) 'backup_failure_keeps_owner_running'}
       'task_backup_failure'{Check ($failure -ceq 'fixture_task_backup_failed' -and $script:installStops -eq 0 -and $script:installerCalls -eq 0 -and $script:restores -eq 0) 'task_snapshot_failure_keeps_owner_running'}
+      'deadline_expired'{Check ($failure -ceq 'UPDATE_DEADLINE_EXPIRED|runtime_stop_not_started' -and -not $fullInstallerStarted -and $script:installStops -eq 0 -and $script:installerCalls -eq 0 -and $script:restores -eq 0) 'expired_admission_keeps_owner_running'}
       'stop_failure'{Check ($failure -ceq 'fixture_stop_failed' -and $script:installerCalls -eq 0 -and $script:restores -eq 0 -and $script:starts -eq 0 -and $report.rollback -ceq 'failed') 'stop_failure_never_installs_or_restores'}
       'inventory_failure'{Check ($failure -ceq 'fixture_inventory_unavailable' -and $script:installerCalls -eq 1 -and $report.rollback -ceq 'succeeded' -and $script:restores -eq 1 -and $script:starts -eq 1 -and $script:healthChecks -eq 1) 'inventory_failure_restores_original_runtime'}
       'interrupted'{Check ($failure -ceq 'recovered full installer did not complete the task-pinned Agent replacement' -and $script:recoveryWaits -eq 1 -and $script:installerCalls -eq 0 -and $report.rollback -ceq 'succeeded' -and $script:restores -eq 1 -and $script:starts -eq 1 -and $script:healthChecks -eq 1) 'interrupted_quiesce_uses_existing_recovery'}

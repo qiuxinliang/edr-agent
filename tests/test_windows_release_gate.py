@@ -41,7 +41,7 @@ WINDOWS_EXPECTED = {
     "windows_isolation_mock_behavior", "windows_install_compatibility_behavior", "http_telemetry_budget",
     "windows_release_collector_pe_closure", "windows_inplace_collector_transaction",
     "windows_update_physical_guard", "windows_updater_health_clock", "windows_updater_storage_start", "windows_updater_stop", "windows_inno_evidence_space",
-    "windows_updater_task_recovery", "windows_updater_atomic_json", "windows_autorun_acl", "windows_autorun_task",
+    "windows_updater_task_recovery", "windows_updater_atomic_json", "windows_updater_admission", "windows_autorun_acl", "windows_autorun_task",
     "windows_storage_space_preflight",
     "windows_installer_log_redaction",
     "windows_installer_acl_behavior", "windows_installer_health_behavior",
@@ -235,6 +235,7 @@ class WindowsReleaseGateTests(unittest.TestCase):
                 "windows_updater_stop": (120, "scripts/edr_agent_inplace_update.ps1", "Updater"),
                 "windows_updater_task_recovery": (60, "scripts/edr_agent_inplace_update.ps1", "Updater"),
                 "windows_updater_atomic_json": (30, "scripts/edr_agent_inplace_update.ps1", "Updater"),
+                "windows_updater_admission": (30, "scripts/edr_agent_inplace_update.ps1", "Updater"),
                 "windows_autorun_acl": (180, "install/windows-inno/edr_windows_autorun.ps1", "Autorun"),
                 "windows_autorun_task": (60, "install/windows-inno/edr_windows_autorun.ps1", "Autorun"),
             }
@@ -271,7 +272,7 @@ class WindowsReleaseGateTests(unittest.TestCase):
 
     def test_updater_and_autorun_are_required_and_failure_blocks_windows_gate(self):
         for name in ("windows_updater_health_clock", "windows_updater_storage_start", "windows_updater_stop",
-                     "windows_updater_task_recovery", "windows_updater_atomic_json",
+                     "windows_updater_task_recovery", "windows_updater_atomic_json", "windows_updater_admission",
                      "windows_autorun_acl", "windows_autorun_task"):
             with tempfile.TemporaryDirectory() as directory:
                 source, build, _ = self.fixture(directory, missing_test=name)
@@ -848,7 +849,7 @@ class WindowsReleaseGateTests(unittest.TestCase):
                 'HANDLE CreateThread(void *, size_t, DWORD (WINAPI *)(void *), void *, DWORD, DWORD *);\n'
                 '#define FALSE 0\n#define TRUE 1\n#define CREATE_NO_WINDOW 0x08000000\n#define WAIT_OBJECT_0 0\n'
                 'typedef struct { DWORD cb; } STARTUPINFOA;\n'
-                'typedef struct { HANDLE hProcess, hThread; } PROCESS_INFORMATION;\n'
+                'typedef struct { HANDLE hProcess, hThread; DWORD dwProcessId, dwThreadId; } PROCESS_INFORMATION;\n'
                 'DWORD GetModuleFileNameA(HANDLE, char *, DWORD);\n'
                 'BOOL CreateProcessA(const char *, char *, void *, void *, BOOL, DWORD, void *, const char *, STARTUPINFOA *, PROCESS_INFORMATION *);\n'
                 'DWORD WaitForSingleObject(HANDLE, DWORD);\n'
@@ -864,6 +865,7 @@ class WindowsReleaseGateTests(unittest.TestCase):
                 'BOOL WINAPI QueryPerformanceCounter(LARGE_INTEGER *);\n'
                 'BOOL WINAPI QueryPerformanceFrequency(LARGE_INTEGER *);\n'
                 'HANDLE WINAPI GetCurrentProcess(void);\n'
+                'DWORD WINAPI GetCurrentProcessId(void);\n'
                 'BOOL WINAPI GetProcessTimes(HANDLE, FILETIME *, FILETIME *, FILETIME *, FILETIME *);\n'
                 'BOOL WINAPI GetProcessIoCounters(HANDLE, IO_COUNTERS *);\n'
                 'BOOL WINAPI IsWow64Process2(HANDLE, USHORT *, USHORT *);\n'

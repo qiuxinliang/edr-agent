@@ -62,6 +62,27 @@ The local checkpoint receipt is an Actions artifact only, not a release asset.
 Install/upgrade/rollback/uninstall and embedded-updater validation remain required
 before publication, including after a build checkpoint is reused.
 
+The real Setup lifecycle also installs the unchanged published baseline, waits
+for that old Agent to materialize its original embedded updater, and invokes
+that updater against the candidate's declared upgrade class. The artifact
+manifest supplies the class, service mode and version bounds. Runtime ZIP bytes
+remain unchanged; a full-installer test envelope only renames the existing
+installer/manifest/signature members. Evidence binds both updater hashes and
+checks the installed binary and complete native runtime. The manifest also
+pins signing policy and publisher identity: only an explicitly unsigned release
+with native `NotSigned` inputs receives the unsigned marker;
+signed inputs must be `Valid` and match that publisher, including the installer.
+The separate direct Setup and binary-hot lifecycle checks remain. This first-hop
+gate covers the existing service installation on a clean runner; it does not certify scheduled
+task mode, populated endpoint storage, authenticated platform command delivery
+or backend health observation.
+
+Direct calls to `windows_setup_exe_lifecycle_smoke.ps1` now require `-UpgradeInput`:
+first run the checkpoint owner's `prepare-lifecycle-upgrade` command against
+the downloaded target/baseline releases, and pass its `transition.json`. The
+release workflow supplies this required input automatically. Missing input is
+an error; the new first-hop check is never silently counted as passed.
+
 After publication, the publish job removes only that run's large CI checkpoints;
 the immutable Release assets remain the installation and rollback source. Draft
 or failed runs keep their recovery checkpoints until the one-day expiry. Rule

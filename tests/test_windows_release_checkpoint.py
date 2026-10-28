@@ -1052,5 +1052,131 @@ class HeadlessReleaseTests(unittest.TestCase):
             cp.select_baseline([info],SOURCE['tag'],package_scope='headless')
 
 
+class LifecycleUpgradeInputTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.target = self.root / 'target'; self.target.mkdir()
+        self.baseline = self.root / 'baseline'; self.baseline.mkdir()
+        self.destination = self.root / 'transition'
+        self.version = '3.2.725'; self.old_version = '3.2.673'; self.arch = 'arm64'
+        self.signature = dict(format='none',status='unsigned')
+        self.build_mode = 'unsigned'
+        self.data = {'FDSensor.exe': b'new agent', 'edr_agent_setup.exe': b'original installer',
+                     'edr_agent_inplace_update.ps1': b'new updater', 'VERSION': self.version.encode(),
+                     'FDSecurityInstallerWorker.exe': b'worker', 'uninstall.exe': b'uninstall'}
+        self.data['native-package-integrity.json'] = json.dumps(dict(schema='edr.windows.native-package-integrity.v1',
+            files=[dict(name=name,sha256=hashlib.sha256(self.data[name]).hexdigest()) for name in
+                   ('FDSecurityInstallerWorker.exe','uninstall.exe')])).encode()
+        self.update = dict(internal_name='FDSensor', internal_version=self.version, upgrade_class='runtime_bundle',
+            deployment_mode='service', service_name='FDSecurityAgent', min_current_version='0.0.0',
+            max_current_version=self.version, min_free_bytes=268435456,
+            runtime_identity_sha256=hashlib.sha256(self.data['native-package-integrity.json']).hexdigest())
+        self.full = dict(version=self.version,target_arch=self.arch,agent_binary_sha256=hashlib.sha256(self.data['FDSensor.exe']).hexdigest(),
+            runtime_identity_sha256=self.update['runtime_identity_sha256'],setup_exe_sha256=hashlib.sha256(self.data['edr_agent_setup.exe']).hexdigest(),
+            upgrade_protocol='edr.windows.full-installer-upgrade.v1',preserves_existing_identity=True,
+            preserves_offline_queue=True,preserves_evidence_cache=True,setup_exe_signed=False,
+            publisher_thumbprint='',capabilities=dict(signature_status='unsigned'))
+        old = dict(self.data, VERSION=self.old_version.encode(), **{'edr_agent_inplace_update.ps1': b'original old updater'})
+        self.old_archive = self.baseline / f'edr-agent-win_{self.old_version}-windows-{self.arch}-exe.zip'
+        self.write_zip(self.old_archive, old)
+
+    def write_zip(self, path, data):
+        with zipfile.ZipFile(path, 'w') as archive:
+            for name, value in data.items(): archive.writestr(name, value)
+
+    def prepare(self):
+        self.data['full-installer-manifest.json'] = json.dumps(self.full).encode()
+        prefix = f'edr-agent-win_{self.version}-windows-{self.arch}-'
+        archive = self.target / (prefix+'exe.zip'); self.write_zip(archive, self.data)
+        manifest = dict(schema_version=1,version=self.version,signature=self.signature,build_provenance=dict(mode=self.build_mode),artifacts=[
+            dict(name=archive.name,size=archive.stat().st_size,sha256=cp.digest(archive)),
+            dict(name=prefix+'FDSensor.exe',size=len(self.data['FDSensor.exe']),sha256=hashlib.sha256(self.data['FDSensor.exe']).hexdigest(),
+                 version=self.version,platform='windows',arch=self.arch,update=self.update)])
+        (self.target / (prefix+'artifact-manifest.json')).write_text(json.dumps(manifest))
+        return cp.prepare_lifecycle_upgrade(self.target,self.baseline,self.destination,
+            'win_'+self.version,'win_'+self.old_version,self.arch)
+
+    def test_runtime_bundle_preserves_original_zip_and_distinct_updater_identities(self):
+        old_hash = cp.digest(self.old_archive)
+        value = self.prepare()
+        self.assertEqual(cp.digest(self.old_archive), old_hash)
+        self.assertEqual(value['upgrade_class'], 'runtime_bundle')
+        self.assertEqual(value['baseline_updater_sha256'], hashlib.sha256(b'original old updater').hexdigest())
+        self.assertEqual(value['target_updater_sha256'], hashlib.sha256(b'new updater').hexdigest())
+        self.assertEqual(value['runtime_package_sha256'], cp.digest(Path(value['runtime_package'])))
+        self.assertEqual(Path(value['runtime_package']).parent, self.target.resolve())
+        self.assertEqual(Path(value['binary_path']).read_bytes(), b'new agent')
+        self.assertEqual(value['min_free_bytes'], 268435456)
+
+    def test_full_installer_envelope_copies_original_members_without_reserializing(self):
+        self.update['upgrade_class'] = 'installer_required'
+        self.build_mode = 'usb'
+        self.signature=dict(format='cms-detached-sha256',status='signed',signer_thumbprint='A'*40,signer_subject='CN=Release Publisher')
+        self.full.update(setup_exe_signed=True,publisher_thumbprint='A'*40,capabilities=dict(signature_status='signed'))
+        self.data['full-installer-manifest.p7s'] = b'original CMS bytes'
+        value = self.prepare()
+        self.assertEqual(value['signature_status'],'signed')
+        self.assertEqual(value['publisher_thumbprint'],'A'*40)
+        self.assertEqual(value['publisher_subject'],'CN=Release Publisher')
+        self.assertEqual(Path(value['installer_path']).read_bytes(),self.data['edr_agent_setup.exe'])
+        with zipfile.ZipFile(value['runtime_package']) as archive:
+            self.assertEqual(set(archive.namelist()), {'FDSecuritySetup.exe','setup-ui-manifest.json','setup-ui-manifest.p7s'})
+            for old,new in [('edr_agent_setup.exe','FDSecuritySetup.exe'),('full-installer-manifest.json','setup-ui-manifest.json'),
+                            ('full-installer-manifest.p7s','setup-ui-manifest.p7s')]:
+                self.assertEqual(archive.read(new),self.data[old])
+
+    def test_binary_hot_has_no_package_and_rejects_changed_baseline_runtime(self):
+        self.update['upgrade_class'] = 'binary_hot'
+        value = self.prepare()
+        self.assertEqual(value['runtime_package'], '')
+        self.assertEqual(value['runtime_package_sha256'], '')
+        self.destination = self.root/'rejected'
+        with zipfile.ZipFile(self.old_archive) as archive: old = {name:archive.read(name) for name in archive.namelist()}
+        old['uninstall.exe'] = b'old uninstaller'
+        native = json.loads(old['native-package-integrity.json'])
+        next(item for item in native['files'] if item['name']=='uninstall.exe')['sha256'] = hashlib.sha256(old['uninstall.exe']).hexdigest()
+        old['native-package-integrity.json'] = json.dumps(native).encode(); self.write_zip(self.old_archive,old)
+        with self.assertRaisesRegex(ValueError,'binary_hot cannot change'): self.prepare()
+
+    def test_mode_class_version_and_preservation_refusals(self):
+        cases = [('upgrade_class','auto'),('deployment_mode','scheduled_task'),('service_name','unrelated'),
+                 ('min_current_version','3.2.700'),('max_current_version','3.2.672'),('min_free_bytes',True)]
+        for key,bad in cases:
+            with self.subTest(key=key):
+                old=self.update[key]; self.update[key]=bad
+                with self.assertRaises(ValueError): self.prepare()
+                self.update[key]=old
+                self.assertFalse(self.destination.exists())
+        self.update['upgrade_class']='installer_required';self.full['preserves_evidence_cache']=False
+        with self.assertRaisesRegex(ValueError,'preservation'):self.prepare()
+
+    def test_tampered_target_runtime_is_rejected_before_creating_output(self):
+        self.data['uninstall.exe']=b'tampered'
+        with self.assertRaisesRegex(ValueError,'hash mismatch'):self.prepare()
+        self.assertFalse(self.destination.exists())
+
+    def test_signature_policy_cannot_downgrade_or_invent_publisher(self):
+        cases=[(None,'unsigned'),(dict(status='unknown'),'unsigned'),
+               (dict(format='none',status='unsigned'),'signed'),
+               (dict(format='cms-detached-sha256',status='signed'),'signed'),
+               (dict(format='cms-detached-sha256',status='signed',signer_thumbprint='A'*40,signer_subject=''),'signed'),
+               (dict(format='none',status='unsigned',signer_thumbprint='A'*40),'unsigned')]
+        for signature,mode in cases:
+            with self.subTest(signature=signature,mode=mode):
+                self.signature=signature;self.build_mode=mode
+                with self.assertRaises(ValueError):self.prepare()
+                self.assertFalse(self.destination.exists())
+
+    def test_installer_signature_must_match_release_policy(self):
+        self.update['upgrade_class']='installer_required'
+        self.full['setup_exe_signed']=True
+        with self.assertRaisesRegex(ValueError,'installer signature policy'):self.prepare()
+        self.full['setup_exe_signed']=False
+        self.data['full-installer-manifest.p7s']=b'unexpected signature'
+        with self.assertRaisesRegex(ValueError,'installer signature policy'):self.prepare()
+
+
 if __name__ == "__main__":
     unittest.main()
