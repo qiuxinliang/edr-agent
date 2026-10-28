@@ -1956,7 +1956,18 @@ static void *preprocess_main(void *arg) {
 #endif
 source_unconfirmed:
   atomic_store(&s_stop_source_unconfirmed,1);
-  fprintf(stderr,"[preprocess] shutdown failed: local source commit unconfirmed; retaining worker dependencies\n");
+  {
+    EdrP0EmitMetrics failed_state={0};
+    edr_p0_rule_get_emit_metrics(&failed_state);
+    fprintf(stderr,"[preprocess] shutdown failed: local source commit unconfirmed; retaining worker dependencies; reason=%s pending=%llu failed=%llu exhausted=%llu loss=%d stop_group_failed=%d bus_used=%llu\n",
+        failed_state.source_only_terminal_reason,
+        (unsigned long long)failed_state.source_only_retry_pending,
+        (unsigned long long)failed_state.source_only_backpressure_failed,
+        (unsigned long long)failed_state.source_only_retry_capacity_exhausted,
+        failed_state.source_only_loss_detected,
+        edr_p0_rule_source_only_stop_group_failed(),
+        (unsigned long long)edr_event_bus_used_approx(s_bus));
+  }
   atomic_store_explicit(&s_worker_phase,PREPROCESS_PHASE_WORKER_EXIT,memory_order_relaxed);
   atomic_store(&s_preprocess_exited,1);
 #ifdef _WIN32

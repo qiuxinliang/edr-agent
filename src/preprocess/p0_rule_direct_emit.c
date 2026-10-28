@@ -1210,6 +1210,12 @@ static void p0_source_only_mark_unhealthy_locked(const char *reason, int unrecov
   s_p0_source_only_terminal_unhealthy = 1;
   s_p0_source_only_recovery_verified = 0;
   if (unrecoverable) {
+    if (!s_p0_source_only_loss_detected) {
+      /* Preserve the first closed diagnostic cause before retry/recovery
+       * updates replace terminal_reason. No event, identity or payload. */
+      fprintf(stderr, "[p0] first unresolved source assertion: reason=%s\n",
+              reason && reason[0] ? reason : "source_only_durable_unavailable");
+    }
     s_p0_source_only_unrecoverable = 1;
     s_p0_source_only_loss_detected = 1;
     s_p0_source_only_loss_audit_durable = 0;
@@ -1405,12 +1411,23 @@ static int p0_source_only_enqueue_frozen(const EdrBehaviorRecord *record,
     size_t wire_len, const char *batch_id) {
   EdrStorageQueueLocalEvidenceOwner owner;
   int typed=p0_source_only_record_owner(record,&owner);
-  return (typed || successor ?
+  EdrError status=typed || successor ?
       edr_storage_queue_p0_source_only_commit_local_typed_handoff(
           latch,record->event_id,batch_id,wire,wire_len,0,recovery_audit,
           typed?&owner:NULL,successor) :
       edr_storage_queue_p0_source_only_commit_local(
-          latch,record->event_id,batch_id,wire,wire_len,0,recovery_audit))==EDR_OK;
+          latch,record->event_id,batch_id,wire,wire_len,0,recovery_audit);
+  if (status != EDR_OK) {
+    p0_state_lock();
+    if (!s_p0_emit_source_only_backpressure_failed) {
+      fprintf(stderr,
+              "[p0] first source commit failure: status=%d reason=%s type=%d bytes=%llu\n",
+              (int)status, typed ? owner.diagnostic_reason : "untyped",
+              (int)record->type, (unsigned long long)wire_len);
+    }
+    p0_state_unlock();
+  }
+  return status==EDR_OK;
 }
 
 static int p0_source_only_enqueue_record(const EdrBehaviorRecord *record,
