@@ -558,6 +558,58 @@ static void maximum_canonical_audit(void) {
   free(wire);free(record_out);
 }
 
+/* Exercise the actual source producer, codec and SQLite owner for every
+ * event admitted by the IR gate, including the formerly rejected subtypes.
+ * These remain local evidence; no rule, action or remote receipt is created. */
+static void ruleset_source_event_families(int grouped) {
+  static const EdrEventType types[]={EDR_EVENT_PROCESS_CREATE,EDR_EVENT_FILE_READ,
+    EDR_EVENT_FILE_CREATE,EDR_EVENT_FILE_WRITE,EDR_EVENT_FILE_DELETE,
+    EDR_EVENT_FILE_RENAME,EDR_EVENT_FILE_PERMISSION_CHANGE,EDR_EVENT_NET_CONNECT,
+    EDR_EVENT_NET_LISTEN,EDR_EVENT_REG_CREATE_KEY,EDR_EVENT_REG_SET_VALUE};
+  static const char *reasons[]={"p0_ir_not_ready","p0_ir_evaluation_unavailable"};
+  char path[256];snprintf(path,sizeof(path),"p0_ruleset_families_%ld_%d.db",(long)TEST_PID,grouped);
+  int64_t now=(int64_t)time(NULL);
+  fixture_ir_ready=1;open_synthetic(path,now);fixture_ir_ready=0;
+  edr_p0_rule_source_only_set_stop_group(grouped);
+  EdrBehaviorRecord *raw=calloc(1,sizeof(*raw)),*expected=calloc(22u,sizeof(*expected));
+  assert(raw && expected);unsigned count=0u;
+  for(unsigned reason=0;reason<2u;++reason) for(unsigned i=0;i<11u;++i) {
+    record(raw,1500u+count,now);raw->type=types[i];strcpy(raw->cmdline,"synthetic source");
+    raw->detection_context[0]=0;
+    assert(edr_p0_rule_test_build_source_only_ruleset_evaluation_record(raw,reasons[reason],&expected[count]));
+    int result=edr_p0_rule_emit_ruleset_evaluation_gate(raw,reasons[reason]);
+    printf("ruleset family grouped=%d type=%d reason=%s result=%d\n",grouped,(int)raw->type,reasons[reason],result);fflush(stdout);
+    assert(result==1 || (grouped && result==2));++count;
+  }
+  assert(edr_p0_rule_source_only_flush_stop_group());
+  EdrP0EmitMetrics metrics;edr_p0_rule_get_emit_metrics(&metrics);
+  assert(!metrics.source_only_retry_pending && !metrics.source_only_loss_detected &&
+      !metrics.source_only_retry_capacity_exhausted && !metrics.source_only_backpressure_failed);
+  assert(!edr_storage_queue_p0_source_only_latch_is_set());
+  sqlite3 *db=NULL;assert(sqlite3_open(path,&db)==SQLITE_OK);
+  assert(scalar(db,"SELECT COUNT(*) FROM event_queue")==22);
+  char before[22][65],after[65];
+  for(unsigned i=0;i<count;++i) {
+    assert_exact_source(db,&expected[i]);source_row_sha(db,expected[i].event_id,before[i]);
+    size_t n=0;uint8_t *wire=edr_behavior_record_alloc_durable_wire(&expected[i],NULL,&n);char reason[128];
+    assert(!edr_egress_batch_validate(wire,12u,wire+12u,n-12u,reason,sizeof(reason)));
+    assert(!strcmp(reason,"source_only_requires_local_owner_v3"));free(wire);
+  }
+  assert_local_only(db);assert(sqlite3_close(db)==SQLITE_OK);edr_storage_queue_close();
+  /* A clean reopen/maintenance may not rewrite local bytes or offer them to
+   * egress. Queue schema and the local retention owner are unchanged. */
+  assert(edr_storage_queue_open(path)==EDR_OK);edr_storage_queue_test_run_cleanup();
+  assert(sqlite3_open(path,&db)==SQLITE_OK);
+  for(unsigned i=0;i<count;++i) {
+    assert_exact_source(db,&expected[i]);source_row_sha(db,expected[i].event_id,after);
+    assert(!strcmp(before[i],after));
+    assert(edr_p0_rule_emit_ruleset_evaluation_gate(&expected[i],reasons[i/11u])==1);
+  }
+  assert(scalar(db,"SELECT COUNT(*) FROM event_queue")==22);assert_local_only(db);
+  assert(sqlite3_close(db)==SQLITE_OK);edr_storage_queue_close();
+  free(raw);free(expected);assert(!remove(path));fixture_ir_ready=1;
+}
+
 static uint64_t stop_group_case(int grouped,int fault) {
   char path[256];snprintf(path,sizeof(path),"p0_stop_group_%ld_%d_%d.db",(long)TEST_PID,grouped,fault);
   int64_t now=(int64_t)time(NULL);
@@ -813,6 +865,7 @@ int main(int argc,char **argv) {
   run_case(0,0);run_case(1,0);run_case(0,1);
   clean_close_with_pending();abrupt_restart_with_pending();recreated_queue_with_pending();
   legacy_remote_owner_remains_protected();maximum_canonical_audit();
+  ruleset_source_event_families(0);ruleset_source_event_families(1);
   stop_group_contract();
   stop_group_mixed_and_frozen();stop_group_first_prepare_failure();
   stop_group_collector_handoff(0);stop_group_collector_handoff(1);stop_group_collector_handoff(2);

@@ -196,6 +196,10 @@ int edr_p0_source_only_build_pre_evaluation_record(const EdrBehaviorRecord *sour
                                                     const char *reason,
                                                     EdrBehaviorRecord *out);
 
+/* Shared by the IR gate and local durable validation. This classification
+ * grants no alert/action authority or permission to upload source records. */
+int edr_p0_source_only_ruleset_event_type(EdrEventType type);
+
 /* Reject malformed, unregistered, or stage-mixed P0 source-only envelopes
  * before they cross the durable boundary.  Backend still verifies published
  * direct-rule bindings against its immutable artifact authority. */

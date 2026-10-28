@@ -80,12 +80,18 @@ static int p0_source_only_forbids_rule_binding(const cJSON *root) {
          p0_json_member_absent(root, "action");
 }
 
-static int p0_ruleset_event_type(EdrEventType type) {
+int edr_p0_source_only_ruleset_event_type(EdrEventType type) {
   switch (type) {
   case EDR_EVENT_PROCESS_CREATE:
   case EDR_EVENT_FILE_READ:
+  case EDR_EVENT_FILE_CREATE:
   case EDR_EVENT_FILE_WRITE:
+  case EDR_EVENT_FILE_DELETE:
+  case EDR_EVENT_FILE_RENAME:
+  case EDR_EVENT_FILE_PERMISSION_CHANGE:
   case EDR_EVENT_NET_CONNECT:
+  case EDR_EVENT_NET_LISTEN:
+  case EDR_EVENT_REG_CREATE_KEY:
   case EDR_EVENT_REG_SET_VALUE:
     return 1;
   default:
@@ -187,7 +193,7 @@ int edr_p0_source_only_validate_record(const EdrBehaviorRecord *record) {
     break;
   }
   case EDR_P0_SOURCE_ONLY_STAGE_RULESET_EVALUATION:
-    ok = p0_ruleset_event_type(record->type) && p0_source_only_forbids_rule_binding(root);
+    ok = edr_p0_source_only_ruleset_event_type(record->type) && p0_source_only_forbids_rule_binding(root);
     break;
   case EDR_P0_SOURCE_ONLY_STAGE_COLLECTOR_EVIDENCE_GATE:
     ok = record->type == EDR_EVENT_FILE_READ && p0_source_only_forbids_rule_binding(root) &&

@@ -4444,25 +4444,6 @@ replay_done:
  * back to a local heuristic or to claim any rule.  Persist the registered
  * ruleset-evaluation gate once, with the source identity intact and no
  * alert/action authority. */
-static int p0_is_ruleset_evaluation_event(EdrEventType type) {
-  switch (type) {
-  case EDR_EVENT_PROCESS_CREATE:
-  case EDR_EVENT_FILE_READ:
-  case EDR_EVENT_FILE_CREATE:
-  case EDR_EVENT_FILE_WRITE:
-  case EDR_EVENT_FILE_DELETE:
-  case EDR_EVENT_FILE_RENAME:
-  case EDR_EVENT_FILE_PERMISSION_CHANGE:
-  case EDR_EVENT_NET_CONNECT:
-  case EDR_EVENT_NET_LISTEN:
-  case EDR_EVENT_REG_CREATE_KEY:
-  case EDR_EVENT_REG_SET_VALUE:
-    return 1;
-  default:
-    return 0;
-  }
-}
-
 int edr_p0_rule_emit_ruleset_evaluation_gate(const EdrBehaviorRecord *br,
                                             const char *reason) {
   EdrBehaviorRecord evidence;
@@ -4549,7 +4530,7 @@ int edr_p0_rule_try_emit_with_command_facts_status(
    * before source-completeness and attribution filters: those filters may
    * normally shed telemetry, but cannot erase the fact that the current P0
    * authority was unavailable. */
-  if (p0_is_ruleset_evaluation_event(br->type) && !edr_p0_rule_ir_is_ready()) {
+  if (edr_p0_source_only_ruleset_event_type(br->type) && !edr_p0_rule_ir_is_ready()) {
     edr_p0_rule_observe_validation_stage(br, "ruleset", "p0_ir_not_ready");
     (void)edr_p0_rule_emit_ruleset_evaluation_gate(br, "p0_ir_not_ready");
     return 0;
@@ -4638,7 +4619,7 @@ int edr_p0_rule_try_emit_with_command_facts_status(
        * successfully evaluated rule may not create an alert or action while
        * a source-only fault in the same event family remains unresolved. */
       delivery_gate = p0_delivery_gate_reason(br->type);
-      if (p0_is_ruleset_evaluation_event(br->type) && delivery_gate) {
+      if (edr_p0_source_only_ruleset_event_type(br->type) && delivery_gate) {
         edr_p0_rule_observe_validation_stage(br, "family_gate", delivery_gate);
         gate_closed = 1;
       }
@@ -4721,12 +4702,12 @@ int edr_p0_rule_try_emit_with_command_facts_status(
      * pressure) is fail-closed: never mix a legacy rule with unknown active
      * authority.  Record the registered source-only gate before returning;
      * it intentionally has no rule/bundle/action claim. */
-    if (p0_is_ruleset_evaluation_event(br->type) && edr_p0_rule_ir_is_ready()) {
+    if (edr_p0_source_only_ruleset_event_type(br->type) && edr_p0_rule_ir_is_ready()) {
       edr_p0_rule_observe_validation_stage(br, "matcher", "p0_ir_evaluation_unavailable");
       (void)edr_p0_rule_emit_ruleset_evaluation_gate(br, "p0_ir_evaluation_unavailable");
       return 0;
     }
-    if (p0_is_ruleset_evaluation_event(br->type)) {
+    if (edr_p0_source_only_ruleset_event_type(br->type)) {
       (void)edr_p0_rule_emit_ruleset_evaluation_gate(br, "p0_ir_not_ready");
       return 0;
     }
@@ -4749,7 +4730,7 @@ int edr_p0_rule_try_emit_status(const EdrBehaviorRecord *br,
       : edr_behavior_p0_source_quality_hard_reject(br));
   if (br && getenv_int01_disabled_on_zero("EDR_P0_DIRECT_EMIT") &&
       !hard_reject &&
-      (!p0_is_ruleset_evaluation_event(br->type) || edr_p0_rule_ir_is_ready())) {
+      (!edr_p0_source_only_ruleset_event_type(br->type) || edr_p0_rule_ir_is_ready())) {
     edr_local_evidence_cache_resolve_commands(br, &facts.subject, &facts.parent);
   }
   emitted = edr_p0_rule_try_emit_with_command_facts_status(br, &facts,

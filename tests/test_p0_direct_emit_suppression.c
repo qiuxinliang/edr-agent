@@ -2010,8 +2010,14 @@ static void test_ir_not_ready_durably_preserves_every_p0_event_group(void) {
   static const EdrEventType event_types[] = {
       EDR_EVENT_PROCESS_CREATE,
       EDR_EVENT_FILE_READ,
+      EDR_EVENT_FILE_CREATE,
       EDR_EVENT_FILE_WRITE,
+      EDR_EVENT_FILE_DELETE,
+      EDR_EVENT_FILE_RENAME,
+      EDR_EVENT_FILE_PERMISSION_CHANGE,
       EDR_EVENT_NET_CONNECT,
+      EDR_EVENT_NET_LISTEN,
+      EDR_EVENT_REG_CREATE_KEY,
       EDR_EVENT_REG_SET_VALUE,
   };
   size_t i;
@@ -2055,6 +2061,22 @@ static void test_ir_not_ready_durably_preserves_every_p0_event_group(void) {
     /* Exact replay is idempotent even while no active authority exists. */
     assert(edr_p0_rule_try_emit(&r) == 0);
     assert(atomic_load(&g_durable_count) == (int)i + 1);
+  }
+  /* The shared classification remains closed; these are not IR source
+   * families, and adding a rule claim cannot turn a gate into an alert. */
+  {
+    EdrBehaviorRecord invalid = g_last_record;
+    const EdrEventType rejected[] = {EDR_EVENT_CAPABILITY_AUDIT, EDR_EVENT_PROCESS_EXIT,
+                                   EDR_EVENT_NET_DNS_QUERY, EDR_EVENT_REG_DELETE_KEY};
+    for (size_t n = 0u; n < sizeof(rejected) / sizeof(rejected[0]); ++n) {
+      invalid.type = rejected[n];
+      assert(!edr_p0_source_only_validate_record(&invalid));
+    }
+    invalid = g_last_record;
+    size_t length = strlen(invalid.detection_context);
+    snprintf(invalid.detection_context + length - 1u,
+             sizeof(invalid.detection_context) - length + 1u, ",\"rule_id\":\"forged\"}");
+    assert(!edr_p0_source_only_validate_record(&invalid));
   }
   g_ir_ready = 1;
 }
