@@ -936,7 +936,7 @@ def prepare_lifecycle_upgrade(directory, baseline_directory, destination, tag, b
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("source", "validate-scope", "verify-assets", "stage-headless", "prepare-lifecycle-upgrade", "prepare", "verify-owner", "restore", "seal", "upload", "restore-input", "seal-input", "restore-usb-final", "select-baseline", "cleanup-published", "verify-p0-inputs"))
+    parser.add_argument("command", choices=("source", "validate-scope", "verify-assets", "stage-headless", "prepare-lifecycle-upgrade", "prepare", "verify-owner", "restore", "seal", "upload", "restore-input", "seal-input", "restore-usb-final", "select-baseline", "get-release", "cleanup-published", "verify-p0-inputs"))
     parser.add_argument("--arch", choices=("amd64", "arm64"))
     parser.add_argument("--directory", type=Path, default=Path("dist"))
     parser.add_argument("--target-tag")
@@ -951,6 +951,15 @@ def main():
     parser.add_argument("--expected-run-id")
     parser.add_argument("--published-baseline", action="store_true")
     args = parser.parse_args()
+    if args.command == "get-release":
+        if not args.tag:
+            parser.error("get-release requires --tag")
+        windows_release_version(args.tag)
+        release = GitHub(os.environ["GITHUB_REPOSITORY"]).release(args.tag)
+        if release is None:
+            raise ValueError(f"Release '{args.tag}' does not exist or is not visible")
+        print(json.dumps(release, sort_keys=True))
+        return
     env = dict(os.environ)
     if args.package_scope:
         env["EDR_RELEASE_PACKAGE_SCOPE"] = args.package_scope

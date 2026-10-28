@@ -229,18 +229,16 @@ jobs:
           $script:immutableReleases = @{}
           function Get-ImmutableRelease([string]$Tag) {
             if ($script:immutableReleases.ContainsKey($Tag)) { return $script:immutableReleases[$Tag] }
-            $releaseOutput = gh api `
-              "repos/$env:GITHUB_REPOSITORY/releases?per_page=100" 2>&1
+            # The shared owner resolves both draft and published tags exactly,
+            # then fetches their assets by stable release ID with pagination.
+            $releaseOutput = python scripts/windows_release_checkpoint.py get-release --tag $Tag 2>&1
             if ($LASTEXITCODE -ne 0) {
-              throw "cannot list draft and published releases while resolving '$Tag': $($releaseOutput -join ' ')"
+              throw "cannot resolve immutable release '$Tag': $($releaseOutput -join ' ')"
             }
-            $releases = @($releaseOutput | ConvertFrom-Json)
-            $releaseMatches = @($releases | Where-Object { $_.tag_name -eq $Tag })
-            if ($releaseMatches.Count -ne 1) {
-              $availableTags = @($releases | ForEach-Object { $_.tag_name }) -join ', '
-              throw "release '$Tag' was not found in the authenticated draft/published release list; visible tags: $availableTags"
+            $release = ($releaseOutput -join "`n") | ConvertFrom-Json -NoEnumerate -ErrorAction Stop
+            if ($release -isnot [pscustomobject] -or $release.tag_name -cne $Tag) {
+              throw "invalid immutable release identity for '$Tag'"
             }
-            $release = $releaseMatches[0]
             $script:immutableReleases[$Tag] = $release
             return $release
           }

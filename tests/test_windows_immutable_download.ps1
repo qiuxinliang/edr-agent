@@ -3,7 +3,7 @@ $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Net.Http
 $workflow = Join-Path $PSScriptRoot '../.github/workflows/windows-install-upgrade-rollback.yml'
 $source = Get-Content -LiteralPath $workflow -Raw
-$match = [regex]::Match($source, '(?ms)^          function Download-ImmutableAsset\(.*?(?=^          \$targetRuntime = )')
+$match = [regex]::Match($source, '(?ms)^          function Get-ImmutableRelease\(.*?(?=^          \$targetRuntime = )')
 if (-not $match.Success) { throw 'workflow download function not found' }
 $functionSource = $match.Value -replace '(?m)^          ', ''
 if ($functionSource -match 'SkipCertificateCheck|AllowInsecureRedirect|PreserveAuthorizationOnRedirect|ServerCertificateValidationCallback') {
@@ -13,6 +13,53 @@ if ($functionSource -match 'SkipCertificateCheck|AllowInsecureRedirect|PreserveA
 
 function Assert-DownloadTest([bool]$Condition, [string]$Message) {
   if (-not $Condition) { throw "download regression: $Message" }
+}
+
+# Execute the real workflow resolver; only its Python process is replaced.
+# The CLI's exact GraphQL/REST behavior is covered by the shared owner tests.
+$savedNativeExit = Get-Variable LASTEXITCODE -Scope Global -ErrorAction SilentlyContinue
+$savedNativeExitValue = if ($savedNativeExit) { $savedNativeExit.Value } else { $null }
+try {
+  function python {
+    Assert-DownloadTest (($args -join '|') -ceq 'scripts/windows_release_checkpoint.py|get-release|--tag|win_3.2.723') 'shared release owner invocation changed'
+    $script:releaseCalls++
+    $global:LASTEXITCODE = $script:releaseCase.exit
+    return $script:releaseCase.output
+  }
+  $releaseCases = @(
+    @{name='published';exit=0;output='{"id":425330868,"tag_name":"win_3.2.723","draft":false,"assets":[]}';ok=$true},
+    @{name='draft';exit=0;output='{"id":425330868,"tag_name":"win_3.2.723","draft":true,"assets":[]}';ok=$true},
+    @{name='missing';exit=1;output='release not visible';ok=$false;cause='cannot resolve immutable release'},
+    @{name='api-failure';exit=1;output='HTTP 403: forbidden';ok=$false;cause='403'},
+    @{name='invalid-json';exit=0;output='{';ok=$false;cause=''},
+    @{name='null';exit=0;output='null';ok=$false;cause='invalid immutable release identity'},
+    @{name='array';exit=0;output='[{"tag_name":"win_3.2.723"}]';ok=$false;cause='invalid immutable release identity'},
+    @{name='wrong-tag';exit=0;output='{"tag_name":"win_3.2.724"}';ok=$false;cause='invalid immutable release identity'}
+  )
+  foreach ($script:releaseCase in $releaseCases) {
+    $script:immutableReleases=@{}; $script:releaseCalls=0; $failed=$false
+    try {
+      $resolved=Get-ImmutableRelease 'win_3.2.723'
+    } catch {
+      $failed=$true
+      Assert-DownloadTest (-not $script:releaseCase.ok) ($script:releaseCase.name+' unexpected failure: '+$_.Exception.Message)
+      Assert-DownloadTest ($_.Exception.Message -match $script:releaseCase.cause) ($script:releaseCase.name+' lost cause')
+    }
+    Assert-DownloadTest ($script:releaseCalls -eq 1 -and $failed -eq (-not $script:releaseCase.ok)) ($script:releaseCase.name+' process result')
+    if ($script:releaseCase.ok) {
+      $cached=Get-ImmutableRelease 'win_3.2.723'
+      Assert-DownloadTest ($resolved.id -eq 425330868 -and [object]::ReferenceEquals($resolved,$cached) -and $script:releaseCalls -eq 1) 'only successful exact identity is cached'
+      Assert-DownloadTest ($resolved.draft -eq ($script:releaseCase.name -ceq 'draft')) 'draft state preserved'
+    } else {
+      Assert-DownloadTest ($script:immutableReleases.Count -eq 0) ($script:releaseCase.name+' failure cached')
+    }
+    Write-Host ('PASS release-'+$script:releaseCase.name)
+  }
+  Write-Host "Passed $($releaseCases.Count) immutable release resolution cases"
+} finally {
+  Remove-Item Function:\python
+  if ($savedNativeExit) { $global:LASTEXITCODE = $savedNativeExitValue }
+  else { Remove-Variable LASTEXITCODE -Scope Global -ErrorAction SilentlyContinue }
 }
 
 function Get-ImmutableAsset([string]$Tag, [string]$Expected) {

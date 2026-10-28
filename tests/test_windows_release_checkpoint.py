@@ -424,6 +424,53 @@ class ReleaseCheckpointTests(unittest.TestCase):
                 self.assertEqual(result["id"], 397548605)
                 self.assertEqual([a["name"] for a in result["assets"]], ["first", "second"])
                 self.assertFalse(any("/releases/tags/" in str(call) for call in calls))
+                # The lifecycle CLI uses the same exact owner, without build
+                # source variables or a first-page release-list dependency.
+                output = io.StringIO()
+                with patch.object(cp, "GitHub", return_value=api), \
+                        patch.dict(cp.os.environ, {"GITHUB_REPOSITORY": SOURCE["repository"]}, clear=True), \
+                        patch.object(sys, "argv", ["checkpoint", "get-release", "--tag", SOURCE["tag"]]), \
+                        patch("sys.stdout", output):
+                    cp.main()
+                self.assertEqual(json.loads(output.getvalue()), result)
+                self.assertEqual(len(calls), 6)
+                self.assertEqual(calls[2][-2:], ("--paginate", "--slurp"))
+                self.assertEqual(calls[5][-2:], ("--paginate", "--slurp"))
+
+    def test_get_release_cli_rejects_invalid_input_before_transport(self):
+        for arguments, exception in (([], SystemExit), (["--tag", "latest"], ValueError),
+                                     (["--tag", "win_3.2.723/extra"], ValueError)):
+            with self.subTest(arguments=arguments), patch.object(cp.GitHub, "call") as call, \
+                    patch.dict(cp.os.environ, {"GITHUB_REPOSITORY": SOURCE["repository"]}, clear=True), \
+                    patch.object(sys, "argv", ["checkpoint", "get-release", *arguments]), \
+                    patch("sys.stdout", io.StringIO()) as output, patch("sys.stderr", io.StringIO()):
+                with self.assertRaises(exception):
+                    cp.main()
+                call.assert_not_called()
+                self.assertEqual(output.getvalue(), "")
+
+    def test_get_release_cli_preserves_missing_error_and_identity_failures(self):
+        identity = {"id": 425330868, "tag_name": "win_3.2.723"}
+        graphql = lambda release: json.dumps({"data": {"repository": {"release": release}}})
+        cases = (
+            ([graphql(None)], ValueError, "does not exist or is not visible"),
+            ([RuntimeError("HTTP 403: forbidden")], RuntimeError, "403"),
+            ([RuntimeError("transport failure")], RuntimeError, "transport failure"),
+            ([json.dumps({"data": {"repository": None}})], RuntimeError, "repository access"),
+            ([json.dumps({"data": {"repository": {"release": identity}}, "errors": [{"message": "denied"}]})], RuntimeError, "repository access"),
+            (["invalid-json"], ValueError, ""),
+            ([graphql(dict(identity, tag_name="win_3.2.724"))], RuntimeError, "tag/ID binding"),
+            ([graphql(dict(identity, id="425330868"))], RuntimeError, "tag/ID binding"),
+            ([graphql(identity), json.dumps(dict(identity, tag_name="win_3.2.724"))], RuntimeError, "tag changed"),
+        )
+        for responses, exception, cause in cases:
+            with self.subTest(responses=responses), patch.object(cp.GitHub, "call", side_effect=responses), \
+                    patch.dict(cp.os.environ, {"GITHUB_REPOSITORY": SOURCE["repository"]}, clear=True), \
+                    patch.object(sys, "argv", ["checkpoint", "get-release", "--tag", "win_3.2.723"]), \
+                    patch("sys.stdout", io.StringIO()) as output:
+                with self.assertRaisesRegex(exception, cause):
+                    cp.main()
+                self.assertEqual(output.getvalue(), "")
 
     def test_graphql_missing_release_differs_from_permission_or_partial_error(self):
         api = cp.GitHub(SOURCE["repository"])

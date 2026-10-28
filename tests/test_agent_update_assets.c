@@ -700,8 +700,8 @@ int main(void) {
            "release lifecycle selects baseline runtime assets by architecture-specific immutable exact name");
   contains(lifecycle, "contents: write",
            "release lifecycle has the push-level visibility GitHub requires for draft releases");
-  contains(lifecycle, "repos/$env:GITHUB_REPOSITORY/releases?per_page=100",
-           "release lifecycle resolves target drafts from the authenticated release list");
+  contains(lifecycle, "python scripts/windows_release_checkpoint.py get-release --tag $Tag",
+           "release lifecycle resolves exact draft and published identities through the shared release owner");
   contains(lifecycle, "Invoke-WebRequest -Uri $apiUrl",
            "release lifecycle downloads draft and published assets through the authenticated asset API");
   contains(lifecycle, "test_windows_immutable_download.ps1",
