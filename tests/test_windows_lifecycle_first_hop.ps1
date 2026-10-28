@@ -35,10 +35,12 @@ try {
   $script:events=@()
   function Add-Evidence([string]$Stage,[string]$Status,[string]$Detail) { $script:events+=@{stage=$Stage;status=$Status;detail=$Detail} }
   $target=Join-Path $root 'FDSensor.next.exe'
-  # A real unsigned PE exercises the native NotSigned result on success. The
-  # invalid/trust outcomes below isolate only the Authenticode OS boundary.
+  # An unsigned PE library is data for hash, copy and native NotSigned checks;
+  # it is never executed as an Agent. Library output works in the workflow's
+  # PowerShell 7 host, which cannot emit ConsoleApplication assemblies.
+  # Invalid/trust outcomes below isolate only the Authenticode OS boundary.
   Add-Type -TypeDefinition 'public static class LifecycleUnsignedFixture { public static int Main() { return 0; } }' `
-    -OutputAssembly $target -OutputType ConsoleApplication
+    -OutputAssembly $target -OutputType Library
   $setup=Join-Path $root 'FDSecuritySetup.exe';Copy-Item -LiteralPath $target -Destination $setup
   $newUpdater='throw "candidate updater must never execute the first hop"'
   Put (Join-Path $root 'new-updater.txt') $newUpdater

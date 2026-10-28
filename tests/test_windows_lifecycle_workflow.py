@@ -10,6 +10,8 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = ROOT / '.github/workflows/windows-install-upgrade-rollback.yml'
+RELEASE_WORKFLOW = ROOT / '.github/workflows/edr-agent-client-release.yml'
+EARLY_PREFLIGHT_STEP = 'Verify lifecycle preflight before native build'
 DOWNLOAD_STEP = 'Download immutable runtime and Setup EXE release packages'
 SETUP_STEP = 'Execute real Setup EXE install, upgrade, rollback, and uninstall'
 
@@ -35,6 +37,43 @@ def download_branches(text):
 class WindowsLifecycleWorkflowTests(unittest.TestCase):
     def setUp(self):
         self.text = WORKFLOW.read_text(encoding='utf-8')
+
+    def assert_early_preflight(self, text):
+        build = text.split('  windows-build:\n', 1)[1].split('\n  windows-', 1)[0]
+        body = step(build, EARLY_PREFLIGHT_STEP)
+        self.assertNotIn('if:', body)
+        self.assertIn('timeout-minutes: 3', body)
+        self.assertIn('shell: pwsh\n', body)
+        self.assertEqual(re.findall(r'^          & (.+)$', body, re.M), [
+            r'.\tests\test_windows_lifecycle_first_hop.ps1',
+            r'.\tests\test_windows_immutable_download.ps1',
+        ])
+        # Run on the actual harness host before dependency/build work, including
+        # same-run checkpoint resumes; standalone lifecycle keeps its own gates.
+        self.assertLess(build.index('actions/checkout@'), build.index('- name: '+EARLY_PREFLIGHT_STEP))
+        self.assertLess(build.index('- name: '+EARLY_PREFLIGHT_STEP),
+                        build.index('- name: Restore pinned ARM64-host Python tool cache'))
+
+    def test_release_checks_lifecycle_preflight_before_native_build(self):
+        self.assert_early_preflight(RELEASE_WORKFLOW.read_text(encoding='utf-8'))
+
+    def test_early_preflight_host_skip_and_late_execution_are_detected(self):
+        text = RELEASE_WORKFLOW.read_text(encoding='utf-8')
+        body = step(text, EARLY_PREFLIGHT_STEP)
+        original = '      - name: '+EARLY_PREFLIGHT_STEP+'\n'+body
+        mutations = [
+            text.replace(original, original.replace('shell: pwsh', 'shell: powershell'), 1),
+            text.replace(original, original.replace('        shell:', "        if: steps.resume.outputs.restored != 'true'\n        shell:"), 1),
+            text.replace(original, original.replace('          & .\\tests\\test_windows_lifecycle_first_hop.ps1\n', ''), 1),
+            text.replace(original, original.replace('          & .\\tests\\test_windows_immutable_download.ps1\n', ''), 1),
+            text.replace(original, '', 1).replace('      - name: Verify hosted release workflow contract\n',
+                                                original+'      - name: Verify hosted release workflow contract\n', 1),
+        ]
+        for mutated in mutations:
+            with self.subTest(mutation=mutations.index(mutated)):
+                self.assertNotEqual(mutated, text)
+                with self.assertRaises(AssertionError):
+                    self.assert_early_preflight(mutated)
 
     def assert_asset_scope(self, text):
         common, full, headless = download_branches(text)

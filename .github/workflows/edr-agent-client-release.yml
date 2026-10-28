@@ -212,6 +212,12 @@ jobs:
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
+      - name: Verify lifecycle preflight before native build
+        timeout-minutes: 3
+        shell: pwsh
+        run: |
+          & .\tests\test_windows_lifecycle_first_hop.ps1
+          & .\tests\test_windows_immutable_download.ps1
       # P0 encryption produces architecture-independent artifacts.  Pin it to
       # x64 CPython before any workflow Python invocation: the selected
       # cryptography release has an x64 Windows wheel but no native ARM64 one.
