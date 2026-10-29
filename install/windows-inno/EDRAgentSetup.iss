@@ -109,6 +109,8 @@ Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile
 
 [UninstallDelete]
 Type: files; Name: "{app}\*.pid"
+; Embedded updater versions are materialized by the Agent, outside [Files].
+Type: files; Name: "{app}\edr_agent_inplace_update-*.ps1"
 Type: files; Name: "{app}\edr_queue.db*"
 Type: files; Name: "{app}\local_evidence_cache.db*"
 Type: files; Name: "{app}\command_state.jsonl*"
