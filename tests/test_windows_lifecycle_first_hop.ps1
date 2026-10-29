@@ -50,7 +50,9 @@ try {
   $copyOwner=@($faultAst.FindAll({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Copy-RecoveryInstallerEvidence'},$true))
   Check ($copyOwner.Count -eq 1) 'unique recovery evidence owner'
   . ([scriptblock]::Create($copyOwner[0].Extent.Text))
-  $evidenceCommand='ci-installer-timeout-'+[Guid]::NewGuid().ToString('N')
+  # This fixture adds a temporary profile root above ProgramData. Keep its
+  # command short so the native symlink API stays inside the legacy path bound.
+  $evidenceCommand='e'+[Guid]::NewGuid().ToString('N')
   $evidenceLeaf="agent-update-$evidenceCommand-$evidenceCommand-installer.log.redacted"
   $evidenceSource=Join-Path (Join-Path $env:ProgramData 'FDSecurity\logs') $evidenceLeaf
   $evidenceCopy=Join-Path $EvidenceDir 'installer.log.redacted'
@@ -92,6 +94,9 @@ try {
   Must-Fail {Copy-RecoveryInstallerEvidence $logReport $logJournal $evidenceCommand $EvidenceDir} '*not a regular file of the reported size*'
   Remove-Item -LiteralPath $evidenceSource
   $linkTarget=Join-Path $root 'evidence-link-target.txt';Put $linkTarget $logText
+  Check ([IO.Directory]::Exists((Split-Path $evidenceSource -Parent)) -and [IO.File]::Exists($linkTarget)) 'symlink fixture parent and target exist'
+  Check ($evidenceSource.Length -lt 248 -and $linkTarget.Length -lt 248) 'symlink fixture stays within native path bounds'
+  Write-Output ("recovery evidence fixture: link_path_length={0}; target_path_length={1}; parent_and_target_exist=true" -f $evidenceSource.Length,$linkTarget.Length)
   New-Item -ItemType SymbolicLink -Path $evidenceSource -Target $linkTarget | Out-Null
   Must-Fail {Copy-RecoveryInstallerEvidence $logReport $logJournal $evidenceCommand $EvidenceDir} '*not a regular file of the reported size*'
   Remove-Item -LiteralPath $evidenceSource,$linkTarget
