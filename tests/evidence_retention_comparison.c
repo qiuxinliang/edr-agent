@@ -24,6 +24,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <errno.h>
 #include <sys/stat.h>
 #include "edr/sha256.h"
 
@@ -167,6 +168,7 @@ static uint64_t benchmark_physical_bytes(const char *path) {
   for(unsigned i=0;i<3;++i) { char file[640]; struct stat st;
     snprintf(file,sizeof(file),"%s%s",path,suffixes[i]);
     if(stat(file,&st)==0) total+=(uint64_t)st.st_size;
+    else assert(errno==ENOENT); /* Unknown size must never be reported as zero. */
   }
   return total;
 }
@@ -186,6 +188,129 @@ static int64_t compact_scalar(sqlite3 *db, const char *sql) {
   int64_t value = sqlite3_column_int64(st, 0);
   sqlite3_finalize(st); return value;
 }
+
+static int64_t retention_reference_errors(sqlite3 *db, int64_t *legacy, int64_t *compact) {
+  *legacy=compact_scalar(db,"SELECT COUNT(*) FROM candidate_context_refs");
+  *compact=0;
+  int64_t errors=compact_scalar(db,
+      "SELECT COUNT(*) FROM candidate_context_refs r "
+      "LEFT JOIN p0_candidates p ON p.candidate_id=r.candidate_id "
+      "LEFT JOIN context_facts f ON f.fact_id=r.fact_id "
+      "WHERE p.candidate_id IS NULL OR f.fact_id IS NULL "
+      "OR p.endpoint_id IS NOT f.endpoint_id OR p.tenant_id IS NOT f.tenant_id");
+  if(compact_scalar(db,"SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='compact_context_refs'")) {
+    *compact=compact_scalar(db,"SELECT COUNT(*) FROM compact_context_refs");
+    /* The production projection uses inner joins. Inspect physical refs here
+     * so broken integer keys cannot disappear from the verification itself. */
+    errors+=compact_scalar(db,
+        "SELECT COUNT(*) FROM compact_context_refs r "
+        "LEFT JOIN context_candidates c ON c.id=r.candidate_key "
+        "LEFT JOIN context_fact_keys k ON k.id=r.fact_key "
+        "LEFT JOIN p0_candidates p ON p.candidate_id=c.candidate_id "
+        "LEFT JOIN context_facts f ON f.fact_id=k.fact_id "
+        "WHERE c.id IS NULL OR k.id IS NULL OR p.candidate_id IS NULL OR f.fact_id IS NULL "
+        "OR p.endpoint_id IS NOT f.endpoint_id OR p.tenant_id IS NOT f.tenant_id");
+  }
+  return errors;
+}
+
+static void retention_reference_oracle_selftest(void) {
+  sqlite3 *db=NULL; assert(sqlite3_open(":memory:",&db)==SQLITE_OK);
+  assert(sqlite3_exec(db,
+      "CREATE TABLE p0_candidates(candidate_id TEXT,endpoint_id TEXT,tenant_id TEXT);"
+      "CREATE TABLE context_facts(fact_id TEXT,endpoint_id TEXT,tenant_id TEXT);"
+      "CREATE TABLE candidate_context_refs(candidate_id TEXT,fact_id TEXT);"
+      "INSERT INTO p0_candidates VALUES('owner','endpoint','tenant');"
+      "INSERT INTO context_facts VALUES('fact','endpoint','tenant');"
+      "INSERT INTO candidate_context_refs VALUES('owner','fact');",NULL,NULL,NULL)==SQLITE_OK);
+  int64_t legacy,compact;
+  assert(retention_reference_errors(db,&legacy,&compact)==0 && legacy==1 && compact==0);
+  assert(sqlite3_exec(db,
+      "CREATE TABLE context_candidates(id INTEGER,candidate_id TEXT);"
+      "CREATE TABLE context_fact_keys(id INTEGER,fact_id TEXT);"
+      "CREATE TABLE compact_context_refs(candidate_key INTEGER,fact_key INTEGER);"
+      "INSERT INTO context_candidates VALUES(1,'owner');"
+      "INSERT INTO context_fact_keys VALUES(1,'fact');"
+      "INSERT INTO compact_context_refs VALUES(1,1);",NULL,NULL,NULL)==SQLITE_OK);
+  assert(retention_reference_errors(db,&legacy,&compact)==0 && compact==1);
+  const char *mutations[]={
+    "INSERT INTO compact_context_refs VALUES(99,1)",
+    "INSERT INTO compact_context_refs VALUES(1,99)",
+    "DELETE FROM context_facts",
+    "DELETE FROM p0_candidates",
+    "UPDATE context_facts SET endpoint_id='other'",
+    "UPDATE context_facts SET tenant_id='other'",
+    "INSERT INTO candidate_context_refs VALUES('missing','fact')"};
+  for(unsigned i=0;i<sizeof(mutations)/sizeof(mutations[0]);++i) {
+    assert(sqlite3_exec(db,"SAVEPOINT broken",NULL,NULL,NULL)==SQLITE_OK);
+    assert(sqlite3_exec(db,mutations[i],NULL,NULL,NULL)==SQLITE_OK);
+    assert(retention_reference_errors(db,&legacy,&compact)>0);
+    assert(sqlite3_exec(db,"ROLLBACK TO broken;RELEASE broken",NULL,NULL,NULL)==SQLITE_OK);
+    assert(retention_reference_errors(db,&legacy,&compact)==0);
+  }
+  sqlite3_close(db);
+  puts("PASS: legacy and compact physical reference oracle rejects missing keys, owners, facts and cross-domain refs");
+}
+
+#if defined(BENCH_HAS_AUTHORIZED_RECALL) && BENCH_HAS_AUTHORIZED_RECALL
+static unsigned retention_authorized_post_recall(int64_t now, unsigned hour) {
+  unsigned recalled=0;
+  for(unsigned item=0;item<24;item+=4) {
+    unsigned pid=5000u+hour*24u+item;
+    EdrSoarCommandMeta meta={0}; char output[16384];
+    meta.issued_at_unix_ms=now/1000000; meta.deadline_ms=60000;
+    EdrCommandResultAuthorization *a=&meta.result_authorization;
+    strcpy(a->command_id,"retention-post-recall");strcpy(a->command_type,"rtq_query");
+    strcpy(a->endpoint_id,"bench-endpoint");strcpy(a->tenant_id,"bench-tenant");
+    a->expires_unix_ms=meta.issued_at_unix_ms+60000;
+    snprintf(a->content_contract,sizeof(a->content_contract),
+        "{\"schema\":\"edr.command.result-purpose.v1\",\"kind\":\"cached_rtq\",\"max_bytes\":16383,"
+        "\"max_rows\":50,\"window_s\":28800,\"issued_unix_ms\":%lld,\"request\":{"
+        "\"time_window_s\":28800,\"event_type\":\"network\",\"pid\":%u,\"remote_port\":80,"
+        "\"process_start_key\":\"%u\",\"process_creation_filetime_100ns\":\"%llu\"}}",
+        (long long)meta.issued_at_unix_ms,pid,pid,(unsigned long long)(UINT64_C(133700000000000000)+pid));
+    int rc=edr_local_evidence_cache_query_authorized_json(a->command_id,&meta,output,sizeof(output));
+    if(rc)fprintf(stderr,"retention authorized recall failed: %s\n",output);
+    assert(rc==0);
+    cJSON *root=cJSON_Parse(output);assert(root);
+    const cJSON *rows=cJSON_GetObjectItemCaseSensitive(root,"rows"),*row=NULL;
+    assert(cJSON_IsArray(rows));
+    assert(cJSON_IsFalse(cJSON_GetObjectItemCaseSensitive(root,"absence_is_evidence")));
+    unsigned matched=0;
+    cJSON_ArrayForEach(row,rows) {
+      const cJSON *source=cJSON_GetObjectItemCaseSensitive(row,"source");
+      assert(cJSON_IsString(source) && !strcmp(source->valuestring,"context_post"));
+      const cJSON *actor=cJSON_GetObjectItemCaseSensitive(row,"pid");
+      const cJSON *port=cJSON_GetObjectItemCaseSensitive(row,"dst_port");
+      const cJSON *start=cJSON_GetObjectItemCaseSensitive(row,"process_start_key");
+      const cJSON *birth=cJSON_GetObjectItemCaseSensitive(row,"process_creation_filetime_100ns");
+      const cJSON *endpoint=cJSON_GetObjectItemCaseSensitive(row,"endpoint_id");
+      const cJSON *remote=cJSON_GetObjectItemCaseSensitive(row,"remote_ip");
+      const cJSON *type=cJSON_GetObjectItemCaseSensitive(row,"type");
+      const cJSON *stamp=cJSON_GetObjectItemCaseSensitive(row,"event_time_ns");
+      char expected_start[24],expected_birth[24];
+      snprintf(expected_start,sizeof(expected_start),"%u",pid);
+      snprintf(expected_birth,sizeof(expected_birth),"%llu",(unsigned long long)(UINT64_C(133700000000000000)+pid));
+      assert(cJSON_IsNumber(actor) && actor->valuedouble==pid);
+      assert(cJSON_IsNumber(port) && port->valueint==80);
+      assert(cJSON_IsString(start) && !strcmp(start->valuestring,expected_start));
+      assert(cJSON_IsString(birth) && !strcmp(birth->valuestring,expected_birth));
+      assert(cJSON_IsString(endpoint) && !strcmp(endpoint->valuestring,"bench-endpoint"));
+      assert(cJSON_IsString(remote) && !strcmp(remote->valuestring,"10.2.3.4"));
+      assert(cJSON_IsNumber(type) && type->valueint==EDR_EVENT_NET_CONNECT);
+      /* Compare at the existing double projection precision, never claim
+       * that the producer/consumer retained this occurrence's final +1 ns. */
+      int64_t expected_time=now-INT64_C(479)*60000000000LL+(int64_t)hour*3600000000000LL+
+          (int64_t)item*1000000000LL+1;
+      assert(cJSON_IsNumber(stamp) && stamp->valuedouble==(double)expected_time);
+      ++matched;
+    }
+    printf("retention_recall hour=%u item=%u pid=%u expected_last_hour=%u matched=%u\n",hour,item,pid,hour==7,matched);
+    assert(matched<=1);recalled+=matched;cJSON_Delete(root);
+  }
+  return recalled;
+}
+#endif
 
 
 #ifndef BENCH_SOURCE
@@ -277,7 +402,8 @@ static void test_retention_value_benchmark(void) {
     assert(sqlite3_prepare_v2(db,"PRAGMA integrity_check",-1,&st,NULL)==SQLITE_OK);
     assert(sqlite3_step(st)==SQLITE_ROW && !strcmp((const char *)sqlite3_column_text(st,0),"ok"));
     sqlite3_finalize(st);
-    int64_t orphan_refs=compact_scalar(db,"SELECT COUNT(*) FROM candidate_context_refs r LEFT JOIN p0_candidates p ON p.candidate_id=r.candidate_id LEFT JOIN context_facts f ON f.fact_id=r.fact_id WHERE p.candidate_id IS NULL OR f.fact_id IS NULL");
+    int64_t legacy_refs=0,compact_refs=0;
+    int64_t orphan_refs=retention_reference_errors(db,&legacy_refs,&compact_refs);
     assert(orphan_refs==0);
     snprintf(sql,sizeof(sql),"SELECT MIN(event_time_ns),MAX(event_time_ns) FROM p0_candidates WHERE type=%d",(int)EDR_EVENT_PMFE_SCAN_RESULT);
     assert(sqlite3_prepare_v2(db,sql,-1,&st,NULL)==SQLITE_OK);
@@ -306,9 +432,23 @@ static void test_retention_value_benchmark(void) {
       cJSON_Delete(fact);
     }
     sqlite3_finalize(st);
+    sqlite3_close(db); db=NULL;
+    /* Reopen the production cache before querying: SQL readability alone is
+     * not evidence that the signed, scoped consumer can obtain the event. */
+    int authorized_recall_available=0,authorized_recent_post=-1,authorized_oldest_post=-1;
+#if defined(BENCH_HAS_AUTHORIZED_RECALL) && BENCH_HAS_AUTHORIZED_RECALL
+    char queue_path[512];assert(make_test_sqlite_path(queue_path,sizeof(queue_path))==0);
+    edr_storage_queue_configure(8,1);assert(edr_storage_queue_open(queue_path)==EDR_OK);
+    assert(BENCH_OPEN(path,selected)==0);
+    authorized_recall_available=1;
+    authorized_recent_post=(int)retention_authorized_post_recall(base+INT64_C(479)*60000000000LL,7);
+    authorized_oldest_post=(int)retention_authorized_post_recall(base+INT64_C(479)*60000000000LL,0);
+    assert(authorized_recent_post==6); /* Independent six last-hour input facts. */
+    edr_local_evidence_cache_close();edr_storage_queue_close();cleanup_test_sqlite_path(queue_path);
+#endif
     uint8_t digest[32]; char input_sha[65]; edr_sha256_final(&benchmark_input_hash,digest);
     for (unsigned j=0;j<32;++j) snprintf(input_sha+2*j,3,"%02x",digest[j]);
-    printf("retention_value_benchmark source=%s selected_hours=%u input_candidates=192 low_context=48 recent=%d selected=%d selected_min_ns=%lld selected_max_ns=%lld complete_parent_chains=%u retained_post_context=%u reconstructable_chains_with_process_cache=%u physical_peak_bytes=%llu final_db_wal_shm_bytes=%llu cpu_seconds=%.6f sqlite_vfs_read_bytes=%llu sqlite_vfs_write_bytes=%llu sqlite_vfs_syncs=%llu input_protobuf_bytes=%llu input_sha256=%s sqlite_write_amplification=%.6f wall_seconds=%.6f cpu_user_seconds=%.6f cpu_system_seconds=%.6f process_io_available=%d process_read_bytes=%llu process_write_bytes=%llu native_machine=%u process_machine=%u integrity_ok=1 orphan_references=%lld candidate_requests=%llu candidate_admitted=%llu candidate_rejected=%llu candidate_deduped=%llu sqlite_version=%s\n",
+    printf("retention_value_benchmark source=%s selected_hours=%u input_candidates=192 low_context=48 recent=%d selected=%d selected_min_ns=%lld selected_max_ns=%lld complete_parent_chains=%u retained_post_context=%u reconstructable_chains_with_process_cache=%u physical_peak_bytes=%llu final_db_wal_shm_bytes=%llu cpu_seconds=%.6f sqlite_vfs_read_bytes=%llu sqlite_vfs_write_bytes=%llu sqlite_vfs_syncs=%llu input_protobuf_bytes=%llu input_sha256=%s sqlite_write_amplification=%.6f wall_seconds=%.6f cpu_user_seconds=%.6f cpu_system_seconds=%.6f process_io_available=%d process_read_bytes=%llu process_write_bytes=%llu native_machine=%u process_machine=%u integrity_ok=1 orphan_references=%lld legacy_refs=%lld compact_refs=%lld authorized_recall_available=%d authorized_recent_post=%d authorized_oldest_post=%d candidate_requests=%llu candidate_admitted=%llu candidate_rejected=%llu candidate_deduped=%llu sqlite_version=%s\n",
       BENCH_SOURCE,selected,recent,valuable,(long long)earliest,(long long)latest,intact,retained_post_context,reconstructable,(unsigned long long)physical_peak,
       (unsigned long long)status.physical_bytes,cpu_seconds,(unsigned long long)reads,(unsigned long long)writes,(unsigned long long)syncs,(unsigned long long)benchmark_input_bytes,input_sha,(double)writes/(double)benchmark_input_bytes,
       metrics_end.wall_seconds-metrics_begin.wall_seconds,metrics_end.user_seconds-metrics_begin.user_seconds,
@@ -316,9 +456,10 @@ static void test_retention_value_benchmark(void) {
       (unsigned long long)(metrics_end.process_read_bytes-metrics_begin.process_read_bytes),
       (unsigned long long)(metrics_end.process_write_bytes-metrics_begin.process_write_bytes),
       metrics_end.native_machine,metrics_end.process_machine,(long long)orphan_refs,
+      (long long)legacy_refs,(long long)compact_refs,authorized_recall_available,authorized_recent_post,authorized_oldest_post,
       (unsigned long long)status.candidate_requests,(unsigned long long)status.candidate_admitted,
       (unsigned long long)status.candidate_rejected,(unsigned long long)status.candidate_deduped,sqlite3_libversion());
-    sqlite3_close(db); cleanup_test_sqlite_path(path); free(r);
+    cleanup_test_sqlite_path(path); free(r);
   }
   assert(sqlite3_vfs_register(retention_bench_vfs_parent,1)==SQLITE_OK);
   assert(sqlite3_vfs_unregister(&vfs)==SQLITE_OK);
@@ -329,4 +470,7 @@ static void test_retention_value_benchmark(void) {
 }
 
 
-int main(void) { test_retention_value_benchmark(); return 0; }
+int main(int argc,char **argv) {
+  if(argc==2 && !strcmp(argv[1],"--reference-oracle")) {retention_reference_oracle_selftest();return 0;}
+  assert(argc==1);test_retention_value_benchmark();return 0;
+}
