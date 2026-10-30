@@ -14734,6 +14734,8 @@ static void test_accounting_generation_reopen(void) {
   puts("accounting_generation reopen=1 failed_open=1 same_open_stable=1 saturated_unknown_not_reused=1");
 }
 
+#include "retirement_delete_atomicity_cases.h"
+
 static void test_phase2_commit_fairness_and_backoff(void) {
   const int64_t now=INT64_C(1700000000000000000),old=now-INT64_C(360000000000000);
   char path[512],before_hash[65],after_hash[65];sqlite3 *db=NULL;
@@ -15390,6 +15392,9 @@ int main(int argc, char **argv) {
   if (argc==2 && (!strcmp(argv[1],"--window-lifecycle-probe") || !strcmp(argv[1],"--window-lifecycle-contract"))) { test_window_entry_order_and_recovery(!strcmp(argv[1],"--window-lifecycle-contract")); if (!strcmp(argv[1],"--window-lifecycle-contract")) test_window_recovery_failures_and_frozen_policy(); return 0; }
 #endif
 #if defined(EDR_HAVE_SQLITE)
+  if (argc==2 && !strcmp(argv[1],"--retirement-delete-atomicity")) {
+    test_retirement_delete_failure_boundaries(); return 0;
+  }
   if (argc==2 && !strcmp(argv[1],"--phase2-continuation")) {
     test_phase2_continues_across_ttl(0);test_phase2_commit_fairness_and_backoff();test_accounting_generation_reopen();return 0;
   }
@@ -15606,6 +15611,7 @@ int main(int argc, char **argv) {
   RUN_CACHE_CASE("context", test_window_recovery_budget(1));
   RUN_CACHE_CASE("retention", test_phase2_continues_across_ttl(0));
   RUN_CACHE_CASE("retention", test_phase2_commit_fairness_and_backoff());
+  RUN_CACHE_CASE("retention", test_retirement_delete_failure_boundaries());
   for (int scenario = 0; scenario < 9; ++scenario) {
     RUN_CACHE_CASE("context", test_candidate_alert_source_ownership(scenario));
   }
