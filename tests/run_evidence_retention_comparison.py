@@ -122,7 +122,7 @@ summaries = {}
 frozen_sources = []
 variants=[]; binaries={}; all_samples={}
 for label,source in [('baseline',old),('current',current)]:
-    header=(source/'include/edr/local_evidence_cache.h').read_text()
+    header=(source/'include/edr/local_evidence_cache.h').read_text(encoding='utf-8')
     has_policy=bool(re.search(r'\bint\s+edr_local_evidence_cache_open_with_policy\s*\(',header))
     has_recall=bool(re.search(r'\bint\s+edr_local_evidence_cache_query_authorized_json\s*\(',header))
     for selected in args.selected_hours:
