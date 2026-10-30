@@ -1,6 +1,6 @@
 # Native contracts and storage comparisons before a candidate release. Contract
 # dependencies are built; private compiled tools preserve their actual gate outcome.
-# Failed-gate tools are restricted to the two fixed isolated reclaim contracts.
+# Failed-gate tools are restricted to fixed isolated reclaim/phase-2 diagnostics.
 # No product packaging, release or endpoint access. A manual opt-in diagnosis
 # may create one disposable ARM64 SCM service from an unshipped diagnostic build.
 name: Evidence retention native comparison

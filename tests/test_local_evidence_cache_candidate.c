@@ -14798,6 +14798,17 @@ static void test_phase2_commit_fairness_and_backoff(void) {
 /* An already retired owner must not lose its continuation merely because the
  * next rotating TTL stage consumes a slice. The oversized optional copy is
  * intentionally held by the existing byte budget, without delaying SQLite. */
+/* Explicit diagnostic entry only: flushed boundaries survive a supervisor
+ * timeout. Keep this out of both the normal suite and cost comparisons. */
+static int s_phase2_diagnostic;
+static void phase2_diagnostic_stage(const char *stage) {
+  if (!s_phase2_diagnostic) return;
+  printf("phase2_stage stage=%s monotonic_ns=%llu vfs_read_bytes=%llu vfs_write_bytes=%llu\n",
+      stage, (unsigned long long)soak_monotonic_ns(),
+      (unsigned long long)retention_bench_reads, (unsigned long long)retention_bench_writes);
+  fflush(stdout);
+}
+
 static void test_phase2_continues_across_ttl(int benchmark) {
   const int64_t now=INT64_C(1700000000000000000), old=now-INT64_C(360000000000000);
   char path[512], before_hash[65], after_hash[65]; sqlite3 *db=NULL;
@@ -14807,6 +14818,7 @@ static void test_phase2_continues_across_ttl(int benchmark) {
   vfs.zName="phase2-scheduler-comparison";vfs.pNext=NULL;
   vfs.szOsFile+=(int)sizeof(RetentionBenchFile);vfs.xOpen=retention_bench_open;
   assert(sqlite3_vfs_register(&vfs,1)==SQLITE_OK);
+  phase2_diagnostic_stage("prepare_begin");
   assert(make_test_sqlite_path(path,sizeof(path))==0);
   edr_local_evidence_cache_test_set_now_unix_ns(now);
   s_test_monotonic_ns=UINT64_C(1000000000);
@@ -14823,6 +14835,7 @@ static void test_phase2_continues_across_ttl(int benchmark) {
       "INSERT INTO process_cache(endpoint_id,pid,name,last_seen_ns) VALUES('oversize-ttl',1,printf('%05000000d',1),1);");
   retention_ref_fixture(db,"phase2-keeper","phase2-f00001",old);
   assert(edr_context_store_open(&store,db)==0);
+  phase2_diagnostic_stage("proof_begin");
   unsigned proof_turns=0;
   while(!compact_scalar(db,"SELECT COUNT(*) FROM context_retirement_progress WHERE phase=2")) {
     compact_exec(db,"BEGIN IMMEDIATE;");
@@ -14836,6 +14849,7 @@ static void test_phase2_continues_across_ttl(int benchmark) {
   assert(before.db_bytes+before.wal_bytes<512u*1024u*1024u);
   unsigned turns=0, active_turns=0; uint64_t poll_wall=0,poll_cpu=0,poll_reads=0,poll_writes=0;
   s_test_monotonic_ns+=UINT64_C(60000000000);
+  phase2_diagnostic_stage("maintenance_begin");
   while(compact_scalar(db,"SELECT COUNT(*) FROM context_retirement_progress WHERE phase=2") && turns<(benchmark ? 2000u : 80u)) {
     uint64_t started=soak_monotonic_ns();clock_t cpu=clock();
     uint64_t reads=retention_bench_reads,writes=retention_bench_writes;
@@ -14851,6 +14865,7 @@ static void test_phase2_continues_across_ttl(int benchmark) {
     if(!benchmark) assert(after.maintenance_runs==before.maintenance_runs+1u);
     before=after; s_test_monotonic_ns+=benchmark ? UINT64_C(1000000000) : UINT64_C(1000000);
   }
+  phase2_diagnostic_stage("verification_begin");
   assert(compact_scalar(db,"SELECT COUNT(*) FROM context_retirement_progress WHERE phase=2")==0);
   assert(compact_scalar(db,"SELECT COUNT(*) FROM process_cache WHERE endpoint_id='oversize-ttl'")==1);
   compact_startup_rowset_hash(db,"SELECT * FROM materialized_artifacts WHERE candidate_id='phase2-keeper' ORDER BY artifact_id",after_hash);
@@ -14858,10 +14873,12 @@ static void test_phase2_continues_across_ttl(int benchmark) {
   printf("phase2_ttl refs=%lld turns=%u active_turns=%u owner_interval_ms=%u poll_wall_us=%llu poll_cpu_us=%llu poll_read_bytes=%llu poll_write_bytes=%llu keeper=%s\n",(long long)initial,turns,active_turns,benchmark ? 1000u : 1u,
       (unsigned long long)(poll_wall/1000u),(unsigned long long)(poll_cpu*1000000u/CLOCKS_PER_SEC),
       (unsigned long long)poll_reads,(unsigned long long)poll_writes,after_hash);
+  phase2_diagnostic_stage("close_begin");
   assert(sqlite3_close(db)==SQLITE_OK);edr_local_evidence_cache_close();cleanup_test_sqlite_path(path);
   edr_local_evidence_cache_test_set_now_unix_ns(0);s_test_monotonic_ns=UINT64_C(1000000000);
   assert(sqlite3_vfs_register(retention_bench_vfs_parent,1)==SQLITE_OK);
   assert(sqlite3_vfs_unregister(&vfs)==SQLITE_OK);
+  phase2_diagnostic_stage("complete");
 }
 #endif
 
@@ -15397,6 +15414,9 @@ int main(int argc, char **argv) {
   }
   if (argc==2 && !strcmp(argv[1],"--phase2-continuation")) {
     test_phase2_continues_across_ttl(0);test_phase2_commit_fairness_and_backoff();test_accounting_generation_reopen();return 0;
+  }
+  if (argc==2 && !strcmp(argv[1],"--phase2-diagnostic")) {
+    s_phase2_diagnostic=1;test_phase2_continues_across_ttl(0);return 0;
   }
   if (argc==2 && !strcmp(argv[1],"--phase2-scheduling-benchmark")) {
     test_phase2_continues_across_ttl(1); return 0;
