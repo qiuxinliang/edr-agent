@@ -8083,7 +8083,7 @@ startup_failed:
      * Earlier additive statements or normal maintenance may be committed; this
      * is not a whole-open rollback. A later open can resume additive startup. */
     char message[sizeof(s_status.last_error)];
-    snprintf(message,sizeof(message),"evidence cache startup schema unavailable within logical page limit: %.120s",cause);
+    snprintf(message,sizeof(message),"evidence cache startup unavailable: %.124s",cause);
     set_error(message);
   }
   evidence_cache_unlock();
@@ -8645,18 +8645,38 @@ static int64_t context_window_until(int64_t now_ns) {
 static int window_metadata_set(const char *id, const char *state,
                                const char *spec, const char *gap) {
   sqlite3_stmt *st = NULL;
-  if (sqlite3_prepare_v2(s_db, "UPDATE p0_candidates SET context_window_state=?1,"
+  const char *stage = "prepare";
+  int rc = sqlite3_prepare_v2(s_db, "UPDATE p0_candidates SET context_window_state=?1,"
       "context_window_spec=CASE WHEN ?2 IS NULL THEN context_window_spec ELSE ?2 END,"
       "context_window_gap_reason=CASE WHEN ?3='' THEN context_window_gap_reason "
       "WHEN ?3='activation_gap' OR substr(?3,1,15)='activation_gap+' THEN ?3 "
       "WHEN context_window_gap_reason='activation_gap' OR substr(context_window_gap_reason,1,15)='activation_gap+' "
-      "THEN 'activation_gap+'||?3 ELSE ?3 END WHERE candidate_id=?4;", -1, &st, NULL) != SQLITE_OK) return -1;
-  bind_text(st, 1, state);
-  if (spec) bind_text(st, 2, spec); else sqlite3_bind_null(st, 2);
-  bind_text(st, 3, gap); bind_text(st, 4, id);
-  int rc = sqlite3_step(st);
+      "THEN 'activation_gap+'||?3 ELSE ?3 END WHERE candidate_id=?4;", -1, &st, NULL);
+  if (rc == SQLITE_OK) {
+    bind_text(st, 1, state);
+    if (spec) bind_text(st, 2, spec); else sqlite3_bind_null(st, 2);
+    bind_text(st, 3, gap); bind_text(st, 4, id);
+    stage = "update";
+    rc = sqlite3_step(st);
+  }
+  int ok = rc == SQLITE_DONE && sqlite3_changes(s_db) == 1;
+  if (!ok) {
+    if (rc == SQLITE_DONE) {
+      rc = SQLITE_NOTFOUND;
+      set_error("window metadata update matched no owner");
+    } else {
+      /* Finalize/rollback may overwrite the connection's error. Return the
+       * typed cause as well as preserving it for startup diagnostics. */
+      int extended = sqlite3_extended_errcode(s_db);
+      char error[160];
+      snprintf(error, sizeof(error), "window metadata %s failed (sqlite=%d): %.95s",
+          stage, extended, sqlite3_errmsg(s_db));
+      set_error(error);
+      rc = extended;
+    }
+  }
   sqlite3_finalize(st);
-  return rc == SQLITE_DONE && sqlite3_changes(s_db) == 1 ? 0 : -1;
+  return ok ? 0 : rc;
 }
 
 static int window_plan_has_victim(const ContextWindowPlan *plan, const char *id) {
@@ -8866,7 +8886,8 @@ static int sqlite_recover_context_windows(void) {
     copy_s(spec, sizeof(spec), bounded ? raw : ""); sqlite3_finalize(st);
     copy_s(cursor, sizeof(cursor), id);
     ContextWindowPlan plan = {0}; const char *state = "active", *gap = "service_restart_gap";
-    if (!bounded || window_spec_decode(spec, id, endpoint, tenant, &plan) != 0) {
+    int decoded = bounded && window_spec_decode(spec, id, endpoint, tenant, &plan) == 0;
+    if (!decoded) {
       state = "interrupted"; gap = "invalid_window_metadata";
     } else {
       for (unsigned i = 0; i < plan.count; ++i) {
@@ -8878,11 +8899,46 @@ static int sqlite_recover_context_windows(void) {
     if (!sqlite_database_write_allow(16384u) || exec_sql("BEGIN IMMEDIATE;") != 0) {
       set_error("window recovery metadata capacity unavailable; owner preserved"); return -1;
     }
-    if (window_metadata_set(id, state, NULL, gap) != 0 ||
-        (!strcmp(state, "active") && plan_context_window_slots(&plan) != 0) ||
-        exec_sql("COMMIT;") != 0) { sqlite_rollback_silent(); return -1; }
+    int metadata_rc = window_metadata_set(id, state, NULL, gap);
+    if (metadata_rc != 0) {
+      sqlite_rollback_silent();
+      /* A full compatible store can have no page for a longer state/gap.
+       * Only a verified, now-terminal execution plan may be consumed. The
+       * frozen time bounds/floor and every evidence payload/ref remain intact.
+       * A live plan that cannot persist its restart gap is explicitly refused,
+       * just as bounded slot replacement interrupts a window; never publish
+       * it as recovered. Invalid plans remain available for diagnosis.
+       * This is one retry on startup FULL, not normal ingestion work. */
+      if ((metadata_rc & 0xff) != SQLITE_FULL || !decoded) return -1;
+      if (!sqlite3_get_autocommit(s_db)) {
+        set_error("window recovery SQLITE_FULL rollback unconfirmed; owner preserved");
+        return -1;
+      }
+      if (!strcmp(state, "active")) {
+        state = "interrupted";
+        gap = "window_capacity_replaced";
+      }
+      if (!sqlite_database_write_allow(16384u) || exec_sql("BEGIN IMMEDIATE;") != 0 ||
+          window_metadata_set(id, state, "", gap) != 0) goto recovery_failed;
+    }
+    if ((!strcmp(state, "active") && plan_context_window_slots(&plan) != 0) ||
+        exec_sql("COMMIT;") != 0) goto recovery_failed;
     changed = 1;
     if (!strcmp(state, "active")) publish_context_window_plan(&plan);
+    continue;
+recovery_failed:
+    {
+      char retry_error[sizeof(s_status.last_error)];
+      copy_s(retry_error, sizeof(retry_error), s_status.last_error);
+      sqlite_rollback_silent();
+      if ((metadata_rc & 0xff) == SQLITE_FULL) {
+        char error[160];
+        snprintf(error, sizeof(error), "window recovery first sqlite=%d FULL; retry: %.80s",
+            metadata_rc, retry_error);
+        set_error(error);
+      }
+      return -1;
+    }
   }
   sqlite3_stmt *remaining = NULL;
   int ok = sqlite3_prepare_v2(s_db, "SELECT 1 FROM p0_candidates WHERE context_window_state='active' "

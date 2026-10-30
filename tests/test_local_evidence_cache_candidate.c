@@ -13398,7 +13398,7 @@ static void test_startup_logical_budget_legacy(int vacuum_mode, int already_over
   edr_local_evidence_cache_get_status(&status);
   sqlite3_int64 after=compact_scalar(db,"PRAGMA page_count");
   fprintf(stderr,"startup_limit_legacy mode=%d already_over=%d before_pages=%lld after_pages=%lld open_rc=%d db_open=%u error=%s\n",vacuum_mode,already_over,(long long)initial,(long long)after,rc,status.db_open,status.last_error);fflush(stderr);
-  assert(rc<0 && !status.db_open && strstr(status.last_error,"startup schema unavailable"));
+  assert(rc<0 && !status.db_open && strstr(status.last_error,"startup unavailable"));
   assert(after<=(already_over?initial:budget_pages));startup_preserve_legacy(db,0);
   /* A failure is explicit and restart-safe, not a claim that the old schema
    * was queryable through this runtime or that all DDL rolled back. */
@@ -15348,8 +15348,14 @@ static void test_window_entry_order_and_recovery(int enforce) {
 #endif
 
 #include "retained_context_recall_cases.h"
+#include "window_recovery_budget_cases.h"
 
 int main(int argc, char **argv) {
+#if defined(EDR_HAVE_SQLITE)
+  if(argc==2 && (!strcmp(argv[1],"--window-recovery-budget") || !strcmp(argv[1],"--window-recovery-budget-probe"))) {
+    test_window_recovery_budget(!strcmp(argv[1],"--window-recovery-budget")); return 0;
+  }
+#endif
 #if defined(EDR_HAVE_SQLITE)
   if(argc==2 && (!strcmp(argv[1],"--retained-context-recall") || !strcmp(argv[1],"--retained-context-probe"))) {
     int enforce=!strcmp(argv[1],"--retained-context-recall");
@@ -15597,6 +15603,7 @@ int main(int argc, char **argv) {
   RUN_CACHE_CASE("context", test_window_entry_order_and_recovery(1));
   RUN_CACHE_CASE("context", test_window_activation_gap(1));
   RUN_CACHE_CASE("context", test_window_recovery_failures_and_frozen_policy());
+  RUN_CACHE_CASE("context", test_window_recovery_budget(1));
   RUN_CACHE_CASE("retention", test_phase2_continues_across_ttl(0));
   RUN_CACHE_CASE("retention", test_phase2_commit_fairness_and_backoff());
   for (int scenario = 0; scenario < 9; ++scenario) {
