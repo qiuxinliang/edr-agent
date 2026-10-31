@@ -1498,6 +1498,10 @@ static void test_context_fanout_owner_set_is_atomic(void) {
   puts("context_owner_set roles_deduplicated=1 missing_owner=1 endpoint_scope=1 tenant_scope=1 retired_owner=1 atomic=1");
 }
 
+/* Explicit diagnostic mode only; ordinary contracts keep their original I/O. */
+static int s_retention_cost_diagnostic;
+static void retention_cost_mark(const char *stage, unsigned step);
+
 static void test_context_fanout_owner_set_maximum(void) {
   const char *db = "local_evidence_cache_owner_maximum.sqlite";
   EdrBehaviorRecord r; struct timespec ts;
@@ -1506,6 +1510,7 @@ static void test_context_fanout_owner_set_maximum(void) {
   assert(timespec_get(&ts, TIME_UTC) == TIME_UTC);
   int64_t now = (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
   assert(edr_local_evidence_cache_open(db, 64u, 24u) == 0);
+  retention_cost_mark("fanout_opened",0);
   init_record(&r, EDR_EVENT_NET_CONNECT); r.pid=74601u; r.ppid=0;
   r.parent_pid_state=EDR_PARENT_PID_EXPLICIT_ZERO;
   r.process_start_key=74601u; r.process_creation_filetime_100ns=UINT64_C(133700000000074601);
@@ -1515,18 +1520,24 @@ static void test_context_fanout_owner_set_maximum(void) {
     r.event_time_ns=now+(int64_t)i;
     snprintf(r.event_id,sizeof(r.event_id),"maximum-owner-%u",i);
     edr_local_evidence_cache_record_behavior(&r);
+    if ((i+1u)%64u==0u) retention_cost_mark("fanout_seeded",i+1u);
   }
   EdrEvidenceCacheStatus before,after; edr_local_evidence_cache_get_status(&before);
   assert(before.candidate_admitted==256u && before.context_windows_used==256u);
   uint64_t refs=sqlite_table_count(db,"context_reference_projection"),facts=sqlite_table_count(db,"context_facts");
   r.type=EDR_EVENT_PROCESS_CREATE; r.net_dst[0]='\0'; r.net_dport=0; r.event_time_ns=now+1000;
   strcpy(r.event_id,"maximum-owner-context"); strcpy(r.cmdline,"owner-maximum.exe --ordinary");
-  assert(!edr_local_evidence_cache_is_candidate(&r)); edr_local_evidence_cache_record_behavior(&r);
+  assert(!edr_local_evidence_cache_is_candidate(&r));
+  retention_cost_mark("fanout_ready",256u);
+  edr_local_evidence_cache_record_behavior(&r);
+  retention_cost_mark("fanout_written",256u);
   edr_local_evidence_cache_get_status(&after);
   assert(after.context_refs_written==before.context_refs_written+256u);
   assert(sqlite_table_count(db,"context_reference_projection")==refs+256u);
   assert(sqlite_table_count(db,"context_facts")==facts+1u);
+  retention_cost_mark("fanout_verified",256u);
   edr_local_evidence_cache_close();
+  retention_cost_mark("fanout_closed",256u);
   (void)remove(db); (void)remove("local_evidence_cache_owner_maximum.sqlite-wal");
   (void)remove("local_evidence_cache_owner_maximum.sqlite-shm");
   puts("context_owner_set maximum_owners=256 complete_fanout=1");
@@ -2608,7 +2619,9 @@ static void test_capacity_success_does_not_throttle_next_reclaim(void) {
         "PRAGMA wal_checkpoint(TRUNCATE);",round,round);
     assert(fixture); assert(sqlite3_exec(raw,fixture,NULL,NULL,NULL)==SQLITE_OK); sqlite3_free(fixture);
     char prefix[64]; snprintf(prefix,sizeof(prefix),"missing-%u-%%",round);
+    retention_cost_mark("capacity_seeded",round);
     classify_pressure_fixture_groups(raw,prefix);
+    retention_cost_mark("capacity_classified",round);
     int64_t before_refs=sqlite_scalar_integer(db,"SELECT COUNT(*) FROM candidate_context_refs WHERE fact_id='orphan-fixture';");
     candidate.event_time_ns++;
     snprintf(candidate.event_id, sizeof(candidate.event_id), "rapid-reclaim-%u", round);
@@ -2636,6 +2649,7 @@ static void test_capacity_success_does_not_throttle_next_reclaim(void) {
       if(bytes<best_bytes) best_bytes=bytes;
       retired_seen=after.retention_groups_retired;
     }
+    retention_cost_mark("capacity_reclaimed",round);
     if (after.candidate_admitted != before.candidate_admitted + 1u) {
       fprintf(stderr,"capacity convergence failed: round=%u retired=%llu held=%llu "
           "maintenance=%llu db=%llu wal=%llu retention_failures=%llu cause=%s\n",round,
@@ -7949,6 +7963,58 @@ static int retention_bench_open(sqlite3_vfs *v,const char *name,sqlite3_file *fi
   return rc;
 }
 #undef BENCH_FILE
+
+/* The existing VFS delegates remain authoritative. Timers wrap real calls,
+ * never inject delays or replace results. Counters are cumulative per run. */
+static void retention_cost_mark(const char *stage, unsigned step) {
+  if (!s_retention_cost_diagnostic) return;
+  double user=0.0,system=0.0;
+  uint64_t process_reads=0,process_writes=0;
+  int process_io=0;
+#if defined(_WIN32)
+  FILETIME created,exited,kernel,user_time; IO_COUNTERS io;
+  assert(GetProcessTimes(GetCurrentProcess(),&created,&exited,&kernel,&user_time));
+  assert(GetProcessIoCounters(GetCurrentProcess(),&io));
+  user=((uint64_t)user_time.dwHighDateTime<<32 | user_time.dwLowDateTime)/1e7;
+  system=((uint64_t)kernel.dwHighDateTime<<32 | kernel.dwLowDateTime)/1e7;
+  process_reads=io.ReadTransferCount;process_writes=io.WriteTransferCount;process_io=1;
+#else
+  struct rusage usage;assert(getrusage(RUSAGE_SELF,&usage)==0);
+  user=usage.ru_utime.tv_sec+usage.ru_utime.tv_usec/1e6;
+  system=usage.ru_stime.tv_sec+usage.ru_stime.tv_usec/1e6;
+#endif
+  printf("retention_cost stage=%s step=%u monotonic_ns=%llu user_s=%.6f system_s=%.6f "
+      "vfs_read_bytes=%llu vfs_write_bytes=%llu vfs_syncs=%llu process_io_available=%d "
+      "process_read_bytes=%llu process_write_bytes=%llu",
+      stage,step,(unsigned long long)soak_monotonic_ns(),user,system,
+      (unsigned long long)retention_bench_reads,(unsigned long long)retention_bench_writes,
+      (unsigned long long)retention_bench_syncs,process_io,
+      (unsigned long long)process_reads,(unsigned long long)process_writes);
+  assert(retention_delegate_hz);
+  for (unsigned i=0;i<3u;++i) {
+    const RetentionDelegateTiming *t=&retention_delegate_timing[i];
+    printf(" delegate_%u_calls=%llu delegate_%u_us=%.3f delegate_%u_max_us=%.3f",i,
+        (unsigned long long)t->calls,i,1e6*(double)t->ticks/(double)retention_delegate_hz,
+        i,1e6*(double)t->maximum/(double)retention_delegate_hz);
+  }
+  puts("");assert(fflush(stdout)==0);
+}
+
+static void test_retention_cost_diagnostic(void) {
+  retention_bench_vfs_parent=sqlite3_vfs_find(NULL);assert(retention_bench_vfs_parent);
+  sqlite3_vfs vfs=*retention_bench_vfs_parent;vfs.zName="retention-cost-diagnostic";vfs.pNext=NULL;
+  vfs.szOsFile+=(int)sizeof(RetentionBenchFile);vfs.xOpen=retention_bench_open;
+  assert(sqlite3_vfs_register(&vfs,1)==SQLITE_OK);
+  retention_delegate_reset(1);s_retention_cost_diagnostic=1;
+  retention_cost_mark("begin",0);
+  test_context_fanout_owner_set_maximum();
+  retention_cost_mark("capacity_begin",0);
+  test_capacity_success_does_not_throttle_next_reclaim();
+  retention_cost_mark("complete",0);
+  s_retention_cost_diagnostic=0;retention_delegate_reset(0);
+  assert(sqlite3_vfs_register(retention_bench_vfs_parent,1)==SQLITE_OK);
+  assert(sqlite3_vfs_unregister(&vfs)==SQLITE_OK);
+}
 
 static void test_capacity_reclaim_with_slow_io(unsigned checkpoint_ms, unsigned read_ms) {
   retention_bench_vfs_parent=sqlite3_vfs_find(NULL); assert(retention_bench_vfs_parent);
@@ -15414,6 +15480,9 @@ int main(int argc, char **argv) {
   }
   if (argc==2 && !strcmp(argv[1],"--phase2-continuation")) {
     test_phase2_continues_across_ttl(0);test_phase2_commit_fairness_and_backoff();test_accounting_generation_reopen();return 0;
+  }
+  if (argc==2 && !strcmp(argv[1],"--retention-cost-diagnostic")) {
+    test_retention_cost_diagnostic();return 0;
   }
   if (argc==2 && !strcmp(argv[1],"--phase2-diagnostic")) {
     s_phase2_diagnostic=1;test_phase2_continues_across_ttl(0);return 0;

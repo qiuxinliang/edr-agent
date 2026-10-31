@@ -115,13 +115,13 @@ class NativeToolsTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "hash/size mismatch"):
             TOOLS.verify_stage(self.args.output, manifest)
 
-    def test_failed_gate_diagnostics_are_exactly_three_fixed_single_case_commands(self):
+    def test_failed_gate_diagnostics_are_exactly_four_fixed_diagnostic_commands(self):
         self.args.prior_contract_status = "failed"
         manifest = self.stage()
         self.assertEqual(manifest["allowed_diagnostic_argv"],
                          [["--sliced-reclaim-contract"], ["--capacity-reclaim-contract"],
-                          ["--phase2-diagnostic"]])
-        self.assertIn("isolated_reclaim_and_phase2_reproduction_only",
+                          ["--phase2-diagnostic"], ["--retention-cost-diagnostic"]])
+        self.assertIn("isolated_reclaim_phase2_and_fixed_cost_reproduction_only",
                       manifest["limitations"])
         self.assertNotIn(["--suite", "retention"], manifest["allowed_diagnostic_argv"])
         self.assertNotIn(["--alert-parent-soak", "7380"], manifest["allowed_diagnostic_argv"])

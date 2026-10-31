@@ -233,9 +233,10 @@ def stage(args):
         # product/release owner. The workflow must preserve its gate failure.
         manifest["allowed_diagnostic_argv"] = [["--sliced-reclaim-contract"],
                                                ["--capacity-reclaim-contract"],
-                                               ["--phase2-diagnostic"]]
+                                               ["--phase2-diagnostic"],
+                                               ["--retention-cost-diagnostic"]]
         manifest["limitations"] += ["prior_native_contracts_failed",
-                                    "isolated_reclaim_and_phase2_reproduction_only",
+                                    "isolated_reclaim_phase2_and_fixed_cost_reproduction_only",
                                     "not_long_soak_or_release_acceptance"]
     output = Path(os.path.abspath(args.output))
     real_path(output.parent, directory=True)

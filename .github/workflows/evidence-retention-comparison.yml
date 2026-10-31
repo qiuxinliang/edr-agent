@@ -22,6 +22,11 @@ on:
         type: boolean
         required: false
         default: false
+      diagnose_retention_cost:
+        description: 'Attribute two fixed ARM64 retention cases; no gate override'
+        type: boolean
+        required: false
+        default: false
       diagnose_pressure_temp:
         description: 'Compare the unchanged AMD64 pressure contract on profile and runner temp volumes; no gate override'
         type: boolean
@@ -202,6 +207,12 @@ jobs:
           $opensslTools = Join-Path $prefix 'tools/openssl'
           & .\tests\run_telemetry_windows_native.ps1 -BuildDir contract-build -Configuration Release -OpenSslBin $opensslTools -IncludeReleaseGate
           if ($LASTEXITCODE -ne 0) { throw 'Actual native release and telemetry contracts failed before comparison' }
+      - name: Attribute bounded ARM64 retention preparation and operation cost
+        if: ${{ always() && github.event_name == 'workflow_dispatch' && inputs.diagnose_retention_cost && matrix.arch == 'arm64' }}
+        shell: pwsh
+        run: |
+          python -B tests/run_retention_cost_diagnostic.py --build-dir contract-build --output "$env:RUNNER_TEMP/retention-cost-diagnosis"
+          if ($LASTEXITCODE -ne 0) { throw 'Retention cost diagnosis unavailable or incomplete; original gate outcome retained' }
       # Temporary diagnosis for the observed C: xSync timeout. Keep a failed
       # normal gate failed; this A/B measurement cannot grant release status.
       - name: Diagnose AMD64 pressure temporary-volume boundary
@@ -637,5 +648,7 @@ jobs:
             ${{ runner.temp }}/retention-sliced-contract/*.log
             ${{ runner.temp }}/queue-critical-load/*.log
             ${{ runner.temp }}/queue-critical-load/*.json
+            ${{ runner.temp }}/retention-cost-diagnosis/*.json
+            ${{ runner.temp }}/retention-cost-diagnosis/*.log
             ${{ runner.temp }}/pressure-temp-diagnosis/*.json
             ${{ runner.temp }}/pressure-temp-diagnosis/*.log
