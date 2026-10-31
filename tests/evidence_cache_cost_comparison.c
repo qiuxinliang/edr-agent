@@ -17,7 +17,21 @@ static double cost_percentile(double *samples, unsigned count, unsigned pct) {
   unsigned index=(count*pct+99u)/100u;
   return samples[(index?index:1u)-1u];
 }
-static double cost_now(void) { return retention_bench_metrics().wall_seconds; }
+/* Per-entry latency must not include process-metric system calls. Keep CPU,
+ * process I/O and architecture sampling at the existing phase boundaries. */
+static double cost_now(void) {
+#ifdef _WIN32
+  static LARGE_INTEGER frequency;
+  LARGE_INTEGER counter;
+  if (!frequency.QuadPart) assert(QueryPerformanceFrequency(&frequency) && frequency.QuadPart>0);
+  assert(QueryPerformanceCounter(&counter));
+  return (double)counter.QuadPart/(double)frequency.QuadPart;
+#else
+  struct timespec stamp;
+  assert(clock_gettime(CLOCK_MONOTONIC,&stamp)==0);
+  return stamp.tv_sec+stamp.tv_nsec/1e9;
+#endif
+}
 typedef struct { uint64_t reads, writes, syncs; } CostIoSnapshot;
 static CostIoSnapshot cost_io_snapshot(void) {
   CostIoSnapshot value={retention_bench_reads,retention_bench_writes,retention_bench_syncs};
