@@ -23,7 +23,7 @@ on:
         required: false
         default: false
       diagnose_retention_cost:
-        description: 'Attribute two fixed ARM64 retention cases; no gate override'
+        description: 'Validate the latency clock and attribute two fixed ARM64 retention cases; no gate override'
         type: boolean
         required: false
         default: false
@@ -183,6 +183,14 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Windows release gate dependency regression failed' }
           python -B tests/test_pcre2_cmake_gate.py PCRE2CMakeGateTests.test_static_matcher_header_wins_over_shared_dependency_prefix -v
           if ($LASTEXITCODE -ne 0) { throw 'Windows PCRE2 header isolation regression failed' }
+      - name: Verify native cost clock without process-metric contamination
+        if: ${{ inputs.diagnose_retention_cost == true }}
+        timeout-minutes: 8
+        shell: pwsh
+        run: |
+          $prefix = Join-Path $env:GITHUB_WORKSPACE 'vcpkg_installed/${{ matrix.triplet }}'
+          python -B tests/run_evidence_cost_clock_contract.py --output "$env:RUNNER_TEMP/cost-clock-contract" --dependency-prefix "$prefix" --native-machine '${{ matrix.arch }}'
+          if ($LASTEXITCODE -ne 0) { throw 'Native cost clock regression failed; original and corrected observations retained' }
       - name: Build and execute actual native release and telemetry contracts
         id: contracts
         shell: pwsh
@@ -650,5 +658,7 @@ jobs:
             ${{ runner.temp }}/queue-critical-load/*.json
             ${{ runner.temp }}/retention-cost-diagnosis/*.json
             ${{ runner.temp }}/retention-cost-diagnosis/*.log
+            ${{ runner.temp }}/cost-clock-contract/**/*.json
+            ${{ runner.temp }}/cost-clock-contract/**/*.log
             ${{ runner.temp }}/pressure-temp-diagnosis/*.json
             ${{ runner.temp }}/pressure-temp-diagnosis/*.log
