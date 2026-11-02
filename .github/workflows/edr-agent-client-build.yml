@@ -472,6 +472,13 @@ jobs:
             name = "collector/forensic_collector_builtin.exe"
             sha256 = (Get-FileHash -LiteralPath $builtinCollectorPackagePath -Algorithm SHA256).Hash.ToLowerInvariant()
           })
+          Get-ChildItem -LiteralPath $outDir -Filter "*.dll" -File -ErrorAction SilentlyContinue |
+            Sort-Object Name | ForEach-Object {
+              $null = $nativeIntegrityFiles.Add([ordered]@{
+                name = $_.Name
+                sha256 = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+              })
+            }
           [object[]]$nativeIntegrityFileArray = $nativeIntegrityFiles.ToArray()
           [ordered]@{
             schema = "edr.windows.native-package-integrity.v1"

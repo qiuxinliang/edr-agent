@@ -136,6 +136,37 @@ class WindowsReleaseWorkflowTests(unittest.TestCase):
         source = (ROOT / '.github/workflows/edr-agent-client-build.yml').read_text(encoding='utf-8')
         self.assert_client_build_version_and_identity_contract(source)
 
+    def assert_client_build_native_dll_identity_contract(self, source):
+        start = '          Get-ChildItem -LiteralPath $outDir -Filter "*.dll" -File -ErrorAction SilentlyContinue |'
+        end = '          [object[]]$nativeIntegrityFileArray = $nativeIntegrityFiles.ToArray()'
+        release = self.text.split(start, 1)[1].split('          # PowerShell 7', 1)[0]
+        self.assertEqual(source.split(start, 1)[1].split(end, 1)[0], release)
+        package = source.split('- name: Package (setup exe + runtime zip)\n', 1)[1].split('\n      - ', 1)[0]
+        for name in ('FDSecurityInstallerWorker.exe', 'uninstall.exe',
+                     'collector/forensic_collector_builtin.exe'):
+            self.assertIn('name = "' + name + '"', package)
+        self.assertLess(package.index(start), package.index('Set-Content -LiteralPath $nativeIntegrityPath'))
+        self.assertLess(package.index('Set-Content -LiteralPath $nativeIntegrityPath'),
+                        package.index('Build-BundledInstaller.ps1'))
+        self.assert_client_build_version_and_identity_contract(source)
+
+    def test_client_build_binds_root_dlls_before_building_installers(self):
+        source = (ROOT / '.github/workflows/edr-agent-client-build.yml').read_text(encoding='utf-8')
+        self.assert_client_build_native_dll_identity_contract(source)
+
+    def test_client_build_rejects_missing_or_changed_dll_identity(self):
+        source = (ROOT / '.github/workflows/edr-agent-client-build.yml').read_text(encoding='utf-8')
+        start = '          Get-ChildItem -LiteralPath $outDir -Filter "*.dll" -File -ErrorAction SilentlyContinue |'
+        end = '          [object[]]$nativeIntegrityFileArray = $nativeIntegrityFiles.ToArray()'
+        block = source[source.index(start):source.index(end)]
+        # The first mutation recreates d64d55d3: packaged DLLs with no identity entries.
+        for changed in ('', block.replace('Sort-Object Name', 'Sort-Object Length'),
+                        block.replace('name = $_.Name', 'name = $_.Name.ToLowerInvariant()'),
+                        block.replace('-LiteralPath $_.FullName', '-LiteralPath $workerExe'),
+                        block.replace('-File -ErrorAction', '-File -Recurse -ErrorAction')):
+            with self.subTest(mutation=changed), self.assertRaises((AssertionError, IndexError)):
+                self.assert_client_build_native_dll_identity_contract(source.replace(block, changed, 1))
+
     def test_client_build_rejects_version_and_identity_contract_regressions(self):
         source = (ROOT / '.github/workflows/edr-agent-client-build.yml').read_text(encoding='utf-8')
         for before, after in (
