@@ -121,8 +121,6 @@ function Test-CollectorBuildStaging([string] $Root) {
             $start = $text.IndexOf('$outDir = $null')
             $end = $text.IndexOf('$workerExe = Join-Path $outDir', $start)
             if ($start -lt 0 -or $end -lt 0) { throw "missing packaging prefix: $workflowName" }
-            # The manual workflow supports AMD64 only; the formal workflow covers both.
-            if ($architecture -eq 'arm64' -and $workflowName -eq 'edr-agent-client-build.yml') { continue }
             Push-Location $caseRoot
             try {
               Invoke-Expression $text.Substring($start, $end - $start)

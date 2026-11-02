@@ -15,6 +15,143 @@ class WindowsReleaseWorkflowTests(unittest.TestCase):
         self.jobs = dict(re.findall(r'^  ([\w-]+):\n(.*?)(?=^  [\w-]+:\n|\Z)',
                                    self.text.split('\njobs:\n', 1)[1], re.M | re.S))
 
+    def assert_client_build_architecture_contract(self, source):
+        jobs = dict(re.findall(r'^  ([\w-]+):\n(.*?)(?=^  [\w-]+:\n|\Z)',
+                               source.split('\njobs:\n', 1)[1], re.M | re.S))
+        self.assertEqual(set(jobs), {'windows-build'})
+        build = jobs['windows-build']
+        self.assertNotIn('strategy:', build)  # Exactly one selected architecture.
+        option = source.split('      architecture:\n', 1)[1].split('      agent_version:', 1)[0]
+        self.assertIn('type: choice', option)
+        self.assertIn('default: amd64', option)
+        self.assertEqual(re.findall(r'^          - (\w+)$', option, re.M), ['amd64', 'arm64'])
+        self.assertIn("EDR_RELEASE_ARCH: ${{ inputs.architecture || 'amd64' }}", build)
+        guard = "if ($env:EDR_RELEASE_ARCH -cnotin @('amd64', 'arm64')) { throw"
+        self.assertIn(guard, build)
+        self.assertLess(build.index(guard), build.index('uses: actions/checkout'))
+        fields = {'runner': 'runs-on', 'msvc_arch': 'EDR_MSVC_ARCH',
+                  'triplet': 'EDR_VCPKG_TRIPLET', 'runtime_identifier': 'EDR_RUNTIME_IDENTIFIER',
+                  'cmake_processor': 'EDR_CMAKE_PROCESSOR', 'include_windivert': 'EDR_INCLUDE_WINDIVERT'}
+        for arch in ('amd64', 'arm64'):
+            row = self.jobs['windows-build'].split(f'          - arch: {arch}\n', 1)[1].split('\n    env:', 1)[0].split('\n          - arch:', 1)[0]
+            for release_field, build_field in fields.items():
+                expected = re.search(r'^            ' + release_field + r': [\"]?([^\"\n]+)', row, re.M)[1]
+                expression = re.search(r'^\s+' + build_field + r": \$\{\{ inputs.architecture == 'arm64' && '([^']+)' \|\| '([^']+)' \}\}$", build, re.M)
+                self.assertIsNotNone(expression, build_field)
+                self.assertEqual(expression[1 if arch == 'arm64' else 2], expected, (arch, build_field))
+        self.assertIn("VCPKG_DEFAULT_TRIPLET: ${{ inputs.architecture == 'arm64' && 'arm64-windows' || 'x64-windows' }}", build)
+        self.assertIn('timeout-minutes: 360', build)
+        self.assertIn('permissions:\n  contents: read', source)
+        for forbidden in ('contents: write', 'gh release create', 'gh release upload',
+                          'vcpkg_release_cache.py publish', 'VCPKG_INSTALLED_X64'):
+            self.assertNotIn(forbidden, source)
+        python = build.split('- name: Set up pinned Python for release tools\n', 1)[1].split('\n      - ', 1)[0]
+        self.assertIn('architecture: x64', python)
+        for consumer in ('Initialize-VSEnvironment.ps1 -Architecture $env:EDR_MSVC_ARCH',
+                         'vcpkg_cache_key.py --triplet $env:EDR_VCPKG_TRIPLET',
+                         '"vcpkg_installed\\$env:EDR_VCPKG_TRIPLET"',
+                         '"-DCMAKE_PREFIX_PATH=$env:VCPKG_INSTALLED_ROOT"',
+                         '"-DCMAKE_SYSTEM_PROCESSOR=$env:EDR_CMAKE_PROCESSOR"',
+                         '"-DEDR_WINDOWS_TARGET_ARCH=$env:EDR_RELEASE_ARCH"',
+                         '"-DEDR_PCRE2_PRODUCER_TARGET=windows/$env:EDR_RELEASE_ARCH"',
+                         'Restore-SetupUiLocked.ps1 -RuntimeIdentifier $env:EDR_RUNTIME_IDENTIFIER',
+                         'stage_msvc_runtime_dlls_build_release.ps1 -Architecture $env:EDR_RELEASE_ARCH',
+                         '-TargetArch $env:EDR_RELEASE_ARCH',
+                         '-RuntimeIdentifier $env:EDR_RUNTIME_IDENTIFIER -SetupTargetArch $env:EDR_RELEASE_ARCH',
+                         '-MaxAttempts 6 -InitialBackoffSeconds 30'):
+            self.assertIn(consumer, build)
+        # Reuse the release owner's PE closure and architecture-dependent gates.
+        for start, end in (
+                ('$runtimePeFiles = @(Get-ChildItem -LiteralPath $outDir -File', '          foreach ($p in @(\n'),
+                ('$requiredRuntimeDlls = @(', '            if (-not ($entries -match \'(^|/|\\\\)edr_agent_setup'),
+                ("if ($env:EDR_INCLUDE_WINDIVERT -eq 'true') {\n              $requiredEntries", '            foreach ($required in $requiredEntries)')):
+            release = self.jobs['windows-build'].split(start, 1)[1].split(end, 1)[0]
+            actual = build.split(start, 1)[1].split(end, 1)[0]
+            self.assertEqual(actual, release)
+        stage = build.split('- name: Stage vcpkg + MSVC runtime DLLs\n', 1)[1].split('\n      - ', 1)[0]
+        self.assertIn("if ($env:EDR_INCLUDE_WINDIVERT -eq 'true') {\n            ./scripts/stage_windivert_runtime.ps1", stage)
+        self.assert_canonical_p0_test_inputs(build)
+
+    def test_client_build_selects_one_release_architecture_without_publication(self):
+        source = (ROOT / '.github/workflows/edr-agent-client-build.yml').read_text(encoding='utf-8')
+        self.assert_client_build_architecture_contract(source)
+
+    def test_client_build_rejects_architecture_and_gate_regressions(self):
+        source = (ROOT / '.github/workflows/edr-agent-client-build.yml').read_text(encoding='utf-8')
+        changes = (
+            ("'windows-11-vs2026-arm'", "'windows-2022'"),
+            ("'arm64-windows'", "'x64-windows'"),
+            ("-cnotin @('amd64', 'arm64')", '-eq $null'),
+            ('-TargetArch $env:EDR_RELEASE_ARCH', '-TargetArch amd64'),
+            ('-Architecture $env:EDR_RELEASE_ARCH', '-Architecture amd64'),
+            ("if ($env:EDR_INCLUDE_WINDIVERT -eq 'true')", 'if ($true)'),
+            ("$requiredRuntimeDlls += 'vcruntime140_1.dll'", '$requiredRuntimeDlls += @()'),
+            ('contents: read', 'contents: write'),
+            ('    timeout-minutes: 360', '    strategy:\n      matrix: { arch: [amd64, arm64] }\n    timeout-minutes: 360'),
+        )
+        for before, after in changes:
+            with self.subTest(boundary=before), self.assertRaises((AssertionError, IndexError)):
+                self.assert_client_build_architecture_contract(source.replace(before, after, 1))
+
+    def assert_client_build_version_and_identity_contract(self, source):
+        option = source.split('      agent_version:\n', 1)[1].split('      p0_test_inputs_ref:', 1)[0]
+        self.assertIn("default: ''", option)
+        self.assertIn('type: string', option)
+        version = source.split('- name: Resolve agent version\n', 1)[1].split('\n      - ', 1)[0]
+        self.assertIn('EDR_BUILD_AGENT_VERSION: ${{ inputs.agent_version }}', version)
+        run = version.split('        run: |\n', 1)[1]
+        self.assertNotIn('${{', run)  # Untrusted input is never interpolated into code.
+        self.assertIn('$requestedVersion = [string]$env:EDR_BUILD_AGENT_VERSION', run)
+        self.assertIn("if ($requestedVersion -ne '')", run)
+        pattern = r'\A(0|[1-9][0-9]{0,4})\.(0|[1-9][0-9]{0,4})\.(0|[1-9][0-9]{0,4})\z'
+        self.assertIn("$ver -cnotmatch '" + pattern + "'", run)
+        self.assertIn('if ([int]$component -gt 65534) { throw', run)
+        mutate = '& ./scripts/update-version.ps1 $ver'
+        self.assertLess(run.index('$ver -cnotmatch'), run.index(mutate))
+        self.assertLess(run.index('-gt 65534'), run.index(mutate))
+        self.assertLess(run.index(mutate), run.index('} elseif ($ref -match'))
+        self.assertIn("if (-not $?) { throw 'Test build version update failed' }", run)
+        self.assertIn('$updatedCmake = [System.IO.File]::ReadAllText', run)
+        self.assertIn('$Matches[1] -cne $ver', run)
+        self.assertLess(run.index(mutate), run.index('$updatedCmake ='))
+        self.assertLess(run.index('$Matches[1] -cne $ver'), run.index('"EDR_AGENT_VERSION=$ver"'))
+        for consumer in ('"EDR_AGENT_VERSION=$ver"', '"VERSION"), $ver)',
+                         '"-DEDR_AGENT_VERSION_STRING=$env:EDR_AGENT_VERSION"',
+                         '-AppVersion $env:EDR_AGENT_VERSION'):
+            self.assertIn(consumer, source)
+        cmake = (ROOT / 'CMakeLists.txt').read_text(encoding='utf-8')
+        self.assertIn('EDR_VERSION_MAJOR=${PROJECT_VERSION_MAJOR}', cmake)
+        self.assertIn('EDR_VERSION_STRING=', cmake)
+        package = source.split('- name: Package (setup exe + runtime zip)\n', 1)[1].split('\n      - ', 1)[0]
+        hash_line = '$runtimeIdentitySha256 = (Get-FileHash -LiteralPath $nativeIntegrityPath -Algorithm SHA256).Hash.ToLowerInvariant()'
+        self.assertIn(hash_line, package)
+        self.assertLess(package.index('Set-Content -LiteralPath $nativeIntegrityPath'), package.index(hash_line))
+        self.assertLess(package.index('Build-BundledInstaller.ps1'), package.index(hash_line))
+        self.assertLess(package.index(hash_line), package.index('Build-SetupUi.ps1'))
+        self.assertIn('-RuntimeIdentitySha256 $runtimeIdentitySha256', package)
+        self.assertIn('runtime_identity_sha256 = $RuntimeIdentitySha256',
+                      (ROOT / 'install/windows-setup-ui/Build-SetupUi.ps1').read_text(encoding='utf-8'))
+
+    def test_client_build_version_and_identity_bind_existing_consumers(self):
+        source = (ROOT / '.github/workflows/edr-agent-client-build.yml').read_text(encoding='utf-8')
+        self.assert_client_build_version_and_identity_contract(source)
+
+    def test_client_build_rejects_version_and_identity_contract_regressions(self):
+        source = (ROOT / '.github/workflows/edr-agent-client-build.yml').read_text(encoding='utf-8')
+        for before, after in (
+                ('$ref = $env:GITHUB_REF_NAME', "$ref = '${{ github.ref_name }}'"),
+                ('[string]$env:EDR_BUILD_AGENT_VERSION', '$env:EDR_BUILD_AGENT_VERSION'),
+                ('-gt 65534', '-gt 65535'),
+                (r"\z'", "$'"),
+                ('& ./scripts/update-version.ps1 $ver', 'Write-Host $ver'),
+                ('$Matches[1] -cne $ver', '$false'),
+                ('-RuntimeIdentitySha256 $runtimeIdentitySha256', '-RuntimeIdentitySha256 ""'),
+                ('Get-FileHash -LiteralPath $nativeIntegrityPath', 'Get-FileHash -LiteralPath $agentExe')):
+            with self.subTest(boundary=before):
+                self.assertIn(before, source)
+                with self.assertRaises((AssertionError, ValueError)):
+                    self.assert_client_build_version_and_identity_contract(source.replace(before, after, 1))
+
     def test_single_usb_handoff_keeps_public_jobs_hosted(self):
         self.assertEqual(set(self.jobs), {'prepare-release', 'windows-build', 'usb-finalize', 'windows-lifecycle', 'publish-release'})
         for removed in ('usb-native', 'usb-installer', 'usb-manifest', 'self-hosted', 'build_purpose', 'unsigned-candidate-'):
@@ -423,7 +560,7 @@ class WindowsReleaseWorkflowTests(unittest.TestCase):
             with self.subTest(workflow=filename):
                 source = (ROOT / '.github/workflows' / filename).read_text(encoding='utf-8')
                 test = source.split('- name: Test\n', 1)[1].split('\n      - ', 1)[0]
-                if filename == 'edr-agent-client-release.yml':
+                if filename in ('edr-agent-client-release.yml', 'edr-agent-client-build.yml'):
                     self.assertIn("Join-Path $env:VCPKG_INSTALLED_ROOT 'tools\\openssl'", test)
                 else:
                     self.assertIn("Join-Path $env:GITHUB_WORKSPACE 'vcpkg_installed\\x64-windows\\tools\\openssl'", test)
