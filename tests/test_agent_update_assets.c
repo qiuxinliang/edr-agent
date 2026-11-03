@@ -94,11 +94,12 @@ static void function_excludes(const char *text, const char *function_name, const
   free(body);
 }
 
-/* This workflow permits one explicit manual-subset selector, not a matrix
+/* This workflow permits one explicit manual-subset gate, not a matrix
  * selector: GitHub evaluates job-level if before expanding strategy.matrix. */
 static int native_lifecycle_job_if_is_supported(const char *text) {
   const char *job = text ? strstr(text, "  native-lifecycle:") : NULL;
   const char *allowed = "    if: ${{ !inputs.cache_recovery_subset }}";
+  const char *allowed_signed = "    if: ${{ !inputs.cache_recovery_subset && !inputs.publisher_validation_request }}";
   const char *line;
   int conditions = 0;
   if (!job || (job != text && job[-1] != '\n')) return 0;
@@ -111,8 +112,9 @@ static int native_lifecycle_job_if_is_supported(const char *text) {
         line[2] != '\r' && line[2] != '\n' && line[2] != '#') break;
     if (strncmp(line, "    if:", 7u) == 0) {
       length = strcspn(line, "\r\n");
-      if (++conditions != 1 || length != strlen(allowed) ||
-          strncmp(line, allowed, length) != 0) return 0;
+      if (++conditions != 1 ||
+          !((length == strlen(allowed) && strncmp(line, allowed, length) == 0) ||
+            (length == strlen(allowed_signed) && strncmp(line, allowed_signed, length) == 0))) return 0;
     }
     line = strchr(line, '\n');
   }
@@ -125,7 +127,11 @@ int main(void) {
                    native_lifecycle_job_if_is_supported(
                    "jobs:\n  native-lifecycle:\n    if: ${{ !inputs.cache_recovery_subset }}\n    strategy:\n      matrix: {}\n") &&
                    native_lifecycle_job_if_is_supported(
-                   "jobs:\r\n  native-lifecycle:\r\n    if: ${{ !inputs.cache_recovery_subset }}\r\n    strategy:\r\n      matrix: {}\r\n"),
+                   "jobs:\r\n  native-lifecycle:\r\n    if: ${{ !inputs.cache_recovery_subset }}\r\n    strategy:\r\n      matrix: {}\r\n") &&
+                   native_lifecycle_job_if_is_supported(
+                   "jobs:\n  native-lifecycle:\n    if: ${{ !inputs.cache_recovery_subset && !inputs.publisher_validation_request }}\n    strategy:\n      matrix: {}\n") &&
+                   native_lifecycle_job_if_is_supported(
+                   "jobs:\r\n  native-lifecycle:\r\n    if: ${{ !inputs.cache_recovery_subset && !inputs.publisher_validation_request }}\r\n    strategy:\r\n      matrix: {}\r\n"),
                "lifecycle job condition accepts no gate or only the explicit manual gate in LF and CRLF");
   require_true(native_lifecycle_job_if_is_supported(
                    "jobs:\n  native-lifecycle:\n    steps:\n      - name: example\n        if: ${{ matrix.arch == 'arm64' }}\n  recover-synthetic-owner:\n    if: ${{ matrix.arch == 'arm64' }}\n"),
@@ -136,6 +142,10 @@ int main(void) {
                    "jobs:\r\n  native-lifecycle:\r\n    strategy:\r\n      matrix: {}\r\n    if: ${{ matrix.arch == 'arm64' }}\r\n") &&
                    !native_lifecycle_job_if_is_supported(
                    "jobs:\n  native-lifecycle:\n    if: ${{ !inputs.cache_recovery_subset && matrix.arch == 'arm64' }}\n") &&
+                   !native_lifecycle_job_if_is_supported(
+                   "jobs:\n  native-lifecycle:\n    if: ${{ !inputs.cache_recovery_subset && !inputs.publisher_validation_request && matrix.arch == 'arm64' }}\n") &&
+                   !native_lifecycle_job_if_is_supported(
+                   "jobs:\n  native-lifecycle:\n    if: ${{ !inputs.cache_recovery_subset && !inputs.publisher_validation_request }}\n    if: ${{ matrix.arch == 'arm64' }}\n") &&
                    !native_lifecycle_job_if_is_supported(
                    "jobs:\n  native-lifecycle:\n    if: ${{ !inputs.cache_recovery_subset }}\n    if: ${{ matrix.arch == 'arm64' }}\n") &&
                    !native_lifecycle_job_if_is_supported(
