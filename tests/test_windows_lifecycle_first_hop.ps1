@@ -114,7 +114,7 @@ try {
   $configured=[IO.File]::ReadAllText($configPath)
   Check ((Hash $templatePath) -ceq $templateHash) 'baseline template remains immutable'
   Check ((Hash $configPath) -ceq $configHash) 'prepared configuration digest'
-  foreach($pattern in @('(?m)^endpoint_id = "ci-setup-lifecycle-[a-f0-9]{32}"\r?$',
+  foreach($pattern in @('(?m)^endpoint_id = "ci-lifecycle-[a-f0-9]{32}"\r?$',
       '(?m)^tenant_id = "ci-lifecycle"\r?$', '(?m)^rest_base_url = "https://127\.0\.0\.1:9/api/v1"\r?$',
       '(?m)^proxy_mode = "off"\r?$', '(?m)^proxy_url = ""\r?$', '(?m)^relay_url = ""\r?$')) {
     Check ([regex]::Matches($configured,$pattern).Count -eq 1) ('active config field '+$pattern)
@@ -150,10 +150,17 @@ try {
     -OutputAssembly $target -OutputType Library
   $setup=Join-Path $root 'FDSecuritySetup.exe';Copy-Item -LiteralPath $target -Destination $setup
   # A real child must discover PS5.1 inbox modules, not merely run core cmdlets
-  # such as Copy-Item. No Get-FileHash or ScheduledTasks function is stubbed.
+  # such as Copy-Item. Hash, Security ACL and ScheduledTasks commands are real.
   $null=Get-Command Start-Process,Get-AuthenticodeSignature,Get-FileHash
   $foreignModules=Join-Path $root 'foreign-powershell-modules'
   New-Item -ItemType Directory -Path $foreignModules | Out-Null
+  # Reproduce the CI PS7 -> native Setup/worker -> PS5.1 boundary using the
+  # installed incompatible module directory when this test runs under PS7.
+  $hostModules=Join-Path $PSHOME 'Modules'
+  if($PSVersionTable.PSVersion.Major -ge 7 -and [IO.File]::Exists((Join-Path $hostModules 'Microsoft.PowerShell.Security\Microsoft.PowerShell.Security.psd1'))) {
+    $foreignModules=$hostModules
+    Write-Output ('module probe foreign owner: PowerShell ' + $PSVersionTable.PSVersion.Major + ' inbox modules')
+  }
   $probe=@'
 $ErrorActionPreference='Stop'
 $ProgressPreference='SilentlyContinue'
@@ -174,6 +181,22 @@ try {
   if($PSVersionTable.PSVersion.Major -ne 5){throw 'windows_powershell_5_required'}
   Set-ProbePhase 'hash_read'
   $hash=(& $command -LiteralPath '__PROBE_FILE__' -Algorithm SHA256).Hash.ToLowerInvariant()
+  Set-ProbePhase 'security_lookup'
+  $getAcl=Get-Command Get-Acl -CommandType Cmdlet -ErrorAction Stop
+  $setAcl=Get-Command Set-Acl -CommandType Cmdlet -ErrorAction Stop
+  if($getAcl.ModuleName -cne 'Microsoft.PowerShell.Security' -or $setAcl.ModuleName -cne 'Microsoft.PowerShell.Security'){throw 'unexpected_acl_owner'}
+  Set-ProbePhase 'acl_roundtrip'
+  [IO.File]::WriteAllText('__PROBE_ACL__','isolated ACL fixture')
+  $acl=& $getAcl -LiteralPath '__PROBE_ACL__'
+  $access=[Security.AccessControl.AccessControlSections]::Access
+  $originalAcl=$acl.GetSecurityDescriptorSddlForm($access)
+  $acl.SetAccessRuleProtection($true,$true)
+  & $setAcl -LiteralPath '__PROBE_ACL__' -AclObject $acl
+  $readAcl=& $getAcl -LiteralPath '__PROBE_ACL__'
+  if(-not $readAcl.AreAccessRulesProtected){throw 'acl_write_not_observed'}
+  $readAcl.SetSecurityDescriptorSddlForm($originalAcl,$access)
+  & $setAcl -LiteralPath '__PROBE_ACL__' -AclObject $readAcl
+  if((& $getAcl -LiteralPath '__PROBE_ACL__').GetSecurityDescriptorSddlForm($access) -cne $originalAcl){throw 'acl_restore_not_observed'}
   Set-ProbePhase 'scheduled_tasks'
   $taskCommand=Get-Command Get-ScheduledTask -CommandType Cmdlet,Function -ErrorAction Stop
   if($taskCommand.ModuleName -cne 'ScheduledTasks' -or $hash -cne '__PROBE_HASH__'){throw 'probe_contract_failed'}
@@ -182,26 +205,65 @@ try {
     $modulePath=[string]$command.Module.Path;$moduleBase=[string]$command.Module.ModuleBase
     if($null -ne $command.Module.Version){$moduleVersion=$command.Module.Version.ToString()}
   }
+  Set-ProbePhase 'native_wait'
+  . ([scriptblock]::Create([IO.File]::ReadAllText('__PROBE_HELPER__')))
+  $null=Get-Command Start-Process -ErrorAction Stop
+  $previousModulePath=[Environment]::GetEnvironmentVariable('PSModulePath',[EnvironmentVariableTarget]::Process)
+  $nativeProcess=$null
+  try {
+    [Environment]::SetEnvironmentVariable('PSModulePath','__PROBE_FOREIGN__',[EnvironmentVariableTarget]::Process)
+    # The outer probe has a deadline and owns this process tree. Keep Wait in
+    # the actual call: Setup requires its process-tree completion semantics.
+    $nativeProcess=Start-LifecycleWindowsProcess -ProcessParameters @{
+      FilePath=(Join-Path $env:WINDIR 'System32\cmd.exe');ArgumentList=@('/d','/c','exit /b 23');Wait=$true;PassThru=$true
+      RedirectStandardOutput='__PROBE_NATIVE_OUT__';RedirectStandardError='__PROBE_NATIVE_ERR__'
+    }
+    if($nativeProcess -isnot [Diagnostics.Process] -or -not $nativeProcess.HasExited -or $nativeProcess.ExitCode -ne 23){throw 'native_wait_or_original_exit_lost'}
+    if([Environment]::GetEnvironmentVariable('PSModulePath',[EnvironmentVariableTarget]::Process) -cne '__PROBE_FOREIGN__'){throw 'native_wait_parent_environment_changed'}
+    if([IO.File]::ReadAllText('__PROBE_NATIVE_OUT__').Length -ne 0 -or [IO.File]::ReadAllText('__PROBE_NATIVE_ERR__').Length -ne 0){throw 'native_redirect_contract_failed'}
+  } finally {
+    [Environment]::SetEnvironmentVariable('PSModulePath',$previousModulePath,[EnvironmentVariableTarget]::Process)
+    if($nativeProcess){$nativeProcess.Dispose()}
+  }
   Set-ProbePhase 'result_serialization'
   [Console]::Out.WriteLine((@{status='ok';sha256=$hash;ps_major=$PSVersionTable.PSVersion.Major;
     hash_command_type=[string]$command.CommandType;hash_module=$command.ModuleName;
     hash_module_path=$modulePath;hash_module_base=$moduleBase;hash_module_version=$moduleVersion;ps_home=$PSHOME;
-    scheduled_tasks_module=$taskCommand.ModuleName}|ConvertTo-Json -Compress));exit 0
+    scheduled_tasks_module=$taskCommand.ModuleName;security_module=$setAcl.ModuleName;acl_roundtrip=$true;
+    native_wait_exit=23;native_wait_parent_restored=$true}|ConvertTo-Json -Compress));exit 0
 } catch { [Console]::Out.WriteLine('probe-failed:'+ $phase+':'+ $_.Exception.GetType().Name+':'+$_.Exception.Message);exit 71 }
 '@
   $probe=$probe.Replace('__PROBE_FILE__',$target.Replace("'","''")).Replace('__PROBE_HASH__',(Hash $target))
+  $probe=$probe.Replace('__PROBE_HELPER__',(Join-Path $RepoRoot 'scripts/Start-LifecycleWindowsPowerShell.ps1').Replace("'","''"))
+  $probe=$probe.Replace('__PROBE_FOREIGN__',$foreignModules.Replace("'","''"))
   $counterfactualFailure=$false
-  foreach($isolated in @($false,$true)) {
-    $probeOut=Join-Path $root ("module-probe-{0}.out" -f $isolated)
-    $probeErr=Join-Path $root ("module-probe-{0}.err" -f $isolated)
-    $probeTrace=Join-Path $root ("module-probe-{0}.phases" -f $isolated)
-    $encodedProbe=[Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($probe.Replace('__PROBE_TRACE__',$probeTrace.Replace("'","''"))))
+  foreach($probeCase in @(@{native=$false;isolated=$false},@{native=$false;isolated=$true},@{native=$true;isolated=$false},@{native=$true;isolated=$true})) {
+    $isolated=$probeCase.isolated;$nativeRelay=$probeCase.native
+    $probeName='module-probe-native-{0}-isolated-{1}' -f $nativeRelay,$isolated
+    $probeOut=Join-Path $root ($probeName+'.out')
+    $probeErr=Join-Path $root ($probeName+'.err')
+    $probeTrace=Join-Path $root ($probeName+'.phases')
+    $caseProbe=$probe.Replace('__PROBE_TRACE__',$probeTrace.Replace("'","''"))
+    $caseProbe=$caseProbe.Replace('__PROBE_ACL__',(Join-Path $root ($probeName+'.acl')).Replace("'","''"))
+    $caseProbe=$caseProbe.Replace('__PROBE_NATIVE_OUT__',(Join-Path $root ($probeName+'.native.out')).Replace("'","''"))
+    $caseProbe=$caseProbe.Replace('__PROBE_NATIVE_ERR__',(Join-Path $root ($probeName+'.native.err')).Replace("'","''"))
+    $probeScript=Join-Path $root ($probeName+'.ps1')
+    [IO.File]::WriteAllText($probeScript,$caseProbe,[Text.Encoding]::Unicode)
+    $encodedProbe=[Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($caseProbe))
     $probeProcess=$null;$probeFailure=$null
     $probeClock=[Diagnostics.Stopwatch]::StartNew()
     try {
       [Environment]::SetEnvironmentVariable('PSModulePath',$foreignModules,[EnvironmentVariableTarget]::Process)
       try {
-        if($isolated) {
+        if($nativeRelay) {
+          $nativeParameters=@{
+            FilePath=(Join-Path $env:WINDIR 'System32\cmd.exe')
+            # A file avoids cmd.exe's 8191-character command-line limit.
+            ArgumentList=('/d /s /c ""{0}" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{1}""' -f (Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'),$probeScript)
+            RedirectStandardOutput=$probeOut;RedirectStandardError=$probeErr;PassThru=$true
+          }
+          $probeProcess=if($isolated){Start-LifecycleWindowsProcess -ProcessParameters $nativeParameters}else{Start-Process @nativeParameters}
+        } elseif($isolated) {
           $probeProcess=Start-LifecycleWindowsPowerShell $encodedProbe $probeOut $probeErr
         } else {
           $probeProcess=Start-Process -FilePath (Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe') `
@@ -215,7 +277,7 @@ try {
       # This is a diagnostic cold-start window, not a product deadline. The
       # earlier 10-second probe timed out before emitting its command result.
       # A 60-second timeout still fails, including the counterfactual launch.
-      Write-Output ("Windows PowerShell module probe started isolated={0} pid={1} wait_seconds=60" -f $isolated,$probeProcess.Id)
+      Write-Output ("Windows PowerShell module probe started native={0} isolated={1} pid={2} wait_seconds=60" -f $nativeRelay,$isolated,$probeProcess.Id)
       Check ($probeProcess.WaitForExit(60000)) 'bounded real module probe'
       $probeProcess.WaitForExit()
       Write-Output ("Windows PowerShell module probe phases isolated={0}: {1}" -f $isolated,(Read-ModuleProbeDiagnostic $probeTrace))
@@ -226,22 +288,38 @@ try {
       $probeData=if($probeProcess.ExitCode -eq 0){$probeText|ConvertFrom-Json}else{$null}
       $probeOk=$probeData -and $probeData.status -ceq 'ok' -and $probeData.sha256 -ceq (Hash $target) -and
         $probeData.ps_major -eq 5 -and $probeData.hash_module -ceq 'Microsoft.PowerShell.Utility' -and
-        $probeData.hash_command_type -in @('Cmdlet','Function') -and $probeData.scheduled_tasks_module -ceq 'ScheduledTasks'
+        $probeData.hash_command_type -in @('Cmdlet','Function') -and $probeData.scheduled_tasks_module -ceq 'ScheduledTasks' -and
+        $probeData.security_module -ceq 'Microsoft.PowerShell.Security' -and $probeData.acl_roundtrip -eq $true -and
+        $probeData.native_wait_exit -eq 23 -and $probeData.native_wait_parent_restored -eq $true
       if($isolated) {
-        Check ($probeProcess.ExitCode -eq 0 -and $probeOk) 'isolated child hashes real bytes and discovers ScheduledTasks'
+        Check ($probeProcess.ExitCode -eq 0 -and $probeOk) 'isolated direct/native child performs real hash/ACL and preserves native Wait/exit'
       } else {
         # OS versions may repair inherited module paths. Record that real
         # result; the corrected launch must work on every supported host.
         Check ($probeProcess.ExitCode -in @(0,71)) 'counterfactual child has known terminal result'
-        $counterfactualFailure=$probeProcess.ExitCode -eq 71 -and (
+        $caseCounterfactualFailure=$probeProcess.ExitCode -eq 71 -and (
           $probeText.StartsWith('probe-failed:hash_lookup:CommandNotFoundException:') -or
+          $probeText.StartsWith('probe-failed:security_lookup:CommandNotFoundException:') -or
+          $probeText.StartsWith('probe-failed:acl_roundtrip:CommandNotFoundException:') -or
           $probeText.StartsWith('probe-failed:scheduled_tasks:CommandNotFoundException:'))
-        Check ($counterfactualFailure -or $probeOk) 'counterfactual module discovery result'
+        Check ($caseCounterfactualFailure -or $probeOk) 'counterfactual module discovery result'
+        $counterfactualFailure=$counterfactualFailure -or $caseCounterfactualFailure
       }
     } catch { $probeFailure=$_;throw } finally {
       $cleanupFailure=$null
       if($probeProcess) {
-        try { if(-not $probeProcess.HasExited){$probeProcess.Kill();Check ($probeProcess.WaitForExit(10000)) 'owned module probe cleanup'} }
+        try {
+          if(-not $probeProcess.HasExited){
+            # Native relays and the Wait probe can have descendants. Terminate
+            # only this still-owned process tree, then bound the cleanup wait.
+            $cleanupProcess=Start-Process -FilePath (Join-Path $env:WINDIR 'System32\taskkill.exe') -ArgumentList @('/PID',[string]$probeProcess.Id,'/T','/F') -PassThru -WindowStyle Hidden
+            try {
+              $null=$cleanupProcess.Handle
+              if(-not $cleanupProcess.WaitForExit(10000)){$cleanupProcess.Kill();Check ($cleanupProcess.WaitForExit(10000)) 'owned taskkill cleanup';throw 'owned process-tree cleanup timed out'}
+              Check ($probeProcess.WaitForExit(10000)) 'owned module probe tree cleanup'
+            } finally {$cleanupProcess.Dispose()}
+          }
+        }
         catch { $cleanupFailure=$_ }
       }
       if($probeFailure -or $cleanupFailure) {
@@ -263,6 +341,8 @@ try {
   try {
     Must-Fail {Start-LifecycleWindowsPowerShell $encodedProbe (Join-Path $root 'unused.out') (Join-Path $root 'unused.err')} 'synthetic_launch_failure'
     Check ([Environment]::GetEnvironmentVariable('PSModulePath',[EnvironmentVariableTarget]::Process) -ceq $foreignModules) 'failed launch restores parent module path'
+    Must-Fail {Start-LifecycleWindowsProcess -ProcessParameters @{FilePath='synthetic-missing.exe';Wait=$true;PassThru=$true}} 'synthetic_launch_failure'
+    Check ([Environment]::GetEnvironmentVariable('PSModulePath',[EnvironmentVariableTarget]::Process) -ceq $foreignModules) 'failed native launch preserves cause and restores parent module path'
   } finally {
     Remove-Item Function:\Start-Process
     [Environment]::SetEnvironmentVariable('PSModulePath',$savedModulePath,[EnvironmentVariableTarget]::Process)
@@ -410,7 +490,7 @@ exit 0
   Put $oldPath ($oldScript.Replace("status='succeeded'","status='failed_rolled_back'")); $inputBinding.baseline_updater_sha256=Hash $oldPath
   Must-Fail {Invoke-BaselineUpdaterUpgrade $inputBinding} '*did not report*'
   Check (@($script:events|Where-Object{$_.status -eq 'verified'}).Count -eq 4) 'failures never counted as passed'
-  Write-Output ("module environment: foreign counterfactual failed={0}; corrected child hash/ScheduledTasks and parent restoration passed" -f $counterfactualFailure)
+  Write-Output ("module environment: foreign counterfactual failed={0}; corrected direct/native child hash/Security ACL/ScheduledTasks, native Wait/exit 23 and parent restoration passed" -f $counterfactualFailure)
   Write-Output 'old updater lifecycle orchestration: offline configuration preservation and 5 rejection cases; 3 service class executions plus auto task selection and resolved-mode rejection, consumed staging preservation, signed publisher binding and 20 negative controls passed'
 } finally {
   [Environment]::SetEnvironmentVariable('PSModulePath',$savedModulePath,[EnvironmentVariableTarget]::Process)

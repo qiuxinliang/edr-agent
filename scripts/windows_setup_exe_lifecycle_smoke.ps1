@@ -128,7 +128,9 @@ function Invoke-Installer([string] $Path, [string] $Stage, [bool] $UpgradeExisti
   )
   if ($UpgradeExisting) { $arguments += "/EDR_UPGRADE_EXISTING=1" }
   Add-Evidence $Stage "started" $Path
-  $process = Start-Process -FilePath $Path -ArgumentList $arguments -Wait -PassThru
+  $process = Start-LifecycleWindowsProcess -ProcessParameters @{
+    FilePath=$Path;ArgumentList=$arguments;Wait=$true;PassThru=$true
+  }
   if ($process.ExitCode -ne 0) {
     throw "Setup EXE stage '$Stage' failed with exit code $($process.ExitCode); log=$log"
   }
@@ -148,7 +150,9 @@ function Invoke-BaselineRepair([string] $Path, [string] $Stage, [string] $Backup
     ('/LOG="{0}"' -f $log)
   )
   Add-Evidence $Stage "started" "repairing missing Inno lifecycle baseline"
-  $process = Start-Process -FilePath $Path -ArgumentList $arguments -Wait -PassThru
+  $process = Start-LifecycleWindowsProcess -ProcessParameters @{
+    FilePath=$Path;ArgumentList=$arguments;Wait=$true;PassThru=$true
+  }
   if ($process.ExitCode -ne 0) {
     throw "Setup EXE baseline repair '$Stage' failed with exit code $($process.ExitCode); log=$log"
   }
@@ -281,9 +285,11 @@ function Invoke-UninstallerAndAssertCleanup([string] $Stage) {
     throw "$Stage is missing the Inno Setup uninstaller: $uninstaller"
   }
   Add-Evidence $Stage "started" $uninstaller
-  $uninstallProcess = Start-Process -FilePath $uninstaller -ArgumentList @(
-    "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", ('/LOG="{0}"' -f $uninstallLog)
-  ) -Wait -PassThru
+  $uninstallProcess = Start-LifecycleWindowsProcess -ProcessParameters @{
+    FilePath=$uninstaller;ArgumentList=@(
+      "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", ('/LOG="{0}"' -f $uninstallLog)
+    );Wait=$true;PassThru=$true
+  }
   if ($uninstallProcess.ExitCode -ne 0) {
     throw "$Stage failed with exit code $($uninstallProcess.ExitCode); log=$uninstallLog"
   }
@@ -338,7 +344,9 @@ function Initialize-LifecycleOfflineConfig([string] $TemplatePath) {
       throw "offline lifecycle configuration requires one active $section section"
     }
   }
-  $endpoint = 'ci-setup-lifecycle-' + [Guid]::NewGuid().ToString('N')
+  # The original cache query contract stores endpoint IDs in 48 bytes including
+  # the terminator. Keep this synthetic identity within that installed boundary.
+  $endpoint = 'ci-lifecycle-' + [Guid]::NewGuid().ToString('N')
   foreach ($pair in @(@('endpoint_id', $endpoint), @('tenant_id', 'ci-lifecycle'),
       @('rest_base_url', 'https://127.0.0.1:9/api/v1'), @('proxy_mode', 'off'),
       @('proxy_url', ''), @('relay_url', ''))) {

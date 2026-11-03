@@ -17,8 +17,8 @@ static const char *compat_tenant,*compat_endpoint;
 #ifdef _WIN32
 static USHORT compat_process_machine,compat_native_machine;
 #endif
-static int compat_identity(const char *s) {
-  size_t n=strlen(s);if(!n||n>63u)return 0;
+static int compat_identity(const char *s,size_t capacity) {
+  size_t n=strlen(s);if(!n||n>=capacity)return 0;
   for(size_t i=0;i<n;i++)if(!((s[i]>='a'&&s[i]<='z')||(s[i]>='A'&&s[i]<='Z')||(s[i]>='0'&&s[i]<='9')||s[i]=='-'||s[i]=='_'))return 0;
   return 1;
 }
@@ -34,7 +34,13 @@ static void compat_args(int argc,char **argv) {
   compat_need(!errno && end && !*end && compat_epoch>0 && llabs((long long)time(NULL)-compat_epoch)<3600,"fresh_epoch");
   compat_need(!strcmp(argv[4],"1") || !strcmp(argv[4],"2"),"generations");
   compat_generations=(unsigned)atoi(argv[4]);
-  compat_tenant=argv[5];compat_endpoint=argv[6];compat_need(compat_identity(compat_tenant)&&compat_identity(compat_endpoint),"fixture_identity");
+  compat_tenant=argv[5];compat_endpoint=argv[6];
+  /* Both the original record and wire owners must retain the whole identity.
+   * Reject before opening a DB or copying into either fixed-size field. */
+  compat_need(compat_identity(compat_tenant,sizeof(((EdrBehaviorRecord *)0)->tenant_id))&&
+              compat_identity(compat_tenant,sizeof(((edr_v1_BehaviorEvent *)0)->tenant_id)),"fixture_tenant_identity");
+  compat_need(compat_identity(compat_endpoint,sizeof(((EdrBehaviorRecord *)0)->endpoint_id))&&
+              compat_identity(compat_endpoint,sizeof(((edr_v1_BehaviorEvent *)0)->endpoint_id)),"fixture_endpoint_identity");
   compat_max_mb=compat_positive(argv[7]);compat_retention=compat_positive(argv[8]);compat_selected=compat_positive(argv[9]);
   compat_need(compat_selected>=compat_retention,"selected_retention_must_cover_recent");
   const char *blocked[]={"EDR_QUEUE_MAX_DB_MB","EDR_QUEUE_RETENTION_HOURS","EDR_QUEUE_MAX_RETRIES","EDR_QUEUE_DRAIN_MAX_ROWS","EDR_QUEUE_CIRCUIT_BACKOFF_MS","EDR_EVIDENCE_CONTEXT_WINDOW_S"};

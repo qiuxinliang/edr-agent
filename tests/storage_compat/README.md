@@ -95,6 +95,9 @@ isolated installation's actual config. Positive budget/retention values must
 likewise be copied from that config, with default selected retention resolved by
 the existing config contract. Queue passes its retention twice. The adapter
 rejects relevant environment overrides rather than silently using another policy.
+Identity must fit both original record and protobuf fields, including the NUL
+terminator: endpoint at most 47 ASCII bytes, tenant at most 63. Invalid identity
+is rejected before opening a database or copying into an owner record.
 
 `seed` and `append` may operate on the verified disposable installation only
 after its exact runtime owner is stopped and all its processes have exited.
@@ -131,6 +134,12 @@ Windows tools reject emulated execution before touching a database.
 additional writes with candidate and intended old rollback readers, always in
 fresh processes and independent SQLite snapshots. It also rejects duplicate
 seeding, absent generations/databases, expired fixture metadata and corruption.
+The main matrix has 8 reads, 4 write phases and 10 negative cases. Separate
+identity-boundary cases add 4 writes and 4 snapshot reads at the exact 47-byte
+endpoint/63-byte tenant limits, across both tools and source versions. Another
+12 negative cases reject 48- and 51-byte endpoints and 64-byte tenants with the
+specific identity cause and verify that no database or sidecar was created.
+The summary reports boundary reads/writes separately and 22 total negatives.
 This standalone result is explicitly not an installed Agent lifecycle result.
 The signed lifecycle helper must still seed the actual installed DBs, start the
 original runtime and validate snapshots after upgrade and timeout/rollback.
