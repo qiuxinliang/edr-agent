@@ -203,7 +203,8 @@ function Assert-BaselineRepair([string] $SetupPath) {
   } else {
     Stop-Service -Name $ServiceName -Force -ErrorAction SilentlyContinue
   }
-  foreach($process in @(Get-LifecycleAgentProcesses)) { Stop-Process -Id $process.ProcessId -Force -ErrorAction Stop }
+  $stopReceipt=Stop-LifecycleAgentProcesses
+  Add-Evidence $stage 'processes-stopped' ('generation_bound=true wait_budget_seconds='+$stopReceipt.wait_budget_seconds+' remaining=0')
   New-BaselineRepairBackup $backupDir
   foreach ($name in @("unins000.exe", "unins000.dat")) {
     Remove-Item -LiteralPath (Join-Path $InstallDir $name) -Force
@@ -598,20 +599,119 @@ function Get-LifecycleAgentProcesses {
   })
 }
 
-function Get-LifecycleRuntimeProcess {
+function Open-LifecycleAgentProcess($Snapshot) {
+  $expected=[IO.Path]::GetFullPath((Join-Path $InstallDir 'FDSensor.exe'))
+  if($Snapshot.ProcessId -le 0 -or $Snapshot.CreationDate -isnot [DateTime] -or
+      [string]$Snapshot.ExecutablePath -ine $expected){throw 'invalid scoped Agent process snapshot'}
+  $process=$null;$retained=$false
+  try {
+    try {
+      $process=Get-Process -Id $Snapshot.ProcessId -ErrorAction Stop
+      $null=$process.Handle
+    } catch {
+      $failure=$_;$cause=$failure.Exception
+      while($cause.InnerException){$cause=$cause.InnerException}
+      $missing=($cause.GetType().FullName -ceq 'Microsoft.PowerShell.Commands.ProcessCommandException' -and
+        $failure.FullyQualifiedErrorId -ceq 'NoProcessFoundForGivenId,Microsoft.PowerShell.Commands.GetProcessCommand') -or
+        ($cause -is [ComponentModel.Win32Exception] -and $cause.NativeErrorCode -eq 87)
+      if($missing -and @(Get-CimInstance Win32_Process -Filter ('ProcessId='+$Snapshot.ProcessId) -ErrorAction Stop).Count -eq 0){return $null}
+      throw
+    }
+    if($process.HasExited){return $null}
+    try {
+      if($process.Id -ne $Snapshot.ProcessId -or $process.Path -ine $expected -or
+          [Math]::Abs(($process.StartTime.ToUniversalTime()-$Snapshot.CreationDate.ToUniversalTime()).Ticks) -gt 10){
+        throw 'scoped Agent process generation or image changed'
+      }
+    } catch [InvalidOperationException] {
+      if($process.HasExited){return $null}
+      throw
+    }
+    $retained=$true
+    return $process
+  } finally {if($process -and -not $retained){$process.Dispose()}}
+}
+
+function Stop-LifecycleAgentProcesses {
+  $clock=[Diagnostics.Stopwatch]::StartNew();$budgetMs=30000
+  foreach($snapshot in @(Get-LifecycleAgentProcesses)) {
+    $process=Open-LifecycleAgentProcess $snapshot
+    if(-not $process){continue}
+    try {
+      if(-not $process.HasExited) {
+        try {$process.Kill()} catch [InvalidOperationException] {if(-not $process.HasExited){throw}}
+      }
+      $remaining=$budgetMs-[int]$clock.ElapsedMilliseconds
+      if($remaining -le 0 -or -not $process.WaitForExit($remaining)){throw 'scoped Agent stop exceeded the 30 second test budget'}
+    } finally {$process.Dispose()}
+  }
+  if(@(Get-LifecycleAgentProcesses).Count -ne 0){throw 'scoped Agent processes remain after stop'}
+  return [pscustomobject]@{wait_budget_seconds=30;remaining=0}
+}
+
+function Get-LifecycleUpdaterIdentity($UpdaterProcess) {
+  if($UpdaterProcess -isnot [Diagnostics.Process]){throw 'storage preflight requires the owned updater Process'}
+  $null=$UpdaterProcess.Handle
+  if($UpdaterProcess.HasExited){throw 'storage preflight updater is no longer live'}
+  $rows=@(Get-CimInstance Win32_Process -Filter ('ProcessId='+$UpdaterProcess.Id) -ErrorAction Stop)
+  if($rows.Count -ne 1 -or $rows[0].CreationDate -isnot [DateTime] -or
+      $rows[0].ExecutablePath -ine $UpdaterProcess.Path -or
+      [Math]::Abs(($rows[0].CreationDate.ToUniversalTime()-$UpdaterProcess.StartTime.ToUniversalTime()).Ticks) -gt 10 -or
+      $UpdaterProcess.HasExited){throw 'storage preflight updater parent generation is unverified'}
+  return [pscustomobject]@{pid=$UpdaterProcess.Id;created_utc=$UpdaterProcess.StartTime.ToUniversalTime();image=$UpdaterProcess.Path}
+}
+
+function Get-LifecycleStoragePreflight($Snapshot,$UpdaterProcess) {
+  $executable=[IO.Path]::GetFullPath((Join-Path $InstallDir 'FDSensor.exe'))
+  $config=Join-Path $InstallDir 'agent.toml'
+  $exePattern='"'+[regex]::Escape($executable)+'"'
+  if($executable -notmatch '\s'){$exePattern='(?:'+$exePattern+'|'+[regex]::Escape($executable)+')'}
+  $pattern='^(?i:'+ $exePattern +') --storage-space-preflight --config "(?i:'+ [regex]::Escape($config) +')" --output "(?<output>(?i:'+ [regex]::Escape($InstallDir.TrimEnd('\')) +')\\\.storage-preflight-[a-f0-9]{32}\\floor)"$'
+  $match=[regex]::Match([string]$Snapshot.CommandLine,$pattern)
+  if(-not $match.Success){return $null}
+  $parent=Get-LifecycleUpdaterIdentity $UpdaterProcess
+  if($Snapshot.ParentProcessId -ne $parent.pid -or $Snapshot.CreationDate -isnot [DateTime] -or
+      $Snapshot.CreationDate.ToUniversalTime() -lt $parent.created_utc){throw 'storage preflight child parent generation is unverified'}
+  $child=Open-LifecycleAgentProcess $Snapshot
+  try {
+    return [pscustomobject]@{role='storage_space_preflight';pid=[uint32]$Snapshot.ProcessId;parent_pid=$parent.pid;
+      created_utc=$Snapshot.CreationDate.ToUniversalTime().ToString('o');updater_created_utc=$parent.created_utc.ToString('o');
+      image=$executable;config=$config;output=$match.Groups['output'].Value;
+      observation=$(if($child){'live'}else{'observed_then_exited'})}
+  } finally {if($child){$child.Dispose()}}
+}
+
+function Get-LifecycleRuntimeProcess($UpdaterProcess=$null) {
   $service=Get-CimInstance Win32_Service -Filter ("Name='{0}'" -f $ServiceName) -ErrorAction Stop
   $agents=@(Get-LifecycleAgentProcesses)
-  if ($agents.Count -gt 1) { throw 'multiple Agent processes own the isolated install directory' }
+  $preflights=New-Object 'System.Collections.Generic.List[object]'
+  if($null -ne $UpdaterProcess) {
+    $runtime=New-Object 'System.Collections.Generic.List[object]'
+    foreach($agent in $agents) {
+      $probe=Get-LifecycleStoragePreflight $agent $UpdaterProcess
+      if($probe){$preflights.Add($probe)}else{$runtime.Add($agent)}
+    }
+    $agents=@($runtime.ToArray())
+  }
+  if ($agents.Count -gt 1) {
+    $failure=[InvalidOperationException]::new('multiple Agent processes own the isolated install directory')
+    $details=@($agents|Select-Object -First 8|ForEach-Object {
+      [ordered]@{pid=$_.ProcessId;parent_pid=$_.ParentProcessId;created=$_.CreationDate;
+        image=([string]$_.ExecutablePath).Substring(0,[Math]::Min(512,([string]$_.ExecutablePath).Length));role='runtime_candidate'}
+    })
+    $failure.Data['lifecycle_process_snapshot']=$details|ConvertTo-Json -Depth 4 -Compress
+    throw $failure
+  }
   $pidValue=if($agents.Count -eq 1){[uint32]$agents[0].ProcessId}else{0}
   if ($RuntimeMode -ceq 'scheduled_task') {
     if ($service) { throw 'scheduled-task validation found an unexpected service owner' }
     $task=Get-ScheduledTask -TaskName $ServiceName -TaskPath '\' -ErrorAction SilentlyContinue
-    return [pscustomobject]@{State=$(if($task){[string]$task.State}else{'Absent'});ProcessId=$pidValue}
+    return [pscustomobject]@{State=$(if($task){[string]$task.State}else{'Absent'});ProcessId=$pidValue;StoragePreflightProcesses=$preflights.ToArray()}
   }
   if ($service -and $service.State -ceq 'Running' -and $pidValue -gt 0 -and $service.ProcessId -ne $pidValue) {
     throw 'service process does not own the isolated install directory'
   }
-  return [pscustomobject]@{State=$(if($service){[string]$service.State}else{'Absent'});ProcessId=$pidValue}
+  return [pscustomobject]@{State=$(if($service){[string]$service.State}else{'Absent'});ProcessId=$pidValue;StoragePreflightProcesses=$preflights.ToArray()}
 }
 
 function Get-LifecycleTaskDefinition {

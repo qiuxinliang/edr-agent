@@ -95,6 +95,31 @@ function Read-RecoveryJournal([string]$Path) {
   try { return [IO.File]::ReadAllText($Path) | ConvertFrom-Json }
   catch [IO.IOException] { return $null }
 }
+function Get-RecoveryFailureProcessSnapshot([object[]]$OwnedHandles) {
+  # This later sample is diagnostic only. It cannot reconstruct a process that
+  # exited before the failure handler or change any runtime acceptance decision.
+  $matches=@(Get-LifecycleAgentProcesses | Sort-Object ProcessId)
+  $items=New-Object System.Collections.Generic.List[object]
+  foreach($candidate in @($matches | Select-Object -First 16)) {
+    $items.Add([ordered]@{pid=[uint32]$candidate.ProcessId;parent_pid=[uint32]$candidate.ParentProcessId;
+      created_filetime=([DateTime]$candidate.CreationDate).ToUniversalTime().ToFileTimeUtc();
+      image=[string]$candidate.ExecutablePath;identity_source='cim_query'})
+  }
+  $handles=New-Object System.Collections.Generic.List[object]
+  foreach($owned in @($OwnedHandles | Select-Object -First 4)) {
+    if($owned.handle -eq [IntPtr]::Zero){continue}
+    $item=[ordered]@{role=$owned.role;pid=$owned.pid;identity_source='held_process_handle'}
+    try {
+      $item.created_filetime=[LifecycleInstallerFault]::Created($owned.handle)
+      $item.image=[LifecycleInstallerFault]::Image($owned.handle)
+      $item.exited=[LifecycleInstallerFault]::Exited($owned.handle)
+    } catch { $item.query_error_type=$_.Exception.GetType().FullName }
+    $handles.Add($item)
+  }
+  return [ordered]@{scope='post_failure_sample';captured_at=[DateTime]::UtcNow.ToString('o');
+    matching_process_count=$matches.Count;process_limit=16;truncated=($matches.Count -gt 16);
+    processes=$items.ToArray();owned_handles=$handles.ToArray()}
+}
 function Assert-RecoveryFiles($Expected) {
   foreach ($entry in $Expected.GetEnumerator()) {
     $path = Join-Path $InstallDir $entry.Key
@@ -212,6 +237,8 @@ $job = [IntPtr]::Zero; $rootHandle = [IntPtr]::Zero; $oldRuntime = [IntPtr]::Zer
 $delegatedRuntime = [IntPtr]::Zero; $process = $null
 $suspended = $false; $stopped = $false; $delegatedRunning = $false; $passed = $false
 $observations = New-Object System.Collections.Generic.List[object]
+$preflightObservations = New-Object System.Collections.Generic.List[object]
+$preflightIdentities = @{}
 $receipt = [ordered]@{ schema='edr.windows.real-installer-timeout.v1'; command_id=$commandId; status='failed';
   architecture=$InputBinding.architecture; target_version=$InputBinding.target_version; runtime_mode=$RuntimeMode;
   updater_sha256=$InputBinding.target_updater_sha256; installer_sha256=$InputBinding.installer_sha256;
@@ -230,7 +257,16 @@ try {
   $lastState = ''
   while (-not $process.HasExited -and $clock.Elapsed.TotalSeconds -lt 240) {
     $journal = Read-RecoveryJournal $journalPath
-    $runtimeProcess = Get-LifecycleRuntimeProcess
+    $runtimeProcess = Get-LifecycleRuntimeProcess -UpdaterProcess $process
+    foreach($probe in @($runtimeProcess.StoragePreflightProcesses)) {
+      $identity=([string]$probe.pid)+':'+$probe.created_utc
+      if(-not $preflightIdentities.ContainsKey($identity)) {
+        if($preflightObservations.Count -lt 32) {
+          $preflightIdentities[$identity]=$true
+          $preflightObservations.Add($probe)
+        } else {$receipt.storage_preflight_observations_truncated=$true}
+      }
+    }
     if ($journal -and $journal.stop_intent -and [LifecycleInstallerFault]::Exited($oldRuntime) -and -not $stopped) {
       $stopped = $true
       $receipt.runtime_stopped = [ordered]@{ at=[DateTime]::UtcNow.ToString('o'); state=$runtimeProcess.State;
@@ -308,16 +344,23 @@ try {
     throw 'Actual installer hang did not produce the required timeout, zero-writer receipt and successful rollback'
   }
   Assert-RecoveryFiles $files
+  if ([string]::IsNullOrWhiteSpace([string]$report.first_error) -or
+      [string]$report.first_error -cne [string]$journal.first_error -or
+      [string]$report.error_code -cne [string]$journal.error_code -or
+      [string]$report.failed_stage -cne [string]$journal.failed_stage) {
+    throw 'Installer first failure was not preserved separately from recovery'
+  }
+  $receipt.first_failure = [ordered]@{ error_code=$report.error_code; stage=$report.failed_stage; first_error=$report.first_error }
+  $receipt.recovery = [ordered]@{ status=$report.status; rollback=$report.rollback; installed_sha256=$report.installed_sha256 }
   $afterOwner = Get-RecoveryOwnerSnapshot | ConvertTo-Json -Depth 8 -Compress
+  $receipt.owner_after = ($afterOwner | ConvertFrom-Json)
   if ($beforeOwner -cne $afterOwner) { throw 'Recovery changed runtime owner identity or Inno uninstall registration' }
   $runtimeProcess = Get-LifecycleRuntimeProcess
   if ($runtimeProcess.State -cne 'Running' -or $runtimeProcess.ProcessId -le 0 -or -not [LifecycleInstallerFault]::Exited($delegatedRuntime)) {
     throw 'Recovery did not stop the installer-created runtime and start a healthy recovered owner'
   }
-  $receipt.first_failure = [ordered]@{ error_code=$report.error_code; stage=$report.failed_stage; first_error=$report.first_error }
-  $receipt.recovery = [ordered]@{ status=$report.status; rollback=$report.rollback; installed_sha256=$report.installed_sha256 }
   $receipt.installer_evidence = Copy-RecoveryInstallerEvidence $report $journal $commandId $stage
-  $receipt.status = 'succeeded'; $receipt.owner_after = ($afterOwner | ConvertFrom-Json)
+  $receipt.status = 'succeeded'
   $receipt.recovered_runtime_pid = $runtimeProcess.ProcessId
   if($RuntimeMode -ceq 'service') {
     $receipt.recovered_service_pid=$receipt.recovered_runtime_pid
@@ -325,8 +368,34 @@ try {
   $receipt.installer_quiesced = $true
   $passed = $true
 } catch {
-  $receipt.failure = $_.Exception.Message
-  throw
+  $failureRecord=$_
+  $receipt.failure_at=[DateTime]::UtcNow.ToString('o')
+  $receipt.failure = $failureRecord.Exception.Message
+  try {
+    $failureStack=[string]$failureRecord.ScriptStackTrace
+    $receipt.failure_error=[ordered]@{type=$failureRecord.Exception.GetType().FullName;
+      script=$failureRecord.InvocationInfo.ScriptName;line=$failureRecord.InvocationInfo.ScriptLineNumber;
+      column=$failureRecord.InvocationInfo.OffsetInLine;
+      script_stack=$failureStack.Substring(0,[Math]::Min(2048,$failureStack.Length))}
+    $cause=$failureRecord.Exception
+    for($depth=0;$cause -and $depth -lt 8;$depth++) {
+      $frozen=[string]$cause.Data['lifecycle_process_snapshot']
+      if($frozen) {
+        if($frozen.Length -gt 16384){throw 'runtime failure snapshot exceeds diagnostic bound'}
+        $parsedCandidates=$frozen|ConvertFrom-Json
+        $receipt.failure_runtime_candidates=@($parsedCandidates)
+        break
+      }
+      $cause=$cause.InnerException
+    }
+    $held=@(
+      @{role='initial_runtime';pid=$receipt.initial_runtime.pid;handle=$oldRuntime},
+      @{role='installer_root';pid=$receipt.fault.root_pid;handle=$rootHandle},
+      @{role='delegated_runtime';pid=$receipt.delegated_runtime.pid;handle=$delegatedRuntime})
+    if($process){$held+=@{role='candidate_updater';pid=$process.Id;handle=$process.Handle}}
+    $receipt.failure_processes=Get-RecoveryFailureProcessSnapshot $held
+  } catch { $receipt.failure_diagnostics_error_type=$_.Exception.GetType().FullName }
+  throw $failureRecord
 } finally {
   try {
     if (-not $passed -and $job -ne [IntPtr]::Zero) {
@@ -356,6 +425,7 @@ try {
   } finally {
     try {
       $receipt.observations = $observations.ToArray()
+      $receipt.storage_preflight_observations = $preflightObservations.ToArray()
       [IO.File]::WriteAllText((Join-Path $stage 'receipt.json'), ($receipt | ConvertTo-Json -Depth 12), [Text.UTF8Encoding]::new($false))
     } finally {
       foreach ($handle in @($rootHandle, $oldRuntime, $delegatedRuntime, $job)) {

@@ -23,7 +23,8 @@ try {
   $tokens=$null;$errors=$null
   $ast=[Management.Automation.Language.Parser]::ParseFile((Join-Path $RepoRoot 'scripts/windows_setup_exe_lifecycle_smoke.ps1'),[ref]$tokens,[ref]$errors)
   if ($errors.Count -ne 0) { throw 'lifecycle script parse failed' }
-  foreach($name in @('Get-LifecycleAgentProcesses','Get-LifecycleRuntimeProcess','Get-LifecycleRuntimeOwner',
+  foreach($name in @('Get-LifecycleAgentProcesses','Open-LifecycleAgentProcess','Stop-LifecycleAgentProcesses',
+      'Get-LifecycleUpdaterIdentity','Get-LifecycleStoragePreflight','Get-LifecycleRuntimeProcess','Get-LifecycleRuntimeOwner',
       'New-LifecyclePreservationSnapshot','Assert-LifecyclePreservationSnapshot','Invoke-Installer','Invoke-BaselineRepair')) {
     $owners=@($ast.FindAll({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq $name},$true))
     if ($owners.Count -ne 1) { throw ('missing unique harness owner '+$name) }
@@ -48,7 +49,14 @@ try {
   function Get-CimInstance {
     [CmdletBinding()]param($ClassName,[string]$Filter)
     if($ClassName -ceq 'Win32_Service'){return $script:service}
-    if($ClassName -ceq 'Win32_Process'){return $script:processes}
+    if($ClassName -ceq 'Win32_Process'){
+      if($Filter -match '^ProcessId=([0-9]+)$') {
+        $wanted=[uint32]$Matches[1]
+        if($script:updaterRow -and $wanted -eq $script:updaterRow.ProcessId){return $script:updaterRow}
+        return @($script:processes|Where-Object{$_.ProcessId -eq $wanted})
+      }
+      return $script:processes
+    }
     throw 'unexpected CIM boundary'
   }
   function Get-ScheduledTask {
@@ -148,6 +156,139 @@ try {
   Reject 'multiple_directory_processes' '*multiple Agent processes*' {Get-LifecycleRuntimeProcess|Out-Null}
   $script:processes=@($script:processes[1])
   Pass 'no_directory_process_never_claims_running_pid' {if((Get-LifecycleRuntimeProcess).ProcessId -ne 0){throw 'foreign runtime accepted'}}
+  # Real current-process identity is read only. Agent child handles and every
+  # stop/kill boundary below are fixtures; no actual process is terminated.
+  # Use actual .NET methods so their exceptions have the Process.Kill boundary,
+  # without PowerShell ScriptMethod's extra exception wrapping or any OS API.
+  if(-not ('EdrLifecycleFixtureProcess' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+public sealed class EdrLifecycleFixtureProcess {
+    public int Id;
+    public IntPtr Handle = new IntPtr(7);
+    public string Path, mode;
+    public DateTime StartTime;
+    public bool HasExited, disposed, killed;
+    public int wait_ms;
+    public Action<int, bool> OnWait;
+    public void Dispose() { disposed = true; }
+    public void Kill() {
+        if (mode == "kill-denied") throw new Win32Exception(5, "fixture_kill_denied");
+        if (mode == "exit-before-kill") { HasExited = true; throw new InvalidOperationException("fixture already exited"); }
+        killed = true;
+        if (mode != "wait-timeout") HasExited = true;
+    }
+    public bool WaitForExit(int milliseconds) {
+        wait_ms = milliseconds;
+        if (mode == "wait-timeout") return false;
+        if (OnWait != null) OnWait(Id, mode == "respawn");
+        return HasExited;
+    }
+}
+'@
+  }
+  $savedProcesses=$script:processes
+  $updater=[Diagnostics.Process]::GetCurrentProcess()
+  try {
+    $null=$updater.Handle
+    $script:updaterRow=[pscustomobject]@{ProcessId=$updater.Id;ExecutablePath=$updater.Path;CreationDate=$updater.StartTime}
+    $childTime=$updater.StartTime.AddSeconds(1)
+    $image=Join-Path $InstallDir 'FDSensor.exe';$config=Join-Path $InstallDir 'agent.toml'
+    $output=Join-Path (Join-Path $InstallDir ('.storage-preflight-'+('a'*32))) 'floor'
+    $probeCommand='"'+$image+'" --storage-space-preflight --config "'+$config+'" --output "'+$output+'"'
+    $runtimeRow=[pscustomobject]@{ExecutablePath=$image;ProcessId=123;ParentProcessId=700;CreationDate=$childTime;CommandLine='runtime fixture'}
+    $probeRow=[pscustomobject]@{ExecutablePath=$image;ProcessId=124;ParentProcessId=$updater.Id;CreationDate=$childTime;CommandLine=$probeCommand}
+    $script:handleMode='live';$script:lastHandle=$null
+    function Get-Process {
+      [CmdletBinding()]param([int]$Id)
+      if($script:handleMode -ceq 'access-denied'){throw [ComponentModel.Win32Exception]::new(5,'fixture_access_denied')}
+      if($script:handleMode -ceq 'wrong-missing-error'){throw [ArgumentException]::new('fixture_wrong_missing_error')}
+      if($script:handleMode -cin @('missing','missing-still-present')) {
+        if($script:handleMode -ceq 'missing'){$script:processes=@($script:processes|Where-Object{$_.ProcessId -ne $Id})}
+        # An impossible Windows PID obtains the real cmdlet's exact error type
+        # and ErrorId, without opening or operating any actual Agent process.
+        Microsoft.PowerShell.Management\Get-Process -Id 2147483647 -ErrorAction Stop
+      }
+      $row=@($script:processes|Where-Object{$_.ProcessId -eq $Id})[0]
+      $h=New-Object EdrLifecycleFixtureProcess
+      $h.Id=$Id;$h.Path=$row.ExecutablePath;$h.StartTime=$row.CreationDate
+      $h.HasExited=($script:handleMode -ceq 'exited');$h.mode=$script:handleMode
+      if($h.mode -ceq 'reused'){$h.StartTime=$h.StartTime.AddSeconds(1)}
+      if($h.mode -ceq 'image-changed'){$h.Path='C:\outside\FDSensor.exe'}
+      if($h.HasExited){$script:processes=@($script:processes|Where-Object{$_.ProcessId -ne $Id})}
+      $h.OnWait=[Action[int,bool]]{
+        param([int]$OwnedId,[bool]$Respawn)
+        $script:processes=@($script:processes|Where-Object{$_.ProcessId -ne $ownedId})
+        if($Respawn){$script:processes+=@([pscustomobject]@{ProcessId=125;ExecutablePath=$script:lastHandle.Path;CreationDate=$script:lastHandle.StartTime.AddSeconds(1)})}
+      }
+      $script:lastHandle=$h;return $h
+    }
+    function Stop-Process {throw 'PID-only stop must never be used'}
+    $script:processes=@($runtimeRow,$probeRow)
+    Reject 'default_still_counts_preflight' '*multiple Agent processes*' {Get-LifecycleRuntimeProcess|Out-Null}
+    Pass 'owned_updater_preflight_is_separate_from_runtime' {
+      $state=Get-LifecycleRuntimeProcess -UpdaterProcess $updater
+      if($state.ProcessId -ne 123 -or @($state.StoragePreflightProcesses).Count -ne 1 -or
+          $state.StoragePreflightProcesses[0].observation -cne 'live' -or
+          $state.StoragePreflightProcesses[0].parent_pid -ne $updater.Id -or
+          $state.StoragePreflightProcesses[0].output -cne $output -or -not $script:lastHandle.disposed -or $updater.HasExited){throw 'probe identity or handle ownership changed'}
+    }
+    $script:processes=@($probeRow)
+    Pass 'probe_alone_never_claims_runtime_pid' {if((Get-LifecycleRuntimeProcess -UpdaterProcess $updater).ProcessId -ne 0){throw 'probe became runtime'}}
+    $script:processes=@($runtimeRow,$probeRow);$script:handleMode='missing'
+    Pass 'verified_probe_naturally_exits_before_handle_open' {
+      $state=Get-LifecycleRuntimeProcess -UpdaterProcess $updater
+      if($state.ProcessId -ne 123 -or $state.StoragePreflightProcesses[0].observation -cne 'observed_then_exited'){throw 'exited probe was not retained as observation'}
+    }
+    $script:handleMode='live'
+    foreach($bad in @('',($probeCommand+' --extra'),$probeCommand.Replace('--storage-space-preflight','--storage-space-preflight-other'),
+        $probeCommand.Replace('agent.toml','other.toml'),$probeCommand.Replace('.storage-preflight-','.other-'),
+        $probeCommand.Replace(('a'*32),('a'*31)),$probeCommand.Replace('\floor"','\other"'),
+        $probeCommand.Replace($InstallDir,'C:\outside'))) {
+      $probeRow.CommandLine=$bad;$script:processes=@($runtimeRow,$probeRow)
+      Reject 'unknown_or_inexact_command_is_not_ignored' '*multiple Agent processes*' {Get-LifecycleRuntimeProcess -UpdaterProcess $updater|Out-Null}
+    }
+    $probeRow.CommandLine=$probeCommand;$probeRow.ParentProcessId=$updater.Id+4
+    Reject 'probe_wrong_parent' '*parent generation is unverified*' {Get-LifecycleRuntimeProcess -UpdaterProcess $updater|Out-Null}
+    $probeRow.ParentProcessId=$updater.Id;$probeRow.CreationDate=$updater.StartTime.AddSeconds(-1)
+    Reject 'probe_predates_updater' '*parent generation is unverified*' {Get-LifecycleRuntimeProcess -UpdaterProcess $updater|Out-Null}
+    $probeRow.CreationDate=$childTime;$script:updaterRow.CreationDate=$updater.StartTime.AddSeconds(1)
+    Reject 'updater_parent_PID_reused' '*parent generation is unverified*' {Get-LifecycleRuntimeProcess -UpdaterProcess $updater|Out-Null}
+    $script:updaterRow.CreationDate=$updater.StartTime
+    Reject 'fake_updater_handle' '*owned updater Process*' {Get-LifecycleRuntimeProcess -UpdaterProcess ([pscustomobject]@{Id=$updater.Id})|Out-Null}
+    $script:handleMode='reused'
+    Reject 'probe_child_PID_reused' '*generation or image changed*' {Get-LifecycleRuntimeProcess -UpdaterProcess $updater|Out-Null}
+    $script:handleMode='access-denied'
+    Reject 'probe_handle_access_denied_is_fatal' '*fixture_access_denied*' {Get-LifecycleRuntimeProcess -UpdaterProcess $updater|Out-Null}
+    $script:handleMode='live';$probeRow.CommandLine='second genuine runtime'
+    Pass 'two_runtimes_rejected_with_bounded_identity_diagnostic' {
+      try {Get-LifecycleRuntimeProcess -UpdaterProcess $updater|Out-Null;throw 'unexpected acceptance'} catch {
+        if($_.Exception.Message -notlike '*multiple Agent processes*'){throw}
+        $detail=[string]$_.Exception.Data['lifecycle_process_snapshot']
+        $parsed=if($detail){$detail|ConvertFrom-Json}else{$null}
+        $overbroad=$detail -match 'CommandLine|second genuine runtime'
+        if(-not $detail -or $overbroad -or @($parsed).Count -ne 2){
+          throw ('ambiguous runtime evidence missing or overbroad: present='+[bool]$detail+' parsed_count='+@($parsed).Count+' overbroad='+$overbroad+' exception_type='+$_.Exception.GetType().FullName)
+        }
+      }
+    }
+    foreach($mode in @('live','missing','exited','exit-before-kill')) {
+      $script:handleMode=$mode;$script:processes=@($runtimeRow);$script:lastHandle=$null
+      Pass ('stop_same_generation_or_confirmed_exit_'+$mode) {
+        $result=Stop-LifecycleAgentProcesses
+        if($result.remaining -ne 0 -or $result.wait_budget_seconds -ne 30 -or $script:processes.Count -ne 0){throw 'stop did not establish quiescence'}
+        if($script:lastHandle -and -not $script:lastHandle.disposed){throw 'stop leaked process handle'}
+      }
+    }
+    foreach($entry in @(@('reused','*generation or image changed*'),@('access-denied','*fixture_access_denied*'),
+        @('image-changed','*generation or image changed*'),@('missing-still-present','*2147483647*'),
+        @('wrong-missing-error','*fixture_wrong_missing_error*'),@('kill-denied','*fixture_kill_denied*'),
+        @('wait-timeout','*30 second test budget*'),@('respawn','*processes remain after stop*'))) {
+      $script:handleMode=$entry[0];$script:processes=@($runtimeRow)
+      Reject ('stop_rejects_'+$entry[0]) $entry[1] {Stop-LifecycleAgentProcesses|Out-Null}
+    }
+  } finally {$updater.Dispose();$script:updaterRow=$null;$script:processes=$savedProcesses}
   $snapshot=New-LifecyclePreservationSnapshot 'task-fixture'
   Pass 'task_config_XML_SDDL_and_marker_preservation' {Assert-LifecyclePreservationSnapshot $snapshot 'fixture'}
   $script:definition.xml=$originalXml.Replace('2026-01-01','2026-01-02')
@@ -159,7 +300,7 @@ try {
   $script:definition.sddl=$originalSddl
   [ordered]@{status='succeeded';case_count=$cases.Count;cases=$cases.ToArray();scope='AST harness owners with isolated task, service, process and Setup I/O; no actual Agent or task operation'}|ConvertTo-Json -Depth 5
 } finally {
-  foreach($name in @('Get-CimInstance','Get-ScheduledTask','Get-ItemProperty','Start-Process')) {
+  foreach($name in @('Get-CimInstance','Get-ScheduledTask','Get-ItemProperty','Start-Process','Get-Process','Stop-Process')) {
     if(Test-Path -LiteralPath ('Function:'+$name)){Remove-Item -LiteralPath ('Function:'+$name)}
   }
   Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction Stop

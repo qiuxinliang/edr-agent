@@ -43,6 +43,7 @@ try {
   $context=@{tools=$tools;root=$root;install=$InstallDir;config=$path;epoch=1793700000;generation=1;writer_uncertain=$false;
     binding=[pscustomobject]@{config_sha256=(Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant();tenant_id='fixture';endpoint_id='fixture-ep';cache=$policy;queue=$policy};
     expected=@{cache=@([pscustomobject]@{pid=96010;process_start_key='18446744073709551010';cmdline='兼容'},[pscustomobject]@{pid=96011;process_start_key='18446744073709551011';cmdline='fixture'});queue=@([pscustomobject]@{batch_id='storage-compat-1-0';wire_sha256=('a'*64);wire_bytes=123;compressed=$false},[pscustomobject]@{batch_id='storage-compat-1-1';wire_sha256=('b'*64);wire_bytes=99;compressed=$true})}}
+  $readbackExpected=$context.expected
   function Receipt([string]$Kind,[string]$Action='read'){
     return [pscustomobject]@{schema='edr.test.storage-compat.v1';owner=$(if($Kind -ceq 'cache'){'evidence_cache'}else{'queue'});action=$Action;
       platform='Windows';native_windows=$true;process_machine=0;native_machine=0xaa64;
@@ -165,22 +166,75 @@ try {
   $script:writerRemains=$false;$script:writeFails=$true;$script:restartFails=$true;$script:sequence.Clear();$script:fake.HasExited=$false
   Reject 'first_write_failure_survives_restart_failure' '*write_primary*' {Write-LifecycleStorageFixture $context 'seed' 'fixture' 3>$null}
   if($script:sequence -cnotcontains 'Start' -or $context.generation -ne 0){throw 'failed fixture projection changed'}
-  $context.generation=1;$script:fake.HasExited=$false;$script:copies=New-Object 'System.Collections.Generic.List[string]'
+  $context.generation=1;$context.expected=$readbackExpected;$script:fake.HasExited=$false;$script:copies=New-Object 'System.Collections.Generic.List[string]'
+  # Retain actual owner admission and receipt validation; isolate only external
+  # process I/O. Cleanup must not run merely because a child returned exit zero.
+  foreach($owner in @($ast.FindAll({param($n)$n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -ceq 'Invoke-LifecycleStorageOwner'},$true))){. ([scriptblock]::Create($owner.Extent.Text))}
   function Invoke-LifecycleStoragePython {
     param($Context,$Arguments,$Label)
     if($Arguments[0] -cne 'backup' -or $Arguments[3] -cne $Context.binding.config_sha256){throw 'snapshot lost actual configuration binding'}
     [IO.File]::WriteAllText($Arguments[5],'sealed actual-database snapshot fixture')
-    return [pscustomobject]@{schema='edr.test.storage-snapshot.v1';sqlite_backup=$true;source_readonly=$true;source=$Context.binding.($Arguments[4]).path;config_sha256=$Context.binding.config_sha256;sha256=(Get-FileHash -LiteralPath $Arguments[5] -Algorithm SHA256).Hash.ToLowerInvariant()}
+    $proof=[pscustomobject]@{schema='edr.test.storage-snapshot.v1';sqlite_backup=$true;source_readonly=$true;source=$Context.binding.($Arguments[4]).path;config_sha256=$Context.binding.config_sha256;sha256=(Get-FileHash -LiteralPath $Arguments[5] -Algorithm SHA256).Hash.ToLowerInvariant()}
+    [IO.File]::WriteAllText((Join-Path $Context.root ($Label+'.stdout.json')),($proof|ConvertTo-Json -Compress))
+    [IO.File]::WriteAllText((Join-Path $Context.root ($Label+'.stderr.log')),'')
+    return $proof
   }
-  function Invoke-LifecycleStorageOwner {
-    param($Context,$Role,$Kind,$Action,$Database,$Generation,$Label)
-    if($Action -cne 'read' -or [IO.File]::ReadAllText($Database) -cne 'sealed actual-database snapshot fixture'){throw 'consumer did not receive fresh snapshot copy'}
+  $script:readerCase='success'
+  function Invoke-LifecycleStorageProcess {
+    param($Context,$Executable,$Arguments,$Label,$Seconds)
+    if($Label -cnotmatch '-(cache|queue)-(legacy|candidate)-read$'){throw 'unexpected reader label'}
+    $kind=$Matches[1];$role=$Matches[2];$database=$Arguments[1]
+    if($Arguments[0] -cne 'read' -or [IO.File]::ReadAllText($database) -cne 'sealed actual-database snapshot fixture'){throw 'consumer did not receive fresh snapshot copy'}
     $script:copies.Add($Database);[IO.File]::WriteAllText($Database,'consumer maintenance touched only its own copy')
+    if($kind -cne 'queue' -or $role -cne 'candidate') {
+      [IO.File]::WriteAllText(($database+'-wal'),'reader WAL')
+      if($script:readerCase -ceq 'directory-sidecar'){[IO.Directory]::CreateDirectory($database+'-shm')|Out-Null}else{[IO.File]::WriteAllText(($database+'-shm'),'')}
+    }
+    [IO.File]::WriteAllText(($database+'.diagnostic.txt'),'keep adjacent diagnostic')
+    $receipt=Receipt $kind;$receipt.source_commit=$Context.tools.$role.source_commit
+    if($script:readerCase -ceq 'invalid-receipt' -and $role -ceq 'candidate'){$receipt.source_commit='0'*40}
+    [IO.File]::WriteAllText((Join-Path $Context.root ($Label+'.stdout.json')),($receipt|ConvertTo-Json -Depth 8 -Compress))
+    [IO.File]::WriteAllText((Join-Path $Context.root ($Label+'.stderr.log')),'reader diagnostic')
+    if($script:readerCase -ceq 'failed-child' -and $role -ceq 'candidate'){throw 'read_primary'}
+    if($script:readerCase -ceq 'uncertain-child'){$Context.writer_uncertain=$true}
+    if($script:readerCase -ceq 'changed-snapshot'){[IO.File]::WriteAllText((Join-Path (Split-Path -Parent $database) ($kind+'.snapshot.db')),'changed canonical')}
+    return $receipt
   }
   function Add-Evidence {param($Stage,$Status,$Detail)}
   Pass 'each_legacy_candidate_reader_gets_independent_actual_snapshot_copy' {
     Test-LifecycleStorageReadback $context 'readback'
     if($script:copies.Count -ne 4 -or @($script:copies|Select-Object -Unique).Count -ne 4){throw 'consumer copies shared'}
+  }
+  Pass 'successful_readers_remove_only_their_copies_and_optional_sidecars' {
+    foreach($copy in $script:copies) {
+      foreach($file in @($copy,($copy+'-wal'),($copy+'-shm'))){if(Test-Path -LiteralPath $file){throw 'successful reader copy retained'}}
+      if([IO.File]::ReadAllText($copy+'.diagnostic.txt') -cne 'keep adjacent diagnostic'){throw 'adjacent diagnostic removed'}
+    }
+    foreach($kind in @('cache','queue')) {
+      $snapshot=Join-Path $root ('readback/'+$kind+'.snapshot.db')
+      $proof=[IO.File]::ReadAllText((Join-Path $root ('readback-'+$kind+'-snapshot.stdout.json')))|ConvertFrom-Json
+      if([IO.File]::ReadAllText($snapshot) -cne 'sealed actual-database snapshot fixture' -or $proof.sha256 -cne (Get-FileHash -LiteralPath $snapshot -Algorithm SHA256).Hash.ToLowerInvariant()){throw 'canonical snapshot or proof changed'}
+      foreach($label in @('snapshot','legacy-read','candidate-read')){foreach($suffix in @('.stdout.json','.stderr.log')){
+        if(-not (Test-Path -LiteralPath (Join-Path $root ('readback-'+$kind+'-'+$label+$suffix)))){throw 'storage evidence removed'}
+      }}
+    }
+  }
+  foreach($readerFailure in @('failed-child','invalid-receipt','uncertain-child','changed-snapshot','directory-sidecar')) {
+    $script:readerCase=$readerFailure
+    $cause=switch($readerFailure){'failed-child'{'*read_primary*'}'invalid-receipt'{'*receipt identity, policy or record count mismatch*'}'uncertain-child'{'*cleanup blocked by unresolved child*'}'changed-snapshot'{'*sealed storage snapshot was modified*'}'directory-sidecar'{'*cleanup requires bounded regular files*'}}
+    Reject ($readerFailure+'_blocks_cleanup') $cause {Test-LifecycleStorageReadback $context $readerFailure}
+    Pass ($readerFailure+'_preserves_failed_copy_and_evidence') {
+      $failedRole=if($readerFailure -in @('failed-child','invalid-receipt')){'candidate'}else{'legacy'}
+      $copy=Join-Path $root ($readerFailure+'/cache.'+$failedRole+'.db')
+      foreach($file in @($copy,($copy+'-wal'),($copy+'-shm'))){if(-not (Test-Path -LiteralPath $file)){throw 'failed reader evidence removed'}}
+      $snapshot=Join-Path $root ($readerFailure+'/cache.snapshot.db')
+      if($readerFailure -cne 'changed-snapshot' -and [IO.File]::ReadAllText($snapshot) -cne 'sealed actual-database snapshot fixture'){throw 'failed reader changed canonical snapshot'}
+      foreach($label in @('snapshot',($failedRole+'-read'))){foreach($suffix in @('.stdout.json','.stderr.log')){
+        if(-not (Test-Path -LiteralPath (Join-Path $root ($readerFailure+'-cache-'+$label+$suffix)))){throw 'failed reader receipt or log removed'}
+      }}
+      if($failedRole -ceq 'candidate'){foreach($suffix in @('','-wal','-shm')){if(Test-Path -LiteralPath (Join-Path $root ($readerFailure+'/cache.legacy.db'+$suffix))){throw 'earlier successful reader was not cleaned'}}}
+    }
+    $context.writer_uncertain=$false
   }
   [ordered]@{status='succeeded';case_count=$cases.Count;cases=$cases.ToArray();scope='Actual helper AST owners; lifecycle and external tool I/O stubbed; no Agent/service/task/registry operations'}|ConvertTo-Json -Depth 5
 } catch {throw ('storage harness: '+$_.Exception.Message+'; '+$_.ScriptStackTrace)} finally {Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction Stop}

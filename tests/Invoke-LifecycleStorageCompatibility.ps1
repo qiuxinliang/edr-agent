@@ -275,6 +275,23 @@ function Test-LifecycleStorageReadback($Context,[string]$Stage) {
       Copy-Item -LiteralPath $snapshot -Destination $copy -ErrorAction Stop
       if((Get-FileHash -LiteralPath $copy -Algorithm SHA256).Hash.ToLowerInvariant() -cne $proof.sha256){throw 'consumer copy differs from sealed snapshot'}
       $null=Invoke-LifecycleStorageOwner $Context $role $kind 'read' $copy $Context.generation ($Stage+'-'+$kind+'-'+$role+'-read')
+      # The child has exited and its complete receipt passed admission. Keep the
+      # sealed snapshot and all evidence; only this reader's disposable DB goes.
+      if($Context.writer_uncertain){throw 'storage reader cleanup blocked by unresolved child'}
+      $null=Assert-LifecycleStorageRegular $snapshot
+      if((Get-FileHash -LiteralPath $snapshot -Algorithm SHA256).Hash.ToLowerInvariant() -cne $proof.sha256){throw 'sealed storage snapshot was modified'}
+      $null=Assert-LifecycleStorageRegular $copy
+      $discard=@()
+      foreach($readerFile in @($copy,($copy+'-wal'),($copy+'-shm'))) {
+        if(Test-Path -LiteralPath $readerFile) {
+          $item=Get-Item -LiteralPath $readerFile -Force -ErrorAction Stop
+          # SQLite sidecars may be empty. The common parent was checked above;
+          # admit all exact paths before deleting any of the reader's files.
+          if($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or $item.Length -gt 1073741824){throw 'storage reader cleanup requires bounded regular files'}
+          $discard+=$item.FullName
+        }
+      }
+      foreach($readerFile in $discard){[IO.File]::Delete($readerFile)}
     }
     if((Get-FileHash -LiteralPath $snapshot -Algorithm SHA256).Hash.ToLowerInvariant() -cne $proof.sha256){throw 'sealed storage snapshot was modified'}
   }
