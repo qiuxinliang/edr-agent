@@ -639,7 +639,18 @@ int edr_command_result_project_detail(const EdrCommandResultAuthorization *a,con
   if(cJSON_IsString(wrapper_raw) && !*result_text(raw,"schema") && cJSON_HasObjectItem(raw,"task_id")) {
     if(strcmp(result_text(raw,"task_id"),a->command_id))goto done;
     inner=edr_egress_parse_purpose_object(wrapper_raw->valuestring,strlen(wrapper_raw->valuestring));body=inner;}
-  if(status!=1 && !strcmp(result_text(body,"schema"),"edr.command.status.v1"))projected=result_status(status,exit_code);
+  if(status!=1 && !strcmp(result_text(body,"schema"),"edr.command.status.v1")) {
+    projected=result_status(status,exit_code);
+    if(projected && status==2 && exit_code==19 && !strcmp(type,"agent_update") &&
+       !strcmp(type,a->command_type) && !strcmp(kind,"status") &&
+       result_integer(body,"status",2,2,NULL) && result_integer(body,"exit_code",19,19,NULL) &&
+       result_member(result_text(body,"diagnostic"),
+           "agent_update_publisher_subject_length_invalid|agent_update_payload_contract_rejected")) {
+      if(!cJSON_SetValuestring(cJSON_GetObjectItemCaseSensitive(projected,"diagnostic"),result_text(body,"diagnostic"))) {
+        cJSON_Delete(projected);projected=NULL;
+      }
+    }
+  }
   else if(status==1 && !strcmp(type,"shell_open") && !strcmp(kind,"shell_stream"))projected=result_shell_open(body,a,exit_code);
   else if(!strcmp(type,"shell_stream") && !strcmp(kind,"shell_stream"))projected=result_shell(body,contract,a,1);
   else if(!strcmp(type,"rtr_shell") && !strcmp(kind,"shell_output") && body && cJSON_HasObjectItem(body,"output"))projected=result_shell(body,contract,a,0);

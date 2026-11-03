@@ -704,7 +704,7 @@ static int request_field_known(const char *name) {
   static const char *fields[] = {
     "schema", "task_id", "campaign_id", "operation", "initiated_by", "artifact_id",
     "artifact_url", "hash", "version", "arch", "internal_name",
-    "publisher_thumbprint", "publisher_subject", "min_current_version",
+    "publisher_thumbprint", "publisher_subject", "publisher_subject_der_sha256", "min_current_version",
     "max_current_version", "runtime_manifest_url", "runtime_manifest_sha256",
     "upgrade_class",
     "deployment_mode", "scheduled_task_name", "scheduled_task_path", "service_name",
@@ -796,6 +796,7 @@ int edr_agent_update_parse_request(const uint8_t *payload, size_t payload_len,
   COPY("internal_name", internal_name, 1);
   COPY("publisher_thumbprint", publisher_thumbprint, 1);
   COPY("publisher_subject", publisher_subject, 1);
+  COPY("publisher_subject_der_sha256", publisher_subject_der_sha256, 0);
   COPY("min_current_version", min_current_version, 0);
   COPY("max_current_version", max_current_version, 0);
   COPY("runtime_manifest_url", runtime_manifest_url, 0);
@@ -835,6 +836,11 @@ int edr_agent_update_parse_request(const uint8_t *payload, size_t payload_len,
   }
   if (!is_hex(out->sha256, 64u) || (out->runtime_manifest_sha256[0] && !is_hex(out->runtime_manifest_sha256, 64u))) {
     fail(reason, reason_cap, "agent_update SHA256 must contain 64 hex characters"); goto invalid;
+  }
+  if (out->publisher_subject_der_sha256[0] &&
+      (!is_hex(out->publisher_subject_der_sha256, 64u) ||
+       strcmp(out->publisher_thumbprint, "SHA256_ONLY_UNSIGNED") == 0)) {
+    fail(reason, reason_cap, "publisher subject DER SHA256 requires a signed publisher and 64 hex characters"); goto invalid;
   }
   int cmp = 0;
   if (!edr_agent_update_semver_compare(out->target_version, out->target_version, &cmp) ||
@@ -909,13 +915,17 @@ static int write_update_invocation_script(const char *path, const char *updater,
     req->max_current_version, req->upgrade_class, req->deployment_mode, req->scheduled_task_name,
     req->scheduled_task_path, req->service_name, command_id, manifest, req->runtime_manifest_sha256,
     req->task_id, req->campaign_id, req->operation, req->artifact_id, updater_task_name,
-    staging_directory };
-  char quoted[24][4600];
-  for (size_t i = 0; i < 24u; ++i) if (!quote_ps(values[i], quoted[i], sizeof(quoted[i]))) return 0;
+    staging_directory, req->publisher_subject_der_sha256 };
+  char quoted[25][4600];
+  for (size_t i = 0; i < 25u; ++i) if (!quote_ps(values[i], quoted[i], sizeof(quoted[i]))) return 0;
   FILE *file = fopen(path, "wb");
   if (!file) return 0;
-  fprintf(file, "$ErrorActionPreference='Stop'\r\n& %s -StagedBinary %s -ExpectedSha256 %s -TargetVersion %s -ExpectedArchitecture %s -ExpectedInternalName %s -TrustedPublisherThumbprint %s -TrustedPublisherSubject %s -MinCurrentVersion %s -MaxCurrentVersion %s -UpgradeClass %s -DeploymentMode %s -ScheduledTaskName %s -ScheduledTaskPath %s -ServiceName %s -CommandId %s -RuntimeManifest %s -RuntimeManifestSha256 %s -TaskId %s -CampaignId %s -Operation %s -ArtifactId %s -UpdaterTaskName %s -StagingDirectory %s -MinFreeBytes %llu -IssuedAtUnixMs %llu -DeadlineUnixMs %llu -HealthObserveMs %llu\r\n$updaterSucceeded=$?\r\nif ($updaterSucceeded) { exit 0 }\r\nif ((Test-Path variable:LASTEXITCODE) -and $LASTEXITCODE -is [int] -and $LASTEXITCODE -ne 0) { exit $LASTEXITCODE }\r\nexit 1\r\n",
+  fprintf(file, "$ErrorActionPreference='Stop'\r\n& %s -StagedBinary %s -ExpectedSha256 %s -TargetVersion %s -ExpectedArchitecture %s -ExpectedInternalName %s -TrustedPublisherThumbprint %s -TrustedPublisherSubject %s -MinCurrentVersion %s -MaxCurrentVersion %s -UpgradeClass %s -DeploymentMode %s -ScheduledTaskName %s -ScheduledTaskPath %s -ServiceName %s -CommandId %s -RuntimeManifest %s -RuntimeManifestSha256 %s -TaskId %s -CampaignId %s -Operation %s -ArtifactId %s -UpdaterTaskName %s -StagingDirectory %s -MinFreeBytes %llu -IssuedAtUnixMs %llu -DeadlineUnixMs %llu -HealthObserveMs %llu",
           quoted[0], quoted[1], quoted[2], quoted[3], quoted[4], quoted[5], quoted[6], quoted[7], quoted[8], quoted[9], quoted[10], quoted[11], quoted[12], quoted[13], quoted[14], quoted[15], quoted[16], quoted[17], quoted[18], quoted[19], quoted[20], quoted[21], quoted[22], quoted[23], (unsigned long long)req->min_free_bytes, (unsigned long long)req->issued_at_unix_ms, (unsigned long long)req->deadline_unix_ms, (unsigned long long)req->health_observe_ms);
+  if (req->publisher_subject_der_sha256[0]) {
+    fprintf(file, " -TrustedPublisherSubjectDerSha256 %s", quoted[24]);
+  }
+  fputs("\r\n$updaterSucceeded=$?\r\nif ($updaterSucceeded) { exit 0 }\r\nif ((Test-Path variable:LASTEXITCODE) -and $LASTEXITCODE -is [int] -and $LASTEXITCODE -ne 0) { exit $LASTEXITCODE }\r\nexit 1\r\n", file);
   return fclose(file) == 0;
 }
 

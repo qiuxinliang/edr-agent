@@ -12,7 +12,9 @@ extern "C" {
 #define EDR_AGENT_UPDATE_EXIT_UNSUPPORTED 95
 #define EDR_AGENT_UPDATE_EXIT_LAUNCHED 96
 #define EDR_AGENT_UPDATE_MAX_ARTIFACT_BYTES (256u * 1024u * 1024u)
-#define EDR_AGENT_UPDATE_UPDATER_PROTOCOL_VERSION 5
+#define EDR_AGENT_UPDATE_UPDATER_PROTOCOL_VERSION 6
+/* Matches the existing platform VARCHAR(512) utf8mb4 publisher metadata. */
+#define EDR_AGENT_UPDATE_PUBLISHER_SUBJECT_MAX_BYTES 2048u
 
 typedef struct EdrAgentUpdateRuntimeInfo {
   int ready;
@@ -74,7 +76,8 @@ typedef struct EdrAgentUpdateRequest {
   char architecture[16];
   char internal_name[65];
   char publisher_thumbprint[129];
-  char publisher_subject[257];
+  char publisher_subject[EDR_AGENT_UPDATE_PUBLISHER_SUBJECT_MAX_BYTES + 1u];
+  char publisher_subject_der_sha256[65];
   char min_current_version[65];
   char max_current_version[65];
   char runtime_manifest_url[2049];

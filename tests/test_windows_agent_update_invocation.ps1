@@ -41,7 +41,9 @@ $strings=@('StagedBinary','ExpectedSha256','TargetVersion','ExpectedArchitecture
 $uints=@('MinFreeBytes','IssuedAtUnixMs','DeadlineUnixMs','HealthObserveMs')
 function ArgumentsDigest([Collections.IDictionary]$Map){
   $b=New-Object Text.StringBuilder
-  foreach($name in $strings+$uints){
+  $names=$strings+$uints
+  if($Map.Contains('TrustedPublisherSubjectDerSha256')){$names+='TrustedPublisherSubjectDerSha256'}
+  foreach($name in $names){
     $v=$Map[$name];$number=$name -cin $uints
     Need (($number -and $v -is [UInt64]) -or (-not $number -and $v -is [string])) 'argument_type'
     $s=if($number){$v.ToString([Globalization.CultureInfo]::InvariantCulture)}else{$v}
@@ -51,10 +53,11 @@ function ArgumentsDigest([Collections.IDictionary]$Map){
 }
 # Parameter binder only: deliberately permits test UInt64 extremes/empty fields.
 # It is not an authorized request and does not invoke updater business validators.
-$declarations=@($strings|ForEach-Object {'[AllowEmptyString()][string]$'+$_})+@($uints|ForEach-Object {'[UInt64]$'+$_})
+$declarations=@(($strings+@('TrustedPublisherSubjectDerSha256'))|ForEach-Object {'[AllowEmptyString()][string]$'+$_})+@($uints|ForEach-Object {'[UInt64]$'+$_})
 $workerTemplate='param('+($declarations -join ',')+")`n"+@'
 $ErrorActionPreference='Stop';Set-StrictMode -Version Latest
 $names=@('__NAMES__');$nums=@('__NUMS__');$b=New-Object Text.StringBuilder
+if($PSBoundParameters.ContainsKey('TrustedPublisherSubjectDerSha256')){$names+='TrustedPublisherSubjectDerSha256'}
 foreach($name in $names){
   $v=$PSBoundParameters[$name];$number=$name -cin $nums
   if(($number -and $v -isnot [UInt64]) -or (-not $number -and $v -isnot [string])){throw 'public_argument_type'}
@@ -81,13 +84,19 @@ try{
   New-Item -ItemType Directory -Path $root | Out-Null
   [Environment]::SetEnvironmentVariable('PATHEXT','.EXE','Process')
   foreach($owner in @('C','QA')){
-    foreach($kind in @('success_return','exit1','exit7','throw','args_only')){
+    $kinds=@('success_return','exit1','exit7','throw','args_only')
+    if($owner -ceq 'C'){$kinds+='args_only_der'}
+    foreach($kind in $kinds){
       Need ($clock.ElapsedMilliseconds -lt 60000) 'invocation_test_deadline'
       $part=if($owner -ceq 'C'){"C'quote-"+$kind}else{'QA-'+$kind}
       $dir=Join-Path $root $part;New-Item -ItemType Directory -Path $dir | Out-Null
       $Updater=Join-Path $dir 'worker.ps1';$invoke=Join-Path $dir 'invoke.ps1';$paramFile=Join-Path $dir 'arguments.clixml'
       [IO.File]::WriteAllText($Updater,$workerTemplate,[Text.UTF8Encoding]::new($false))
       $p=[ordered]@{StagedBinary='';ExpectedSha256=('a'*64);TargetVersion='3.2.699-public';ExpectedArchitecture='arm64';ExpectedInternalName='public ''"name"\';TrustedPublisherThumbprint='';TrustedPublisherSubject='CN=Public ''" subject\';MinCurrentVersion='';MaxCurrentVersion='3.2.999';UpgradeClass='installer_required';DeploymentMode='scheduled_task';ScheduledTaskName='public ''" task\';ScheduledTaskPath='\public ''" path\';ServiceName='public service';CommandId='public-command';RuntimeManifest='C:\public path\manifest''".json';RuntimeManifestSha256='';TaskId='public-task';CampaignId='';Operation=$kind;ArtifactId='public-artifact';UpdaterTaskName='public updater';StagingDirectory='';MinFreeBytes=[UInt64]::MaxValue;IssuedAtUnixMs=[UInt64]0;DeadlineUnixMs=[UInt64]9007199254740991;HealthObserveMs=[UInt64]9223372036854775808}
+      if($kind -ceq 'args_only_der'){
+        $p.Operation='args_only';$p.TrustedPublisherSubject='A'*378
+        $p.TrustedPublisherSubjectDerSha256='b'*64
+      }
       if($owner -ceq 'C'){
         & $ContractExe --write-public-invocation $invoke $Updater $kind
         Need ($LASTEXITCODE -eq 0) 'actual_C_invocation_writer'
@@ -105,14 +114,14 @@ try{
       Need ($received.child_exit_code -eq $want) ('caller_exit_'+$owner+'_'+$kind)
       $recordBytes=ReadSmall (Join-Path $dir 'record.json') 4096
       $record=([Text.UTF8Encoding]::new($false,$true).GetString($recordBytes)|ConvertFrom-Json)
-      Need ($record.argument_count -eq 27 -and $record.arguments_sha256 -ceq (ArgumentsDigest $p)) 'all27_parameters_preserved'
+      Need ($record.argument_count -eq $p.Count -and $record.arguments_sha256 -ceq (ArgumentsDigest $p)) 'all_parameters_preserved'
       $stdout=ReadSmall $out 8192;$stderr=ReadSmall $err 8192
       Need ($stdout.Length -eq 0 -and (($kind -ceq 'throw' -and $stderr.Length -gt 0) -or ($kind -cne 'throw' -and $stderr.Length -eq 0))) 'public_child_streams'
-      $null=$rows.Add(@{owner=$owner;case=$kind;exit_code=$received.child_exit_code;argument_count=27;arguments_sha256=$record.arguments_sha256;job_natural_zero=$true;termination_attempted=$false})
+      $null=$rows.Add(@{owner=$owner;case=$kind;exit_code=$received.child_exit_code;argument_count=$p.Count;arguments_sha256=$record.arguments_sha256;job_natural_zero=$true;termination_attempted=$false})
     }
   }
-  Need ($rows.Count -eq 10 -and $clock.ElapsedMilliseconds -lt 60000) 'ten_bounded_invocation_contracts'
-  @{test='windows_agent_update_invocation';passed=10;cases=@($rows);actual_C_writer=$true;actual_QA_writer=$true;real_Agent_or_updater_executions=0}|ConvertTo-Json -Depth 5 -Compress|Write-Host
+  Need ($rows.Count -eq 11 -and $clock.ElapsedMilliseconds -lt 60000) 'eleven_bounded_invocation_contracts'
+  @{test='windows_agent_update_invocation';passed=11;cases=@($rows);actual_C_writer=$true;actual_QA_writer=$true;real_Agent_or_updater_executions=0}|ConvertTo-Json -Depth 5 -Compress|Write-Host
   $passed=$true
 }finally{
   [Environment]::SetEnvironmentVariable('PATHEXT',$oldPathExt,'Process')

@@ -2,6 +2,7 @@
 #include "edr/command_contract.h"
 
 #include "edr/command_registry.h"
+#include "edr/agent_update_command.h"
 #include "edr/command_state.h"
 #include "cJSON.h"
 #include "../attack_surface/attack_surface_groups.h"
@@ -292,7 +293,8 @@ static const CommandFieldRule k_agent_update_rules[] = {
     RULE("arch", FIELD_STRING, 1, 0, 0, 15, 0),
     RULE("internal_name", FIELD_STRING, 1, 0, 0, 64, 0),
     RULE("publisher_thumbprint", FIELD_STRING, 1, 0, 0, 128, 0),
-    RULE("publisher_subject", FIELD_STRING, 1, 0, 0, 256, 0),
+    RULE("publisher_subject", FIELD_STRING, 1, 0, 0, EDR_AGENT_UPDATE_PUBLISHER_SUBJECT_MAX_BYTES, 0),
+    RULE("publisher_subject_der_sha256", FIELD_STRING, 0, 0, 0, 64, 0),
     RULE("min_current_version", FIELD_STRING, 0, 0, 0, 64, 0),
     RULE("max_current_version", FIELD_STRING, 0, 0, 0, 64, 0),
     RULE("runtime_manifest_url", FIELD_STRING, 0, 0, 0, 2048, 0),

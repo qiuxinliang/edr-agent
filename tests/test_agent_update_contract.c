@@ -178,7 +178,8 @@ int edr_agent_update_test_write_invocation(const char *path, const char *updater
 static int write_public_invocation(const char *path, const char *worker,
                                    const char *kind) {
   if (strcmp(kind, "success_return") && strcmp(kind, "exit1") &&
-      strcmp(kind, "exit7") && strcmp(kind, "throw") && strcmp(kind, "args_only"))
+      strcmp(kind, "exit7") && strcmp(kind, "throw") && strcmp(kind, "args_only") &&
+      strcmp(kind, "args_only_der"))
     return 2;
   EdrAgentUpdateRequest req;
   memset(&req, 0, sizeof(req));
@@ -187,6 +188,10 @@ static int write_public_invocation(const char *path, const char *worker,
   snprintf(req.architecture, sizeof(req.architecture), "arm64");
   snprintf(req.internal_name, sizeof(req.internal_name), "public '\"name\"\\");
   snprintf(req.publisher_subject, sizeof(req.publisher_subject), "CN=Public '\" subject\\");
+  if (!strcmp(kind, "args_only_der")) {
+    memset(req.publisher_subject, 'A', 378u); req.publisher_subject[378] = '\0';
+    memset(req.publisher_subject_der_sha256, 'b', 64u);
+  }
   snprintf(req.max_current_version, sizeof(req.max_current_version), "3.2.999");
   snprintf(req.upgrade_class, sizeof(req.upgrade_class), "installer_required");
   snprintf(req.deployment_mode, sizeof(req.deployment_mode), "scheduled_task");
@@ -194,7 +199,7 @@ static int write_public_invocation(const char *path, const char *worker,
   snprintf(req.scheduled_task_path, sizeof(req.scheduled_task_path), "\\public '\" path\\");
   snprintf(req.service_name, sizeof(req.service_name), "public service");
   snprintf(req.task_id, sizeof(req.task_id), "public-task");
-  snprintf(req.operation, sizeof(req.operation), "%s", kind);
+  snprintf(req.operation, sizeof(req.operation), "%s", !strcmp(kind, "args_only_der") ? "args_only" : kind);
   snprintf(req.artifact_id, sizeof(req.artifact_id), "public-artifact");
   req.min_free_bytes = UINT64_MAX;
   req.issued_at_unix_ms = 0u;
@@ -298,6 +303,57 @@ finish:
 }
 #endif
 
+static void test_publisher_subject_contract(const char *valid) {
+  cJSON *json = cJSON_Parse(valid);
+  require_true(json != NULL, "publisher request fixture parses");
+  char subject[2050];
+  const size_t lengths[] = {255u, 256u, 257u, 336u, 378u, 2048u, 2049u};
+  for (size_t i = 0; i < sizeof(lengths) / sizeof(lengths[0]); ++i) {
+    memset(subject, 'A', lengths[i]); subject[lengths[i]] = '\0';
+    cJSON_ReplaceItemInObjectCaseSensitive(json, "publisher_subject", cJSON_CreateString(subject));
+    char *raw = cJSON_PrintUnformatted(json);
+    char reason[256]; EdrAgentUpdateRequest request;
+    int expected = lengths[i] <= 2048u;
+    require_true(edr_command_contract_validate("agent_update", (const uint8_t *)raw,
+        strlen(raw), reason, sizeof(reason)) == expected, "publisher byte limit at receive boundary");
+    require_true(edr_agent_update_parse_request((const uint8_t *)raw, strlen(raw),
+        &request, reason, sizeof(reason)) == expected, "publisher byte limit at executor boundary");
+    if (expected) require_true(strlen(request.publisher_subject) == lengths[i], "publisher is not truncated");
+    free(raw);
+  }
+  /* The limit is UTF-8 bytes, not code points. */
+  for (size_t i = 0; i < 1024u; ++i) { subject[2*i] = (char)0xc3; subject[2*i+1] = (char)0xa9; }
+  subject[2048] = '\0';
+  cJSON_ReplaceItemInObjectCaseSensitive(json, "publisher_subject", cJSON_CreateString(subject));
+  const char *hashes[] = {
+    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    "0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF",
+    "", "abc", "g123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+  };
+  for (size_t i = 0; i < sizeof(hashes) / sizeof(hashes[0]); ++i) {
+    cJSON_DeleteItemFromObjectCaseSensitive(json, "publisher_subject_der_sha256");
+    cJSON_AddStringToObject(json, "publisher_subject_der_sha256", hashes[i]);
+    char *raw = cJSON_PrintUnformatted(json);
+    char reason[256]; EdrAgentUpdateRequest request;
+    require_true(edr_agent_update_parse_request((const uint8_t *)raw, strlen(raw),
+        &request, reason, sizeof(reason)) == (i < 2u), "DER identity is optional but must be an exact SHA256 when supplied");
+    if (i < 2u) {
+      require_true(edr_command_contract_validate("agent_update", (const uint8_t *)raw,
+          strlen(raw), reason, sizeof(reason)), "receiver accepts bounded UTF-8 and DER identity");
+      require_true(strcmp(request.publisher_subject_der_sha256, hashes[i]) == 0 &&
+          strlen(request.publisher_subject) == 2048u, "complete signed publisher identity retained");
+    }
+    free(raw);
+  }
+  cJSON_ReplaceItemInObjectCaseSensitive(json, "publisher_subject_der_sha256", cJSON_CreateString(hashes[0]));
+  cJSON_ReplaceItemInObjectCaseSensitive(json, "publisher_thumbprint", cJSON_CreateString("SHA256_ONLY_UNSIGNED"));
+  char *raw = cJSON_PrintUnformatted(json);
+  char reason[256]; EdrAgentUpdateRequest request;
+  require_true(!edr_agent_update_parse_request((const uint8_t *)raw, strlen(raw),
+      &request, reason, sizeof(reason)), "DER identity cannot turn a signed request into unsigned mode");
+  free(raw); cJSON_Delete(json);
+}
+
 int main(int argc, char **argv) {
   if (argc == 5 && strcmp(argv[1], "--write-public-invocation") == 0)
     return write_public_invocation(argv[2], argv[3], argv[4]);
@@ -324,6 +380,7 @@ int main(int argc, char **argv) {
       "\"min_current_version\":\"2.0.0\",\"max_current_version\":\"2.0.99\","
       "\"issued_at_unix_ms\":1720000000000,\"deadline_unix_ms\":1720003600000,"
       "\"health_observe_ms\":300000}";
+  test_publisher_subject_contract(valid);
   char reason[256];
   EdrAgentUpdateRequest request;
   const EdrCommandDescriptor *descriptor = edr_command_registry_lookup("agent_update");

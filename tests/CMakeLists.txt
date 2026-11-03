@@ -301,6 +301,10 @@ if(WIN32)
     ENVIRONMENT "EDR_SOURCE_DIR=${CMAKE_SOURCE_DIR}")
   # CTest inherits PSModulePath from CI's pwsh host. Windows PowerShell must
   # rebuild its own module path before startup (not import PowerShell 7 modules).
+  add_test(NAME windows_updater_publisher
+    COMMAND "${CMAKE_COMMAND}" -E env --unset=PSModulePath powershell.exe -NoProfile -NonInteractive -Command
+      "& ([scriptblock]::Create((Get-Content -LiteralPath '${CMAKE_CURRENT_SOURCE_DIR}/test_windows_updater_publisher.ps1' -Raw -Encoding UTF8))) -UpdaterPath '${CMAKE_SOURCE_DIR}/scripts/edr_agent_inplace_update.ps1'")
+  set_tests_properties(windows_updater_publisher PROPERTIES TIMEOUT 60)
   add_test(NAME windows_release_collector_pe_closure
     COMMAND "${CMAKE_COMMAND}" -E env --unset=PSModulePath powershell.exe -NoProfile -Command
       "& ([scriptblock]::Create((Get-Content -LiteralPath '${CMAKE_CURRENT_SOURCE_DIR}/test_windows_release_collector_pe_closure.ps1' -Raw -Encoding UTF8))) -RepoRoot '${CMAKE_SOURCE_DIR}'")
