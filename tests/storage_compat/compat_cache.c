@@ -10,7 +10,16 @@ enum { COMPAT_CACHE_QUERY_LIMIT=1000, COMPAT_CACHE_SCAN_BOUND=20100,
 /* At most 15 fixed milestones per invocation; stdout remains the receipt.
  * Flush before owner calls so a terminated child retains its last boundary. */
 static void compat_cache_phase(const char *phase,unsigned generation,unsigned item) {
-  fprintf(stderr,"storage_compat_cache phase=%s generation=%u item=%u\n",phase,generation,item);
+  static uint64_t started_ns;
+  static int started;
+  const uint64_t now=edr_monotonic_ns();
+  if(!started){started_ns=now;started=1;}
+  compat_need(now>=started_ns,"diagnostic_monotonic_clock_regressed");
+  /* Existing real monotonic owner; subtract before dividing to avoid overflow.
+   * Integer milliseconds are rounded down and exclude process/argument setup. */
+  const uint64_t elapsed_ms=(now-started_ns)/UINT64_C(1000000);
+  fprintf(stderr,"storage_compat_cache phase=%s generation=%u item=%u elapsed_ms=%llu\n",
+      phase,generation,item,(unsigned long long)elapsed_ms);
   fflush(stderr);
 }
 

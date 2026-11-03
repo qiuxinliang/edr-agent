@@ -476,7 +476,8 @@ public sealed class EdrLifecycleFixtureChild {
         @('unknown-writer','*writer remains or its path is unknown*'),@('owner-running','*is not stopped*'))) {
       $EvidenceDir=Join-Path $root ('repair-'+$RuntimeMode+'-'+$entry[0]);[IO.Directory]::CreateDirectory($EvidenceDir)|Out-Null
       Reset-RepairFixture $entry[0]
-      Reject ($RuntimeMode+'_repair_rejects_'+$entry[0]) $entry[1] {Assert-BaselineRepair 'original-immutable-setup.exe'}
+      $script:repairFailureRecord=$null
+      Reject ($RuntimeMode+'_repair_rejects_'+$entry[0]) $entry[1] {try{Assert-BaselineRepair 'original-immutable-setup.exe'}catch{$script:repairFailureRecord=$_;throw}}
       Pass ($RuntimeMode+'_repair_failure_preserves_installer_files_'+$entry[0]) {
         if($script:repairSequence -ccontains 'setup' -or (Test-Path -LiteralPath (Join-Path $EvidenceDir 'repair-baseline-backup')) -or
             [IO.File]::ReadAllText((Join-Path $InstallDir 'agent.toml')) -cne 'isolated configuration'){throw 'failed stop mutated repair inputs'}
@@ -484,6 +485,16 @@ public sealed class EdrLifecycleFixtureChild {
         if($script:lastHandle -and (-not $script:lastHandle.disposed -or $script:lastHandle.killed)){throw 'repair leaked or killed Agent handle'}
         if($script:controlChild -and (-not $script:controlChild.disposed -or $script:controlChild.first_wait_ms -ne 35000 -or
             $script:controlChild.killed -ne ($entry[0] -ceq 'owner-timeout'))){throw 'repair control child exceeded its original boundary'}
+        if($script:controlChild) {
+          $json=[string]$script:repairFailureRecord.Exception.Data['lifecycle_repair_stop_failure']
+          $detail=$json|ConvertFrom-Json
+          $phase=if($entry[0] -in @('owner-stop-failure','owner-timeout')){'owner-stop'}elseif($entry[0] -ceq 'runtime-timeout'){'runtime-exit'}else{'quiescence'}
+          if(-not $json -or [Text.Encoding]::UTF8.GetByteCount($json) -gt 8192 -or $detail.schema -cne 'edr.test.lifecycle-repair-stop-failure.v1' -or
+              $detail.phase -cne $phase -or $detail.runtime_mode -cne $RuntimeMode -or $detail.pid -ne $script:lastHandle.Id -or
+              $detail.created_utc -cne $script:lastHandle.StartTime.ToUniversalTime().ToString('o') -or
+              $detail.held_has_exited -ne $script:lastHandle.HasExited -or $detail.held_observation_error_type -or
+              @($detail.PSObject.Properties).Count -ne 7){throw 'repair stop lost its bounded local handle diagnostic'}
+        }
       }
     }
   }

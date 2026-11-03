@@ -20,7 +20,7 @@ function Invoke-LifecycleStorageProcess($Context,[string]$Executable,[string[]]$
   try {
     $process=Start-Process -FilePath $Executable -ArgumentList $quoted -PassThru -RedirectStandardOutput $stdout -RedirectStandardError $stderr
     $null=$process.Handle
-    if(-not $process.WaitForExit($Seconds*1000)){throw 'storage child exceeded its finite deadline'}
+    if(-not $process.WaitForExit($Seconds*1000)){throw ('storage child exceeded its finite deadline: label='+$Label+' budget_seconds='+$Seconds)}
     $process.WaitForExit()
     if($process.ExitCode -ne 0) {
       $detail=''
@@ -182,9 +182,11 @@ function Assert-LifecycleStorageQuiescent($Native) {
 function Invoke-LifecycleStorageRuntimeAction($Context,[ValidateSet('Stop','Start')][string]$Action,[string]$Label) {
   if($ServiceName -cnotmatch '^[A-Za-z0-9_-]+$'){throw 'unsafe lifecycle owner name'}
   if($RuntimeMode -ceq 'service') {
-    $body=('$service=Get-Service -Name ''{0}'' -ErrorAction Stop;{1}-Service -InputObject $service -ErrorAction Stop;$service.WaitForStatus(''{2}'',[TimeSpan]::FromSeconds(30))' -f $ServiceName,$Action,$(if($Action -ceq 'Stop'){'Stopped'}else{'Running'}))
-  } else {$body=('{0}-ScheduledTask -TaskName ''{1}'' -TaskPath ''\'' -ErrorAction Stop' -f $Action,$ServiceName)}
-  $source='$ErrorActionPreference=''Stop'';$ProgressPreference=''SilentlyContinue'';$env:PSModulePath=$PSHOME+''\Modules'';'+$body+';[Console]::Out.WriteLine(''{"status":"completed"}'')'
+    $body=('Write-LifecycleRuntimeActionPhase ''get_owner_begin'';$service=Get-Service -Name ''{0}'' -ErrorAction Stop;Write-LifecycleRuntimeActionPhase ''get_owner_returned'';Write-LifecycleRuntimeActionPhase ''owner_action_enter'';{1}-Service -InputObject $service -ErrorAction Stop;Write-LifecycleRuntimeActionPhase ''owner_action_returned'';$service.WaitForStatus(''{2}'',[TimeSpan]::FromSeconds(30));Write-LifecycleRuntimeActionPhase ''wait_completed''' -f $ServiceName,$Action,$(if($Action -ceq 'Stop'){'Stopped'}else{'Running'}))
+  } else {$body=('Write-LifecycleRuntimeActionPhase ''owner_action_enter'';{0}-ScheduledTask -TaskName ''{1}'' -TaskPath ''\'' -ErrorAction Stop;Write-LifecycleRuntimeActionPhase ''owner_action_returned''' -f $Action,$ServiceName)}
+  # Fixed stderr milestones bypass PowerShell's buffered CLIXML stream. The
+  # receipt stays on stdout, and the existing owner calls/deadlines stay intact.
+  $source='$ErrorActionPreference=''Stop'';$ProgressPreference=''SilentlyContinue'';function Write-LifecycleRuntimeActionPhase([string]$phase){[Console]::Error.WriteLine(''lifecycle_runtime_action phase=''+$phase);[Console]::Error.Flush()};Write-LifecycleRuntimeActionPhase ''engine_enter'';$env:PSModulePath=$PSHOME+''\Modules'';'+$body+';[Console]::Out.WriteLine(''{"status":"completed"}'')'
   $encoded=[Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($source))
   $result=Invoke-LifecycleStorageProcess $Context (Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe') @('-NoProfile','-NonInteractive','-EncodedCommand',$encoded) $Label 35
   if($result.status -cne 'completed'){throw 'storage runtime action did not complete'}

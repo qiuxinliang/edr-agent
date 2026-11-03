@@ -199,11 +199,28 @@ function Assert-BaselineRepair([string] $SetupPath) {
   $configHash = (Get-FileHash -LiteralPath $configPath -Algorithm SHA256).Hash
 
   $native=Get-LifecycleStorageNative
+  $stopPhase='owner-stop'
   try {
     $stopContext=@{root=$EvidenceDir;writer_uncertain=$false}
     Invoke-LifecycleStorageRuntimeAction $stopContext 'Stop' ($stage+'-stop')
+    $stopPhase='runtime-exit'
     if(-not $native.process.WaitForExit(30000)){throw 'original runtime did not exit before baseline repair within 30 seconds'}
+    $stopPhase='quiescence'
     Assert-LifecycleStorageQuiescent $native
+  } catch {
+    $stopFailure=$_
+    try {
+      $exited=$null;$observationError=$null
+      try {$exited=$native.process.HasExited}catch{$observationError=$_.Exception.GetType().FullName}
+      # Read only the already-held local handle and its frozen identity. Do not
+      # add CIM/SCM calls that could block while retaining the original failure.
+      $detail=[ordered]@{schema='edr.test.lifecycle-repair-stop-failure.v1';phase=$stopPhase;
+        runtime_mode=$RuntimeMode;pid=$native.pid;created_utc=$native.created_utc;
+        held_has_exited=$exited;held_observation_error_type=$observationError}|ConvertTo-Json -Compress
+      if([Text.Encoding]::UTF8.GetByteCount($detail) -gt 8192){throw 'repair stop diagnostic exceeds bound'}
+      $stopFailure.Exception.Data['lifecycle_repair_stop_failure']=$detail
+    } catch {Write-Warning ('Repair stop diagnostic unavailable: '+$_.Exception.GetType().FullName)}
+    throw $stopFailure
   } finally {$native.process.Dispose()}
   Add-Evidence $stage 'processes-stopped' 'generation_bound=true wait_budget_seconds=30 remaining=0'
   New-BaselineRepairBackup $backupDir
@@ -943,19 +960,23 @@ try {
 } catch {
   $lifecycleFailure = $_
   try {
-    $cause=$lifecycleFailure.Exception
-    for($depth=0;$cause -and $depth -lt 8;$depth++) {
-      $detail=[string]$cause.Data['lifecycle_process_open_failure']
-      if($detail) {
-        if([Text.Encoding]::UTF8.GetByteCount($detail) -gt 8192){throw 'process open diagnostic exceeds bound'}
-        $parsed=$detail|ConvertFrom-Json
-        if($parsed.schema -cne 'edr.test.lifecycle-process-open-failure.v1'){throw 'process open diagnostic schema mismatch'}
-        [IO.File]::WriteAllText((Join-Path $EvidenceDir 'process-open-failure.json'),$detail,[Text.UTF8Encoding]::new($false))
-        break
+    foreach($entry in @(
+        @{key='lifecycle_process_open_failure';schema='edr.test.lifecycle-process-open-failure.v1';file='process-open-failure.json'},
+        @{key='lifecycle_repair_stop_failure';schema='edr.test.lifecycle-repair-stop-failure.v1';file='repair-stop-failure.json'})) {
+      $cause=$lifecycleFailure.Exception
+      for($depth=0;$cause -and $depth -lt 8;$depth++) {
+        $detail=[string]$cause.Data[$entry.key]
+        if($detail) {
+          if([Text.Encoding]::UTF8.GetByteCount($detail) -gt 8192){throw 'lifecycle process diagnostic exceeds bound'}
+          $parsed=$detail|ConvertFrom-Json
+          if($parsed.schema -cne $entry.schema){throw 'lifecycle process diagnostic schema mismatch'}
+          [IO.File]::WriteAllText((Join-Path $EvidenceDir $entry.file),$detail,[Text.UTF8Encoding]::new($false))
+          break
+        }
+        $cause=$cause.InnerException
       }
-      $cause=$cause.InnerException
     }
-  } catch {Write-Warning ('Process open evidence unavailable: '+$_.Exception.GetType().FullName)}
+  } catch {Write-Warning ('Lifecycle process evidence unavailable: '+$_.Exception.GetType().FullName)}
   Copy-InstallerDiagnostics -Stage $script:LastLifecycleStage -SetupLog $script:LastSetupLog
   Add-Evidence "lifecycle" "failed" $lifecycleFailure.Exception.Message
   throw $lifecycleFailure

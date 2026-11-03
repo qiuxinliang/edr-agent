@@ -106,11 +106,13 @@ try {
   Reject 'running_task_blocks_write' '*task is not stopped*' {Assert-LifecycleStorageQuiescent $quiescent}
   $RuntimeMode='service';$script:serviceStatus='Running'
   Reject 'running_service_blocks_write' '*service is not stopped*' {Assert-LifecycleStorageQuiescent $quiescent}
+  $script:childStarts=0
   function Start-Process {
     [CmdletBinding()]param($FilePath,$ArgumentList,[switch]$PassThru,$RedirectStandardOutput,$RedirectStandardError)
+    $script:childStarts++
     [IO.File]::WriteAllText($RedirectStandardOutput,'{"status":"ok"}');[IO.File]::WriteAllText($RedirectStandardError,'fixture_child_cause')
-    $script:child=[pscustomobject]@{Handle=[IntPtr]1;HasExited=$false;ExitCode=$(if($script:childCase -ceq 'nonzero'){7}else{0});killed=$false;disposed=$false}
-    $script:child|Add-Member ScriptMethod WaitForExit {param($ms);if($script:childCase -ceq 'timeout' -and -not $this.killed){return $false};$this.HasExited=$true;return $true}
+    $script:child=[pscustomobject]@{Handle=[IntPtr]1;HasExited=$false;ExitCode=$(if($script:childCase -ceq 'nonzero'){7}else{0});killed=$false;disposed=$false;first_wait_ms=0}
+    $script:child|Add-Member ScriptMethod WaitForExit {param($ms);if($ms -and -not $this.first_wait_ms){$this.first_wait_ms=$ms};if($script:childCase -ceq 'timeout' -and -not $this.killed){return $false};$this.HasExited=$true;return $true}
     $script:child|Add-Member ScriptMethod Kill {$this.killed=$true}
     $script:child|Add-Member ScriptMethod Dispose {$this.disposed=$true}
     return $script:child
@@ -120,18 +122,72 @@ try {
   $script:childCase='nonzero'
   Reject 'child_failure_preserves_bounded_cause' '*exit=7 cause=fixture_child_cause*' {Invoke-LifecycleStorageProcess $context $exe @('read') 'child-failure'|Out-Null}
   $script:childCase='timeout'
-  Reject 'child_timeout_is_terminal' '*finite deadline*' {Invoke-LifecycleStorageProcess $context $exe @('read') 'child-timeout'|Out-Null}
-  Pass 'timed_out_owned_child_is_killed_and_reaped' {if(-not $script:child.killed -or -not $script:child.disposed -or $context.writer_uncertain){throw 'timeout cleanup failed'}}
+  $beforeStarts=$script:childStarts
+  Reject 'child_timeout_is_terminal' '*finite deadline: label=child-timeout budget_seconds=20*' {Invoke-LifecycleStorageProcess $context $exe @('read') 'child-timeout'|Out-Null}
+  Pass 'timed_out_owned_child_is_killed_and_reaped_without_retry' {if(-not $script:child.killed -or -not $script:child.disposed -or $context.writer_uncertain -or $script:child.first_wait_ms -ne 20000 -or $script:childStarts -ne ($beforeStarts+1)){throw 'timeout cleanup or original budget changed'}}
+  $beforeStarts=$script:childStarts
+  Reject 'owner_timeout_reports_explicit_budget' '*finite deadline: label=owner-timeout budget_seconds=35*' {Invoke-LifecycleStorageProcess $context $exe @('stop') 'owner-timeout' 35|Out-Null}
+  Pass 'owner_timeout_does_not_retry_or_change_budget' {if($script:child.first_wait_ms -ne 35000 -or $script:childStarts -ne ($beforeStarts+1) -or -not $script:child.disposed){throw 'owner timeout changed its boundary'}}
   function Invoke-LifecycleStorageProcess {
     param($Context,$Executable,$Arguments,$Label,$Seconds)
     $script:runtimeRequest=[Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($Arguments[-1]));$script:runtimeBudget=$Seconds
     return [pscustomobject]@{status='completed'}
   }
+  if(-not ('EdrLifecycleRuntimePhaseWriter' -as [type])) {
+    Add-Type -TypeDefinition @'
+public sealed class EdrLifecycleRuntimePhaseWriter : System.IO.StringWriter {
+    public int FlushCount;
+    public override void Flush() { FlushCount++; base.Flush(); }
+}
+'@
+  }
+  function Get-Service {
+    [CmdletBinding()]param($Name)
+    if($Name -cne $ServiceName -or $script:phaseWriter.FlushCount -ne 2){throw 'owner query preceded its flushed marker'}
+    if($script:phaseFailure -ceq 'get_owner'){throw 'fixture_runtime_action_get_owner'}
+    $service=[pscustomobject]@{Status='fixture'}
+    $service|Add-Member ScriptMethod WaitForStatus {
+      param($State,$Budget)
+      if($script:phaseWriter.FlushCount -ne 5 -or $Budget.TotalSeconds -ne 30 -or $State -cne $script:phaseTarget){throw 'owner wait changed its marker or deadline'}
+      if($script:phaseFailure -ceq 'wait'){throw 'fixture_runtime_action_wait'}
+    }
+    return $service
+  }
+  function Invoke-FixtureRuntimeAction {
+    if($script:phaseWriter.FlushCount -ne $(if($RuntimeMode -ceq 'service'){4}else{2})){throw 'owner action preceded its flushed marker'}
+    if($script:phaseFailure -ceq 'owner_action'){throw 'fixture_runtime_action_owner_action'}
+  }
+  function Start-Service {[CmdletBinding()]param($InputObject);Invoke-FixtureRuntimeAction}
+  function Stop-Service {[CmdletBinding()]param($InputObject);Invoke-FixtureRuntimeAction}
+  function Start-ScheduledTask {[CmdletBinding()]param($TaskName,$TaskPath);Invoke-FixtureRuntimeAction}
+  function Stop-ScheduledTask {[CmdletBinding()]param($TaskName,$TaskPath);Invoke-FixtureRuntimeAction}
   foreach($RuntimeMode in @('service','scheduled_task')){foreach($runtimeAction in @('Stop','Start')){
     Pass ($RuntimeMode+'_'+$runtimeAction+'_uses_existing_owner_without_recreation') {
       Invoke-LifecycleStorageRuntimeAction $context $runtimeAction 'fixture'
       $command=if($RuntimeMode -ceq 'service'){$runtimeAction+'-Service -InputObject $service'}else{$runtimeAction+"-ScheduledTask -TaskName 'FixtureService' -TaskPath '\'"}
       if(-not $script:runtimeRequest.Contains($command) -or $script:runtimeBudget -ne 35 -or $script:runtimeRequest -match 'Register|Remove|Stop-Process|Force'){throw 'runtime action broadened scope'}
+    }
+    $script:phaseTarget=if($runtimeAction -ceq 'Stop'){'Stopped'}else{'Running'}
+    $phases=if($RuntimeMode -ceq 'service'){@('engine_enter','get_owner_begin','get_owner_returned','owner_action_enter','owner_action_returned','wait_completed')}else{@('engine_enter','owner_action_enter','owner_action_returned')}
+    $failures=if($RuntimeMode -ceq 'service'){@('none','get_owner','owner_action','wait')}else{@('none','owner_action')}
+    foreach($script:phaseFailure in $failures) {
+      Pass ($RuntimeMode+'_'+$runtimeAction+'_flushed_milestones_'+$script:phaseFailure) {
+        $out=[IO.StringWriter]::new();$script:phaseWriter=New-Object EdrLifecycleRuntimePhaseWriter
+        $savedOut=[Console]::Out;$savedError=[Console]::Error;$savedModules=$env:PSModulePath;$failure=$null
+        try {
+          [Console]::SetOut($out);[Console]::SetError($script:phaseWriter)
+          try {& ([scriptblock]::Create($script:runtimeRequest))}catch{$failure=$_}
+        } finally {[Console]::SetOut($savedOut);[Console]::SetError($savedError);$env:PSModulePath=$savedModules}
+        try {
+          $count=if($script:phaseFailure -ceq 'get_owner'){2}elseif($script:phaseFailure -ceq 'owner_action'){if($RuntimeMode -ceq 'service'){4}else{2}}elseif($script:phaseFailure -ceq 'wait'){5}else{$phases.Count}
+          $observed=@($script:phaseWriter.ToString() -split '\r?\n'|Where-Object{$_})
+          $expected=@($phases|Select-Object -First $count|ForEach-Object{'lifecycle_runtime_action phase='+$_})
+          if(($observed -join '|') -cne ($expected -join '|') -or $script:phaseWriter.FlushCount -ne $count -or $count -gt 6){throw 'runtime milestones changed or were not flushed before owner I/O'}
+          if($script:phaseFailure -ceq 'none') {
+            if($failure -or $out.ToString().Trim() -cne '{"status":"completed"}'){throw 'runtime stdout receipt changed'}
+          } elseif(-not $failure -or $failure.Exception.Message -notlike ('*fixture_runtime_action_'+$script:phaseFailure+'*') -or $out.ToString()) {throw 'runtime failure was masked or claimed completed'}
+        } finally {$out.Dispose();$script:phaseWriter.Dispose()}
+      }
     }
   }}
   $RuntimeMode='service'
