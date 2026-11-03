@@ -25,7 +25,7 @@ RUNTIME_GATE = ROOT / "cmake" / "AgentRuntimeGate.cmake"
 LABEL = "^windows-release-gate$"
 WINDOWS_EXPECTED = {
     "agent_update_command_contract", "agent_update_packaging_contract",
-    "windows_agent_update_invocation",
+    "windows_agent_update_invocation", "windows_updater_publisher",
     "windows_headless_runtime_contract", "command_registry_and_payload_contract",
     "windows_headless_log_stream_initialization",
     "command_process_identity_and_receipts",
@@ -272,7 +272,7 @@ class WindowsReleaseGateTests(unittest.TestCase):
                 self.assertEqual(selected_modules.resolve(), (build / "foreign-powershell-modules").resolve())
 
     def test_updater_and_autorun_are_required_and_failure_blocks_windows_gate(self):
-        for name in ("windows_updater_health_clock", "windows_updater_storage_start", "windows_updater_stop",
+        for name in ("windows_updater_publisher", "windows_updater_health_clock", "windows_updater_storage_start", "windows_updater_stop",
                      "windows_updater_task_recovery", "windows_updater_atomic_json", "windows_updater_admission", "windows_updater_installer_job",
                      "windows_autorun_acl", "windows_autorun_task"):
             with tempfile.TemporaryDirectory() as directory:
