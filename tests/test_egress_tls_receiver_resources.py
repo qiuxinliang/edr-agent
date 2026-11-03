@@ -256,7 +256,7 @@ class ReceiverResourcesTest(unittest.TestCase):
         original_modes = [
             "positive", "positive-ip", "positive-v2", "wrong-ca", "wrong-host",
             "positive-pmfe", "positive-journal", "positive-p0-journal",
-            "positive-command",
+            "positive-command", "positive-upgrade-denial",
         ]
         download_modes = ["positive-update-download-x64", "positive-update-download-arm64",
                           "wrong-update-download-ca", "wrong-update-download-host"]
@@ -265,6 +265,7 @@ class ReceiverResourcesTest(unittest.TestCase):
         for flags, expected_modes in (
             ([], original_modes + download_modes + ["positive-crash-restart"]),
             (["--exclude-update-download"], original_modes + ["positive-crash-restart"]),
+            (["--command-only"], ["positive-command", "positive-upgrade-denial"]),
             (["--update-download-only"], download_modes),
             (["--command-delivery-only"], delivery_modes),
         ):

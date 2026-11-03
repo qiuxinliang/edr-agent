@@ -245,7 +245,7 @@ function Invoke-FullInstallerUpgrade {
   return @{ExitCode=0;Evidence=@{Sha256='public-log';Size=1;OriginalSize=1;Status='ready';Path='C:\public\setup.log'};EvidenceId='public-id';StorageKey='public-key';BaselineMode='upgrade_existing'}
 }
 $RuntimeManifest='C:\public\package.zip';$stagedPath='C:\public\FDSensor.exe';$expectedHash='target-hash'
-$TargetVersion='3.2.704';$TrustedPublisherThumbprint='';$TrustedPublisherSubject=''
+$TargetVersion='3.2.704';$TrustedPublisherThumbprint='';$TrustedPublisherSubject='';$TrustedPublisherSubjectDerSha256=''
 $UpgradeClass='installer_required';$Operation='upgrade';$verifiedStatus='verified';$journalPath='C:\public\journal.json'
 $fullInstallerTaskBackupPath='C:\public\task-backup.json'
 foreach($name in @('Assert-UpdateStartDeadline','Get-UnixTimeMilliseconds')) {
@@ -278,7 +278,7 @@ foreach($mode in @('scheduled_task','service')){
     }
     Check ($script:taskRestores -eq $(if($mode -eq 'scheduled_task' -and $flowCase -in @('inventory_failure','interrupted')){1}else{0})) 'only_task_rollback_restores_definition'
     switch($flowCase){
-      'success'{Check ($null -eq $failure -and $report.status -ceq 'succeeded' -and $script:installStops -eq 1 -and $script:installerCalls -eq 1 -and $script:healthChecks -eq 1 -and $script:restores -eq 0) 'quiesce_then_inventory_then_health'}
+      'success'{Check ($null -eq $failure -and $report.status -ceq 'succeeded' -and $script:installStops -eq 1 -and $script:installerCalls -eq 1 -and $script:healthChecks -eq 1 -and $script:restores -eq 0) ("quiesce_then_inventory_then_health: mode={0}; first_failure={1}" -f $mode,$failure)}
       'backup_failure'{Check ($failure -ceq 'fixture_backup_failed' -and $script:installStops -eq 0 -and $script:installerCalls -eq 0 -and $script:restores -eq 0) 'backup_failure_keeps_owner_running'}
       'task_backup_failure'{Check ($failure -ceq 'fixture_task_backup_failed' -and $script:installStops -eq 0 -and $script:installerCalls -eq 0 -and $script:restores -eq 0) 'task_snapshot_failure_keeps_owner_running'}
       'deadline_expired'{Check ($failure -ceq 'UPDATE_DEADLINE_EXPIRED|runtime_stop_not_started' -and -not $fullInstallerStarted -and $script:installStops -eq 0 -and $script:installerCalls -eq 0 -and $script:restores -eq 0) 'expired_admission_keeps_owner_running'}
