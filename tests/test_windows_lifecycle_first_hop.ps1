@@ -187,15 +187,33 @@ try {
   if($getAcl.ModuleName -cne 'Microsoft.PowerShell.Security' -or $setAcl.ModuleName -cne 'Microsoft.PowerShell.Security'){throw 'unexpected_acl_owner'}
   Set-ProbePhase 'acl_roundtrip'
   [IO.File]::WriteAllText('__PROBE_ACL__','isolated ACL fixture')
-  $acl=& $getAcl -LiteralPath '__PROBE_ACL__'
   $access=[Security.AccessControl.AccessControlSections]::Access
-  $originalAcl=$acl.GetSecurityDescriptorSddlForm($access)
-  $acl.SetAccessRuleProtection($true,$true)
+  # Own this plaintext fixture's DACL instead of testing the hosted runner's
+  # inherited-ACE merge rules. Never change its parent, owner, group or SACL.
+  $baselineAcl=[Security.AccessControl.FileSecurity]::new()
+  $baselineAcl.SetAccessRuleProtection($true,$false)
+  $userSid=[Security.Principal.WindowsIdentity]::GetCurrent().User
+  $baselineAcl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new(
+    $userSid,[Security.AccessControl.FileSystemRights]::FullControl,[Security.AccessControl.AccessControlType]::Allow))
+  & $setAcl -LiteralPath '__PROBE_ACL__' -AclObject $baselineAcl
+  $baselineAcl=& $getAcl -LiteralPath '__PROBE_ACL__'
+  $originalAcl=$baselineAcl.GetSecurityDescriptorSddlForm($access)
+  if(-not $baselineAcl.AreAccessRulesProtected -or $baselineAcl.GetAccessRules($true,$false,[Security.Principal.SecurityIdentifier]).Count -ne 1){throw 'acl_fixture_baseline_invalid'}
+  $acl=[Security.AccessControl.FileSecurity]::new()
+  $acl.SetSecurityDescriptorBinaryForm($baselineAcl.GetSecurityDescriptorBinaryForm(),$access)
+  $adminSid=[Security.Principal.SecurityIdentifier]::new('S-1-5-32-544')
+  $adminRights=[Security.AccessControl.FileSystemRights]::ReadAndExecute
+  $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new(
+    $adminSid,$adminRights,[Security.AccessControl.AccessControlType]::Allow))
   & $setAcl -LiteralPath '__PROBE_ACL__' -AclObject $acl
   $readAcl=& $getAcl -LiteralPath '__PROBE_ACL__'
-  if(-not $readAcl.AreAccessRulesProtected){throw 'acl_write_not_observed'}
-  $readAcl.SetSecurityDescriptorSddlForm($originalAcl,$access)
-  & $setAcl -LiteralPath '__PROBE_ACL__' -AclObject $readAcl
+  $adminRules=@($readAcl.GetAccessRules($true,$false,[Security.Principal.SecurityIdentifier])|Where-Object {
+    $_.IdentityReference.Value -ceq $adminSid.Value -and -not $_.IsInherited -and
+    $_.AccessControlType -eq [Security.AccessControl.AccessControlType]::Allow -and
+    ($_.FileSystemRights -band $adminRights) -eq $adminRights
+  })
+  if(-not $readAcl.AreAccessRulesProtected -or $adminRules.Count -ne 1 -or $readAcl.GetSecurityDescriptorSddlForm($access) -ceq $originalAcl){throw 'acl_write_not_observed'}
+  & $setAcl -LiteralPath '__PROBE_ACL__' -AclObject $baselineAcl
   if((& $getAcl -LiteralPath '__PROBE_ACL__').GetSecurityDescriptorSddlForm($access) -cne $originalAcl){throw 'acl_restore_not_observed'}
   Set-ProbePhase 'scheduled_tasks'
   $taskCommand=Get-Command Get-ScheduledTask -CommandType Cmdlet,Function -ErrorAction Stop
