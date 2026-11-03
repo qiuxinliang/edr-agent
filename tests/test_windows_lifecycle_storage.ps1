@@ -191,6 +191,18 @@ public sealed class EdrLifecycleRuntimePhaseWriter : System.IO.StringWriter {
     }
   }}
   $RuntimeMode='service'
+  Pass 'baseline_service_repair_uses_finite_preparation_budget' {
+    Invoke-LifecycleStorageRuntimeAction $context 'Stop' 'repair-baseline-stop' 120
+    if($script:runtimeBudget -ne 120 -or -not $script:runtimeRequest.Contains('Stop-Service -InputObject $service')){throw 'repair preparation budget was not forwarded'}
+  }
+  $script:runtimeBudget=-1
+  Reject 'other_storage_stop_cannot_use_repair_budget' '*reserved for baseline service repair*' {Invoke-LifecycleStorageRuntimeAction $context 'Stop' 'fixture' 120}
+  Reject 'service_start_cannot_use_repair_budget' '*reserved for baseline service repair*' {Invoke-LifecycleStorageRuntimeAction $context 'Start' 'repair-baseline-stop' 120}
+  Reject 'arbitrary_runtime_budget_rejected' '*Seconds*' {Invoke-LifecycleStorageRuntimeAction $context 'Stop' 'repair-baseline-stop' 36}
+  $RuntimeMode='scheduled_task'
+  Reject 'task_stop_cannot_use_service_repair_budget' '*reserved for baseline service repair*' {Invoke-LifecycleStorageRuntimeAction $context 'Stop' 'repair-baseline-stop' 120}
+  Pass 'invalid_repair_budget_is_rejected_before_child_start' {if($script:runtimeBudget -ne -1){throw 'invalid preparation budget reached child I/O'}}
+  $RuntimeMode='service'
   # OS lifecycle mutations are isolated below. Keep actual orchestration and
   # require zero writes before complete quiescence; injected first failure wins.
   $script:sequence=New-Object 'System.Collections.Generic.List[string]'

@@ -202,7 +202,13 @@ function Assert-BaselineRepair([string] $SetupPath) {
   $stopPhase='owner-stop'
   try {
     $stopContext=@{root=$EvidenceDir;writer_uncertain=$false}
-    Invoke-LifecycleStorageRuntimeAction $stopContext 'Stop' ($stage+'-stop')
+    # Existing service repair preparations took 68-72 seconds before the prior
+    # observer failure. Bound this QA preparation like the headless preflight;
+    # the product updater and other storage actions retain their own budgets.
+    $stopBudget=if($RuntimeMode -ceq 'service'){120}else{35}
+    $stopClock=[Diagnostics.Stopwatch]::StartNew()
+    Invoke-LifecycleStorageRuntimeAction $stopContext 'Stop' ($stage+'-stop') $stopBudget
+    $stopClock.Stop()
     $stopPhase='runtime-exit'
     if(-not $native.process.WaitForExit(30000)){throw 'original runtime did not exit before baseline repair within 30 seconds'}
     $stopPhase='quiescence'
@@ -222,7 +228,7 @@ function Assert-BaselineRepair([string] $SetupPath) {
     } catch {Write-Warning ('Repair stop diagnostic unavailable: '+$_.Exception.GetType().FullName)}
     throw $stopFailure
   } finally {$native.process.Dispose()}
-  Add-Evidence $stage 'processes-stopped' 'generation_bound=true wait_budget_seconds=30 remaining=0'
+  Add-Evidence $stage 'processes-stopped' ('generation_bound=true owner_stop_budget_seconds='+$stopBudget+' owner_stop_elapsed_ms='+$stopClock.ElapsedMilliseconds+' wait_budget_seconds=30 remaining=0')
   New-BaselineRepairBackup $backupDir
   foreach ($name in @("unins000.exe", "unins000.dat")) {
     Remove-Item -LiteralPath (Join-Path $InstallDir $name) -Force

@@ -407,7 +407,7 @@ public sealed class EdrLifecycleFixtureChild {
   $BaselineVersion='3.2.738'
   function Reset-RepairFixture([string]$Case) {
     $script:repairCase=$Case;$script:repairSequence=New-Object 'System.Collections.Generic.List[string]'
-    $script:lastHandle=$null;$script:controlChild=$null
+    $script:lastHandle=$null;$script:controlChild=$null;$script:repairStopEvidence=$null
     $script:handleMode=if($Case -ceq 'runtime-timeout'){'wait-timeout'}elseif($Case -ceq 'reused'){'reused'}else{'live'}
     $script:repairRow=[pscustomobject]@{ExecutablePath=$image;ProcessId=123;CreationDate=$childTime;CommandLine=('"'+$image+'" --config "'+$config+'"')}
     if($Case -ceq 'foreign-config'){$script:repairRow.CommandLine=$script:repairRow.CommandLine.Replace('agent.toml','other.toml')}
@@ -421,6 +421,10 @@ public sealed class EdrLifecycleFixtureChild {
   function Get-Service {[CmdletBinding()]param($Name);if($Name -cne $ServiceName){throw 'unexpected repair service'};return [pscustomobject]@{Status=$script:service.State}}
   function Stop-Service {throw 'repair must use the bounded original owner process'}
   function Stop-ScheduledTask {throw 'repair must use the bounded original owner process'}
+  function Add-Evidence {
+    param($Stage,$Status,$Detail)
+    if($Stage -ceq 'repair-baseline' -and $Status -ceq 'processes-stopped'){$script:repairStopEvidence=$Detail}
+  }
   function Start-Process {
     [CmdletBinding()]param($FilePath,[string[]]$ArgumentList,[switch]$Wait,[switch]$PassThru,$RedirectStandardOutput,$RedirectStandardError)
     if($RedirectStandardOutput) {
@@ -461,13 +465,15 @@ public sealed class EdrLifecycleFixtureChild {
     $null=Get-LifecycleRuntimeOwner
   }
   foreach($RuntimeMode in @('service','scheduled_task')) {
+    $repairStopBudget=if($RuntimeMode -ceq 'service'){120}else{35}
     $EvidenceDir=Join-Path $root ('repair-'+$RuntimeMode+'-success');[IO.Directory]::CreateDirectory($EvidenceDir)|Out-Null
     Reset-RepairFixture 'success'
     Pass ($RuntimeMode+'_repair_binds_before_bounded_owner_stop_and_reuses_held_process') {
       Assert-BaselineRepair 'original-immutable-setup.exe'
       if(($script:repairSequence -join ',') -cne 'open,stop,wait,setup' -or $script:lastHandle.wait_ms -ne 30000 -or
-          -not $script:lastHandle.disposed -or $script:lastHandle.killed -or $script:controlChild.first_wait_ms -ne 35000 -or
+          -not $script:lastHandle.disposed -or $script:lastHandle.killed -or $script:controlChild.first_wait_ms -ne ($repairStopBudget*1000) -or
           -not $script:controlChild.disposed -or $script:controlChild.killed){throw 'repair lost the original finite stop boundary'}
+      if($script:repairStopEvidence -cnotmatch ('^generation_bound=true owner_stop_budget_seconds='+$repairStopBudget+' owner_stop_elapsed_ms=[0-9]+ wait_budget_seconds=30 remaining=0$')){throw 'repair stop budget or elapsed evidence missing'}
     }
     foreach($entry in @(@('unknown-owner',$(if($RuntimeMode -ceq 'service'){'*running lifecycle service*'}else{'*owner, principal or original launcher*'})),
         @('foreign-config','*config/process binding mismatch*'),@('reused','*config/process binding mismatch*'),
@@ -479,19 +485,24 @@ public sealed class EdrLifecycleFixtureChild {
       $script:repairFailureRecord=$null
       Reject ($RuntimeMode+'_repair_rejects_'+$entry[0]) $entry[1] {try{Assert-BaselineRepair 'original-immutable-setup.exe'}catch{$script:repairFailureRecord=$_;throw}}
       Pass ($RuntimeMode+'_repair_failure_preserves_installer_files_'+$entry[0]) {
-        if($script:repairSequence -ccontains 'setup' -or (Test-Path -LiteralPath (Join-Path $EvidenceDir 'repair-baseline-backup')) -or
+        if($script:repairStopEvidence -or $script:repairSequence -ccontains 'setup' -or (Test-Path -LiteralPath (Join-Path $EvidenceDir 'repair-baseline-backup')) -or
             [IO.File]::ReadAllText((Join-Path $InstallDir 'agent.toml')) -cne 'isolated configuration'){throw 'failed stop mutated repair inputs'}
         foreach($name in @('unins000.exe','unins000.dat')){if([IO.File]::ReadAllText((Join-Path $InstallDir $name)) -cne ('fixture-'+$name)){throw 'failed stop removed installer files'}}
         if($script:lastHandle -and (-not $script:lastHandle.disposed -or $script:lastHandle.killed)){throw 'repair leaked or killed Agent handle'}
-        if($script:controlChild -and (-not $script:controlChild.disposed -or $script:controlChild.first_wait_ms -ne 35000 -or
+        if($script:controlChild -and (-not $script:controlChild.disposed -or $script:controlChild.first_wait_ms -ne ($repairStopBudget*1000) -or
             $script:controlChild.killed -ne ($entry[0] -ceq 'owner-timeout'))){throw 'repair control child exceeded its original boundary'}
+        if($entry[0] -ceq 'owner-timeout' -and $script:repairFailureRecord.Exception.Message -cne ('storage child exceeded its finite deadline: label=repair-baseline-stop budget_seconds='+$repairStopBudget)){throw 'repair timeout lost its selected budget or first failure'}
         if($script:controlChild) {
           $json=[string]$script:repairFailureRecord.Exception.Data['lifecycle_repair_stop_failure']
           $detail=$json|ConvertFrom-Json
+          # PowerShell 7 parses the UTC JSON string as DateTime. Comparing it
+          # directly with a string implicitly converts the latter to local time.
+          $createdUtc=$detail.created_utc
+          if($createdUtc -is [DateTime]){$createdUtc=$createdUtc.ToUniversalTime().ToString('o')}
           $phase=if($entry[0] -in @('owner-stop-failure','owner-timeout')){'owner-stop'}elseif($entry[0] -ceq 'runtime-timeout'){'runtime-exit'}else{'quiescence'}
           if(-not $json -or [Text.Encoding]::UTF8.GetByteCount($json) -gt 8192 -or $detail.schema -cne 'edr.test.lifecycle-repair-stop-failure.v1' -or
               $detail.phase -cne $phase -or $detail.runtime_mode -cne $RuntimeMode -or $detail.pid -ne $script:lastHandle.Id -or
-              $detail.created_utc -cne $script:lastHandle.StartTime.ToUniversalTime().ToString('o') -or
+              $createdUtc -cne $script:lastHandle.StartTime.ToUniversalTime().ToString('o') -or
               $detail.held_has_exited -ne $script:lastHandle.HasExited -or $detail.held_observation_error_type -or
               @($detail.PSObject.Properties).Count -ne 7){throw 'repair stop lost its bounded local handle diagnostic'}
         }

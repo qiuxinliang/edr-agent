@@ -179,16 +179,18 @@ function Assert-LifecycleStorageQuiescent($Native) {
     if($task.State -cne 'Ready'){throw 'storage task is not stopped'}
   }
 }
-function Invoke-LifecycleStorageRuntimeAction($Context,[ValidateSet('Stop','Start')][string]$Action,[string]$Label) {
+function Invoke-LifecycleStorageRuntimeAction($Context,[ValidateSet('Stop','Start')][string]$Action,[string]$Label,[ValidateSet(35,120)][int]$Seconds=35) {
   if($ServiceName -cnotmatch '^[A-Za-z0-9_-]+$'){throw 'unsafe lifecycle owner name'}
+  if($Seconds -eq 120 -and ($RuntimeMode -cne 'service' -or $Action -cne 'Stop' -or $Label -cne 'repair-baseline-stop')){throw 'extended runtime stop budget is reserved for baseline service repair'}
   if($RuntimeMode -ceq 'service') {
     $body=('Write-LifecycleRuntimeActionPhase ''get_owner_begin'';$service=Get-Service -Name ''{0}'' -ErrorAction Stop;Write-LifecycleRuntimeActionPhase ''get_owner_returned'';Write-LifecycleRuntimeActionPhase ''owner_action_enter'';{1}-Service -InputObject $service -ErrorAction Stop;Write-LifecycleRuntimeActionPhase ''owner_action_returned'';$service.WaitForStatus(''{2}'',[TimeSpan]::FromSeconds(30));Write-LifecycleRuntimeActionPhase ''wait_completed''' -f $ServiceName,$Action,$(if($Action -ceq 'Stop'){'Stopped'}else{'Running'}))
   } else {$body=('Write-LifecycleRuntimeActionPhase ''owner_action_enter'';{0}-ScheduledTask -TaskName ''{1}'' -TaskPath ''\'' -ErrorAction Stop;Write-LifecycleRuntimeActionPhase ''owner_action_returned''' -f $Action,$ServiceName)}
   # Fixed stderr milestones bypass PowerShell's buffered CLIXML stream. The
-  # receipt stays on stdout, and the existing owner calls/deadlines stay intact.
+  # receipt stays on stdout and the owner calls stay intact; the constrained
+  # caller selects the finite preparation deadline.
   $source='$ErrorActionPreference=''Stop'';$ProgressPreference=''SilentlyContinue'';function Write-LifecycleRuntimeActionPhase([string]$phase){[Console]::Error.WriteLine(''lifecycle_runtime_action phase=''+$phase);[Console]::Error.Flush()};Write-LifecycleRuntimeActionPhase ''engine_enter'';$env:PSModulePath=$PSHOME+''\Modules'';'+$body+';[Console]::Out.WriteLine(''{"status":"completed"}'')'
   $encoded=[Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($source))
-  $result=Invoke-LifecycleStorageProcess $Context (Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe') @('-NoProfile','-NonInteractive','-EncodedCommand',$encoded) $Label 35
+  $result=Invoke-LifecycleStorageProcess $Context (Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe') @('-NoProfile','-NonInteractive','-EncodedCommand',$encoded) $Label $Seconds
   if($result.status -cne 'completed'){throw 'storage runtime action did not complete'}
 }
 function Assert-LifecycleStorageReceipt($Context,$Receipt,[string]$Role,[string]$Kind,[string]$Action,[int]$Generation) {
