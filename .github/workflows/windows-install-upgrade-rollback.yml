@@ -813,14 +813,23 @@ jobs:
 # platform API auth, migrate real data, or claim the immutable 695 clock fixed.
 
   signed-publisher-lifecycle:
+    name: Signed publisher (${{ matrix.arch }}, ${{ matrix.runtime_mode }})
     if: github.event_name == 'workflow_dispatch' && inputs.publisher_validation_request && github.repository == 'qiuxinliang/edr-agent'
     strategy:
       fail-fast: false
       matrix:
         include:
           - arch: amd64
+            runtime_mode: service
             runner: windows-2022
           - arch: arm64
+            runtime_mode: service
+            runner: windows-11-vs2026-arm
+          - arch: amd64
+            runtime_mode: scheduled_task
+            runner: windows-2022
+          - arch: arm64
+            runtime_mode: scheduled_task
             runner: windows-11-vs2026-arm
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
@@ -831,6 +840,7 @@ jobs:
       VALIDATION_CACHE_SUBSET: ${{ inputs.cache_recovery_subset }}
       VALIDATION_RUNNER_ENVIRONMENT: ${{ runner.environment }}
       NATIVE_ARCH: ${{ matrix.arch }}
+      LIFECYCLE_RUNTIME_MODE: ${{ matrix.runtime_mode }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -855,6 +865,7 @@ jobs:
           $expected=if($env:NATIVE_ARCH -eq 'arm64'){'Arm64'}else{'X64'}
           if ([Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString() -cne $expected) { throw 'Runner OS architecture is not native' }
           if (Get-Service -Name FDSecurityAgent,EdrAgent,FDSecurityAgentCISmoke -ErrorAction SilentlyContinue) { throw 'Existing Agent service; refusing test' }
+          if (Get-ScheduledTask -TaskName FDSecurityAgent,EdrAgent -ErrorAction SilentlyContinue) { throw 'Existing Agent task; refusing test' }
           if (Get-Process -Name FDSensor,EDRAgent,FDSecurityInstallerWorker -ErrorAction SilentlyContinue) { throw 'Existing Agent process; refusing test' }
           foreach($path in @('C:\Program Files\FDSecurity','C:\ProgramData\FDSecurity','C:\edr-agent-setup-lifecycle-smoke')) {
             if(Test-Path -LiteralPath $path){throw 'Existing Agent state; refusing test'}
@@ -876,6 +887,7 @@ jobs:
         shell: powershell
         run: |
           & ([scriptblock]::Create([IO.File]::ReadAllText((Join-Path $PWD 'tests/test_windows_lifecycle_publisher.ps1')))) -RepoRoot $PWD
+          & ([scriptblock]::Create([IO.File]::ReadAllText((Join-Path $PWD 'tests/test_windows_lifecycle_runtime_mode.ps1')))) -RepoRoot $PWD
           & ([scriptblock]::Create([IO.File]::ReadAllText((Join-Path $PWD 'tests/test_windows_lifecycle_first_hop.ps1')))) -RepoRoot $PWD
       - name: Admit both immutable signed candidates and original legacy package
         timeout-minutes: 25
@@ -904,7 +916,7 @@ jobs:
             TargetSetupExe=$stage.target_setup_exe; TargetVersion=$stage.target_version
             MigrationInput=$stage.migration_input; UpgradeInput=$stage.upgrade_input
             BaselineConfigTemplate=$stage.legacy_config_template
-            Architecture=$env:NATIVE_ARCH; EvidenceDir='setup-exe-evidence'
+            Architecture=$env:NATIVE_ARCH; RuntimeMode=$env:LIFECYCLE_RUNTIME_MODE; EvidenceDir='setup-exe-evidence'
           }
           & ./scripts/windows_setup_exe_lifecycle_smoke.ps1 @parameters
       - name: Preserve signed acceptance scope and source identities
@@ -925,9 +937,9 @@ jobs:
             $path=Join-Path setup-exe-evidence $name
             if(Test-Path -LiteralPath $path){Copy-Item -LiteralPath $path -Destination runtime-evidence}
           }
-          @'
-          Native service-mode signed full-installer acceptance. Real backend CMS verification receipts bind both candidates. Original 723 migrates via full Setup; original protocol-6 embedded updater performs the next-version upgrade. Candidate installer hang, Job termination, recovery, old-version Setup rollback and uninstall are checked. Preservation covers actual configuration/service identity and synthetic queue/evidence markers. This does not claim platform command transport, real business database readback, or scheduled-task deployment acceptance.
-          '@ | Set-Content runtime-evidence/scope.txt -Encoding utf8
+          @"
+          Native $env:LIFECYCLE_RUNTIME_MODE signed full-installer acceptance. Real backend CMS verification receipts bind both candidates. Original 723 migrates via full Setup; original protocol-6 embedded updater performs the next-version upgrade. Candidate installer hang, Job termination, recovery, old-version Setup rollback and uninstall are checked. Preservation covers actual configuration and service/task identity (including task XML and permissions) plus synthetic queue/evidence markers. This does not claim platform command transport or real business database readback.
+          "@ | Set-Content runtime-evidence/scope.txt -Encoding utf8
           if(Test-Path setup-exe-evidence/summary.json){Get-Content setup-exe-evidence/summary.json|Out-File $env:GITHUB_STEP_SUMMARY -Append}
       - name: Retain signed lifecycle evidence in the private evidence owner
         if: always()
@@ -937,5 +949,5 @@ jobs:
           GH_TOKEN: ${{ secrets.USB_SIGNING_RELEASE_TOKEN }}
           SIGNED_LIFECYCLE_STATUS: ${{ job.status }}
         run: |
-          python scripts/upload_windows_lifecycle_evidence.py --target-tag $env:VALIDATION_TARGET_TAG --arch $env:NATIVE_ARCH --job-status $env:SIGNED_LIFECYCLE_STATUS --workspace $env:GITHUB_WORKSPACE --output-dir "$env:RUNNER_TEMP/signed-lifecycle-evidence-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT-$env:NATIVE_ARCH"
+          python scripts/upload_windows_lifecycle_evidence.py --target-tag $env:VALIDATION_TARGET_TAG --arch $env:NATIVE_ARCH --runtime-mode $env:LIFECYCLE_RUNTIME_MODE --job-status $env:SIGNED_LIFECYCLE_STATUS --workspace $env:GITHUB_WORKSPACE --output-dir "$env:RUNNER_TEMP/signed-lifecycle-evidence-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT-$env:NATIVE_ARCH-$env:LIFECYCLE_RUNTIME_MODE"
           if($LASTEXITCODE -ne 0){throw 'Signed lifecycle evidence was not retained'}

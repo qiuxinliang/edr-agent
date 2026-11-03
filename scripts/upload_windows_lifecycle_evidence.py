@@ -14,7 +14,7 @@ MAX_BYTES = 1024 * 1024 * 1024
 MAX_FILES = 20_000
 
 
-def identity(run_id, attempt, commit, target_tag, architecture, repository=SOURCE):
+def identity(run_id, attempt, commit, target_tag, architecture, repository=SOURCE, *, runtime_mode=None):
     if repository != SOURCE:
         raise ValueError("Lifecycle evidence is restricted to the EDR source repository")
     if not all(re.fullmatch(r"[1-9][0-9]*", str(v)) for v in (run_id, attempt)):
@@ -25,9 +25,22 @@ def identity(run_id, attempt, commit, target_tag, architecture, repository=SOURC
         raise ValueError("Invalid lifecycle target tag")
     if architecture not in ("amd64", "arm64"):
         raise ValueError("Invalid lifecycle architecture")
-    return dict(schema="edr.lifecycle-evidence.v1", repository=repository,
-                run_id=str(run_id), attempt=str(attempt), commit=commit,
-                target_tag=target_tag, architecture=architecture)
+    owner = dict(schema="edr.lifecycle-evidence.v1", repository=repository,
+                 run_id=str(run_id), attempt=str(attempt), commit=commit,
+                 target_tag=target_tag, architecture=architecture)
+    if runtime_mode is not None:
+        if runtime_mode not in ("service", "scheduled_task"):
+            raise ValueError("Invalid lifecycle runtime mode")
+        owner["runtime_mode"] = runtime_mode
+    return owner
+
+
+def mode_suffix(owner):
+    if "runtime_mode" not in owner:
+        return ""
+    if owner["runtime_mode"] not in ("service", "scheduled_task"):
+        raise ValueError("Invalid lifecycle runtime mode")
+    return "-" + owner["runtime_mode"].replace("_", "-")
 
 
 def regular_stat(path, directory=False):
@@ -87,12 +100,13 @@ def digest(path):
 def build_bundle(workspace, destination, owner, job_status):
     if job_status not in ("success", "failure", "cancelled"):
         raise ValueError("Invalid lifecycle job status")
+    suffix = mode_suffix(owner)
     files, missing = collect_files(workspace)
     if job_status == "success" and (missing or not files):
         raise ValueError("Successful lifecycle job is missing required evidence directories")
     destination = Path(destination)
     destination.mkdir(parents=True, exist_ok=False)
-    name = f"windows-lifecycle-evidence-{owner['run_id']}-{owner['attempt']}-{owner['architecture']}"
+    name = f"windows-lifecycle-evidence-{owner['run_id']}-{owner['attempt']}-{owner['architecture']}{suffix}"
     archive_path, receipt_path = destination / f"{name}.zip", destination / f"{name}.json"
     entries, actual_total = [], 0
     with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=1) as archive:
@@ -130,7 +144,7 @@ def build_bundle(workspace, destination, owner, job_status):
 
 def publish_evidence(workspace, destination, owner, job_status, publisher):
     files, receipt = build_bundle(workspace, destination, owner, job_status)
-    tag = f"edr-evidence-{owner['run_id']}-{owner['attempt']}-{owner['architecture']}"
+    tag = f"edr-evidence-{owner['run_id']}-{owner['attempt']}-{owner['architecture']}{mode_suffix(owner)}"
     release = publisher(tag, owner, files, prerelease=False)
     print(f"Private lifecycle evidence retained: release_id={release['id']} "
           f"files={receipt['file_count']} sha256={receipt['archive']['sha256']}")
@@ -141,6 +155,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--target-tag", required=True)
     parser.add_argument("--arch", required=True, choices=("amd64", "arm64"))
+    parser.add_argument("--runtime-mode", choices=("service", "scheduled_task"))
     parser.add_argument("--job-status", required=True, choices=("success", "failure", "cancelled"))
     parser.add_argument("--workspace", default=os.environ.get("GITHUB_WORKSPACE", "."))
     parser.add_argument("--output-dir", required=True)
@@ -149,7 +164,7 @@ def main():
         raise RuntimeError("Private lifecycle evidence needs USB_SIGNING_RELEASE_TOKEN with Contents write on the private signing repository")
     owner = identity(os.environ.get("GITHUB_RUN_ID", ""), os.environ.get("GITHUB_RUN_ATTEMPT", ""),
                      os.environ.get("GITHUB_SHA", ""), args.target_tag, args.arch,
-                     os.environ.get("GITHUB_REPOSITORY", ""))
+                     os.environ.get("GITHUB_REPOSITORY", ""), runtime_mode=args.runtime_mode)
     from usb_release_transport import publish_files
     publish_evidence(args.workspace, args.output_dir, owner, args.job_status, publish_files)
 

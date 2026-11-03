@@ -295,6 +295,32 @@ class WindowsLifecycleWorkflowTests(unittest.TestCase):
             self.assertIn(required, identity)
         self.assertIn('runner-evidence', step(self.text, 'Upload Windows lifecycle evidence'))
 
+    def test_signed_acceptance_covers_each_native_arch_and_deployment_mode(self):
+        signed = self.text.split('  signed-publisher-lifecycle:\n', 1)[1]
+        matrix = signed.split('        include:\n', 1)[1].split('    runs-on:', 1)[0]
+        rows = re.findall(r'- arch: (\w+)\n\s+runtime_mode: (\w+)\n\s+runner: ([\w-]+)', matrix)
+        self.assertCountEqual(rows, [
+            ('amd64', 'service', 'windows-2022'),
+            ('arm64', 'service', 'windows-11-vs2026-arm'),
+            ('amd64', 'scheduled_task', 'windows-2022'),
+            ('arm64', 'scheduled_task', 'windows-11-vs2026-arm'),
+        ])
+        self.assertIn('LIFECYCLE_RUNTIME_MODE: ${{ matrix.runtime_mode }}', signed)
+        clean = step(signed, 'Require a clean native hosted machine for signed acceptance')
+        self.assertIn('Get-ScheduledTask -TaskName FDSecurityAgent,EdrAgent', clean)
+        invoke = step(signed, 'Execute signed migration upgrade timeout rollback and uninstall')
+        for binding in ('RuntimeMode=$env:LIFECYCLE_RUNTIME_MODE',
+                        'LegacySetupExe=$stage.legacy_setup_exe',
+                        'MigrationInput=$stage.migration_input',
+                        'UpgradeInput=$stage.upgrade_input',
+                        'SignedPublisherValidation=$true; ExerciseInstallerTimeout=$true'):
+            self.assertIn(binding, invoke)
+        evidence = step(signed, 'Retain signed lifecycle evidence in the private evidence owner')
+        self.assertIn('--runtime-mode $env:LIFECYCLE_RUNTIME_MODE', evidence)
+        self.assertIn('$env:NATIVE_ARCH-$env:LIFECYCLE_RUNTIME_MODE', evidence)
+        self.assertIn('tests/test_windows_lifecycle_runtime_mode.ps1',
+                      step(signed, 'Check native Windows publisher and old invocation boundaries'))
+
 
 if __name__ == '__main__':
     unittest.main()

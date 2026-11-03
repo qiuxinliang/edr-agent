@@ -6,7 +6,8 @@ param(
   [Parameter(Mandatory=$true)] [string] $InstallDir,
   [Parameter(Mandatory=$true)] [string] $EvidenceDir,
   [Parameter(Mandatory=$true)] [string] $Updater,
-  [Parameter(Mandatory=$true)] $Publisher
+  [Parameter(Mandatory=$true)] $Publisher,
+  [ValidateSet('service','scheduled_task')] [string] $RuntimeMode = 'service'
 )
 $ErrorActionPreference = 'Stop'
 if ($env:GITHUB_ACTIONS -cne 'true' -or $env:OS -cne 'Windows_NT') {
@@ -70,10 +71,7 @@ public static class LifecycleInstallerFault {
 '@
 
 function Get-RecoveryOwnerSnapshot {
-  $service = Get-CimInstance Win32_Service -Filter ("Name='{0}'" -f $InputBinding.service_name)
-  if (-not $service -or $service.PathName.IndexOf($InstallDir, [StringComparison]::OrdinalIgnoreCase) -lt 0) {
-    throw 'Installed service is not bound to this lifecycle directory'
-  }
+  $owner=Get-LifecycleRuntimeOwner
   $uninstall = @('HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
                  'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*') |
     ForEach-Object { Get-ItemProperty -Path $_ -ErrorAction SilentlyContinue } |
@@ -85,8 +83,11 @@ function Get-RecoveryOwnerSnapshot {
   if (@($uninstall).Count -ne 1 -or @($uninstall)[0].version -cne $InputBinding.target_version) {
     throw 'Expected one actual Inno uninstall registration at the installed candidate version'
   }
-  return [ordered]@{ service=[ordered]@{ path=$service.PathName; start_mode=$service.StartMode; account=$service.StartName };
-                     uninstall=@($uninstall) }
+  $snapshot=[ordered]@{ runtime_mode=$RuntimeMode; runtime_owner=$owner; uninstall=@($uninstall) }
+  if($RuntimeMode -ceq 'service') {
+    $snapshot.service=[ordered]@{path=$owner.path;start_mode=$owner.start_mode;account=$owner.account}
+  }
+  return $snapshot
 }
 function Read-RecoveryJournal([string]$Path) {
   if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $null }
@@ -172,7 +173,10 @@ foreach ($prefix in @('edr_queue.db','local_evidence_cache.db')) {
 }
 Assert-RecoveryFiles $files
 $beforeOwner = Get-RecoveryOwnerSnapshot | ConvertTo-Json -Depth 8 -Compress
-$oldService = Get-CimInstance Win32_Service -Filter ("Name='{0}'" -f $InputBinding.service_name)
+$oldRuntimeProcess = Get-LifecycleRuntimeProcess
+if($oldRuntimeProcess.State -cne 'Running' -or $oldRuntimeProcess.ProcessId -le 0) {
+  throw 'Installer fault injection requires the running installed runtime owner'
+}
 $binary = Join-Path $stage 'FDSensor.next.exe'
 $package = Join-Path $stage 'full-installer.zip'
 Copy-Item -LiteralPath $InputBinding.binary_path -Destination $binary
@@ -187,7 +191,7 @@ $parameters = [ordered]@{
   InstallDir=$InstallDir; StagedBinary=$binary; ExpectedSha256=$InputBinding.binary_sha256
   TargetVersion=$InputBinding.target_version; ExpectedArchitecture=$(if ($InputBinding.architecture -eq 'amd64') {'x64'} else {'arm64'})
   TrustedPublisherThumbprint=$Publisher.Thumbprint; TrustedPublisherSubject=$Publisher.Subject
-  DeploymentMode=$InputBinding.deployment_mode; ServiceName=$InputBinding.service_name
+  DeploymentMode=$(if($RuntimeMode -ceq 'scheduled_task'){'auto'}else{$InputBinding.deployment_mode}); ServiceName=$InputBinding.service_name
   CommandId=$commandId; TaskId=$commandId; ArtifactId=('ci-repair-' + $InputBinding.target_version)
   Operation='repair'; UpgradeClass=$InputBinding.upgrade_class
   IssuedAtUnixMs=$issued; DeadlineUnixMs=$issued+120000; HealthObserveMs=30000; StartupTimeoutSeconds=60
@@ -209,15 +213,16 @@ $delegatedRuntime = [IntPtr]::Zero; $process = $null
 $suspended = $false; $stopped = $false; $delegatedRunning = $false; $passed = $false
 $observations = New-Object System.Collections.Generic.List[object]
 $receipt = [ordered]@{ schema='edr.windows.real-installer-timeout.v1'; command_id=$commandId; status='failed';
-  architecture=$InputBinding.architecture; target_version=$InputBinding.target_version;
+  architecture=$InputBinding.architecture; target_version=$InputBinding.target_version; runtime_mode=$RuntimeMode;
   updater_sha256=$InputBinding.target_updater_sha256; installer_sha256=$InputBinding.installer_sha256;
   protected_files=$files; owner_before=($beforeOwner | ConvertFrom-Json); data_check='legacy root marker bytes only; protected databases not modified or validated' }
 try {
-  $oldRuntime = [LifecycleInstallerFault]::Open([uint32]$oldService.ProcessId, $false)
+  $oldRuntime = [LifecycleInstallerFault]::Open([uint32]$oldRuntimeProcess.ProcessId, $false)
   if ([LifecycleInstallerFault]::Image($oldRuntime) -ine (Join-Path $InstallDir 'FDSensor.exe')) {
-    throw 'Initial installed service process is not the expected runtime'
+    throw 'Initial installed runtime process is not the expected runtime'
   }
-  $receipt.initial_service = [ordered]@{ pid=$oldService.ProcessId; created_filetime=[LifecycleInstallerFault]::Created($oldRuntime) }
+  $receipt.initial_runtime = [ordered]@{ pid=$oldRuntimeProcess.ProcessId; created_filetime=[LifecycleInstallerFault]::Created($oldRuntime) }
+  if($RuntimeMode -ceq 'service') { $receipt.initial_service=$receipt.initial_runtime }
   $process = Start-LifecycleWindowsPowerShell -EncodedCommand $encoded `
     -StandardOutput (Join-Path $stage 'updater.stdout.log') -StandardError (Join-Path $stage 'updater.stderr.log')
   $null = $process.Handle
@@ -225,11 +230,11 @@ try {
   $lastState = ''
   while (-not $process.HasExited -and $clock.Elapsed.TotalSeconds -lt 240) {
     $journal = Read-RecoveryJournal $journalPath
-    $service = Get-CimInstance Win32_Service -Filter ("Name='{0}'" -f $InputBinding.service_name)
+    $runtimeProcess = Get-LifecycleRuntimeProcess
     if ($journal -and $journal.stop_intent -and [LifecycleInstallerFault]::Exited($oldRuntime) -and -not $stopped) {
       $stopped = $true
-      $receipt.runtime_stopped = [ordered]@{ at=[DateTime]::UtcNow.ToString('o'); state=$service.State;
-        original_pid=$oldService.ProcessId; original_process_handle_signaled=$true }
+      $receipt.runtime_stopped = [ordered]@{ at=[DateTime]::UtcNow.ToString('o'); state=$runtimeProcess.State;
+        original_pid=$oldRuntimeProcess.ProcessId; original_process_handle_signaled=$true }
     }
     # Launch intent is durable before both Stop and CreateJobObject. Wait for
     # the actual stopped owner and original process, never mistake intent for execution.
@@ -271,20 +276,21 @@ try {
           break
         }
       }
-      if ($suspended -and -not $delegatedRunning -and $members.Count -gt 0 -and $service.State -eq 'Running' -and
-          $service.ProcessId -gt 0) {
-        $serviceHandle = [LifecycleInstallerFault]::Open([uint32]$service.ProcessId, $false)
+      if ($suspended -and -not $delegatedRunning -and $members.Count -gt 0 -and $runtimeProcess.State -eq 'Running' -and
+          $runtimeProcess.ProcessId -gt 0) {
+        $runtimeHandle = [LifecycleInstallerFault]::Open([uint32]$runtimeProcess.ProcessId, $false)
         try {
-          if ([LifecycleInstallerFault]::Image($serviceHandle) -ine (Join-Path $InstallDir 'FDSensor.exe') -or
-              [LifecycleInstallerFault]::Member($serviceHandle, $job)) { throw 'SCM runtime identity or external ownership mismatch' }
+          if ([LifecycleInstallerFault]::Image($runtimeHandle) -ine (Join-Path $InstallDir 'FDSensor.exe') -or
+              [LifecycleInstallerFault]::Member($runtimeHandle, $job)) { throw 'delegated runtime identity or external ownership mismatch' }
           if (-not $delegatedRunning -and $members.Count -gt 0) {
-            $receipt.delegated_service = [ordered]@{ at=[DateTime]::UtcNow.ToString('o'); pid=$service.ProcessId;
-              created_filetime=[LifecycleInstallerFault]::Created($serviceHandle); outside_installer_job=$true }
-            $delegatedRuntime = $serviceHandle
-            $serviceHandle = [IntPtr]::Zero
+            $receipt.delegated_runtime = [ordered]@{ at=[DateTime]::UtcNow.ToString('o'); pid=$runtimeProcess.ProcessId;
+              created_filetime=[LifecycleInstallerFault]::Created($runtimeHandle); outside_installer_job=$true }
+            if($RuntimeMode -ceq 'service') { $receipt.delegated_service=$receipt.delegated_runtime }
+            $delegatedRuntime = $runtimeHandle
+            $runtimeHandle = [IntPtr]::Zero
             $delegatedRunning = $true
           }
-        } finally { if ($serviceHandle -ne [IntPtr]::Zero) { [void][LifecycleInstallerFault]::CloseHandle($serviceHandle) } }
+        } finally { if ($runtimeHandle -ne [IntPtr]::Zero) { [void][LifecycleInstallerFault]::CloseHandle($runtimeHandle) } }
       }
     }
     Start-Sleep -Milliseconds 100
@@ -298,21 +304,24 @@ try {
       $report.operation -cne 'repair' -or $report.error_code -cne 'INSTALL_TIMEOUT' -or
       $report.failed_stage -cne 'full_installer_upgrade' -or $report.status -cne 'failed_rolled_back' -or
       $report.rollback -cne 'succeeded' -or $report.installed_sha256 -cne $InputBinding.binary_sha256 -or
-      $journal.installer_quiesced -ne $true -or @([LifecycleInstallerFault]::Pids($job)).Count -ne 0) {
+      $journal.resolved_deployment_mode -cne $RuntimeMode -or $journal.installer_quiesced -ne $true -or @([LifecycleInstallerFault]::Pids($job)).Count -ne 0) {
     throw 'Actual installer hang did not produce the required timeout, zero-writer receipt and successful rollback'
   }
   Assert-RecoveryFiles $files
   $afterOwner = Get-RecoveryOwnerSnapshot | ConvertTo-Json -Depth 8 -Compress
-  if ($beforeOwner -cne $afterOwner) { throw 'Recovery changed service configuration or Inno uninstall registration' }
-  $service = Get-CimInstance Win32_Service -Filter ("Name='{0}'" -f $InputBinding.service_name)
-  if ($service.State -cne 'Running' -or -not [LifecycleInstallerFault]::Exited($delegatedRuntime)) {
-    throw 'Recovery did not stop the installer-created SCM runtime and start a healthy recovered owner'
+  if ($beforeOwner -cne $afterOwner) { throw 'Recovery changed runtime owner identity or Inno uninstall registration' }
+  $runtimeProcess = Get-LifecycleRuntimeProcess
+  if ($runtimeProcess.State -cne 'Running' -or $runtimeProcess.ProcessId -le 0 -or -not [LifecycleInstallerFault]::Exited($delegatedRuntime)) {
+    throw 'Recovery did not stop the installer-created runtime and start a healthy recovered owner'
   }
   $receipt.first_failure = [ordered]@{ error_code=$report.error_code; stage=$report.failed_stage; first_error=$report.first_error }
   $receipt.recovery = [ordered]@{ status=$report.status; rollback=$report.rollback; installed_sha256=$report.installed_sha256 }
   $receipt.installer_evidence = Copy-RecoveryInstallerEvidence $report $journal $commandId $stage
   $receipt.status = 'succeeded'; $receipt.owner_after = ($afterOwner | ConvertFrom-Json)
-  $receipt.recovered_service_pid = $service.ProcessId
+  $receipt.recovered_runtime_pid = $runtimeProcess.ProcessId
+  if($RuntimeMode -ceq 'service') {
+    $receipt.recovered_service_pid=$receipt.recovered_runtime_pid
+  }
   $receipt.installer_quiesced = $true
   $passed = $true
 } catch {

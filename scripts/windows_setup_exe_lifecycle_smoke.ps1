@@ -10,6 +10,7 @@ param(
   [string] $Architecture,
   [string] $InstallDir = "C:\edr-agent-setup-lifecycle-smoke",
   [string] $ServiceName = "FDSecurityAgent",
+  [ValidateSet('service','scheduled_task')] [string] $RuntimeMode = 'service',
   [string] $EvidenceDir = "setup-exe-evidence",
   [Parameter(Mandatory = $true)] [string] $UpgradeInput,
   [Parameter(Mandatory = $true)] [string] $BaselineConfigTemplate,
@@ -56,6 +57,9 @@ if ($SignedPublisherValidation) {
   & $bootstrapVerifier -Path $LegacySetupExe -PayloadArchitecture $Architecture
 } elseif ($LegacySetupExe -or $LegacyVersion -or $MigrationInput) {
   throw 'legacy migration inputs require signed publisher validation'
+}
+if ($RuntimeMode -ceq 'scheduled_task' -and -not $SignedPublisherValidation) {
+  throw 'scheduled-task lifecycle requires the explicitly bound signed validation path'
 }
 
 $events = New-Object System.Collections.Generic.List[object]
@@ -116,7 +120,7 @@ function Invoke-Installer([string] $Path, [string] $Stage, [bool] $UpgradeExisti
     # Preserve the supported 673 caller contract: the new installer must derive
     # its local floor even when an old embedded updater sends no new argument.
     ('/DIR="{0}"' -f $InstallDir),
-    '/TASKS="windowsservice"',
+    ('/TASKS="{0}"' -f $(if($RuntimeMode -ceq 'scheduled_task'){'windowsautorun'}else{'windowsservice'})),
     ('/LOG="{0}"' -f $log)
   )
   if ($UpgradeExisting) { $arguments += "/EDR_UPGRADE_EXISTING=1" }
@@ -134,7 +138,7 @@ function Invoke-BaselineRepair([string] $Path, [string] $Stage, [string] $Backup
   $arguments = @(
     "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/SP-",
     ('/DIR="{0}"' -f $InstallDir),
-    '/TASKS="windowsservice"',
+    ('/TASKS="{0}"' -f $(if($RuntimeMode -ceq 'scheduled_task'){'windowsautorun'}else{'windowsservice'})),
     '/EDR_REPAIR_BASELINE=1',
     ('/EDR_REPAIR_BACKUP_DIR="{0}"' -f $BackupDir),
     '/EDR_KEEP_OFFLINE_QUEUE=1', '/EDR_KEEP_EVIDENCE_CACHE=1',
@@ -187,8 +191,12 @@ function Assert-BaselineRepair([string] $SetupPath) {
   $configPath = Join-Path $InstallDir "agent.toml"
   $configHash = (Get-FileHash -LiteralPath $configPath -Algorithm SHA256).Hash
 
-  Stop-Service -Name $ServiceName -Force -ErrorAction SilentlyContinue
-  Get-Process -Name "FDSensor" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+  if ($RuntimeMode -ceq 'scheduled_task') {
+    Stop-ScheduledTask -TaskName $ServiceName -TaskPath '\' -ErrorAction Stop
+  } else {
+    Stop-Service -Name $ServiceName -Force -ErrorAction SilentlyContinue
+  }
+  foreach($process in @(Get-LifecycleAgentProcesses)) { Stop-Process -Id $process.ProcessId -Force -ErrorAction Stop }
   New-BaselineRepairBackup $backupDir
   foreach ($name in @("unins000.exe", "unins000.dat")) {
     Remove-Item -LiteralPath (Join-Path $InstallDir $name) -Force
@@ -251,15 +259,15 @@ function Assert-InstalledRuntime(
   }
   $deadline = (Get-Date).AddSeconds(60)
   do {
-    $service = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
-    $runtime = Get-Process -Name "FDSensor" -ErrorAction SilentlyContinue
-    if ($service -and $service.Status -eq "Running" -and $runtime) { break }
+    $runtime = Get-LifecycleRuntimeProcess
+    if ($runtime.State -ceq 'Running' -and $runtime.ProcessId -gt 0) { break }
     Start-Sleep -Milliseconds 500
   } while ((Get-Date) -lt $deadline)
-  if (-not $service -or $service.Status -ne "Running" -or -not $runtime) {
-    throw "$Stage did not leave the Agent service and process healthy"
+  if ($runtime.State -cne 'Running' -or $runtime.ProcessId -le 0) {
+    throw "$Stage did not leave the expected Agent runtime owner and process healthy"
   }
-  Add-Evidence $Stage "verified" "version=$actualVersion service=running process=running"
+  $null=Get-LifecycleRuntimeOwner
+  Add-Evidence $Stage "verified" "version=$actualVersion mode=$RuntimeMode owner=running process=running"
 }
 function Invoke-UninstallerAndAssertCleanup([string] $Stage) {
   $uninstaller = Join-Path $InstallDir "unins000.exe"
@@ -279,15 +287,16 @@ function Invoke-UninstallerAndAssertCleanup([string] $Stage) {
   $deadline = (Get-Date).AddSeconds(120)
   do {
     $service = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
-    $runtime = Get-Process -Name "FDSensor" -ErrorAction SilentlyContinue
+    $task = Get-ScheduledTask -TaskName $ServiceName -TaskPath '\' -ErrorAction SilentlyContinue
+    $runtime = @(Get-LifecycleAgentProcesses)
     $installEntries = @()
     if (Test-Path -LiteralPath $InstallDir -PathType Container) {
       $installEntries = @(Get-ChildItem -LiteralPath $InstallDir -Force -ErrorAction SilentlyContinue | Select-Object -First 1)
     }
-    if (-not $service -and -not $runtime -and $installEntries.Count -eq 0) { break }
+    if (-not $service -and -not $task -and $runtime.Count -eq 0 -and $installEntries.Count -eq 0) { break }
     Start-Sleep -Seconds 1
   } while ((Get-Date) -lt $deadline)
-  if ($service -or $runtime -or (Test-Path -LiteralPath $InstallDir)) {
+  if ($service -or $task -or $runtime.Count -gt 0 -or (Test-Path -LiteralPath $InstallDir)) {
     $residue = @()
     if (Test-Path -LiteralPath $InstallDir -PathType Container) {
       $residue = @(Get-ChildItem -LiteralPath $InstallDir -Force -Recurse -ErrorAction SilentlyContinue |
@@ -300,12 +309,12 @@ function Invoke-UninstallerAndAssertCleanup([string] $Stage) {
       Write-Host "--- $Stage install directory residue ---"
       $residue | ForEach-Object { Write-Host $_ }
     }
-    if ($service -or $runtime -or $residue.Count -gt 0) {
-      throw "$Stage residue: service=$([bool]$service) process=$([bool]$runtime) install_dir=$([bool](Test-Path -LiteralPath $InstallDir)) entries=$($residue -join '|')"
+    if ($service -or $task -or $runtime.Count -gt 0 -or $residue.Count -gt 0) {
+      throw "$Stage residue: service=$([bool]$service) task=$([bool]$task) process_count=$($runtime.Count) install_dir=$([bool](Test-Path -LiteralPath $InstallDir)) entries=$($residue -join '|')"
     }
     Write-Host "$Stage left an empty install directory; runtime removal is complete and the empty container is non-blocking: $InstallDir"
   }
-  Add-Evidence $Stage "verified" "service_removed=true process_stopped=true product_residue=none"
+  Add-Evidence $Stage "verified" "service_removed=true task_removed=true process_stopped=true product_residue=none"
 }
 
 function Initialize-LifecycleOfflineConfig([string] $TemplatePath) {
@@ -511,7 +520,7 @@ function Invoke-BaselineUpdaterUpgrade($InputBinding) {
     ExpectedSha256 = $InputBinding.binary_sha256; TargetVersion = $TargetVersion
     ExpectedArchitecture = $(if ($Architecture -eq 'amd64') { 'x64' } else { 'arm64' })
     TrustedPublisherThumbprint = $publisher.Thumbprint; TrustedPublisherSubject = $publisher.Subject
-    DeploymentMode = $InputBinding.deployment_mode; ServiceName = $ServiceName
+    DeploymentMode = $(if($RuntimeMode -ceq 'scheduled_task'){'auto'}else{$InputBinding.deployment_mode}); ServiceName = $ServiceName
     CommandId = $commandId; TaskId = $commandId; ArtifactId = "ci-$TargetVersion-$Architecture"
     Operation = 'upgrade'; UpgradeClass = $InputBinding.upgrade_class
     IssuedAtUnixMs = $issued; DeadlineUnixMs = $issued + 900000
@@ -551,6 +560,10 @@ function Invoke-BaselineUpdaterUpgrade($InputBinding) {
     if ($null -eq $process.ExitCode -or $process.ExitCode -ne 0) { throw "old embedded updater failed with exit code $($process.ExitCode)" }
     $report = Get-Content -LiteralPath $reportPath -Raw | ConvertFrom-Json
     Assert-LifecycleUpgradeResult $InputBinding $report
+    if ($RuntimeMode -ceq 'scheduled_task') {
+      $journal=Get-Content -LiteralPath (Join-Path $env:ProgramData ("FDSecurity\state\agent-update-{0}.journal.json" -f $commandId)) -Raw | ConvertFrom-Json
+      if ($journal.resolved_deployment_mode -cne 'scheduled_task') { throw 'auto upgrade did not retain the scheduled-task deployment' }
+    }
     $null = Wait-LifecycleEmbeddedUpdater $TargetVersion $InputBinding.target_updater_sha256
     Add-Evidence 'old-updater-upgrade' 'verified' ("class={0} target_updater_sha256={1} native_runtime_verified=true" -f $InputBinding.upgrade_class, $InputBinding.target_updater_sha256)
   } finally {
@@ -567,10 +580,78 @@ function Invoke-BaselineUpdaterUpgrade($InputBinding) {
   }
 }
 
-function New-LifecyclePreservationSnapshot([string] $Stage) {
+function Get-LifecycleAgentProcesses {
+  $expected=[IO.Path]::GetFullPath((Join-Path $InstallDir 'FDSensor.exe'))
+  return @(Get-CimInstance Win32_Process -Filter "Name='FDSensor.exe'" -ErrorAction Stop | Where-Object {
+    $_.ExecutablePath -and [IO.Path]::GetFullPath($_.ExecutablePath) -ieq $expected
+  })
+}
+
+function Get-LifecycleRuntimeProcess {
   $service=Get-CimInstance Win32_Service -Filter ("Name='{0}'" -f $ServiceName) -ErrorAction Stop
-  if (-not $service -or $service.PathName.IndexOf($InstallDir,[StringComparison]::OrdinalIgnoreCase) -lt 0 -or
+  $agents=@(Get-LifecycleAgentProcesses)
+  if ($agents.Count -gt 1) { throw 'multiple Agent processes own the isolated install directory' }
+  $pidValue=if($agents.Count -eq 1){[uint32]$agents[0].ProcessId}else{0}
+  if ($RuntimeMode -ceq 'scheduled_task') {
+    if ($service) { throw 'scheduled-task validation found an unexpected service owner' }
+    $task=Get-ScheduledTask -TaskName $ServiceName -TaskPath '\' -ErrorAction SilentlyContinue
+    return [pscustomobject]@{State=$(if($task){[string]$task.State}else{'Absent'});ProcessId=$pidValue}
+  }
+  if ($service -and $service.State -ceq 'Running' -and $pidValue -gt 0 -and $service.ProcessId -ne $pidValue) {
+    throw 'service process does not own the isolated install directory'
+  }
+  return [pscustomobject]@{State=$(if($service){[string]$service.State}else{'Absent'});ProcessId=$pidValue}
+}
+
+function Get-LifecycleTaskDefinition {
+  $scheduler=New-Object -ComObject 'Schedule.Service'
+  $scheduler.Connect()
+  $registered=$scheduler.GetFolder('\').GetTask($ServiceName)
+  return [pscustomobject]@{xml=[string]$registered.Xml;sddl=[string]$registered.GetSecurityDescriptor(7)}
+}
+
+function Get-LifecycleRuntimeOwner {
+  $service=Get-CimInstance Win32_Service -Filter ("Name='{0}'" -f $ServiceName) -ErrorAction Stop
+  if ($RuntimeMode -ceq 'scheduled_task') {
+    if ($service) { throw 'scheduled-task validation found an unexpected service owner' }
+    $task=Get-ScheduledTask -TaskName $ServiceName -TaskPath '\' -ErrorAction Stop
+    $actions=@($task.Actions)
+    $launcher=Join-Path $InstallDir 'FDSensorTaskLaunch.ps1'
+    $expectedArguments='-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "'+$launcher+'"'
+    if (-not $task -or $task.State -cne 'Running' -or $task.TaskName -cne $ServiceName -or $task.TaskPath -cne '\' -or
+        $task.Principal.UserId -notin @('SYSTEM','NT AUTHORITY\SYSTEM','S-1-5-18') -or
+        [string]$task.Principal.LogonType -cne 'ServiceAccount' -or [string]$task.Principal.RunLevel -cne 'Highest' -or
+        $actions.Count -ne 1 -or $actions[0].Execute -ine (Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe') -or
+        $actions[0].Arguments -cne $expectedArguments -or $actions[0].WorkingDirectory -ine $InstallDir -or
+        -not (Test-Path -LiteralPath $launcher -PathType Leaf)) {
+      throw 'scheduled-task owner, principal or original launcher binding is invalid'
+    }
+    $definition=Get-LifecycleTaskDefinition
+    [xml]$xml=$definition.xml
+    $manager=New-Object Xml.XmlNamespaceManager($xml.NameTable)
+    $manager.AddNamespace('t','http://schemas.microsoft.com/windows/2004/02/mit/task')
+    $triggers=@($xml.SelectNodes('/t:Task/t:Triggers/*',$manager))
+    if ($triggers.Count -ne 1 -or $triggers[0].LocalName -cne 'BootTrigger' -or
+        $xml.SelectSingleNode('/t:Task/t:Settings/t:ExecutionTimeLimit',$manager).InnerText -cne 'PT0S' -or
+        $xml.SelectSingleNode('/t:Task/t:Settings/t:MultipleInstancesPolicy',$manager).InnerText -cne 'IgnoreNew' -or
+        [string]::IsNullOrWhiteSpace($definition.sddl)) {
+      throw 'scheduled-task startup, unlimited lifetime or security definition is invalid'
+    }
+    # Registration time is metadata. All actions, principals, triggers, runtime
+    # settings and the full owner/group/DACL stay in the preservation identity.
+    foreach($date in @($xml.SelectNodes('/t:Task/t:RegistrationInfo/t:Date',$manager))) { [void]$date.ParentNode.RemoveChild($date) }
+    return [ordered]@{mode='scheduled_task';name=$task.TaskName;path=$task.TaskPath;xml=$xml.OuterXml;sddl=$definition.sddl}
+  }
+  if (Get-ScheduledTask -TaskName $ServiceName -TaskPath '\' -ErrorAction SilentlyContinue) {
+    throw 'service validation found an unexpected scheduled-task owner'
+  }
+  if (-not $service -or $service.PathName.IndexOf((Join-Path $InstallDir 'FDSensor.exe'),[StringComparison]::OrdinalIgnoreCase) -lt 0 -or
       $service.State -cne 'Running') { throw 'preservation snapshot requires the running lifecycle service' }
+  return [ordered]@{mode='service';path=$service.PathName;account=$service.StartName;start_mode=$service.StartMode}
+}
+
+function New-LifecyclePreservationSnapshot([string] $Stage) {
+  $owner=Get-LifecycleRuntimeOwner
   $files=@()
   foreach ($name in @('edr_queue.db.signed-lifecycle-preserve','local_evidence_cache.db.signed-lifecycle-preserve')) {
     $path=Join-Path $InstallDir $name
@@ -580,8 +661,8 @@ function New-LifecyclePreservationSnapshot([string] $Stage) {
   }
   $snapshot=[pscustomobject]@{
     config_sha256=(Get-FileHash -LiteralPath (Join-Path $InstallDir 'agent.toml') -Algorithm SHA256).Hash.ToLowerInvariant()
-    deployment_mode='service';service_path=$service.PathName;service_account=$service.StartName;service_start_mode=$service.StartMode
-    markers=$files;scope='Actual configuration and service identity; synthetic queue/evidence marker bytes, not business database readback'
+    deployment_mode=$RuntimeMode;runtime_owner=$owner
+    markers=$files;scope='Actual configuration and runtime owner identity; synthetic queue/evidence marker bytes, not business database readback'
   }
   [IO.File]::WriteAllText((Join-Path $EvidenceDir ($Stage+'-preservation.json')),($snapshot|ConvertTo-Json -Depth 5),[Text.UTF8Encoding]::new($false))
   return $snapshot
@@ -591,17 +672,17 @@ function Assert-LifecyclePreservationSnapshot($Snapshot, [string] $Stage) {
   if ((Get-FileHash -LiteralPath (Join-Path $InstallDir 'agent.toml') -Algorithm SHA256).Hash.ToLowerInvariant() -cne $Snapshot.config_sha256) {
     throw "$Stage changed the original configuration or identity"
   }
-  $service=Get-CimInstance Win32_Service -Filter ("Name='{0}'" -f $ServiceName) -ErrorAction Stop
-  if (-not $service -or $service.State -cne 'Running' -or $service.PathName -cne $Snapshot.service_path -or
-      $service.StartName -cne $Snapshot.service_account -or $service.StartMode -cne $Snapshot.service_start_mode) {
-    throw "$Stage changed the original service deployment identity"
+  $owner=Get-LifecycleRuntimeOwner
+  if ($Snapshot.deployment_mode -cne $RuntimeMode -or
+      ($owner|ConvertTo-Json -Depth 10 -Compress) -cne ($Snapshot.runtime_owner|ConvertTo-Json -Depth 10 -Compress)) {
+    throw "$Stage changed the original $RuntimeMode deployment identity"
   }
   foreach ($item in $Snapshot.markers) {
     if ((Get-FileHash -LiteralPath (Join-Path $InstallDir $item.name) -Algorithm SHA256).Hash.ToLowerInvariant() -cne $item.sha256) {
       throw "$Stage changed the original queue/evidence marker bytes"
     }
   }
-  Add-Evidence $Stage 'preserved' 'original_config=true service_identity=true synthetic_queue_evidence_markers=true business_database_readback=false'
+  Add-Evidence $Stage 'preserved' "original_config=true mode=$RuntimeMode runtime_owner_identity=true synthetic_queue_evidence_markers=true business_database_readback=false"
 }
 
 $status = "failed"
@@ -666,10 +747,10 @@ try {
     $candidateUpdater = Wait-LifecycleEmbeddedUpdater $TargetVersion $upgradeBinding.target_updater_sha256
     $candidatePublisher = Get-LifecycleTrustedPublisher $upgradeBinding
     & (Join-Path $repoRoot 'tests\Invoke-RealInstallerTimeoutRecovery.ps1') -InputBinding $upgradeBinding `
-      -InstallDir $InstallDir -EvidenceDir $EvidenceDir -Updater $candidateUpdater -Publisher $candidatePublisher
+      -InstallDir $InstallDir -EvidenceDir $EvidenceDir -Updater $candidateUpdater -Publisher $candidatePublisher -RuntimeMode $RuntimeMode
     Assert-InstalledRuntime $TargetVersion 'candidate-installer-timeout' $true $true
     if ($SignedPublisherValidation) { Assert-LifecyclePreservationSnapshot $chainSnapshot 'signed-installer-timeout' }
-    Add-Evidence 'candidate-installer-timeout' 'verified' 'original Setup timed out; Job empty; runtime/config/service/uninstall identity restored; queue/evidence marker bytes preserved'
+    Add-Evidence 'candidate-installer-timeout' 'verified' 'original Setup timed out; Job empty; runtime/config/owner/uninstall identity restored; queue/evidence marker bytes preserved'
   }
   Invoke-UninstallerAndAssertCleanup 'uninstall-old-updater-target'
 
@@ -707,6 +788,7 @@ try {
     completed_at = [DateTime]::UtcNow.ToString("o")
     status = $status
     architecture = $Architecture
+    runtime_mode = $RuntimeMode
     baseline_version = $BaselineVersion
     target_version = $TargetVersion
     signed_publisher_validation = [bool]$SignedPublisherValidation

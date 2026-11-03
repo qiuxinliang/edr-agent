@@ -39,6 +39,8 @@ class LifecycleEvidenceTests(unittest.TestCase):
     def test_preserves_complete_relative_tree_and_hash_receipt(self):
         self.fixture()
         files, receipt = evidence.build_bundle(self.workspace, self.destination, self.owner, "success")
+        self.assertEqual(files[0].name, "windows-lifecycle-evidence-123-2-arm64.zip")
+        self.assertNotIn("runtime_mode", receipt["owner"])
         self.assertEqual(receipt["owner"], self.owner)
         self.assertEqual(receipt["job_status"], "success")
         self.assertEqual(receipt["missing_directories"], [])
@@ -67,6 +69,66 @@ class LifecycleEvidenceTests(unittest.TestCase):
         self.assertIn(receipt["archive"]["sha256"], output.getvalue())
         self.assertNotIn("private diagnostic content", output.getvalue())
         self.assertNotIn("agent.toml", output.getvalue())
+
+    def test_runtime_modes_have_distinct_archive_tag_and_receipt_owners(self):
+        self.fixture()
+        names, tags = set(), set()
+        for mode in ("service", "scheduled_task"):
+            with self.subTest(mode=mode):
+                suffix = mode.replace("_", "-")
+                owner = evidence.identity("123", "2", "a" * 40, "win_3.2.621", "arm64", runtime_mode=mode)
+                publisher = Mock(return_value={"id": 789})
+                with contextlib.redirect_stdout(io.StringIO()):
+                    _, receipt = evidence.publish_evidence(self.workspace, self.base / mode, owner, "success", publisher)
+                tag, published_owner, files = publisher.call_args.args
+                self.assertEqual(tag, f"edr-evidence-123-2-arm64-{suffix}")
+                self.assertEqual(published_owner, receipt["owner"])
+                self.assertEqual(receipt["owner"]["runtime_mode"], mode)
+                self.assertEqual(files[0].name, f"windows-lifecycle-evidence-123-2-arm64-{suffix}.zip")
+                self.assertEqual(files[1].name, f"windows-lifecycle-evidence-123-2-arm64-{suffix}.json")
+                self.assertEqual(json.loads(files[1].read_text())["owner"], owner)
+                self.assertEqual(publisher.call_args.kwargs, {"prerelease": False})
+                names.add(files[0].name); tags.add(tag)
+        self.assertEqual(len(names), 2)
+        self.assertEqual(len(tags), 2)
+
+    def test_mode_names_pass_real_private_transport_validation(self):
+        import usb_release_transport as transport
+        self.fixture()
+        for mode in ("service", "scheduled_task"):
+            with self.subTest(mode=mode):
+                owner = evidence.identity("123", "2", "a" * 40, "win_3.2.621", "arm64", runtime_mode=mode)
+                # Exercise the actual transport's tag validation, but stop at
+                # its first external I/O. No GitHub write is performed.
+                with patch.object(transport, "api", side_effect=RuntimeError("offline private repository probe")) as api:
+                    with self.assertRaisesRegex(RuntimeError, "offline private repository probe"):
+                        evidence.publish_evidence(self.workspace, self.base / mode, owner, "success", transport.publish_files)
+                    api.assert_called_once_with("")
+
+    def test_invalid_runtime_mode_rejected_before_collection(self):
+        for mode in ("", "auto", "../outside", "SERVICE", 0, None):
+            with self.subTest(mode=mode):
+                if mode is not None:
+                    with self.assertRaisesRegex(ValueError, "runtime mode"):
+                        evidence.identity("123", "2", "a" * 40, "win_3.2.621", "arm64", runtime_mode=mode)
+                with self.assertRaisesRegex(ValueError, "runtime mode"):
+                    evidence.build_bundle(self.workspace, self.destination, dict(self.owner, runtime_mode=mode), "failure")
+                self.assertFalse(self.destination.exists())
+
+    def test_cli_runtime_mode_reaches_evidence_owner(self):
+        environment = dict(GH_TOKEN="fixture-token", GITHUB_RUN_ID="123", GITHUB_RUN_ATTEMPT="2",
+                           GITHUB_SHA="a" * 40, GITHUB_REPOSITORY=evidence.SOURCE)
+        base = ["upload_windows_lifecycle_evidence.py", "--target-tag", "win_3.2.621", "--arch", "arm64",
+                "--job-status", "failure", "--output-dir", str(self.destination)]
+        for mode in (None, "service", "scheduled_task"):
+            argv = base + (["--runtime-mode", mode] if mode else [])
+            with self.subTest(mode=mode), patch.object(sys, "argv", argv), patch.dict(os.environ, environment), patch.object(evidence, "publish_evidence") as publish:
+                evidence.main()
+                owner = publish.call_args.args[2]
+                if mode is None:
+                    self.assertNotIn("runtime_mode", owner)
+                else:
+                    self.assertEqual(owner["runtime_mode"], mode)
 
     def test_upload_failure_does_not_silently_discard_local_evidence(self):
         self.fixture()

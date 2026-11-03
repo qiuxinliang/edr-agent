@@ -39,7 +39,7 @@ try {
     Check ($functions.Count -eq 1) ('unique owner '+$name)
     . ([scriptblock]::Create($functions[0].Extent.Text))
   }
-  $BaselineVersion='3.2.673'; $TargetVersion='3.2.725'; $Architecture='arm64'; $ServiceName='FDSecurityAgent'
+  $BaselineVersion='3.2.673'; $TargetVersion='3.2.725'; $Architecture='arm64'; $ServiceName='FDSecurityAgent';$RuntimeMode='service'
   $InstallDir=Join-Path $root 'installed'; $EvidenceDir=Join-Path $root 'evidence'
   $env:ProgramData=Join-Path $root 'program-data'
   foreach($path in @($InstallDir,$EvidenceDir,(Join-Path $env:ProgramData 'FDSecurity\logs'))) {
@@ -286,6 +286,11 @@ Copy-Item -LiteralPath (Join-Path (Split-Path $StagedBinary -Parent) 'new-update
 $report=@{status='succeeded';target_version=$TargetVersion;upgrade_class=$UpgradeClass;operation=$Operation;
  expected_sha256=$ExpectedSha256;installed_sha256=$ExpectedSha256}
 [IO.File]::WriteAllText((Join-Path $env:ProgramData ("FDSecurity\logs\agent-update-{0}-report.json" -f $CommandId)),($report|ConvertTo-Json))
+if($DeploymentMode -ceq 'auto') {
+  $state=Join-Path $env:ProgramData 'FDSecurity\state'
+  [IO.Directory]::CreateDirectory($state)|Out-Null
+  [IO.File]::WriteAllText((Join-Path $state ("agent-update-{0}.journal.json" -f $CommandId)),(@{resolved_deployment_mode='scheduled_task'}|ConvertTo-Json))
+}
 [IO.File]::WriteAllText((Join-Path (Split-Path $StagedBinary -Parent) 'actual-arguments.json'),(@{class=$UpgradeClass;
  mode=$DeploymentMode;floor=$MinFreeBytes;health_ms=$HealthObserveMs;package=$RuntimeManifest;
  package_sha=$RuntimeManifestSha256;caller=$PSCommandPath;staged_binary=$StagedBinary;staged_sha=$ExpectedSha256}|ConvertTo-Json))
@@ -340,6 +345,15 @@ exit 0
   $copyReceipt=Get-Content -LiteralPath (Join-Path $root 'robocopy-return.json') -Raw|ConvertFrom-Json
   Check ($copyReceipt.native_exit -eq 1 -and $copyReceipt.normal_return -eq $true) 'real robocopy 1 plus normal script return accepted'
   Write-Output ("real robocopy native_exit={0}; successful script return and strict release report passed" -f $copyReceipt.native_exit)
+  $RuntimeMode='scheduled_task'
+  Invoke-BaselineUpdaterUpgrade $inputBinding
+  $actual=Get-Content -LiteralPath (Join-Path $root 'actual-arguments.json') -Raw|ConvertFrom-Json
+  Check ($actual.mode -ceq 'auto' -and $inputBinding.deployment_mode -ceq 'service' -and $actual.caller -ceq $oldPath) 'original updater receives auto while immutable manifest retains service packaging'
+  $journal=Get-Content -LiteralPath (Join-Path $EvidenceDir 'old-updater-journal.json') -Raw|ConvertFrom-Json
+  Check ($journal.resolved_deployment_mode -ceq 'scheduled_task') 'resolved task mode is retained as evidence'
+  Put $oldPath ($oldScript.Replace("resolved_deployment_mode='scheduled_task'","resolved_deployment_mode='service'"));$inputBinding.baseline_updater_sha256=Hash $oldPath
+  Must-Fail {Invoke-BaselineUpdaterUpgrade $inputBinding} '*auto upgrade did not retain the scheduled-task deployment*'
+  Put $oldPath $oldScript;$inputBinding.baseline_updater_sha256=Hash $oldPath;$RuntimeMode='service'
   function Copy-Item {
     [CmdletBinding()]param([string]$LiteralPath,[string]$Destination)
     Microsoft.PowerShell.Management\Copy-Item -LiteralPath $LiteralPath -Destination $Destination -ErrorAction Stop
@@ -395,9 +409,9 @@ exit 0
   Check ((Get-Content -LiteralPath (Join-Path $EvidenceDir 'old-updater.stderr.log') -Raw) -match 'synthetic_updater_exception') 'updater exception retained'
   Put $oldPath ($oldScript.Replace("status='succeeded'","status='failed_rolled_back'")); $inputBinding.baseline_updater_sha256=Hash $oldPath
   Must-Fail {Invoke-BaselineUpdaterUpgrade $inputBinding} '*did not report*'
-  Check (@($script:events|Where-Object{$_.status -eq 'verified'}).Count -eq 3) 'failures never counted as passed'
+  Check (@($script:events|Where-Object{$_.status -eq 'verified'}).Count -eq 4) 'failures never counted as passed'
   Write-Output ("module environment: foreign counterfactual failed={0}; corrected child hash/ScheduledTasks and parent restoration passed" -f $counterfactualFailure)
-  Write-Output 'old updater lifecycle orchestration: offline configuration preservation and 5 rejection cases; 3 class executions, consumed staging preservation, signed publisher binding and 20 negative controls passed'
+  Write-Output 'old updater lifecycle orchestration: offline configuration preservation and 5 rejection cases; 3 service class executions plus auto task selection and resolved-mode rejection, consumed staging preservation, signed publisher binding and 20 negative controls passed'
 } finally {
   [Environment]::SetEnvironmentVariable('PSModulePath',$savedModulePath,[EnvironmentVariableTarget]::Process)
   $env:ProgramData=$savedProgramData

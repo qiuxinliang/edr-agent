@@ -22,7 +22,7 @@ try {
   $tokens=$null;$errors=$null
   $ast=[Management.Automation.Language.Parser]::ParseFile((Join-Path $RepoRoot 'scripts/windows_setup_exe_lifecycle_smoke.ps1'),[ref]$tokens,[ref]$errors)
   if ($errors.Count -ne 0) { throw 'lifecycle script parse failed' }
-  foreach ($name in @('Get-LifecycleTrustedPublisher','Assert-LifecyclePublisherProtocol','New-LifecyclePreservationSnapshot','Assert-LifecyclePreservationSnapshot')) {
+  foreach ($name in @('Get-LifecycleTrustedPublisher','Assert-LifecyclePublisherProtocol','Get-LifecycleRuntimeOwner','New-LifecyclePreservationSnapshot','Assert-LifecyclePreservationSnapshot')) {
     $owners=@($ast.FindAll({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq $name},$true))
     if ($owners.Count -ne 1) { throw ('missing unique production test owner '+$name) }
     . ([scriptblock]::Create($owners[0].Extent.Text))
@@ -103,11 +103,12 @@ try {
   $binding.publisher_subject='legacy mismatch'
   Reject 'legacy_display_mismatch_stays_rejected' '*publisher differs*' { Get-LifecycleTrustedPublisher $binding|Out-Null }
 
-  $InstallDir=Join-Path $root 'installed';$EvidenceDir=Join-Path $root 'evidence';$ServiceName='FixtureService'
+  $InstallDir=Join-Path $root 'installed';$EvidenceDir=Join-Path $root 'evidence';$ServiceName='FixtureService';$RuntimeMode='service'
   [IO.Directory]::CreateDirectory($InstallDir)|Out-Null;[IO.Directory]::CreateDirectory($EvidenceDir)|Out-Null
   Put (Join-Path $InstallDir 'agent.toml') 'private fixture configuration is never emitted'
   $script:service=[pscustomobject]@{State='Running';PathName=(Join-Path $InstallDir 'FDSensor.exe');StartName='LocalSystem';StartMode='Auto'}
   function Get-CimInstance { [CmdletBinding()]param($ClassName,[string]$Filter) return $script:service }
+  function Get-ScheduledTask { [CmdletBinding()]param([string]$TaskName,[string]$TaskPath) return $null }
   function Add-Evidence { param($Stage,$Status,$Detail) }
   $snapshot=New-LifecyclePreservationSnapshot 'fixture'
   Pass 'actual_config_and_synthetic_marker_preservation' { Assert-LifecyclePreservationSnapshot $snapshot 'fixture' }
@@ -122,7 +123,7 @@ try {
   [ordered]@{status='succeeded';case_count=$cases.Count;cases=$cases.ToArray();scope='Actual lifecycle owners; Authenticode and service I/O isolated; no installed Agent or trust store touched'}|ConvertTo-Json -Depth 5
 } finally {
   if ($certificate) { $certificate.Dispose() }
-  foreach ($name in @('Get-AuthenticodeSignature','Get-CimInstance')) {
+  foreach ($name in @('Get-AuthenticodeSignature','Get-CimInstance','Get-ScheduledTask')) {
     if (Test-Path -LiteralPath ('Function:'+ $name)) { Remove-Item -LiteralPath ('Function:'+ $name) }
   }
   Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction Stop
