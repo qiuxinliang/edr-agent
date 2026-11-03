@@ -27,9 +27,9 @@ def main():
         if remaining<=0:raise TimeoutError('cross-version acceptance deadline')
         policy=['16','24','72'] if kind=='cache' else ['16','72','72']
         result=subprocess.run([str(exe),action,str(db),epoch_arg,str(generation),tenant,endpoint,*policy],
-                              capture_output=True,text=True,timeout=min(30,remaining))
-        (a.output/(label+'.stdout.json')).write_text(result.stdout)
-        (a.output/(label+'.stderr.txt')).write_text(result.stderr)
+                              capture_output=True,text=True,encoding='utf-8',timeout=min(30,remaining))
+        (a.output/(label+'.stdout.json')).write_text(result.stdout,encoding='utf-8')
+        (a.output/(label+'.stderr.txt')).write_text(result.stderr,encoding='utf-8')
         if expect_failure:
             if result.returncode==0 or result.stdout.strip():
                 raise ValueError('negative produced success: '+label)
