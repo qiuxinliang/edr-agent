@@ -19,6 +19,7 @@ function Reject([string]$Name,[string]$Expected,[scriptblock]$Action) {
   $cases.Add($Name)
 }
 try {
+  . ([scriptblock]::Create([IO.File]::ReadAllText((Join-Path $RepoRoot 'scripts/Start-LifecycleWindowsPowerShell.ps1'))))
   $tokens=$null;$errors=$null
   $ast=[Management.Automation.Language.Parser]::ParseFile((Join-Path $RepoRoot 'scripts/windows_setup_exe_lifecycle_smoke.ps1'),[ref]$tokens,[ref]$errors)
   if ($errors.Count -ne 0) { throw 'lifecycle script parse failed' }
