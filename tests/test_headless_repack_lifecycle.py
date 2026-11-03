@@ -295,6 +295,98 @@ class SourceAdmission(unittest.TestCase):
             m.public_source(self.owner['tag'])
 
 
+class Published723Admission(unittest.TestCase):
+    """Original published baseline metadata; this branch is not generally trusted."""
+
+    def setUp(self):
+        self.owner = dict(repository=m.PUBLIC, run_id='40491903517', tag='win_3.2.723',
+                          commit='b51bc3d825e6d5666535463b34eb708201e6fda7', mode='unsigned')
+        self.release = dict(id=425330868, tag_name=self.owner['tag'],
+                            target_commitish=self.owner['commit'], draft=False, prerelease=True)
+        self.run = dict(id=40491903517, run_attempt=2, head_sha=self.owner['commit'],
+                        repository={'full_name': m.PUBLIC}, head_repository={'full_name': m.PUBLIC},
+                        path='.github/workflows/edr-agent-client-release.yml',
+                        status='completed', conclusion='success', event='workflow_dispatch',
+                        head_branch='codex/cache-parent-ownership')
+        self.jobs = [dict(name='Build Windows ' + arch + ' (native)', status='completed',
+                          conclusion='success', run_attempt=2) for arch in m.ARCHES]
+
+    def check(self, **options):
+        self.release['body'] = '<!-- edr-release-source:' + json.dumps(self.owner) + ' -->'
+        if options.get('validation_draft'):
+            self.release['body'] += ('<!-- edr-release-validation-only:true -->'
+                                     '<!-- edr-release-package-scope:headless -->')
+        return m.validate_public(self.release, self.run, self.jobs, self.owner['tag'],
+                                 self.owner['commit'], self.owner['run_id'], **options)
+
+    def test_exact_published_723_source_is_admitted(self):
+        self.assertEqual(self.check(), self.owner)
+
+    def test_historical_exception_rejects_each_coherent_identity_change(self):
+        # Change duplicated fields together so the ordinary provenance checks
+        # still agree. The historical source boundary itself must reject them.
+        for field in ('release_id', 'tag', 'commit', 'run_id', 'attempt', 'branch', 'event'):
+            with self.subTest(field=field):
+                self.setUp()
+                if field == 'release_id':
+                    self.release['id'] += 1
+                elif field == 'tag':
+                    self.owner['tag'] = self.release['tag_name'] = 'win_3.2.724'
+                elif field == 'commit':
+                    self.owner['commit'] = self.release['target_commitish'] = self.run['head_sha'] = 'f' * 40
+                elif field == 'run_id':
+                    self.owner['run_id'] = '40491903518'
+                    self.run['id'] = 40491903518
+                elif field == 'attempt':
+                    self.run['run_attempt'] = 3
+                    for job in self.jobs:
+                        job['run_attempt'] = 3
+                elif field == 'branch':
+                    self.run['head_branch'] = 'codex/cache-parent-ownership-other'
+                else:
+                    self.run['event'] = 'push'
+                with self.assertRaisesRegex(ValueError, 'Untrusted published source event/branch'):
+                    self.check()
+
+    def test_published_723_exception_never_admits_validation_draft(self):
+        self.release['draft'] = True
+        with self.assertRaisesRegex(ValueError, 'identity/success mismatch'):
+            self.check()
+        with self.assertRaisesRegex(ValueError, 'Untrusted published source event/branch'):
+            self.check(validation_draft=True, source_release_id='425330868')
+
+    def test_published_723_still_requires_successful_run_and_both_native_jobs(self):
+        self.run['conclusion'] = 'failure'
+        with self.assertRaisesRegex(ValueError, 'identity/success mismatch'):
+            self.check()
+        self.run['conclusion'] = 'success'
+        for job in self.jobs:
+            with self.subTest(job=job['name']):
+                job['conclusion'] = 'failure'
+                with self.assertRaisesRegex(ValueError, 'successful native build'):
+                    self.check()
+                job['conclusion'] = 'success'
+
+    def test_published_723_still_checks_tag_reference_and_official_asset_hash(self):
+        self.check()
+        item = asset('edr-agent-win_3.2.723-windows-amd64-exe.zip')
+        responses = [self.release, self.run, {'jobs': self.jobs},
+                     {'object': {'type': 'commit', 'sha': self.owner['commit']}}, [item]]
+        with mock.patch.object(m, 'api', side_effect=responses) as api:
+            result = m.public_source(self.owner['tag'])
+        self.assertEqual(result['owner'], self.owner)
+        self.assertEqual(result['attempt'], '2')
+        self.assertEqual(result['assets'][item['name']], item)
+        self.assertIn(mock.call(m.PUBLIC, 'git/ref/tags/win_3.2.723'), api.call_args_list)
+        responses[3] = {'object': {'type': 'commit', 'sha': 'f' * 40}}
+        with mock.patch.object(m, 'api', side_effect=responses), self.assertRaisesRegex(ValueError, 'tag moved'):
+            m.public_source(self.owner['tag'])
+        responses[3] = {'object': {'type': 'commit', 'sha': self.owner['commit']}}
+        item['digest'] = None
+        with mock.patch.object(m, 'api', side_effect=responses), self.assertRaisesRegex(ValueError, 'SHA256 required'):
+            m.public_source(self.owner['tag'])
+
+
 class TransferAdmission(unittest.TestCase):
     def setUp(self):
         self.args, self.source, self.owner, self.release, self.run, self.receipt, self.assets = transfer_fixture()

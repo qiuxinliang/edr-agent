@@ -24,6 +24,11 @@ PUBLIC = 'qiuxinliang/edr-agent'
 PRIVATE = 'qiuxinliang/edr-agent-signing'
 BRANCHES = {'main', 'codex/release-workflow-convergence', 'codex/ic3-p0-deployment', 'codex/rtq-process-batches',
             'codex/rtq-result-delivery-pressure', 'codex/upgrade-installer-stability'}
+# The installed 723 baseline was published from this exact successful run.
+# Admit that immutable historical release, without trusting future branch builds.
+PUBLISHED_723_SOURCE = ('win_3.2.723', 425330868,
+                        'b51bc3d825e6d5666535463b34eb708201e6fda7', '40491903517',
+                        '2', 'codex/cache-parent-ownership')
 ARCHES = {'amd64': 0x8664, 'arm64': 0xAA64}
 NATIVE = {'FDSensor.exe', 'FDSecurityInstallerWorker.exe', 'uninstall.exe',
           'collector/forensic_collector_builtin.exe'}
@@ -145,8 +150,12 @@ def validate_public(release, run, run_jobs, tag, commit=None, run_id=None,
             or run.get('status') != 'completed' or run.get('conclusion') != 'success'
             or not re.fullmatch(r'[1-9][0-9]*', str(run.get('run_attempt', '')))):
         raise ValueError('Published unsigned source identity/success mismatch')
+    historical_baseline = (not validation_draft and
+        (tag, release.get('id'), owner['commit'], owner['run_id'],
+         str(run['run_attempt']), run.get('head_branch')) == PUBLISHED_723_SOURCE)
     if not ((run.get('event') == 'push' and run.get('head_branch') == tag)
-            or (run.get('event') == 'workflow_dispatch' and run.get('head_branch') in BRANCHES)):
+            or (run.get('event') == 'workflow_dispatch' and
+                (run.get('head_branch') in BRANCHES or historical_baseline))):
         raise ValueError('Untrusted published source event/branch')
     for arch in ARCHES:
         matches = [job for job in run_jobs if job.get('name', '').startswith(f'Build Windows {arch} (')]
