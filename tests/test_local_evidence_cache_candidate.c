@@ -2641,10 +2641,10 @@ static void test_capacity_success_does_not_throttle_next_reclaim(void) {
     rs_entry_begin(RS_ENTRY_INITIAL);
 #endif
     edr_local_evidence_cache_record_behavior(&candidate);
+    edr_local_evidence_cache_get_status(&after);
 #ifdef EDR_RETENTION_SYNC_ATTRIBUTION
     rs_entry_end();
 #endif
-    edr_local_evidence_cache_get_status(&after);
     /* An admission may yield after its work budget. Existing bounded failure
      * backoff and later maintenance must still converge, without fake ACKs.
      * Allow one turn per fixture group plus the bounded reclamation drain;
@@ -2664,10 +2664,10 @@ static void test_capacity_success_does_not_throttle_next_reclaim(void) {
       rs_entry_end(); rs_entry_begin(RS_ENTRY_RETRY);
 #endif
       edr_local_evidence_cache_record_behavior(&candidate);
+      edr_local_evidence_cache_get_status(&after);
 #ifdef EDR_RETENTION_SYNC_ATTRIBUTION
       rs_entry_end();
 #endif
-      edr_local_evidence_cache_get_status(&after);
       uint64_t bytes=after.db_bytes+after.wal_bytes;
       if(after.retention_groups_retired>retired_seen || bytes<best_bytes) stalled=0;
       else ++stalled;
@@ -7969,7 +7969,13 @@ static int bench_write(sqlite3_file *f,const void *b,int n,sqlite3_int64 o) {
 #endif
   return result;
 }
-static int bench_truncate(sqlite3_file *f,sqlite3_int64 n) { return BENCH_FILE(f)->pMethods->xTruncate(BENCH_FILE(f),n); }
+static int bench_truncate(sqlite3_file *f,sqlite3_int64 n) {
+  int result=BENCH_FILE(f)->pMethods->xTruncate(BENCH_FILE(f),n);
+#ifdef EDR_RETENTION_SYNC_ATTRIBUTION
+  rr_truncate(((RetentionBenchFile *)f)->file_kind,n,result);
+#endif
+  return result;
+}
 static int bench_sync(sqlite3_file *f,int flags) {
 #ifdef EDR_RETENTION_SYNC_ATTRIBUTION
   uint64_t previous_ticks=retention_delegate_timing[2].ticks;
