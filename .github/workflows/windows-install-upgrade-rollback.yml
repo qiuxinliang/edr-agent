@@ -1049,6 +1049,8 @@ jobs:
           & ([scriptblock]::Create([IO.File]::ReadAllText((Join-Path $PWD 'tests/test_windows_lifecycle_runtime_mode.ps1')))) -RepoRoot $PWD
           & ([scriptblock]::Create([IO.File]::ReadAllText((Join-Path $PWD 'tests/test_windows_lifecycle_storage.ps1')))) -RepoRoot $PWD
           & ([scriptblock]::Create([IO.File]::ReadAllText((Join-Path $PWD 'tests/test_windows_lifecycle_first_hop.ps1')))) -RepoRoot $PWD
+          & (Get-Command pwsh -ErrorAction Stop).Source -NoProfile -NonInteractive -File (Join-Path $PWD 'tests/test_windows_lifecycle_runtime_mode.ps1') -RepoRoot $PWD
+          if($LASTEXITCODE -ne 0){throw 'Lifecycle runtime boundaries failed in the PowerShell 7 harness host'}
       - name: Admit both immutable signed candidates and original legacy package
         timeout-minutes: 25
         shell: pwsh

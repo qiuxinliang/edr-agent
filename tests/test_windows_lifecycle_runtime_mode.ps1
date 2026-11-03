@@ -7,6 +7,7 @@ $ErrorActionPreference='Stop'
 $root=Join-Path ([IO.Path]::GetTempPath()) ('edr-lifecycle-mode-'+[Guid]::NewGuid().ToString('N'))
 [IO.Directory]::CreateDirectory($root)|Out-Null
 $cases=New-Object 'System.Collections.Generic.List[string]'
+$script:missingProcessError=$null
 function Put([string]$Path,[string]$Text) { [IO.File]::WriteAllText($Path,$Text,[Text.UTF8Encoding]::new($false)) }
 function Pass([string]$Name,[scriptblock]$Action) { & $Action; $cases.Add($Name) }
 function Reject([string]$Name,[string]$Expected,[scriptblock]$Action) {
@@ -98,6 +99,18 @@ try {
     }
   }
   $RuntimeMode='service'
+  Pass 'actual_host_missing_process_error_record_is_observable' {
+    try {Microsoft.PowerShell.Management\Get-Process -Id 2147483647 -ErrorAction Stop|Out-Null} catch {
+      $chain=@();$cause=$_.Exception
+      for($depth=0;$cause -and $depth -lt 8;$depth++) {
+        $chain+=@([ordered]@{type=$cause.GetType().FullName;native_error_code=$(if($cause -is [ComponentModel.Win32Exception]){$cause.NativeErrorCode}else{$null})})
+        $cause=$cause.InnerException
+      }
+      $script:missingProcessError=[ordered]@{powershell_version=$PSVersionTable.PSVersion.ToString();
+        type=$_.Exception.GetType().FullName;error_id=$_.FullyQualifiedErrorId;category=[string]$_.CategoryInfo.Category;exception_chain=$chain}
+    }
+    if(-not $script:missingProcessError -or $script:missingProcessError.category -cne 'ObjectNotFound'){throw 'native missing process error was not observed'}
+  }
   Reject 'service_with_task_owner' '*unexpected scheduled-task owner*' {Get-LifecycleRuntimeOwner|Out-Null}
   $taskFixture=$script:task;$script:task=$null
   Pass 'service_owner_and_runtime_unchanged' {
@@ -288,6 +301,31 @@ public sealed class EdrLifecycleFixtureProcess {
       $script:handleMode=$entry[0];$script:processes=@($runtimeRow)
       Reject ('stop_rejects_'+$entry[0]) $entry[1] {Stop-LifecycleAgentProcesses|Out-Null}
     }
+    foreach($mode in @('access-denied','wrong-missing-error','missing-still-present')) {
+      $script:handleMode=$mode;$script:processes=@($runtimeRow)
+      Pass ('process_open_failure_keeps_original_error_and_bounded_diagnostic_'+$mode) {
+        $failure=$null
+        try {Open-LifecycleAgentProcess $runtimeRow|Out-Null}catch{$failure=$_}
+        if(-not $failure){throw 'process open failure unexpectedly accepted'}
+        $json=[string]$failure.Exception.Data['lifecycle_process_open_failure']
+        $detail=$json|ConvertFrom-Json
+        $isMissing=$mode -ceq 'missing-still-present'
+        if(-not $json -or [Text.Encoding]::UTF8.GetByteCount($json) -gt 8192 -or
+            $detail.schema -cne 'edr.test.lifecycle-process-open-failure.v1' -or $detail.pid -ne $runtimeRow.ProcessId -or
+            $detail.error_id -cne $failure.FullyQualifiedErrorId -or
+            $detail.exception_chain[0].type -cne $failure.Exception.GetType().FullName -or
+            $detail.missing -ne $isMissing -or $detail.cim_recheck_attempted -ne $isMissing -or
+            $detail.cim_recheck_completed -ne $isMissing -or @($detail.exception_chain).Count -gt 8 -or
+            $json -match 'CommandLine|runtime fixture') {throw 'process open diagnostic lost identity or exposed extra fields'}
+        if($isMissing) {
+          if($detail.cim_recheck_count -ne 1 -or @($detail.cim_rows).Count -ne 1 -or
+              $detail.cim_rows[0].pid -ne $runtimeRow.ProcessId -or $detail.cim_rows[0].path -cne $runtimeRow.ExecutablePath){throw 'process recheck evidence changed'}
+          if($failure.Exception.Message -notlike '*2147483647*'){throw 'original missing process error changed'}
+        } elseif($mode -ceq 'access-denied') {
+          if($failure.Exception.Message -cne 'fixture_access_denied' -or @($detail.exception_chain|Where-Object{$_.native_error_code -eq 5}).Count -ne 1){throw 'access denial was masked'}
+        } elseif($failure.Exception.Message -cne 'fixture_wrong_missing_error'){throw 'unknown process error was masked'}
+      }
+    }
   } finally {$updater.Dispose();$script:updaterRow=$null;$script:processes=$savedProcesses}
   $snapshot=New-LifecyclePreservationSnapshot 'task-fixture'
   Pass 'task_config_XML_SDDL_and_marker_preservation' {Assert-LifecyclePreservationSnapshot $snapshot 'fixture'}
@@ -298,7 +336,66 @@ public sealed class EdrLifecycleFixtureProcess {
   $script:definition.xml=$originalXml;$script:definition.sddl+='(A;;FR;;;BA)'
   Reject 'task_SDDL_changed' '*scheduled_task deployment identity*' {Assert-LifecyclePreservationSnapshot $snapshot 'fixture'}
   $script:definition.sddl=$originalSddl
-  [ordered]@{status='succeeded';case_count=$cases.Count;cases=$cases.ToArray();scope='AST harness owners with isolated task, service, process and Setup I/O; no actual Agent or task operation'}|ConvertTo-Json -Depth 5
+  # Actual hosted task definitions from run 41689201966: only a redundant
+  # RegistrationInfo/SecurityDescriptor appeared. These contain isolated test
+  # paths and a disposable host group SID, with no credentials or tenant data.
+  $observedBefore=@'
+<?xml version="1.0" encoding="UTF-16"?><Task version="1.3" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task"><RegistrationInfo><URI>\FDSecurityAgent</URI></RegistrationInfo><Principals><Principal id="Author"><UserId>S-1-5-18</UserId><RunLevel>HighestAvailable</RunLevel></Principal></Principals><Settings><DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries><StopIfGoingOnBatteries>false</StopIfGoingOnBatteries><ExecutionTimeLimit>PT0S</ExecutionTimeLimit><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><RestartOnFailure><Count>3</Count><Interval>PT1M</Interval></RestartOnFailure><StartWhenAvailable>true</StartWhenAvailable><IdleSettings><Duration>PT10M</Duration><WaitTimeout>PT1H</WaitTimeout><StopOnIdleEnd>true</StopOnIdleEnd><RestartOnIdle>false</RestartOnIdle></IdleSettings><UseUnifiedSchedulingEngine>true</UseUnifiedSchedulingEngine></Settings><Triggers><BootTrigger /></Triggers><Actions Context="Author"><Exec><Command>C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe</Command><Arguments>-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "C:\edr-agent-setup-lifecycle-smoke\FDSensorTaskLaunch.ps1"</Arguments><WorkingDirectory>C:\edr-agent-setup-lifecycle-smoke</WorkingDirectory></Exec></Actions></Task>
+'@
+  $observedAfter=@'
+<?xml version="1.0" encoding="UTF-16"?><Task version="1.3" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task"><RegistrationInfo><SecurityDescriptor>O:BAG:S-1-5-21-3977851545-3833041388-3993362562-513D:(A;ID;0x1f019f;;;BA)(A;ID;0x1f019f;;;SY)(A;ID;FA;;;BA)(A;;FR;;;SY)</SecurityDescriptor><URI>\FDSecurityAgent</URI></RegistrationInfo><Principals><Principal id="Author"><UserId>S-1-5-18</UserId><RunLevel>HighestAvailable</RunLevel></Principal></Principals><Settings><DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries><StopIfGoingOnBatteries>false</StopIfGoingOnBatteries><ExecutionTimeLimit>PT0S</ExecutionTimeLimit><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><RestartOnFailure><Count>3</Count><Interval>PT1M</Interval></RestartOnFailure><StartWhenAvailable>true</StartWhenAvailable><IdleSettings><Duration>PT10M</Duration><WaitTimeout>PT1H</WaitTimeout><StopOnIdleEnd>true</StopOnIdleEnd><RestartOnIdle>false</RestartOnIdle></IdleSettings><UseUnifiedSchedulingEngine>true</UseUnifiedSchedulingEngine></Settings><Triggers><BootTrigger /></Triggers><Actions Context="Author"><Exec><Command>C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe</Command><Arguments>-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "C:\edr-agent-setup-lifecycle-smoke\FDSensorTaskLaunch.ps1"</Arguments><WorkingDirectory>C:\edr-agent-setup-lifecycle-smoke</WorkingDirectory></Exec></Actions></Task>
+'@
+  $observedSddl='O:BAG:S-1-5-21-3977851545-3833041388-3993362562-513D:(A;ID;0x1f019f;;;BA)(A;ID;0x1f019f;;;SY)(A;ID;FA;;;BA)(A;;FR;;;SY)'
+  $script:definition.xml=$observedBefore;$script:definition.sddl=$observedSddl
+  $observedOwner=Get-LifecycleRuntimeOwner
+  $observedPreservation=[pscustomobject]@{config_sha256=$snapshot.config_sha256;deployment_mode=$RuntimeMode;runtime_owner=$observedOwner;markers=$snapshot.markers}
+  $observedRecovery=Get-RecoveryOwnerSnapshot|ConvertTo-Json -Depth 8 -Compress
+  $script:definition.xml=$observedAfter
+  Pass 'actual_rollback_inline_security_descriptor_is_redundant' {
+    Assert-LifecyclePreservationSnapshot $observedPreservation 'observed'
+    if((Get-RecoveryOwnerSnapshot|ConvertTo-Json -Depth 8 -Compress) -cne $observedRecovery -or
+        (Get-LifecycleRuntimeOwner).sddl -cne $observedSddl){throw 'actual recovery owner or permissions changed'}
+  }
+  $inline='<SecurityDescriptor>'+$observedSddl+'</SecurityDescriptor>'
+  foreach($bad in @(
+      $observedAfter.Replace($inline,('<SecurityDescriptor>'+$observedSddl+'(A;;FR;;;BA)</SecurityDescriptor>')),
+      $observedAfter.Replace($inline,('<SecurityDescriptor><Value>'+$observedSddl+'</Value></SecurityDescriptor>')),
+      $observedAfter.Replace('<SecurityDescriptor>','<SecurityDescriptor ignored="true">'),
+      $observedAfter.Replace($inline,('<SecurityDescriptor>'+$observedSddl+'<!-- extra --></SecurityDescriptor>')),
+      $observedAfter.Replace($inline,('<SecurityDescriptor><![CDATA['+$observedSddl+']]></SecurityDescriptor>'))
+    )) {
+    $script:definition.xml=$bad
+    Reject 'inline_security_must_be_exact_simple_text' '*inline security descriptor differs from actual permissions or is not simple text*' {Get-LifecycleRuntimeOwner|Out-Null}
+  }
+  $script:definition.xml=$observedAfter.Replace($inline,($inline+$inline))
+  Reject 'inline_security_must_be_unique' '*inline security descriptor must be unique*' {Get-LifecycleRuntimeOwner|Out-Null}
+  $script:definition.xml=$observedAfter.Replace($inline,('<Wrapper>'+$inline+'</Wrapper>'))
+  Reject 'non_direct_inline_security_is_not_removed' '*scheduled_task deployment identity*' {Assert-LifecyclePreservationSnapshot $observedPreservation 'observed'}
+  foreach($changed in @(
+      $observedSddl.Replace('O:BA','O:SY'),
+      $observedSddl.Replace('G:S-1-5-21-3977851545-3833041388-3993362562-513','G:SY'),
+      $observedSddl.Replace('(A;;FR;;;SY)','(A;;FR;;;BA)'),
+      $observedSddl.Replace('(A;;FR;;;SY)','(A;;FA;;;SY)'),
+      $observedSddl.Replace('(A;ID;0x1f019f;;;BA)','(A;;0x1f019f;;;BA)'),
+      $observedSddl.Replace('D:','D:P'),
+      $observedSddl.Replace('D:','D:AI'),
+      $observedSddl.Replace('(A;ID;0x1f019f;;;BA)(A;ID;0x1f019f;;;SY)','(A;ID;0x1f019f;;;SY)(A;ID;0x1f019f;;;BA)')
+    )) {
+    $script:definition.sddl=$changed;$script:definition.xml=$observedAfter.Replace($observedSddl,$changed)
+    Reject 'actual_security_change_still_rejected' '*scheduled_task deployment identity*' {Assert-LifecyclePreservationSnapshot $observedPreservation 'observed'}
+  }
+  $script:definition.sddl=$observedSddl
+  foreach($bad in @($observedAfter.Replace('<Count>3</Count>','<Count>4</Count>'),
+      $observedAfter.Replace('FDSensorTaskLaunch.ps1','OtherTaskLaunch.ps1'),
+      $observedAfter.Replace('<URI>\FDSecurityAgent</URI>','<URI>\OtherTask</URI>'))) {
+    $script:definition.xml=$bad
+    Reject 'remaining_observed_XML_stays_exact' '*scheduled_task deployment identity*' {Assert-LifecyclePreservationSnapshot $observedPreservation 'observed'}
+  }
+  $script:definition.xml=$originalXml;$script:definition.sddl=$originalSddl
+  [ordered]@{status='succeeded';case_count=$cases.Count;cases=$cases.ToArray();missing_process_error=$script:missingProcessError;scope='AST harness owners with isolated task, service, process and Setup I/O; no actual Agent or task operation'}|ConvertTo-Json -Depth 5
+} catch {
+  if($script:missingProcessError){Write-Warning ('native_missing_process_error='+($script:missingProcessError|ConvertTo-Json -Depth 5 -Compress))}
+  throw
 } finally {
   foreach($name in @('Get-CimInstance','Get-ScheduledTask','Get-ItemProperty','Start-Process','Get-Process','Stop-Process')) {
     if(Test-Path -LiteralPath ('Function:'+$name)){Remove-Item -LiteralPath ('Function:'+$name)}

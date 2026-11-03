@@ -7,6 +7,13 @@
 enum { COMPAT_CACHE_QUERY_LIMIT=1000, COMPAT_CACHE_SCAN_BOUND=20100,
        COMPAT_CACHE_NOISE_RECORDS=320 };
 
+/* At most 15 fixed milestones per invocation; stdout remains the receipt.
+ * Flush before owner calls so a terminated child retains its last boundary. */
+static void compat_cache_phase(const char *phase,unsigned generation,unsigned item) {
+  fprintf(stderr,"storage_compat_cache phase=%s generation=%u item=%u\n",phase,generation,item);
+  fflush(stderr);
+}
+
 static cJSON *compat_cache_query_result(const char *out,const EdrBehaviorRecord *expected,int before_write) {
   cJSON *doc=cJSON_Parse(out);compat_need(doc!=NULL,"cache_query_json");
   cJSON *rows=cJSON_GetObjectItemCaseSensitive(doc,"rows");
@@ -62,8 +69,11 @@ static cJSON *compat_cache_facts(const EdrBehaviorRecord *r) {
 }
 int main(int argc,char **argv) {
   compat_args(argc,argv);s_test_real_monotonic=1;
+  compat_cache_phase("starting",0,0);
   /* No fixture clock, identity override or legacy schema switch is enabled. */
+  compat_cache_phase("open_begin",0,0);
   compat_need(edr_local_evidence_cache_open_with_policy(argv[2],compat_max_mb,compat_retention,compat_selected)==0,"cache_owner_open");
+  compat_cache_phase("open_end",0,0);
   edr_pt_cache_init();cJSON *records=cJSON_CreateArray(),*counterfactual=NULL;
   unsigned noise_records_written=0;
   if(strcmp(compat_stage,"read")) {
@@ -74,7 +84,9 @@ int main(int argc,char **argv) {
       EdrBehaviorRecord *r=calloc(1,sizeof(*r));compat_need(r!=NULL,"record_alloc");compat_record(r,generation,item);
       pending[item]=r;
       char filter[256],prior[32768];snprintf(filter,sizeof(filter),"{\"endpoint_id\":\"%s\",\"pid\":%u,\"limit\":%u,\"time_window_s\":3600}",compat_endpoint,r->pid,COMPAT_CACHE_QUERY_LIMIT);
+      compat_cache_phase("query_begin",generation,item);
       compat_need(edr_local_evidence_cache_query_json(filter,prior,sizeof(prior))==0,"pre_write_query");
+      compat_cache_phase("query_end",generation,item);
       cJSON *before=compat_cache_query_result(prior,r,1);cJSON_Delete(before);
     }
     for(unsigned item=0;item<2u;item++) {
@@ -94,10 +106,14 @@ int main(int argc,char **argv) {
         compat_need(edr_local_evidence_cache_record_alert_context(r,&commands)==0,"noise_owner_write");
         noise_records_written++;free(r);
       }
+      compat_cache_phase("reopen_begin",0,0);
       edr_local_evidence_cache_close();
       compat_need(edr_local_evidence_cache_open_with_policy(argv[2],compat_max_mb,compat_retention,compat_selected)==0,"noise_owner_reopen");
+      compat_cache_phase("reopen_end",0,0);
       char filter[256],out[32768];snprintf(filter,sizeof(filter),"{\"endpoint_id\":\"%s\",\"pid\":96010,\"limit\":10,\"time_window_s\":3600}",compat_endpoint);
+      compat_cache_phase("noise_query_begin",0,0);
       compat_need(edr_local_evidence_cache_query_json(filter,out,sizeof(out))==0,"noise_counterfactual_query");
+      compat_cache_phase("noise_query_end",0,0);
       counterfactual=cJSON_Parse(out);compat_need(counterfactual!=NULL,"noise_counterfactual_json");
       cJSON *rows=cJSON_GetObjectItemCaseSensitive(counterfactual,"rows");
       cJSON *scanned=cJSON_GetObjectItemCaseSensitive(counterfactual,"rows_scanned");
@@ -109,7 +125,9 @@ int main(int argc,char **argv) {
     for(unsigned generation=1u;generation<=compat_generations;generation++)for(unsigned item=0;item<2u;item++) {
       EdrBehaviorRecord *r=calloc(1,sizeof(*r));compat_need(r!=NULL,"record_alloc");compat_record(r,generation,item);
       char filter[512],out[32768];snprintf(filter,sizeof(filter),"{\"endpoint_id\":\"%s\",\"pid\":%u,\"process_start_key\":\"%llu\",\"process_creation_filetime_100ns\":\"%llu\",\"limit\":%u,\"time_window_s\":3600}",r->endpoint_id,r->pid,(unsigned long long)r->process_start_key,(unsigned long long)r->process_creation_filetime_100ns,COMPAT_CACHE_QUERY_LIMIT);
+      compat_cache_phase("query_begin",generation,item);
       compat_need(edr_local_evidence_cache_query_json(filter,out,sizeof(out))==0,"cache_query");
+      compat_cache_phase("query_end",generation,item);
       cJSON *doc=compat_cache_query_result(out,r,0);
       char exact_time[80];snprintf(exact_time,sizeof(exact_time),"\"event_time_ns\":%lld,",(long long)r->event_time_ns);
       compat_need(strstr(out,exact_time)!=NULL,"exact_persisted_event_time_ns");
@@ -120,9 +138,13 @@ int main(int argc,char **argv) {
       cJSON_AddItemToArray(records,expected);cJSON_Delete(doc);free(r);
     }
   }
+  compat_cache_phase("status_begin",0,0);
   EdrEvidenceCacheStatus status;edr_local_evidence_cache_get_status(&status);compat_need(status.db_open,"cache_db_open");
+  compat_cache_phase("status_end",0,0);
   if(noise_records_written)compat_need(status.p0_candidate_rows==noise_records_written+2u,"noise_persisted_candidate_count");
+  compat_cache_phase("close_begin",0,0);
   edr_local_evidence_cache_close();edr_pt_cache_shutdown();
+  compat_cache_phase("close_end",0,0);
   cJSON *receipt=compat_receipt("evidence_cache",records);cJSON_AddNumberToObject(receipt,"storage_format",status.storage_format);
   cJSON_AddNumberToObject(receipt,"query_limit",COMPAT_CACHE_QUERY_LIMIT);
   cJSON_AddNumberToObject(receipt,"query_scan_bound",COMPAT_CACHE_SCAN_BOUND);

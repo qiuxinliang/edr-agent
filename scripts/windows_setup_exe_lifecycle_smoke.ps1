@@ -600,11 +600,13 @@ function Get-LifecycleAgentProcesses {
 }
 
 function Open-LifecycleAgentProcess($Snapshot) {
-  $expected=[IO.Path]::GetFullPath((Join-Path $InstallDir 'FDSensor.exe'))
-  if($Snapshot.ProcessId -le 0 -or $Snapshot.CreationDate -isnot [DateTime] -or
-      [string]$Snapshot.ExecutablePath -ine $expected){throw 'invalid scoped Agent process snapshot'}
   $process=$null;$retained=$false
+  $openPhase='scope-validation';$missing=$false;$recheckAttempted=$false;$recheckCompleted=$false;$recheckRows=@()
   try {
+    $expected=[IO.Path]::GetFullPath((Join-Path $InstallDir 'FDSensor.exe'))
+    if($Snapshot.ProcessId -le 0 -or $Snapshot.CreationDate -isnot [DateTime] -or
+        [string]$Snapshot.ExecutablePath -ine $expected){throw 'invalid scoped Agent process snapshot'}
+    $openPhase='process-handle'
     try {
       $process=Get-Process -Id $Snapshot.ProcessId -ErrorAction Stop
       $null=$process.Handle
@@ -614,9 +616,15 @@ function Open-LifecycleAgentProcess($Snapshot) {
       $missing=($cause.GetType().FullName -ceq 'Microsoft.PowerShell.Commands.ProcessCommandException' -and
         $failure.FullyQualifiedErrorId -ceq 'NoProcessFoundForGivenId,Microsoft.PowerShell.Commands.GetProcessCommand') -or
         ($cause -is [ComponentModel.Win32Exception] -and $cause.NativeErrorCode -eq 87)
-      if($missing -and @(Get-CimInstance Win32_Process -Filter ('ProcessId='+$Snapshot.ProcessId) -ErrorAction Stop).Count -eq 0){return $null}
+      if($missing) {
+        $openPhase='missing-cim-recheck';$recheckAttempted=$true
+        $recheckRows=@(Get-CimInstance Win32_Process -Filter ('ProcessId='+$Snapshot.ProcessId) -ErrorAction Stop)
+        $recheckCompleted=$true
+        if($recheckRows.Count -eq 0){return $null}
+      }
       throw
     }
+    $openPhase='process-generation'
     if($process.HasExited){return $null}
     try {
       if($process.Id -ne $Snapshot.ProcessId -or $process.Path -ine $expected -or
@@ -629,6 +637,33 @@ function Open-LifecycleAgentProcess($Snapshot) {
     }
     $retained=$true
     return $process
+  } catch {
+    $openFailure=$_
+    try {
+      $chain=@();$cause=$openFailure.Exception
+      for($depth=0;$cause -and $depth -lt 8;$depth++) {
+        $chain+=@([ordered]@{type=$cause.GetType().FullName;native_error_code=$(if($cause -is [ComponentModel.Win32Exception]){$cause.NativeErrorCode}else{$null})})
+        $cause=$cause.InnerException
+      }
+      $rows=@()
+      foreach($row in @($recheckRows|Select-Object -First 2)) {
+        $path=[string]$row.ExecutablePath
+        $rows+=@([ordered]@{pid=$row.ProcessId;path=$path.Substring(0,[Math]::Min(512,$path.Length));
+          created_utc=$(if($row.CreationDate -is [DateTime]){$row.CreationDate.ToUniversalTime().ToString('o')}else{$null})})
+      }
+      $errorId=[string]$openFailure.FullyQualifiedErrorId
+      $path=[string]$Snapshot.ExecutablePath
+      $detail=[ordered]@{schema='edr.test.lifecycle-process-open-failure.v1';phase=$openPhase;
+        powershell_version=$PSVersionTable.PSVersion.ToString();pid=$Snapshot.ProcessId;
+        path=$path.Substring(0,[Math]::Min(512,$path.Length));
+        created_utc=$(if($Snapshot.CreationDate -is [DateTime]){$Snapshot.CreationDate.ToUniversalTime().ToString('o')}else{$null});
+        error_id=$errorId.Substring(0,[Math]::Min(512,$errorId.Length));category=[string]$openFailure.CategoryInfo.Category;
+        exception_chain=$chain;missing=$missing;cim_recheck_attempted=$recheckAttempted;cim_recheck_completed=$recheckCompleted;
+        cim_recheck_count=$(if($recheckCompleted){$recheckRows.Count}else{$null});cim_rows=$rows}|ConvertTo-Json -Depth 6 -Compress
+      if([Text.Encoding]::UTF8.GetByteCount($detail) -gt 8192){throw 'process open diagnostic exceeds bound'}
+      $openFailure.Exception.Data['lifecycle_process_open_failure']=$detail
+    } catch {Write-Warning ('Process open diagnostic unavailable: '+$_.Exception.GetType().FullName)}
+    throw $openFailure
   } finally {if($process -and -not $retained){$process.Dispose()}}
 }
 
@@ -748,8 +783,19 @@ function Get-LifecycleRuntimeOwner {
         [string]::IsNullOrWhiteSpace($definition.sddl)) {
       throw 'scheduled-task startup, unlimited lifetime or security definition is invalid'
     }
-    # Registration time is metadata. All actions, principals, triggers, runtime
-    # settings and the full owner/group/DACL stay in the preservation identity.
+    # RegisterTask may add this redundant XML representation of the actual ACL.
+    # Remove it only after exact binding; the unmodified SDDL remains identity.
+    $inlineSecurity=@($xml.SelectNodes('/t:Task/t:RegistrationInfo/t:SecurityDescriptor',$manager))
+    if($inlineSecurity.Count -gt 1){throw 'scheduled-task inline security descriptor must be unique'}
+    if($inlineSecurity.Count -eq 1) {
+      $node=$inlineSecurity[0]
+      if($node.Attributes.Count -ne 0 -or $node.ChildNodes.Count -ne 1 -or
+          $node.FirstChild.NodeType -ne [Xml.XmlNodeType]::Text -or
+          $node.InnerText -cne $definition.sddl){throw 'scheduled-task inline security descriptor differs from actual permissions or is not simple text'}
+      [void]$node.ParentNode.RemoveChild($node)
+    }
+    # Registration time is metadata. All remaining XML and the full actual
+    # owner/group/DACL stay in the preservation identity.
     foreach($date in @($xml.SelectNodes('/t:Task/t:RegistrationInfo/t:Date',$manager))) { [void]$date.ParentNode.RemoveChild($date) }
     return [ordered]@{mode='scheduled_task';name=$task.TaskName;path=$task.TaskPath;xml=$xml.OuterXml;sddl=$definition.sddl}
   }
@@ -912,6 +958,20 @@ try {
   $status = "succeeded"
 } catch {
   $lifecycleFailure = $_
+  try {
+    $cause=$lifecycleFailure.Exception
+    for($depth=0;$cause -and $depth -lt 8;$depth++) {
+      $detail=[string]$cause.Data['lifecycle_process_open_failure']
+      if($detail) {
+        if([Text.Encoding]::UTF8.GetByteCount($detail) -gt 8192){throw 'process open diagnostic exceeds bound'}
+        $parsed=$detail|ConvertFrom-Json
+        if($parsed.schema -cne 'edr.test.lifecycle-process-open-failure.v1'){throw 'process open diagnostic schema mismatch'}
+        [IO.File]::WriteAllText((Join-Path $EvidenceDir 'process-open-failure.json'),$detail,[Text.UTF8Encoding]::new($false))
+        break
+      }
+      $cause=$cause.InnerException
+    }
+  } catch {Write-Warning ('Process open evidence unavailable: '+$_.Exception.GetType().FullName)}
   Copy-InstallerDiagnostics -Stage $script:LastLifecycleStage -SetupLog $script:LastSetupLog
   Add-Evidence "lifecycle" "failed" $lifecycleFailure.Exception.Message
   throw $lifecycleFailure
