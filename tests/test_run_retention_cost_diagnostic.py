@@ -85,10 +85,12 @@ class RetentionDiagnosticRunnerTests(unittest.TestCase):
         (Path(env['TEMP']) / 'retained-synthetic.db').write_bytes(b'synthetic fixture')
         return dict(self.result)
 
-    def run_mode(self, preserve=False, native_error=None):
+    def run_mode(self, preserve=False, native_error=None, attribution=False):
         argv = ['--build-dir', str(self.build), '--output', str(self.output)]
         if preserve:
             argv.append('--preserve-contract-volumes')
+        if attribution:
+            argv.append('--sync-attribution')
         with patch.dict(os.environ, self.env, clear=True), \
                 patch.object(diagnostic, 'os', SimpleNamespace(name='nt', environ=os.environ)), \
                 patch.object(diagnostic, 'windows_contract_temp_path', return_value=self.native_temp,
@@ -114,6 +116,23 @@ class RetentionDiagnosticRunnerTests(unittest.TestCase):
         self.assertEqual(binding['scratch'], str(work))
         self.assertEqual(binding['layout_mode'], 'legacy_single_scratch')
         self.assertEqual(binding['binary_sha256'], hashlib.sha256(self.exe.read_bytes()).hexdigest())
+        self.assertFalse(binding['sync_attribution'])
+
+    def test_attribution_selects_and_binds_only_the_isolated_executable(self):
+        self.exe = self.build / 'tests/test_retention_sync_attribution.exe'
+        self.exe.write_bytes(b'isolated SQLite scope probe')
+        _, execute = self.run_mode(True, attribution=True)
+        execute.assert_called_once()
+        binding = self.binding()
+        self.assertTrue(binding['sync_attribution'])
+        self.assertEqual(binding['binary_name'], self.exe.name)
+        self.assertEqual(binding['binary_sha256'], hashlib.sha256(self.exe.read_bytes()).hexdigest())
+
+    def test_missing_attribution_binary_never_falls_back_to_contract(self):
+        with self.assertRaisesRegex(SystemExit, 'executable missing'):
+            self.run_mode(True, attribution=True)
+        self.assertEqual(self.calls, [])
+        self.assertFalse(self.output.exists())
 
     def test_new_mode_preserves_two_roots_and_retains_files(self):
         owner, execute = self.run_mode(True)

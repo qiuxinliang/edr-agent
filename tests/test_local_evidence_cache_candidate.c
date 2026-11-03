@@ -53,6 +53,13 @@ static void test_unsetenv(const char *name) { assert(unsetenv(name) == 0); }
 #if defined(EDR_HAVE_SQLITE)
 #include <sqlite3.h>
 #include "../src/storage/evidence_context_store.h"
+#ifdef EDR_RETENTION_SYNC_ATTRIBUTION
+#define RETENTION_SYNC_PROBE_IMPLEMENTATION
+#include "retention_sync_probe.h"
+static void retention_sync_phase_begin(unsigned round);
+static void retention_sync_phase_end(const EdrEvidenceCacheStatus *before,
+                                     const EdrEvidenceCacheStatus *after);
+#endif
 
 /* Explicit old-layout fixtures keep exercising the supported legacy writer.
  * The seam is restored immediately; all other opens use production defaults. */
@@ -2622,12 +2629,21 @@ static void test_capacity_success_does_not_throttle_next_reclaim(void) {
     retention_cost_mark("capacity_seeded",round);
     classify_pressure_fixture_groups(raw,prefix);
     retention_cost_mark("capacity_classified",round);
+#ifdef EDR_RETENTION_SYNC_ATTRIBUTION
+    retention_sync_phase_begin(round);
+#endif
     int64_t before_refs=sqlite_scalar_integer(db,"SELECT COUNT(*) FROM candidate_context_refs WHERE fact_id='orphan-fixture';");
     candidate.event_time_ns++;
     snprintf(candidate.event_id, sizeof(candidate.event_id), "rapid-reclaim-%u", round);
     snprintf(candidate.net_dst, sizeof(candidate.net_dst), "10.74.33.%u", round + 1u);
     edr_local_evidence_cache_get_status(&before);
+#ifdef EDR_RETENTION_SYNC_ATTRIBUTION
+    rs_entry_begin(RS_ENTRY_INITIAL);
+#endif
     edr_local_evidence_cache_record_behavior(&candidate);
+#ifdef EDR_RETENTION_SYNC_ATTRIBUTION
+    rs_entry_end();
+#endif
     edr_local_evidence_cache_get_status(&after);
     /* An admission may yield after its work budget. Existing bounded failure
      * backoff and later maintenance must still converge, without fake ACKs.
@@ -2640,8 +2656,17 @@ static void test_capacity_success_does_not_throttle_next_reclaim(void) {
     for (unsigned retry=0; after.candidate_admitted==before.candidate_admitted &&
          retry<retry_limit && stalled<32u; ++retry) {
       s_test_monotonic_ns+=60000000000ULL;
+#ifdef EDR_RETENTION_SYNC_ATTRIBUTION
+      rs_entry_begin(RS_ENTRY_POLL);
+#endif
       edr_local_evidence_cache_poll_maintenance();
+#ifdef EDR_RETENTION_SYNC_ATTRIBUTION
+      rs_entry_end(); rs_entry_begin(RS_ENTRY_RETRY);
+#endif
       edr_local_evidence_cache_record_behavior(&candidate);
+#ifdef EDR_RETENTION_SYNC_ATTRIBUTION
+      rs_entry_end();
+#endif
       edr_local_evidence_cache_get_status(&after);
       uint64_t bytes=after.db_bytes+after.wal_bytes;
       if(after.retention_groups_retired>retired_seen || bytes<best_bytes) stalled=0;
@@ -2649,6 +2674,9 @@ static void test_capacity_success_does_not_throttle_next_reclaim(void) {
       if(bytes<best_bytes) best_bytes=bytes;
       retired_seen=after.retention_groups_retired;
     }
+#ifdef EDR_RETENTION_SYNC_ATTRIBUTION
+    retention_sync_phase_end(&before,&after);
+#endif
     retention_cost_mark("capacity_reclaimed",round);
     if (after.candidate_admitted != before.candidate_admitted + 1u) {
       fprintf(stderr,"capacity convergence failed: round=%u retired=%llu held=%llu "
@@ -7796,7 +7824,11 @@ static void test_maintenance_query_copy_slices(void) {
 
 /* Test-only VFS accounting measures SQLite's issued reads/writes, including
  * WAL and checkpoint copies. It is not a hardware disk-controller counter. */
-typedef struct { sqlite3_file base; sqlite3_file *real; int main_database; } RetentionBenchFile;
+typedef struct { sqlite3_file base; sqlite3_file *real; int main_database;
+#ifdef EDR_RETENTION_SYNC_ATTRIBUTION
+  unsigned file_kind;
+#endif
+} RetentionBenchFile;
 static sqlite3_vfs *retention_bench_vfs_parent;
 static uint64_t retention_bench_reads, retention_bench_writes, retention_bench_syncs;
 static int retention_raise_floor_on_write;
@@ -7860,6 +7892,25 @@ static void retention_delegate_record(unsigned index, uint64_t started) {
   if (elapsed>value->maximum) value->maximum=elapsed;
 }
 
+#ifdef EDR_RETENTION_SYNC_ATTRIBUTION
+static void retention_sync_phase_begin(unsigned round) {
+  if (s_retention_cost_diagnostic)
+    rs_round_begin(round,retention_bench_syncs,retention_delegate_timing[2].ticks,retention_bench_writes);
+}
+static void retention_sync_phase_end(const EdrEvidenceCacheStatus *before,
+                                     const EdrEvidenceCacheStatus *after) {
+  if (!s_retention_cost_diagnostic) return;
+  if (after->maintenance_runs<before->maintenance_runs ||
+      after->retention_groups_retired<before->retention_groups_retired ||
+      after->retention_groups_held<before->retention_groups_held)
+    retention_sync_probe.errors|=RS_ERROR_RECONCILE;
+  rs_round_end(retention_bench_syncs,retention_delegate_timing[2].ticks,retention_bench_writes,
+      after->maintenance_runs-before->maintenance_runs,
+      after->retention_groups_retired-before->retention_groups_retired,
+      after->retention_groups_held-before->retention_groups_held);
+}
+#endif
+
 
 static void capacity_reclaim_slow_boundary(int enabled) {
   retention_checkpoint_delay_ms=enabled ? capacity_checkpoint_delay_ms : 0u;
@@ -7913,10 +7964,16 @@ static int bench_write(sqlite3_file *f,const void *b,int n,sqlite3_int64 o) {
   uint64_t delegate_started=retention_delegate_enabled ? retention_delegate_tick() : 0u;
   int result=BENCH_FILE(f)->pMethods->xWrite(BENCH_FILE(f),b,n,o);
   if (retention_delegate_enabled) retention_delegate_record(1u,delegate_started);
+#ifdef EDR_RETENTION_SYNC_ATTRIBUTION
+  rs_write(((RetentionBenchFile *)f)->file_kind,(uint64_t)(unsigned)n,result);
+#endif
   return result;
 }
 static int bench_truncate(sqlite3_file *f,sqlite3_int64 n) { return BENCH_FILE(f)->pMethods->xTruncate(BENCH_FILE(f),n); }
 static int bench_sync(sqlite3_file *f,int flags) {
+#ifdef EDR_RETENTION_SYNC_ATTRIBUTION
+  uint64_t previous_ticks=retention_delegate_timing[2].ticks;
+#endif
   ++retention_bench_syncs;
   /* Preserve the real filesystem result, but make checkpoint I/O slower than
    * one maintenance slice. This must not starve actual group retirement. */
@@ -7932,6 +7989,9 @@ static int bench_sync(sqlite3_file *f,int flags) {
   uint64_t delegate_started=retention_delegate_enabled ? retention_delegate_tick() : 0u;
   int result=BENCH_FILE(f)->pMethods->xSync(BENCH_FILE(f),flags);
   if (retention_delegate_enabled) retention_delegate_record(2u,delegate_started);
+#ifdef EDR_RETENTION_SYNC_ATTRIBUTION
+  rs_sync(((RetentionBenchFile *)f)->file_kind,retention_delegate_timing[2].ticks-previous_ticks,result);
+#endif
   return result;
 }
 static int bench_size(sqlite3_file *f,sqlite3_int64 *n) { return BENCH_FILE(f)->pMethods->xFileSize(BENCH_FILE(f),n); }
@@ -7957,6 +8017,13 @@ static const sqlite3_io_methods retention_bench_methods = {3,bench_close,bench_r
 static int retention_bench_open(sqlite3_vfs *v,const char *name,sqlite3_file *file,int flags,int *out) {
   (void)v; RetentionBenchFile *f=(RetentionBenchFile *)file;
   f->main_database=(flags & SQLITE_OPEN_MAIN_DB)!=0;
+#ifdef EDR_RETENTION_SYNC_ATTRIBUTION
+  f->file_kind=(flags & SQLITE_OPEN_MAIN_DB) ? RS_FILE_MAIN :
+      (flags & SQLITE_OPEN_WAL) ? RS_FILE_WAL :
+      (flags & (SQLITE_OPEN_MAIN_JOURNAL|SQLITE_OPEN_MASTER_JOURNAL)) ? RS_FILE_JOURNAL :
+      (flags & (SQLITE_OPEN_TEMP_DB|SQLITE_OPEN_TRANSIENT_DB|SQLITE_OPEN_TEMP_JOURNAL|SQLITE_OPEN_SUBJOURNAL)) ?
+      RS_FILE_TEMP : RS_FILE_UNKNOWN;
+#endif
   f->real=(sqlite3_file *)(f+1); memset(f->real,0,(size_t)retention_bench_vfs_parent->szOsFile);
   int rc=retention_bench_vfs_parent->xOpen(retention_bench_vfs_parent,name,f->real,flags,out);
   if (f->real->pMethods) f->base.pMethods=&retention_bench_methods;
@@ -8006,11 +8073,18 @@ static void test_retention_cost_diagnostic(void) {
   vfs.szOsFile+=(int)sizeof(RetentionBenchFile);vfs.xOpen=retention_bench_open;
   assert(sqlite3_vfs_register(&vfs,1)==SQLITE_OK);
   retention_delegate_reset(1);s_retention_cost_diagnostic=1;
+#ifdef EDR_RETENTION_SYNC_ATTRIBUTION
+  rs_reset();
+#endif
   retention_cost_mark("begin",0);
   test_context_fanout_owner_set_maximum();
   retention_cost_mark("capacity_begin",0);
   test_capacity_success_does_not_throttle_next_reclaim();
   retention_cost_mark("complete",0);
+#ifdef EDR_RETENTION_SYNC_ATTRIBUTION
+  assert(rs_report(retention_delegate_hz)==0);
+  retention_sync_probe.enabled=0;
+#endif
   s_retention_cost_diagnostic=0;retention_delegate_reset(0);
   assert(sqlite3_vfs_register(retention_bench_vfs_parent,1)==SQLITE_OK);
   assert(sqlite3_vfs_unregister(&vfs)==SQLITE_OK);
@@ -15484,6 +15558,9 @@ int main(int argc, char **argv) {
   if (argc==2 && !strcmp(argv[1],"--retention-cost-diagnostic")) {
     test_retention_cost_diagnostic();return 0;
   }
+#ifdef EDR_RETENTION_SYNC_ATTRIBUTION
+  if (argc==2 && !strcmp(argv[1],"--sync-probe-contract")) return rs_contract()==0 ? 0 : 1;
+#endif
   if (argc==2 && !strcmp(argv[1],"--phase2-diagnostic")) {
     s_phase2_diagnostic=1;test_phase2_continues_across_ttl(0);return 0;
   }

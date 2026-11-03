@@ -135,14 +135,14 @@ class WindowsReleaseWorkflowTests(unittest.TestCase):
         tools = steps['Install build tools']
         self.assertIn("if ($env:EDR_RETENTION_COST_DIAGNOSTIC_ONLY -eq 'true') {\n            & .\\scripts\\Ensure-WindowsBuildTools.ps1 -NinjaOnly\n          } else {\n            & .\\scripts\\Ensure-WindowsBuildTools.ps1\n          }", tools)
         build = steps[diagnostic_only[0]]
-        self.assertEqual(re.findall(r'--target (\S+)', build), ['test_local_evidence_cache_candidate'])
+        self.assertEqual(re.findall(r'--target (\S+)', build), ['test_retention_sync_attribution'])
         self.assertIn("if ($LASTEXITCODE -ne 0) { throw", build)
         normal_targets = steps['Build (Ninja)'].split('$buildTargets = @(', 1)[1].split(')', 1)[0]
         self.assertEqual(re.findall(r"'([^']+)'", normal_targets),
                          ['edr_agent', 'forensic_collector', 'fd_installer_worker',
                           'fd_headless_uninstaller', 'windows_release_gate_tests'])
         run = steps[diagnostic_only[1]]
-        call = 'python -B tests/run_retention_cost_diagnostic.py --build-dir build --preserve-contract-volumes --output "$env:RUNNER_TEMP/retention-cost-diagnosis"'
+        call = 'python -B tests/run_retention_cost_diagnostic.py --build-dir build --preserve-contract-volumes --sync-attribution --output "$env:RUNNER_TEMP/retention-cost-diagnosis"'
         self.assertEqual(source.count(call), 1)
         self.assertIn(call, run)
         self.assertIn('timeout-minutes: 3', run)
@@ -172,10 +172,11 @@ class WindowsReleaseWorkflowTests(unittest.TestCase):
             ('      - name: Test\n        if: ${{ !inputs.retention_cost_diagnostic_only }}', '      - name: Test'),
             ('      - name: Package (setup exe + runtime zip)\n        if: ${{ !inputs.retention_cost_diagnostic_only }}', '      - name: Package (setup exe + runtime zip)'),
             ('      - uses: actions/upload-artifact@v6\n        if: ${{ !inputs.retention_cost_diagnostic_only }}', '      - uses: actions/upload-artifact@v6'),
-            ('--target test_local_evidence_cache_candidate --parallel', '--target windows_release_gate_tests --parallel'),
+            ('--target test_retention_sync_attribution --parallel', '--target windows_release_gate_tests --parallel'),
             ('            & .\\scripts\\Ensure-WindowsBuildTools.ps1 -NinjaOnly', '            & .\\scripts\\Ensure-WindowsBuildTools.ps1'),
             ('run_retention_cost_diagnostic.py --build-dir build', 'run_retention_cost_diagnostic.py --runs 2 --build-dir build'),
-            ('--preserve-contract-volumes --output', '--output'),
+            ('--preserve-contract-volumes --sync-attribution --output', '--output'),
+            (' --sync-attribution --output', ' --output'),
             ("(steps.retention-cost.outcome == 'success' || steps.retention-cost.outcome == 'failure')", "steps.retention-cost.outcome == 'success'"),
             ('retention-cost-diagnosis/stderr.log', 'retention-cost-diagnosis/*'),
         )

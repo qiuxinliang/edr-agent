@@ -338,7 +338,7 @@ jobs:
         if: ${{ inputs.retention_cost_diagnostic_only }}
         shell: pwsh
         run: |
-          cmake --build build --config Release --target test_local_evidence_cache_candidate --parallel $env:NUMBER_OF_PROCESSORS --verbose
+          cmake --build build --config Release --target test_retention_sync_attribution --parallel $env:NUMBER_OF_PROCESSORS --verbose
           if ($LASTEXITCODE -ne 0) { throw 'Native retention diagnostic build failed' }
 
       - name: Run the fixed ARM64 retention diagnostic once
@@ -350,7 +350,7 @@ jobs:
           $compiler = (Get-Command cl.exe -ErrorAction Stop).Source
           $runtimeBin = Join-Path $env:VCPKG_INSTALLED_ROOT 'bin'
           $sqlite = Join-Path $runtimeBin 'sqlite3.dll'
-          & .\scripts\Assert-WindowsPeArchitecture.ps1 -Path 'build/tests/test_local_evidence_cache_candidate.exe' -Architecture arm64
+          & .\scripts\Assert-WindowsPeArchitecture.ps1 -Path 'build/tests/test_retention_sync_attribution.exe' -Architecture arm64
           & .\scripts\Assert-WindowsPeArchitecture.ps1 -Path $sqlite -Architecture arm64
           # A rolling hosted image is not proof of the same host/compiler.
           # Preserve actual identities before the fixed diagnostic is started.
@@ -358,7 +358,7 @@ jobs:
           Write-Host "Compiler SHA256=$((Get-FileHash -LiteralPath $compiler -Algorithm SHA256).Hash.ToLowerInvariant())"
           Write-Host "SQLite SHA256=$((Get-FileHash -LiteralPath $sqlite -Algorithm SHA256).Hash.ToLowerInvariant())"
           $env:PATH = "$runtimeBin;$env:PATH"
-          python -B tests/run_retention_cost_diagnostic.py --build-dir build --preserve-contract-volumes --output "$env:RUNNER_TEMP/retention-cost-diagnosis"
+          python -B tests/run_retention_cost_diagnostic.py --build-dir build --preserve-contract-volumes --sync-attribution --output "$env:RUNNER_TEMP/retention-cost-diagnosis"
           if ($LASTEXITCODE -ne 0) { throw 'Retention cost diagnosis failed or timed out; this is not a product gate result' }
 
       - name: Preserve only fixed retention diagnostic receipts

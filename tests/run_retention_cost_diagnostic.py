@@ -40,11 +40,15 @@ def main(argv=None):
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--preserve-contract-volumes', action='store_true',
                         help='Keep work and temporary stores under their original contract roots')
+    parser.add_argument('--sync-attribution', action='store_true',
+                        help='Use the isolated SQLite call-scope diagnostic binary')
     args = parser.parse_args(argv)
     if os.name != 'nt' or os.environ.get('GITHUB_ACTIONS') != 'true':
         raise SystemExit('explicit native Windows CI diagnostic only')
     build = args.build_dir.resolve(strict=True)
-    binary = build / 'tests/test_local_evidence_cache_candidate.exe'
+    binary_name = ('test_retention_sync_attribution.exe' if args.sync_attribution
+                   else 'test_local_evidence_cache_candidate.exe')
+    binary = build / 'tests' / binary_name
     if not binary.is_file():
         raise SystemExit('native contract executable missing')
     parent = Path(os.environ['RUNNER_TEMP']).resolve(strict=True)
@@ -60,6 +64,7 @@ def main(argv=None):
         scratch = Path(tempfile.mkdtemp(prefix='retention-cost-', dir=parent))
         temporary = scratch
     binding = {'source_sha': os.environ['GITHUB_SHA'], 'diagnostic_only': True,
+               'binary_name': binary_name, 'sync_attribution': args.sync_attribution,
                'binary_sha256': hashlib.sha256(binary.read_bytes()).hexdigest(),
                'scratch': str(scratch), 'deadline_seconds': 150,
                'layout_mode': ('preserve_contract_volumes' if args.preserve_contract_volumes
