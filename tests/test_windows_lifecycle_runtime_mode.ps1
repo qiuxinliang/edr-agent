@@ -8,6 +8,7 @@ $root=Join-Path ([IO.Path]::GetTempPath()) ('edr-lifecycle-mode-'+[Guid]::NewGui
 [IO.Directory]::CreateDirectory($root)|Out-Null
 $cases=New-Object 'System.Collections.Generic.List[string]'
 $script:missingProcessError=$null
+$script:repairSequence=$null
 function Put([string]$Path,[string]$Text) { [IO.File]::WriteAllText($Path,$Text,[Text.UTF8Encoding]::new($false)) }
 function Pass([string]$Name,[scriptblock]$Action) { & $Action; $cases.Add($Name) }
 function Reject([string]$Name,[string]$Expected,[scriptblock]$Action) {
@@ -24,11 +25,20 @@ try {
   $tokens=$null;$errors=$null
   $ast=[Management.Automation.Language.Parser]::ParseFile((Join-Path $RepoRoot 'scripts/windows_setup_exe_lifecycle_smoke.ps1'),[ref]$tokens,[ref]$errors)
   if ($errors.Count -ne 0) { throw 'lifecycle script parse failed' }
-  foreach($name in @('Get-LifecycleAgentProcesses','Open-LifecycleAgentProcess','Stop-LifecycleAgentProcesses',
+  foreach($name in @('Get-LifecycleAgentProcesses','Open-LifecycleAgentProcess',
       'Get-LifecycleUpdaterIdentity','Get-LifecycleStoragePreflight','Get-LifecycleRuntimeProcess','Get-LifecycleRuntimeOwner',
-      'New-LifecyclePreservationSnapshot','Assert-LifecyclePreservationSnapshot','Invoke-Installer','Invoke-BaselineRepair')) {
+      'New-LifecyclePreservationSnapshot','Assert-LifecyclePreservationSnapshot','Invoke-Installer','Invoke-BaselineRepair',
+      'Assert-BaselineRepair','New-BaselineRepairBackup')) {
     $owners=@($ast.FindAll({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq $name},$true))
     if ($owners.Count -ne 1) { throw ('missing unique harness owner '+$name) }
+    . ([scriptblock]::Create($owners[0].Extent.Text))
+  }
+  $storage=[Management.Automation.Language.Parser]::ParseFile((Join-Path $RepoRoot 'tests/Invoke-LifecycleStorageCompatibility.ps1'),[ref]$tokens,[ref]$errors)
+  if($errors.Count -ne 0){throw 'storage owner parse failed'}
+  foreach($name in @('Get-LifecycleStorageNative','Assert-LifecycleStorageQuiescent','Invoke-LifecycleStorageRuntimeAction',
+      'Invoke-LifecycleStorageProcess','Assert-LifecycleStorageRegular')) {
+    $owners=@($storage.FindAll({param($node)$node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq $name},$true))
+    if($owners.Count -ne 1){throw ('missing unique storage owner '+$name)}
     . ([scriptblock]::Create($owners[0].Extent.Text))
   }
   $recovery=[Management.Automation.Language.Parser]::ParseFile((Join-Path $RepoRoot 'tests/Invoke-RealInstallerTimeoutRecovery.ps1'),[ref]$tokens,[ref]$errors)
@@ -171,8 +181,7 @@ try {
   Pass 'no_directory_process_never_claims_running_pid' {if((Get-LifecycleRuntimeProcess).ProcessId -ne 0){throw 'foreign runtime accepted'}}
   # Real current-process identity is read only. Agent child handles and every
   # stop/kill boundary below are fixtures; no actual process is terminated.
-  # Use actual .NET methods so their exceptions have the Process.Kill boundary,
-  # without PowerShell ScriptMethod's extra exception wrapping or any OS API.
+  # The held-process fixture never invokes an OS API; Kill is a failure trap.
   if(-not ('EdrLifecycleFixtureProcess' -as [type])) {
     Add-Type -TypeDefinition @'
 using System;
@@ -184,20 +193,32 @@ public sealed class EdrLifecycleFixtureProcess {
     public DateTime StartTime;
     public bool HasExited, disposed, killed;
     public int wait_ms;
-    public Action<int, bool> OnWait;
+    public Action<int> OnWait;
     public void Dispose() { disposed = true; }
     public void Kill() {
-        if (mode == "kill-denied") throw new Win32Exception(5, "fixture_kill_denied");
-        if (mode == "exit-before-kill") { HasExited = true; throw new InvalidOperationException("fixture already exited"); }
         killed = true;
-        if (mode != "wait-timeout") HasExited = true;
+        throw new InvalidOperationException("PID-only kill must never be used");
     }
     public bool WaitForExit(int milliseconds) {
         wait_ms = milliseconds;
         if (mode == "wait-timeout") return false;
-        if (OnWait != null) OnWait(Id, mode == "respawn");
+        if (OnWait != null) OnWait(Id);
         return HasExited;
     }
+}
+public sealed class EdrLifecycleFixtureChild {
+    public IntPtr Handle = new IntPtr(8);
+    public bool HasExited, disposed, killed, timeout;
+    public int ExitCode, first_wait_ms;
+    public bool WaitForExit(int milliseconds) {
+        if (first_wait_ms == 0) first_wait_ms = milliseconds;
+        if (timeout && !killed) return false;
+        HasExited = true;
+        return true;
+    }
+    public void WaitForExit() { }
+    public void Kill() { killed = true; HasExited = true; }
+    public void Dispose() { disposed = true; }
 }
 '@
   }
@@ -215,6 +236,7 @@ public sealed class EdrLifecycleFixtureProcess {
     $script:handleMode='live';$script:lastHandle=$null
     function Get-Process {
       [CmdletBinding()]param([int]$Id)
+      if($null -ne $script:repairSequence){$script:repairSequence.Add('open')}
       if($script:handleMode -ceq 'access-denied'){throw [ComponentModel.Win32Exception]::new(5,'fixture_access_denied')}
       if($script:handleMode -ceq 'wrong-missing-error'){throw [ArgumentException]::new('fixture_wrong_missing_error')}
       if($script:handleMode -cin @('missing','missing-still-present')) {
@@ -230,11 +252,6 @@ public sealed class EdrLifecycleFixtureProcess {
       if($h.mode -ceq 'reused'){$h.StartTime=$h.StartTime.AddSeconds(1)}
       if($h.mode -ceq 'image-changed'){$h.Path='C:\outside\FDSensor.exe'}
       if($h.HasExited){$script:processes=@($script:processes|Where-Object{$_.ProcessId -ne $Id})}
-      $h.OnWait=[Action[int,bool]]{
-        param([int]$OwnedId,[bool]$Respawn)
-        $script:processes=@($script:processes|Where-Object{$_.ProcessId -ne $ownedId})
-        if($Respawn){$script:processes+=@([pscustomobject]@{ProcessId=125;ExecutablePath=$script:lastHandle.Path;CreationDate=$script:lastHandle.StartTime.AddSeconds(1)})}
-      }
       $script:lastHandle=$h;return $h
     }
     function Stop-Process {throw 'PID-only stop must never be used'}
@@ -254,6 +271,12 @@ public sealed class EdrLifecycleFixtureProcess {
       $state=Get-LifecycleRuntimeProcess -UpdaterProcess $updater
       if($state.ProcessId -ne 123 -or $state.StoragePreflightProcesses[0].observation -cne 'observed_then_exited'){throw 'exited probe was not retained as observation'}
     }
+    $script:processes=@($runtimeRow,$probeRow);$script:handleMode='exited'
+    Pass 'verified_probe_exited_held_handle_is_disposed' {
+      $state=Get-LifecycleRuntimeProcess -UpdaterProcess $updater
+      if($state.ProcessId -ne 123 -or $state.StoragePreflightProcesses[0].observation -cne 'observed_then_exited' -or -not $script:lastHandle.disposed){throw 'exited held probe was not safely released'}
+    }
+    $script:processes=@($runtimeRow,$probeRow)
     $script:handleMode='live'
     foreach($bad in @('',($probeCommand+' --extra'),$probeCommand.Replace('--storage-space-preflight','--storage-space-preflight-other'),
         $probeCommand.Replace('agent.toml','other.toml'),$probeCommand.Replace('.storage-preflight-','.other-'),
@@ -274,6 +297,8 @@ public sealed class EdrLifecycleFixtureProcess {
     Reject 'probe_child_PID_reused' '*generation or image changed*' {Get-LifecycleRuntimeProcess -UpdaterProcess $updater|Out-Null}
     $script:handleMode='access-denied'
     Reject 'probe_handle_access_denied_is_fatal' '*fixture_access_denied*' {Get-LifecycleRuntimeProcess -UpdaterProcess $updater|Out-Null}
+    $script:handleMode='image-changed'
+    Reject 'probe_handle_image_changed_is_fatal' '*generation or image changed*' {Get-LifecycleRuntimeProcess -UpdaterProcess $updater|Out-Null}
     $script:handleMode='live';$probeRow.CommandLine='second genuine runtime'
     Pass 'two_runtimes_rejected_with_bounded_identity_diagnostic' {
       try {Get-LifecycleRuntimeProcess -UpdaterProcess $updater|Out-Null;throw 'unexpected acceptance'} catch {
@@ -285,21 +310,6 @@ public sealed class EdrLifecycleFixtureProcess {
           throw ('ambiguous runtime evidence missing or overbroad: present='+[bool]$detail+' parsed_count='+@($parsed).Count+' overbroad='+$overbroad+' exception_type='+$_.Exception.GetType().FullName)
         }
       }
-    }
-    foreach($mode in @('live','missing','exited','exit-before-kill')) {
-      $script:handleMode=$mode;$script:processes=@($runtimeRow);$script:lastHandle=$null
-      Pass ('stop_same_generation_or_confirmed_exit_'+$mode) {
-        $result=Stop-LifecycleAgentProcesses
-        if($result.remaining -ne 0 -or $result.wait_budget_seconds -ne 30 -or $script:processes.Count -ne 0){throw 'stop did not establish quiescence'}
-        if($script:lastHandle -and -not $script:lastHandle.disposed){throw 'stop leaked process handle'}
-      }
-    }
-    foreach($entry in @(@('reused','*generation or image changed*'),@('access-denied','*fixture_access_denied*'),
-        @('image-changed','*generation or image changed*'),@('missing-still-present','*2147483647*'),
-        @('wrong-missing-error','*fixture_wrong_missing_error*'),@('kill-denied','*fixture_kill_denied*'),
-        @('wait-timeout','*30 second test budget*'),@('respawn','*processes remain after stop*'))) {
-      $script:handleMode=$entry[0];$script:processes=@($runtimeRow)
-      Reject ('stop_rejects_'+$entry[0]) $entry[1] {Stop-LifecycleAgentProcesses|Out-Null}
     }
     foreach($mode in @('access-denied','wrong-missing-error','missing-still-present')) {
       $script:handleMode=$mode;$script:processes=@($runtimeRow)
@@ -392,12 +402,97 @@ public sealed class EdrLifecycleFixtureProcess {
     Reject 'remaining_observed_XML_stays_exact' '*scheduled_task deployment identity*' {Assert-LifecyclePreservationSnapshot $observedPreservation 'observed'}
   }
   $script:definition.xml=$originalXml;$script:definition.sddl=$originalSddl
+  # Exercise the actual repair orchestration and storage stop/identity owners.
+  # Only OS process I/O and final Setup/installed-runtime verification are fakes.
+  $BaselineVersion='3.2.738'
+  function Reset-RepairFixture([string]$Case) {
+    $script:repairCase=$Case;$script:repairSequence=New-Object 'System.Collections.Generic.List[string]'
+    $script:lastHandle=$null;$script:controlChild=$null
+    $script:handleMode=if($Case -ceq 'runtime-timeout'){'wait-timeout'}elseif($Case -ceq 'reused'){'reused'}else{'live'}
+    $script:repairRow=[pscustomobject]@{ExecutablePath=$image;ProcessId=123;CreationDate=$childTime;CommandLine=('"'+$image+'" --config "'+$config+'"')}
+    if($Case -ceq 'foreign-config'){$script:repairRow.CommandLine=$script:repairRow.CommandLine.Replace('agent.toml','other.toml')}
+    $script:processes=@($script:repairRow)
+    $script:service=if($RuntimeMode -ceq 'service'){[pscustomobject]@{State='Running';PathName=$image;StartName='LocalSystem';StartMode='Auto';ProcessId=123}}else{$null}
+    $taskFixture.State='Running';$taskFixture.Principal.UserId='SYSTEM'
+    $script:task=if($RuntimeMode -ceq 'scheduled_task'){$taskFixture}else{$null}
+    if($Case -ceq 'unknown-owner'){if($script:service){$script:service.State='Stopped'}else{$script:task.Principal.UserId='User'}}
+    foreach($name in @('FDSensor.exe','unins000.exe','unins000.dat')){Put (Join-Path $InstallDir $name) ('fixture-'+$name)}
+  }
+  function Get-Service {[CmdletBinding()]param($Name);if($Name -cne $ServiceName){throw 'unexpected repair service'};return [pscustomobject]@{Status=$script:service.State}}
+  function Stop-Service {throw 'repair must use the bounded original owner process'}
+  function Stop-ScheduledTask {throw 'repair must use the bounded original owner process'}
+  function Start-Process {
+    [CmdletBinding()]param($FilePath,[string[]]$ArgumentList,[switch]$Wait,[switch]$PassThru,$RedirectStandardOutput,$RedirectStandardError)
+    if($RedirectStandardOutput) {
+      $body=[Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($ArgumentList[-1].Trim('"')))
+      $expected=if($RuntimeMode -ceq 'service'){'Stop-Service -InputObject $service -ErrorAction Stop'}else{"Stop-ScheduledTask -TaskName 'FixtureService' -TaskPath '\' -ErrorAction Stop"}
+      if($FilePath -ine (Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe') -or -not $PassThru -or $Wait -or
+          -not $body.Contains($expected) -or -not $script:lastHandle -or $script:lastHandle.disposed -or $script:lastHandle.HasExited -or
+          ($script:repairSequence -join ',') -cne 'open'){throw 'owner stop occurred before the original handle was bound'}
+      $script:repairSequence.Add('stop')
+      [IO.File]::WriteAllText($RedirectStandardOutput,'{"status":"completed"}')
+      [IO.File]::WriteAllText($RedirectStandardError,'fixture_owner_stop_failure')
+      $script:controlChild=New-Object EdrLifecycleFixtureChild
+      if($script:repairCase -ceq 'owner-stop-failure'){$script:controlChild.ExitCode=7;return $script:controlChild}
+      if($script:repairCase -ceq 'owner-timeout'){$script:controlChild.timeout=$true;return $script:controlChild}
+      if($script:repairCase -cne 'owner-running'){if($script:service){$script:service.State='Stopped'}else{$script:task.State='Ready'}}
+      $script:lastHandle.HasExited=$script:repairCase -cne 'runtime-timeout'
+      $script:lastHandle.OnWait=[Action[int]]{
+        param([int]$OwnedId)
+        $script:repairSequence.Add('wait')
+        if($script:repairCase -ceq 'writer-remains'){return}
+        $script:processes=if($script:repairCase -ceq 'unknown-writer'){@([pscustomobject]@{ProcessId=$OwnedId;ExecutablePath=$null})}else{@()}
+      }
+      return $script:controlChild
+    }
+    if($FilePath -cne 'original-immutable-setup.exe' -or ($script:repairSequence -join ',') -cne 'open,stop,wait' -or
+        -not $script:lastHandle.disposed -or (Test-Path -LiteralPath (Join-Path $InstallDir 'unins000.exe')) -or
+        (Test-Path -LiteralPath (Join-Path $InstallDir 'unins000.dat')) -or
+        [IO.File]::ReadAllText((Join-Path $EvidenceDir 'repair-baseline-backup/agent.toml')) -cne 'isolated configuration') {throw 'repair setup started before quiescence and authorized backup'}
+    $script:repairSequence.Add('setup')
+    foreach($name in @('unins000.exe','unins000.dat')){Put (Join-Path $InstallDir $name) ('restored-'+$name)}
+    if($script:service){$script:service.State='Running'}else{$script:task.State='Running'}
+    $script:processes=@($script:repairRow)
+    return [pscustomobject]@{ExitCode=0}
+  }
+  function Assert-InstalledRuntime {
+    param($ExpectedVersion,$Stage)
+    if($ExpectedVersion -cne $BaselineVersion -or $Stage -cne 'repair-baseline' -or [IO.File]::ReadAllText((Join-Path $InstallDir 'unins000.exe')) -cne 'restored-unins000.exe'){throw 'wrong repair result'}
+    $null=Get-LifecycleRuntimeOwner
+  }
+  foreach($RuntimeMode in @('service','scheduled_task')) {
+    $EvidenceDir=Join-Path $root ('repair-'+$RuntimeMode+'-success');[IO.Directory]::CreateDirectory($EvidenceDir)|Out-Null
+    Reset-RepairFixture 'success'
+    Pass ($RuntimeMode+'_repair_binds_before_bounded_owner_stop_and_reuses_held_process') {
+      Assert-BaselineRepair 'original-immutable-setup.exe'
+      if(($script:repairSequence -join ',') -cne 'open,stop,wait,setup' -or $script:lastHandle.wait_ms -ne 30000 -or
+          -not $script:lastHandle.disposed -or $script:lastHandle.killed -or $script:controlChild.first_wait_ms -ne 35000 -or
+          -not $script:controlChild.disposed -or $script:controlChild.killed){throw 'repair lost the original finite stop boundary'}
+    }
+    foreach($entry in @(@('unknown-owner',$(if($RuntimeMode -ceq 'service'){'*running lifecycle service*'}else{'*owner, principal or original launcher*'})),
+        @('foreign-config','*config/process binding mismatch*'),@('reused','*config/process binding mismatch*'),
+        @('owner-stop-failure','*exit=7 cause=fixture_owner_stop_failure*'),@('owner-timeout','*finite deadline*'),
+        @('runtime-timeout','*before baseline repair within 30 seconds*'),@('writer-remains','*writer remains or its path is unknown*'),
+        @('unknown-writer','*writer remains or its path is unknown*'),@('owner-running','*is not stopped*'))) {
+      $EvidenceDir=Join-Path $root ('repair-'+$RuntimeMode+'-'+$entry[0]);[IO.Directory]::CreateDirectory($EvidenceDir)|Out-Null
+      Reset-RepairFixture $entry[0]
+      Reject ($RuntimeMode+'_repair_rejects_'+$entry[0]) $entry[1] {Assert-BaselineRepair 'original-immutable-setup.exe'}
+      Pass ($RuntimeMode+'_repair_failure_preserves_installer_files_'+$entry[0]) {
+        if($script:repairSequence -ccontains 'setup' -or (Test-Path -LiteralPath (Join-Path $EvidenceDir 'repair-baseline-backup')) -or
+            [IO.File]::ReadAllText((Join-Path $InstallDir 'agent.toml')) -cne 'isolated configuration'){throw 'failed stop mutated repair inputs'}
+        foreach($name in @('unins000.exe','unins000.dat')){if([IO.File]::ReadAllText((Join-Path $InstallDir $name)) -cne ('fixture-'+$name)){throw 'failed stop removed installer files'}}
+        if($script:lastHandle -and (-not $script:lastHandle.disposed -or $script:lastHandle.killed)){throw 'repair leaked or killed Agent handle'}
+        if($script:controlChild -and (-not $script:controlChild.disposed -or $script:controlChild.first_wait_ms -ne 35000 -or
+            $script:controlChild.killed -ne ($entry[0] -ceq 'owner-timeout'))){throw 'repair control child exceeded its original boundary'}
+      }
+    }
+  }
   [ordered]@{status='succeeded';case_count=$cases.Count;cases=$cases.ToArray();missing_process_error=$script:missingProcessError;scope='AST harness owners with isolated task, service, process and Setup I/O; no actual Agent or task operation'}|ConvertTo-Json -Depth 5
 } catch {
   if($script:missingProcessError){Write-Warning ('native_missing_process_error='+($script:missingProcessError|ConvertTo-Json -Depth 5 -Compress))}
   throw
 } finally {
-  foreach($name in @('Get-CimInstance','Get-ScheduledTask','Get-ItemProperty','Start-Process','Get-Process','Stop-Process')) {
+  foreach($name in @('Get-CimInstance','Get-ScheduledTask','Get-ItemProperty','Start-Process','Get-Process','Stop-Process','Get-Service','Stop-Service','Stop-ScheduledTask')) {
     if(Test-Path -LiteralPath ('Function:'+$name)){Remove-Item -LiteralPath ('Function:'+$name)}
   }
   Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction Stop

@@ -26,6 +26,7 @@ param(
 $ErrorActionPreference = "Stop"
 $repoRoot = Split-Path -Parent $PSScriptRoot
 . (Join-Path $PSScriptRoot 'Start-LifecycleWindowsPowerShell.ps1')
+. (Join-Path $repoRoot 'tests\Invoke-LifecycleStorageCompatibility.ps1')
 $archVerifier = Join-Path $PSScriptRoot "Assert-WindowsPeArchitecture.ps1"
 $bootstrapVerifier = Join-Path $PSScriptRoot "Assert-WindowsInstallerBootstrapArchitecture.ps1"
 $BaselineSetupExe = (Resolve-Path -LiteralPath $BaselineSetupExe).Path
@@ -56,7 +57,6 @@ if ($SignedPublisherValidation) {
   }
   $LegacySetupExe = (Resolve-Path -LiteralPath $LegacySetupExe).Path
   & $bootstrapVerifier -Path $LegacySetupExe -PayloadArchitecture $Architecture
-  . (Join-Path $repoRoot 'tests\Invoke-LifecycleStorageCompatibility.ps1')
   $storageTools=Import-LifecycleStorageTools $StorageToolsInput $Architecture $archVerifier
 } elseif ($LegacySetupExe -or $LegacyVersion -or $MigrationInput -or $StorageToolsInput) {
   throw 'legacy migration inputs require signed publisher validation'
@@ -198,13 +198,14 @@ function Assert-BaselineRepair([string] $SetupPath) {
   $configPath = Join-Path $InstallDir "agent.toml"
   $configHash = (Get-FileHash -LiteralPath $configPath -Algorithm SHA256).Hash
 
-  if ($RuntimeMode -ceq 'scheduled_task') {
-    Stop-ScheduledTask -TaskName $ServiceName -TaskPath '\' -ErrorAction Stop
-  } else {
-    Stop-Service -Name $ServiceName -Force -ErrorAction SilentlyContinue
-  }
-  $stopReceipt=Stop-LifecycleAgentProcesses
-  Add-Evidence $stage 'processes-stopped' ('generation_bound=true wait_budget_seconds='+$stopReceipt.wait_budget_seconds+' remaining=0')
+  $native=Get-LifecycleStorageNative
+  try {
+    $stopContext=@{root=$EvidenceDir;writer_uncertain=$false}
+    Invoke-LifecycleStorageRuntimeAction $stopContext 'Stop' ($stage+'-stop')
+    if(-not $native.process.WaitForExit(30000)){throw 'original runtime did not exit before baseline repair within 30 seconds'}
+    Assert-LifecycleStorageQuiescent $native
+  } finally {$native.process.Dispose()}
+  Add-Evidence $stage 'processes-stopped' 'generation_bound=true wait_budget_seconds=30 remaining=0'
   New-BaselineRepairBackup $backupDir
   foreach ($name in @("unins000.exe", "unins000.dat")) {
     Remove-Item -LiteralPath (Join-Path $InstallDir $name) -Force
@@ -665,23 +666,6 @@ function Open-LifecycleAgentProcess($Snapshot) {
     } catch {Write-Warning ('Process open diagnostic unavailable: '+$_.Exception.GetType().FullName)}
     throw $openFailure
   } finally {if($process -and -not $retained){$process.Dispose()}}
-}
-
-function Stop-LifecycleAgentProcesses {
-  $clock=[Diagnostics.Stopwatch]::StartNew();$budgetMs=30000
-  foreach($snapshot in @(Get-LifecycleAgentProcesses)) {
-    $process=Open-LifecycleAgentProcess $snapshot
-    if(-not $process){continue}
-    try {
-      if(-not $process.HasExited) {
-        try {$process.Kill()} catch [InvalidOperationException] {if(-not $process.HasExited){throw}}
-      }
-      $remaining=$budgetMs-[int]$clock.ElapsedMilliseconds
-      if($remaining -le 0 -or -not $process.WaitForExit($remaining)){throw 'scoped Agent stop exceeded the 30 second test budget'}
-    } finally {$process.Dispose()}
-  }
-  if(@(Get-LifecycleAgentProcesses).Count -ne 0){throw 'scoped Agent processes remain after stop'}
-  return [pscustomobject]@{wait_budget_seconds=30;remaining=0}
 }
 
 function Get-LifecycleUpdaterIdentity($UpdaterProcess) {
