@@ -905,9 +905,27 @@ static int export_recall_projection(const char *input, const char *output) {
   printf("PASS: real recall result projection bytes=%zu canonical=yes\n",strlen(projected));
   cJSON_free(encoded);cJSON_Delete(fixture);return 0;
 }
+static void upgrade_denial_projection_tests(void) {
+  EdrSoarCommandMeta m=task("agent_update_denied","agent_update");
+  char out[1024],again[1024];
+  const char *diagnostics[]={"agent_update_publisher_subject_length_invalid","agent_update_payload_contract_rejected"};
+  for(size_t i=0;i<2;i++) {
+    char detail[512];snprintf(detail,sizeof(detail),"{\"schema\":\"edr.command.status.v1\",\"status\":2,\"exit_code\":19,\"diagnostic\":\"%s\",\"raw_detail\":\"PRIVATE-PAYLOAD\"}",diagnostics[i]);
+    CHECK(edr_command_result_project_detail(&m.result_authorization,"agent_update",2,19,detail,out,sizeof(out))==0);
+    CHECK(strstr(out,diagnostics[i]) && !strstr(out,"PRIVATE-PAYLOAD"));
+    CHECK(edr_command_result_project_detail(&m.result_authorization,"agent_update",2,19,out,again,sizeof(again))==0 && !strcmp(out,again));
+    CHECK(edr_command_result_project_detail(&m.result_authorization,"agent_update",3,19,detail,out,sizeof(out))==0 && !strstr(out,diagnostics[i]));
+    EdrSoarCommandMeta other=task("unrelated-command","noop");
+    CHECK(edr_command_result_project_detail(&other.result_authorization,"noop",2,19,detail,out,sizeof(out))==0 && !strstr(out,diagnostics[i]));
+  }
+  const char *unknown="{\"schema\":\"edr.command.status.v1\",\"status\":2,\"exit_code\":19,\"diagnostic\":\"PRIVATE-PAYLOAD\"}";
+  CHECK(edr_command_result_project_detail(&m.result_authorization,"agent_update",2,19,unknown,out,sizeof(out))==0 && !strstr(out,"PRIVATE-PAYLOAD") && strstr(out,"command_rejected"));
+}
+
 int main(int argc, char **argv) {
   if(argc==4 && !strcmp(argv[1],"--project-recall"))return export_recall_projection(argv[2],argv[3]);
   CHECK(argc==1);
+  upgrade_denial_projection_tests();
   char path[256];snprintf(path,sizeof(path),"./command-egress-%ld",(long)pid());
   env("EDR_COMMAND_STATE_DIR",path);
   EdrSoarCommandMeta m=task("cmd-query","rtq_execute");

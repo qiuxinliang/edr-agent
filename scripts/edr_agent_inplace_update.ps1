@@ -27,6 +27,7 @@ param(
   [string]$TrustedPublisherThumbprint,
   [Parameter(Mandatory = $true)]
   [string]$TrustedPublisherSubject,
+  [string]$TrustedPublisherSubjectDerSha256 = "",
   [string]$MinCurrentVersion = "",
   [string]$MaxCurrentVersion = "",
   [ValidateSet("auto", "scheduled_task", "service")]
@@ -64,7 +65,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
-$AgentUpdateUpdaterProtocolVersion = 5
+$AgentUpdateUpdaterProtocolVersion = 6
 $updateDeadlineProvided = $PSBoundParameters.ContainsKey('DeadlineUnixMs')
 
 function Assert-UpdateStartDeadline {
@@ -706,9 +707,12 @@ function Get-VersionIdentity {
 }
 
 function Assert-AuthenticodePublisher {
-  param([string]$Path, [string]$Thumbprint, [string]$Subject)
+  param([string]$Path, [string]$Thumbprint, [string]$Subject, [string]$SubjectDerSha256 = "")
+  if ($SubjectDerSha256 -and $SubjectDerSha256 -cnotmatch '\A[0-9A-Fa-f]{64}\z') {
+    throw 'publisher subject DER SHA-256 must contain 64 hexadecimal characters'
+  }
   if ($Thumbprint -eq 'SHA256_ONLY_UNSIGNED') {
-    if ($Subject -ne 'Unsigned release; SHA-256 integrity only') {
+    if ($Subject -ne 'Unsigned release; SHA-256 integrity only' -or $SubjectDerSha256) {
       throw "unsigned release publisher marker is inconsistent"
     }
     Write-Warning "Agent candidate is unsigned; accepting the already verified task-pinned SHA-256 because the platform explicitly published this release in optional-signing mode."
@@ -721,7 +725,21 @@ function Assert-AuthenticodePublisher {
   $actualThumbprint = ($signature.SignerCertificate.Thumbprint -replace '\s','').ToUpperInvariant()
   $expectedThumbprint = ($Thumbprint -replace '\s','').ToUpperInvariant()
   if ($actualThumbprint -ne $expectedThumbprint) { throw "candidate publisher thumbprint is not trusted" }
-  if ($signature.SignerCertificate.Subject -ne $Subject) { throw "candidate publisher subject is not trusted" }
+  if ($SubjectDerSha256) {
+    # The platform binds the verified CMS signer's original ASN.1 subject bytes.
+    # Display names vary across Go and Windows; never fall back to display text
+    # after a supplied identity digest fails. Signature and thumbprint checks
+    # above remain mandatory for both raw Agent and full Setup candidates.
+    [byte[]]$subjectDer = $signature.SignerCertificate.SubjectName.RawData
+    if (-not $subjectDer -or $subjectDer.Length -eq 0) { throw 'candidate publisher subject DER is unavailable' }
+    $hasher = [Security.Cryptography.SHA256]::Create()
+    try { $actualSubjectHash = ([BitConverter]::ToString($hasher.ComputeHash($subjectDer))).Replace('-', '').ToLowerInvariant() }
+    finally { $hasher.Dispose() }
+    if ($actualSubjectHash -cne $SubjectDerSha256.ToLowerInvariant()) { throw 'candidate publisher subject DER SHA-256 is not trusted' }
+  } elseif ($signature.SignerCertificate.Subject -ne $Subject) {
+    # Older producers and manual invocations retain their original contract.
+    throw "candidate publisher subject is not trusted"
+  }
 }
 
 function Write-AtomicJson {
@@ -1901,7 +1919,7 @@ try {
   if ($Operation -eq 'repair' -and $versionDirection -ne 0) { throw 'repair target must match the installed version' }
   if ($Operation -eq 'upgrade' -and $MinCurrentVersion -and (Compare-SemVer $currentIdentity.ProductVersion $MinCurrentVersion) -lt 0) { throw 'current version is below update compatibility floor' }
   if ($Operation -eq 'upgrade' -and $MaxCurrentVersion -and (Compare-SemVer $currentIdentity.ProductVersion $MaxCurrentVersion) -gt 0) { throw 'current version is above update compatibility ceiling' }
-  Assert-AuthenticodePublisher -Path $stagedPath -Thumbprint $TrustedPublisherThumbprint -Subject $TrustedPublisherSubject
+  Assert-AuthenticodePublisher -Path $stagedPath -Thumbprint $TrustedPublisherThumbprint -Subject $TrustedPublisherSubject -SubjectDerSha256 $TrustedPublisherSubjectDerSha256
   $resolvedDeploymentMode = Resolve-DeploymentMode -Mode $DeploymentMode -TaskName $ScheduledTaskName -TaskPath $ScheduledTaskPath -WindowsServiceName $ServiceName
   $journal['resolved_deployment_mode'] = $resolvedDeploymentMode
   Set-UpdateStage -Stage 'deployment_resolved'
@@ -1920,7 +1938,7 @@ try {
     $setupPath = [string]$setupPackage.SetupPath
 	$fullInstallerExpectedRuntimeIdentity = ([string]$setupPackage.RuntimeIdentitySha256).ToLowerInvariant()
 	$journal['expected_runtime_identity_sha256'] = $fullInstallerExpectedRuntimeIdentity
-    Assert-AuthenticodePublisher -Path $setupPath -Thumbprint $TrustedPublisherThumbprint -Subject $TrustedPublisherSubject
+    Assert-AuthenticodePublisher -Path $setupPath -Thumbprint $TrustedPublisherThumbprint -Subject $TrustedPublisherSubject -SubjectDerSha256 $TrustedPublisherSubjectDerSha256
     # Capability failures are rejected before stopping the working runtime.
     # Do not fall back to a non-atomic launch on older Windows versions.
     Initialize-InstallerJobType

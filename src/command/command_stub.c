@@ -367,7 +367,16 @@ static int soar_want_report(const EdrSoarCommandMeta *m) {
   return m->soar_correlation_id[0] || m->playbook_run_id[0];
 }
 
-static int command_should_report(const char *cmd_id, const EdrSoarCommandMeta *m) {
+static int command_should_report(const char *cmd_id, const char *command_type,
+                                 const EdrSoarCommandMeta *m, int execution_status,
+                                 int exit_code) {
+  /* Upgrade command IDs use agent_update_, not cmd_. Only an admission
+   * rejection with an authenticated result purpose opts into this exception. */
+  if (execution_status == EdrCmdExecRejected && exit_code == 19 &&
+      cmd_id && command_type && !strcmp(command_type, "agent_update") && m &&
+      !strcmp(m->result_authorization.command_id, cmd_id) &&
+      !strcmp(m->result_authorization.command_type, command_type) &&
+      m->result_authorization.expires_unix_ms > 0) return 1;
   if (soar_want_report(m)) {
     return 1;
   }
@@ -573,7 +582,7 @@ static void soar_emit_ex_policy(const char *cmd_id, const EdrSoarCommandMeta *sm
              taskj, statusj, exit_code, small_err,
              retryable ? "true" : "false", small_raw);
     persist_detail = fallback;
-    int report_pending = command_should_report(cmd_id, sm);
+    int report_pending = command_should_report(cmd_id, s_active_command_type, sm, (int)st, exit_code);
     int state_rc = edr_command_state_finish(cmd_id, s_active_command_type,
                                             sm, rstatus, (int)st, exit_code,
                                             persist_detail, artifacts ? artifacts : "",
@@ -588,7 +597,7 @@ static void soar_emit_ex_policy(const char *cmd_id, const EdrSoarCommandMeta *sm
     return;
   }
   persist_detail = detail_json;
-  int report_pending = command_should_report(cmd_id, sm);
+  int report_pending = command_should_report(cmd_id, s_active_command_type, sm, (int)st, exit_code);
   int state_rc = edr_command_state_finish(cmd_id, s_active_command_type,
                                           sm, rstatus, (int)st, exit_code,
                                           persist_detail,
@@ -5370,7 +5379,9 @@ static void flush_command_result_outbox(void) {
     snprintf(sm.soar_correlation_id, sizeof(sm.soar_correlation_id), "%s", pending[i].soar_correlation_id);
     snprintf(sm.playbook_run_id, sizeof(sm.playbook_run_id), "%s", pending[i].playbook_run_id);
     snprintf(sm.playbook_step_id, sizeof(sm.playbook_step_id), "%s", pending[i].playbook_step_id);
-    if (!command_should_report(pending[i].command_id, &sm)) {
+    sm.result_authorization = pending[i].result_authorization;
+    if (!command_should_report(pending[i].command_id, pending[i].command_type, &sm,
+                               pending[i].execution_status, pending[i].exit_code)) {
       continue;
     }
     int rc = -1;
@@ -6070,9 +6081,16 @@ static int command_receive_envelope_impl(const char *command_id, const char *com
     const EdrCommandDescriptor *descriptor = edr_command_registry_lookup(t);
     s_rejected++;
     audit_both(id, contract_reason[0] ? contract_reason : "command payload contract rejected");
+    const char *detail = contract_reason[0] ? contract_reason : "command payload contract rejected";
+    /* Closed diagnostics preserve the actionable cause without granting the
+     * rejected payload authority to export arbitrary field names or values. */
+    if (descriptor && !strcmp(t, "agent_update")) {
+      detail = !strcmp(contract_reason, "invalid length for payload field: publisher_subject")
+          ? "{\"schema\":\"edr.command.status.v1\",\"status\":2,\"exit_code\":19,\"diagnostic\":\"agent_update_publisher_subject_length_invalid\"}"
+          : "{\"schema\":\"edr.command.status.v1\",\"status\":2,\"exit_code\":19,\"diagnostic\":\"agent_update_payload_contract_rejected\"}";
+    }
     soar_emit(id, sm, descriptor ? EdrCmdExecRejected : EdrCmdExecUnknownType,
-              descriptor ? 19 : 1,
-              contract_reason[0] ? contract_reason : "command payload contract rejected");
+              descriptor ? 19 : 1, detail);
     return 0;
   }
 

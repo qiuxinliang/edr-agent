@@ -604,6 +604,66 @@ static int delivery_wait_poll_complete(uint32_t timeout_ms) {
   } while (delivery_clock_ms() < deadline);
   return 0;
 }
+static int upgrade_denial_scenario(const char *path) {
+  const char *id = "agent_update_synthetic_denied";
+  const char *payload = getenv("EDR_TEST_UPGRADE_PAYLOAD");
+  const char *signature = getenv("EDR_TEST_UPGRADE_SIGNATURE");
+  const char *issued = getenv("EDR_TEST_UPGRADE_ISSUED");
+  CHECK(payload && signature && issued);
+  if (!payload || !signature || !issued) return 1;
+  delivery_env("EDR_COMMAND_STATE_DIR", path);
+  delivery_env("EDR_SOAR_REPORT_ALWAYS", "0");
+  delivery_env("EDR_COMMAND_DELIVERY_POLL_MS", "1000");
+  delivery_env("EDR_COMMAND_RESULT_RETRY_BASE_MS", "1000");
+  delivery_env("EDR_COMMAND_RESULT_RETRY_MAX_MS", "1000");
+  EdrConfig cfg = {0};
+  strcpy(cfg.agent.tenant_id, "synthetic-tenant");
+  strcpy(cfg.agent.endpoint_id, "synthetic-endpoint");
+  edr_command_bind_config(&cfg);
+  EdrSoarCommandMeta meta = {0};
+  snprintf(meta.idempotency_key, sizeof(meta.idempotency_key), "%s", signature);
+  meta.issued_at_unix_ms = strtoll(issued, NULL, 10); meta.deadline_ms = 30000;
+  CHECK(edr_command_receive_envelope("agent_update_forged", "agent_update",
+      (const uint8_t *)payload, strlen(payload), &meta) == 0);
+  CHECK(!edr_command_state_has_final("agent_update_forged", &meta));
+  CHECK(edr_command_receive_envelope(id, "agent_update", (const uint8_t *)"{}", 2, &meta) == 0);
+  CHECK(!edr_command_state_has_final(id, &meta));
+  EdrCommandExecutorHealth before, after;
+  edr_command_executor_get_health(&before);
+  CHECK(edr_command_receive_envelope(id, "agent_update", (const uint8_t *)payload, strlen(payload), &meta) == 0);
+  EdrCommandStateRecord *record = calloc(1, sizeof(*record)); CHECK(record);
+  if (!record) return 1;
+  CHECK(edr_command_state_begin(id, "agent_update", &meta, NULL, record) == EDR_COMMAND_STATE_BEGIN_DUP_FINAL);
+  CHECK(record->final_record && record->report_pending && !record->report_policy_held);
+  CHECK(record->execution_status == EdrCmdExecRejected && record->exit_code == 19);
+  CHECK(strstr(record->detail, "agent_update_publisher_subject_length_invalid"));
+  CHECK(edr_command_state_count_inbox() == 0);
+  char original[1024]; snprintf(original, sizeof(original), "%s", record->detail);
+  CHECK(edr_command_receive_envelope(id, "agent_update", (const uint8_t *)payload, strlen(payload), &meta) == 0);
+  CHECK(edr_command_state_begin(id, "agent_update", &meta, NULL, record) == EDR_COMMAND_STATE_BEGIN_DUP_FINAL);
+  CHECK(!strcmp(original, record->detail) && record->report_pending);
+  /* The actual background delivery owner must send a non-cmd_ upgrade ID.
+   * An incomplete application ACK is retried without re-executing the command. */
+  edr_command_poll_reliable_delivery();
+  uint64_t deadline = delivery_clock_ms() + 12000u;
+  int reported = 0;
+  do {
+    CHECK(edr_command_state_begin(id, "agent_update", &meta, NULL, record) == EDR_COMMAND_STATE_BEGIN_DUP_FINAL);
+    if (!record->report_pending) { reported = 1; break; }
+    delivery_pause();
+  } while (delivery_clock_ms() < deadline);
+  CHECK(reported && record->report_attempts == 1 && !strcmp(record->detail, original));
+  CHECK(edr_command_receive_envelope(id, "agent_update", (const uint8_t *)payload, strlen(payload), &meta) == 0);
+  CHECK(edr_command_state_begin(id, "agent_update", &meta, NULL, record) == EDR_COMMAND_STATE_BEGIN_DUP_FINAL);
+  CHECK(!record->report_pending && !strcmp(record->detail, original));
+  edr_command_executor_get_health(&after);
+  CHECK(before.executed_count == after.executed_count);
+  CHECK(edr_command_state_count_inbox() == 0);
+  free(record);
+  printf("{\"mode\":\"positive-upgrade-denial\",\"signed_denial_reported\":true,\"duplicate_suppressed\":true,\"retry_preserved\":true,\"no_updater_execution\":true,\"failed_checks\":%u}\n", failed);
+  return failed ? 1 : 0;
+}
+
 static int command_delivery_scenario(const char *path, const char *mode) {
   delivery_env("EDR_COMMAND_STATE_DIR", path);
   delivery_env("EDR_COMMAND_DELIVERY_POLL_MS", "1000");
@@ -1057,6 +1117,7 @@ int main(int argc, char **argv) {
 #ifdef EDR_TEST_EXTENDED_EGRESS
   if (strstr(argv[6], "update-download")) return update_download_scenario(argv[5],!strncmp(argv[6],"wrong-",6));
   if (!strcmp(argv[6], "positive-command")) return command_result_scenario(argv[5]);
+  if (!strcmp(argv[6], "positive-upgrade-denial")) return upgrade_denial_scenario(argv[5]);
   if (!strncmp(argv[6], "positive-command-delivery-", 26u))
     return command_delivery_scenario(argv[5], argv[6]);
   if (!strcmp(argv[6], "positive-pmfe")) return pmfe_receipt_scenario(argv[5]);

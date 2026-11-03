@@ -183,7 +183,7 @@ int main(void) {
   contains(script, "Unregister-ScheduledTask", "temporary updater task is cleaned up");
   contains(script, "Clear-StaleUpdateWork", "stale updater tasks and work directories are bounded");
   contains(script, "Remove-CurrentUpdateWork", "terminal update work is removed after durable reporting");
-  contains(script, "AgentUpdateUpdaterProtocolVersion = 5", "updater protocol version is explicit in the release script");
+  contains(script, "AgentUpdateUpdaterProtocolVersion = 6", "updater protocol version is explicit in the release script");
   contains(script, "Invoke-FullInstallerUpgrade", "protocol v5 supports the task-pinned full installer path");
   contains(script, "EDR_UPGRADE_EXISTING=1", "full installer preserves the existing endpoint identity");
   require_true(!strstr(script, "keepofflinequeue,keepevidencecache,stricthealthcheck"),

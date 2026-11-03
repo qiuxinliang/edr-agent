@@ -465,18 +465,26 @@ class Handler(http.server.BaseHTTPRequestHandler):
                                    (command_id, digest, count))
                     self.reply({"code": "OK", "data": {"accepted": True, "complete": True}})
                     return
-                if body["endpoint_id"] != "synthetic-endpoint" or result["command_id"] != "cmd_synthetic_noop" or result["command_type"] != "noop" or result["status"] != 1:
+                upgrade_denial = result["command_id"] == "agent_update_synthetic_denied"
+                if upgrade_denial:
+                    if body["endpoint_id"] != "synthetic-endpoint" or result["command_type"] != "agent_update" or result["status"] != 2 or result["exit_code"] != 19:
+                        raise ValueError("invalid upgrade denial reached receiver")
+                    detail = json.loads(result["detail_utf8"])
+                    if detail != {"schema":"edr.command.status.v1", "status":2, "exit_code":19,
+                                  "diagnostic":"agent_update_publisher_subject_length_invalid"}:
+                        raise ValueError("upgrade denial lost its bounded diagnostic")
+                elif body["endpoint_id"] != "synthetic-endpoint" or result["command_id"] != "cmd_synthetic_noop" or result["command_type"] != "noop" or result["status"] != 1:
                     raise ValueError("unowned command result reached receiver")
                 stable = dict(result)
                 stable.pop("finished_unix_ms")
                 digest = hashlib.sha256(json.dumps(stable, sort_keys=True).encode()).hexdigest()
                 with closing(sqlite3.connect(self.server.database)) as db, db:
                     db.execute("PRAGMA synchronous=FULL")
-                    previous = db.execute("SELECT sha,observations FROM receipt WHERE batch_id='cmd_synthetic_noop'").fetchone()
+                    previous = db.execute("SELECT sha,observations FROM receipt WHERE batch_id=?", (result["command_id"],)).fetchone()
                     if previous and previous[0] != digest:
                         raise ValueError("command retry changed terminal body")
                     count = previous[1] + 1 if previous else 1
-                    db.execute("INSERT INTO receipt VALUES('cmd_synthetic_noop',?,?) ON CONFLICT(batch_id) DO UPDATE SET observations=excluded.observations", (digest, count))
+                    db.execute("INSERT INTO receipt VALUES(?,?,?) ON CONFLICT(batch_id) DO UPDATE SET observations=excluded.observations", (result["command_id"], digest, count))
                 self.reply({"code": "OK", "data": {"accepted": True, "complete": count > 1}})
             elif self.path == "/api/v1/ingest/heartbeat":
                 if set(body) != {"endpoint_id", "agent_version", "policy_version"}:
@@ -704,10 +712,10 @@ def main():
         reports = []
         modes = ("positive", "positive-ip", "positive-v2", "wrong-ca", "wrong-host")
         if not args.baseline:
-            modes += ("positive-pmfe", "positive-journal", "positive-p0-journal", "positive-command", "positive-update-download-x64", "positive-update-download-arm64",
+            modes += ("positive-pmfe", "positive-journal", "positive-p0-journal", "positive-command", "positive-upgrade-denial", "positive-update-download-x64", "positive-update-download-arm64",
                       "wrong-update-download-ca", "wrong-update-download-host")
         if args.command_only:
-            modes = ("positive-command",)
+            modes = ("positive-command", "positive-upgrade-denial")
         if args.command_delivery_only:
             modes = ("positive-command-delivery-pressure", "positive-command-delivery-recovered",
                      "positive-command-delivery-invariants", "positive-command-delivery-batch")
@@ -728,7 +736,7 @@ def main():
                 environment.pop("EDR_CONTROL_DICT_PATH", None)
                 if mode == "positive-v2":
                     environment["EDR_ZSTD_DICT_PATH"] = str(root / "synthetic.dict")
-                if mode == "positive-command":
+                if mode in ("positive-command", "positive-upgrade-denial"):
                     executable = shutil.which("openssl")
                     for command in (
                         ["genpkey", "-algorithm", "ED25519", "-out", "command.key"],
@@ -753,6 +761,23 @@ def main():
                         environment[f"EDR_TEST_{label}_SIGNATURE"] = command_id + "|sigv2|ed25519|synthetic-key|" + signature
                         environment[f"EDR_TEST_{label}_ISSUED"] = issued
                     issued = str(int(time.time() * 1000))
+                    upgrade_payload = json.dumps({"schema":"edr.agent_update.v1", "task_id":"synthetic-upgrade",
+                        "operation":"upgrade", "initiated_by":"operator", "artifact_id":"synthetic-artifact",
+                        "artifact_url":"https://localhost/unused", "hash":"a"*64, "version":"3.2.735",
+                        "arch":"arm64", "internal_name":"FDSensor", "publisher_thumbprint":"b"*40,
+                        "publisher_subject":"X" * 2049, "issued_at_unix_ms":int(issued),
+                        "deadline_unix_ms":int(issued)+30000}, separators=(",", ":"))
+                    command_id = "agent_update_synthetic_denied"
+                    canonical = "\n".join((command_id, "agent_update", command_id, issued,
+                        "30000", hashlib.sha256(upgrade_payload.encode()).hexdigest())).encode()
+                    (root / "command.txt").write_bytes(canonical)
+                    subprocess.run([executable, "pkeyutl", "-sign", "-rawin", "-inkey", "command.key",
+                        "-in", "command.txt", "-out", "command.sig"], cwd=root, check=True,
+                        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=15)
+                    signature = base64.urlsafe_b64encode((root / "command.sig").read_bytes()).decode().rstrip("=")
+                    environment["EDR_TEST_UPGRADE_SIGNATURE"] = command_id + "|sigv2|ed25519|synthetic-key|" + signature
+                    environment["EDR_TEST_UPGRADE_ISSUED"] = issued
+                    environment["EDR_TEST_UPGRADE_PAYLOAD"] = upgrade_payload
                     original = {"schema":"edr.command.status.v1","status":1,"exit_code":0,
                                 "diagnostic":"command_completed"}
                     exact_detail = json.dumps(original,separators=(",",":"))
@@ -839,7 +864,7 @@ def main():
                             reports[-1]["receiver_business_failures"] += 1
                 if "update-download" in mode and len(server.observations) != 5:
                     reports[-1]["receiver_business_failures"] += 1
-                if mode == "positive-command":
+                if mode in ("positive-command", "positive-upgrade-denial"):
                     if len(server.observations) != 2 or reports[-1]["durable_batches"] != 1 or reports[-1]["duplicate_observations"] != 1:
                         reports[-1]["receiver_business_failures"] += 1
                 if server.command_delivery_mode is True:
