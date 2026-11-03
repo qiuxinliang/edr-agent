@@ -525,6 +525,38 @@ static int64_t sqlite_scalar_integer(const char *path, const char *sql) {
   return result;
 }
 
+/* Only the explicit capacity contract uses these observations. File sizes are
+ * the public status sample; live pages come from a later readonly connection.
+ * Neither is the writer's exact COMMIT boundary or its uncommitted snapshot. */
+static int s_capacity_admission_observe;
+static unsigned s_capacity_admission_observations;
+static void capacity_admission_observe(const char *path, const char *scenario,
+    const char *phase, const EdrEvidenceCacheStatus *sample, int read_live) {
+  if (!s_capacity_admission_observe) return;
+  EdrEvidenceCacheStatus current;
+  if (!sample) { edr_local_evidence_cache_get_status(&current); sample = &current; }
+  int64_t live = read_live ? sqlite_scalar_integer(path,
+      "SELECT (page_count-freelist_count)*page_size "
+      "FROM pragma_page_count,pragma_freelist_count,pragma_page_size;") : -1;
+  assert(!read_live || live >= 0);
+  assert(++s_capacity_admission_observations <= 64u);
+  printf("capacity_admission_observation scenario=%s phase=%s limit_bytes=%llu "
+      "db_bytes=%llu wal_bytes=%llu shm_bytes=%llu physical_available=%u "
+      "live_observed=%d live_bytes=%lld live_scope=%s "
+      "atomic_size_live_snapshot=0 exact_commit=0 admitted=%llu rejected=%llu "
+      "candidate_writes=%llu transaction_failures=%llu capacity_cause=%u sqlite_rc=%u\n",
+      scenario, phase, (unsigned long long)sample->max_db_mb * UINT64_C(1048576),
+      (unsigned long long)sample->db_bytes, (unsigned long long)sample->wal_bytes,
+      (unsigned long long)sample->shm_bytes, (unsigned)sample->physical_accounting_available,
+      read_live, (long long)live, read_live ? "committed_readonly_snapshot" : "unobserved",
+      (unsigned long long)sample->candidate_admitted,
+      (unsigned long long)sample->candidate_rejected,
+      (unsigned long long)sample->p0_candidates_written,
+      (unsigned long long)sample->candidate_transaction_failures,
+      (unsigned)sample->capacity_last_cause, (unsigned)sample->capacity_last_sqlite_rc);
+  assert(fflush(stdout) == 0);
+}
+
 static int sqlite_table_has_column(const char *path, const char *table, const char *column) {
   sqlite3 *db = NULL;
   sqlite3_stmt *stmt = NULL;
@@ -940,10 +972,12 @@ static void test_candidate_commit_failure_leaves_no_dedupe_or_context_state(void
   candidate.process_start_key = 0x73101u;
   candidate.process_creation_filetime_100ns = 133700000000000001ULL;
 
+  capacity_admission_observe(db,"commit_failure","pre_record",NULL,1);
   edr_local_evidence_cache_test_fail_next_commits(1u);
   edr_local_evidence_cache_record_behavior(&candidate);
   EdrEvidenceCacheStatus failed;
   edr_local_evidence_cache_get_status(&failed);
+  capacity_admission_observe(db,"commit_failure","failed_public_record_end",&failed,1);
   assert(failed.candidate_requests == 1u);
   assert(failed.candidate_reused == 0u);
   assert(failed.candidate_admission_attempts == 1u);
@@ -974,6 +1008,7 @@ static void test_candidate_commit_failure_leaves_no_dedupe_or_context_state(void
   edr_local_evidence_cache_record_behavior(&candidate);
   EdrEvidenceCacheStatus committed;
   edr_local_evidence_cache_get_status(&committed);
+  capacity_admission_observe(db,"commit_failure","retry_public_record_end",&committed,1);
   assert(committed.candidate_requests == 2u);
   assert(committed.candidate_reused == 0u);
   assert(committed.candidate_admission_attempts == 2u);
@@ -2795,7 +2830,7 @@ static void test_existing_candidate_update_honors_capacity(void) {
   sqlite3 *raw = NULL, *reader = NULL;
   sqlite3_stmt *pin = NULL, *st = NULL;
   EdrBehaviorRecord candidate, context;
-  EdrEvidenceCacheStatus initial, before, after;
+  EdrEvidenceCacheStatus initial, before, after, crossing_pre;
   struct timespec ts;
   assert(make_test_sqlite_path(db, sizeof(db)) == 0);
   assert(edr_local_evidence_cache_open(db, 1u, 24u) == 0);
@@ -2842,11 +2877,21 @@ static void test_existing_candidate_update_honors_capacity(void) {
   assert(sqlite3_step(pin) == SQLITE_ROW);
   assert(strcmp((const char *)sqlite3_column_text(pin, 0), candidate_id) == 0);
   before = initial;
+  if (s_capacity_admission_observe) crossing_pre = before;
+  capacity_admission_observe(db,"pinned_reader","replay_series_pre",&before,1);
   for (unsigned replay = 0; replay < 200u &&
        before.db_bytes + before.wal_bytes <= 1024u * 1024u; ++replay) {
+    if (s_capacity_admission_observe) crossing_pre = before;
     edr_local_evidence_cache_record_behavior(&candidate);
     edr_local_evidence_cache_get_status(&before);
   }
+  if (s_capacity_admission_observe) {
+    assert(crossing_pre.db_bytes + crossing_pre.wal_bytes <= 1024u * 1024u);
+    /* Retain the actual preceding status sample without introducing a query
+     * into every replay. Its corresponding live-page value was not sampled. */
+    capacity_admission_observe(db,"pinned_reader","pre_crossing_public_record",&crossing_pre,0);
+  }
+  capacity_admission_observe(db,"pinned_reader","crossed_public_record_end",&before,1);
   assert(before.db_bytes + before.wal_bytes > 1024u * 1024u);
   assert(before.p0_candidates_written > initial.p0_candidates_written);
   assert(before.candidate_rejected == initial.candidate_rejected);
@@ -2859,6 +2904,8 @@ static void test_existing_candidate_update_honors_capacity(void) {
   for (unsigned refusal = 0; refusal < 2u; ++refusal) {
     edr_local_evidence_cache_record_behavior(&candidate);
     edr_local_evidence_cache_get_status(&after);
+    capacity_admission_observe(db,"pinned_reader",refusal ?
+        "second_refused_public_record_end" : "next_refused_public_record_end",&after,1);
     assert(after.candidate_rejected == before.candidate_rejected + 1u);
     assert(after.db_budget_dropped == before.db_budget_dropped + 1u);
     assert(after.candidate_failure_reasons[EDR_EVIDENCE_FAILURE_CAPACITY] ==
@@ -2881,6 +2928,7 @@ static void test_existing_candidate_update_honors_capacity(void) {
   strcpy(blocked_context.event_id, "blocked-context-different-source");
   edr_local_evidence_cache_record_behavior(&blocked_context);
   edr_local_evidence_cache_get_status(&after);
+  capacity_admission_observe(db,"pinned_reader","context_refused_public_record_end",&after,1);
   assert(after.context_capacity_causes[EDR_EVIDENCE_CAPACITY_WAL_BUSY] == 1u);
   assert(after.capacity_last_sqlite_rc == SQLITE_BUSY && after.capacity_last_owner == 2u);
   assert_capacity_diagnostics(&after);
@@ -2901,6 +2949,7 @@ static void test_existing_candidate_update_honors_capacity(void) {
   snprintf(candidate.cmdline, sizeof(candidate.cmdline), "powershell.exe -File recovered.ps1");
   edr_local_evidence_cache_record_behavior(&candidate);
   edr_local_evidence_cache_get_status(&after);
+  capacity_admission_observe(db,"pinned_reader","reader_released_public_record_end",&after,1);
   assert(after.records_written == before.records_written + 1u);
   assert(after.p0_candidates_written == before.p0_candidates_written + 1u);
   assert(after.candidate_rejected == before.candidate_rejected);
@@ -2922,6 +2971,7 @@ static void test_existing_candidate_update_honors_capacity(void) {
     if (!reopen) {
       assert(edr_local_evidence_cache_open(db, 1u, 24u) == 0);
       edr_local_evidence_cache_get_status(&after);
+      capacity_admission_observe(db,"pinned_reader","same_cap_reopened",&after,1);
       assert(after.capacity_last_owner == 0u);
       assert(after.candidate_capacity_causes[EDR_EVIDENCE_CAPACITY_WAL_BUSY] == 0u);
       assert(after.context_capacity_causes[EDR_EVIDENCE_CAPACITY_WAL_BUSY] == 0u);
@@ -7775,6 +7825,7 @@ static void test_physical_floor_rejects_evidence_copy(void) {
   assert(make_test_sqlite_path(path,sizeof(path))==0);
   assert(edr_local_evidence_cache_open(path,8,1)==0);
   edr_local_evidence_cache_get_status(&before);
+  capacity_admission_observe(path,"physical_floor","pre_record",&before,1);
   test_setenv("EDR_STORAGE_MIN_FREE_MB","1073741824");
   assert(edr_local_evidence_cache_record_command_result("blocked-copy","rtq_query","done",1,0,"detail","")==EDR_EVIDENCE_COMMAND_RESULT_CAPACITY);
   edr_local_evidence_cache_get_status(&after);
@@ -7794,6 +7845,7 @@ static void test_physical_floor_rejects_evidence_copy(void) {
   edr_local_evidence_cache_record_behavior(&candidate);
   edr_local_evidence_cache_get_status(&after);
   assert(after.candidate_capacity_causes[EDR_EVIDENCE_CAPACITY_PHYSICAL_GUARD]==1u);
+  capacity_admission_observe(path,"physical_floor","refused_public_record_end",&after,1);
   assert(after.capacity_last_sqlite_rc==0u);
   assert_capacity_diagnostics(&after);
   test_unsetenv("EDR_STORAGE_MIN_FREE_MB");
@@ -11979,10 +12031,14 @@ static void test_candidate_live_size_query_failure_is_storage(void) {
     edr_behavior_bind_parent_context(candidate);
     EdrEvidenceCacheStatus before, failed, recovered;
     edr_local_evidence_cache_get_status(&before);
+    capacity_admission_observe(path,alert_entry ? "live_query_alert" : "live_query_behavior",
+        "pre_record",&before,1);
     edr_local_evidence_cache_test_fail_next_live_size_queries(1u);
     if (alert_entry) assert(edr_local_evidence_cache_record_alert_context(candidate, NULL) < 0);
     else edr_local_evidence_cache_record_behavior(candidate);
     edr_local_evidence_cache_get_status(&failed);
+    capacity_admission_observe(path,alert_entry ? "live_query_alert" : "live_query_behavior",
+        "failed_public_record_end",&failed,1);
     assert(failed.candidate_requests == before.candidate_requests + 1u);
     assert(failed.candidate_admission_attempts == before.candidate_admission_attempts + 1u);
     assert(failed.candidate_admitted == before.candidate_admitted);
@@ -12008,6 +12064,8 @@ static void test_candidate_live_size_query_failure_is_storage(void) {
     if (alert_entry) assert(edr_local_evidence_cache_record_alert_context(candidate, NULL) == 0);
     else edr_local_evidence_cache_record_behavior(candidate);
     edr_local_evidence_cache_get_status(&recovered);
+    capacity_admission_observe(path,alert_entry ? "live_query_alert" : "live_query_behavior",
+        "retry_public_record_end",&recovered,1);
     assert(recovered.candidate_admitted == before.candidate_admitted + 1u);
     assert(recovered.candidate_rejected == failed.candidate_rejected);
     assert(recovered.candidate_transaction_failures == failed.candidate_transaction_failures);
@@ -12699,9 +12757,13 @@ static void test_pressure_continuation_postwrite_refusal(int fail_rollback) {
   EdrEvidenceCacheStatus before, refused, resumed;
   edr_local_evidence_cache_get_status(&before);
   assert(before.db_bytes == 1048576u && before.wal_bytes == 0u);
+  capacity_admission_observe(path,fail_rollback ? "rollback_unconfirmed" : "postwrite_limit",
+      "pre_record",&before,1);
   if (fail_rollback) edr_local_evidence_cache_test_fail_next_capacity_rollbacks(1u);
   assert(edr_local_evidence_cache_record_alert_context(incoming,&facts) < 0);
   edr_local_evidence_cache_get_status(&refused);
+  capacity_admission_observe(path,fail_rollback ? "rollback_unconfirmed" : "postwrite_limit",
+      "refused_public_record_end",&refused,1);
   assert(refused.candidate_transaction_failures == before.candidate_transaction_failures+1u);
   unsigned reason = fail_rollback ? EDR_EVIDENCE_FAILURE_STORAGE : EDR_EVIDENCE_FAILURE_CAPACITY;
   assert(refused.candidate_failure_reasons[reason] == before.candidate_failure_reasons[reason]+1u);
@@ -12716,10 +12778,14 @@ static void test_pressure_continuation_postwrite_refusal(int fail_rollback) {
     assert(strstr(refused.last_error,"rollback did not finish"));
     for (unsigned turn = 0; turn < 100u; ++turn) edr_local_evidence_cache_poll_maintenance();
     edr_local_evidence_cache_get_status(&resumed);
+    capacity_admission_observe(path,"rollback_unconfirmed","maintenance_held",&resumed,1);
     assert(resumed.maintenance_runs == refused.maintenance_runs);
     parent_fixture_owner_hash(db,protected->pid,after_hash); assert(!strcmp(protected_hash,after_hash));
     edr_local_evidence_cache_close();
     assert(edr_local_evidence_cache_open_with_policy(path,16u,1u,1u) == 0);
+    /* Preserve this older fixture's recovery budget and expose the change;
+     * it does not establish same-capacity reopen after unconfirmed rollback. */
+    capacity_admission_observe(path,"rollback_unconfirmed","reopened_fixture_cap_16mib",NULL,1);
     assert(compact_scalar(db,"SELECT COUNT(*) FROM p0_candidates WHERE pid=99104") == 0);
     parent_fixture_owner_hash(db,protected->pid,after_hash); assert(!strcmp(protected_hash,after_hash));
     printf("pressure_continuation_rollback_failure storage=1 capacity=0 scheduled=0 original_owner_preserved=1\n");
@@ -12728,6 +12794,7 @@ static void test_pressure_continuation_postwrite_refusal(int fail_rollback) {
   s_test_monotonic_ns += UINT64_C(1000000000);
   edr_local_evidence_cache_test_set_retention_monotonic_ms(3604000);
   edr_local_evidence_cache_poll_maintenance(); edr_local_evidence_cache_get_status(&resumed);
+  capacity_admission_observe(path,"postwrite_limit","same_cap_maintenance_resumed",&resumed,1);
   fprintf(stderr,"pressure_continuation_postwrite pre_runs=%llu refused_runs=%llu next_runs=%llu retired=%llu->%llu txfail=%llu->%llu\n",
       (unsigned long long)before.maintenance_runs,(unsigned long long)refused.maintenance_runs,
       (unsigned long long)resumed.maintenance_runs,(unsigned long long)refused.retention_groups_retired,
@@ -15621,6 +15688,22 @@ int main(int argc, char **argv) {
   s_test_executable = argv[0];
 #endif
 #if defined(EDR_HAVE_SQLITE)
+  if (argc == 2 && strcmp(argv[1], "--capacity-admission-contract") == 0) {
+    s_capacity_admission_observe = 1;
+    test_existing_candidate_update_honors_capacity();
+    test_candidate_live_size_query_failure_is_storage();
+    test_pressure_continuation_postwrite_refusal(0);
+    test_pressure_continuation_postwrite_refusal(1);
+    test_candidate_commit_failure_leaves_no_dedupe_or_context_state();
+    test_physical_floor_rejects_evidence_copy();
+    printf("capacity_admission_contract cases=7 observations=%u observation_limit=64 "
+        "prewrite_db_wal_admission=1 candidate_precommit_live_limit=1 "
+        "strict_post_db_wal_limit=0 exact_commit_observed=0 peak_bound_proven=0 "
+        "rollback_unconfirmed_reopen_limit_mib=16 same_cap_rollback_reopen_proven=0\n",
+        s_capacity_admission_observations);
+    assert(fflush(stdout) == 0);
+    return 0;
+  }
   if (argc == 2 && strcmp(argv[1], "--startup-logical-budget-public512") == 0) {
     test_startup_logical_budget_legacy(1,0,512u); return 0;
   }
