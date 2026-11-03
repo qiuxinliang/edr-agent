@@ -353,6 +353,15 @@ class WindowsLifecycleWorkflowTests(unittest.TestCase):
         self.assertNotIn('${{ runner.', tools.split('    steps:\n', 1)[0])
         self.assertIn("github.event_name == 'workflow_dispatch' && inputs.publisher_validation_request", tools)
         self.assertIn('fetch-depth: 0', tools)
+        self.assertIn("P0_TEST_INPUTS_REF: '1190a89c39c0fcf675626afe040ed11b93670f09'", tools)
+        inputs = step(tools, 'Read the existing frozen private P0 test inputs')
+        self.assertIn('checkout_private_p0_inputs.ps1 -Directory .p0-test-inputs -Ref $env:P0_TEST_INPUTS_REF', inputs)
+        self.assertIn('P0_TEST_INPUTS_SSH_KEY: ${{ secrets.P0_TEST_INPUTS_SSH_KEY }}', inputs)
+        verification = step(tools, 'Verify the frozen P0 inputs using the existing release owner')
+        self.assertIn('--only-binary=:all: --requirement ./requirements-release.txt', verification)
+        self.assertIn('windows_release_checkpoint.py verify-p0-inputs --directory .p0-test-inputs', verification)
+        self.assertLess(tools.index('- name: Verify the frozen P0 inputs'),
+                        tools.index('- name: Compile the frozen original'))
         for arch, triplet in [('amd64', 'x64-windows'), ('arm64', 'arm64-windows')]:
             self.assertIn('- arch: '+arch, tools)
             self.assertIn('triplet: '+triplet, tools)
@@ -364,6 +373,7 @@ class WindowsLifecycleWorkflowTests(unittest.TestCase):
                          '-DEDR_REQUIRE_PCRE2=ON', '-DEDR_P0_RULE_IR_ALLOW_TEST_STUB=OFF',
                          "'-DEDR_PCRE2_PRODUCER_TARGET=windows/${{ matrix.arch }}'",
                          '"-DEDR_PCRE2_VCPKG_ROOT=$PWD/vcpkg"',
+                         '"-DEDR_P0_TEST_CONFIG_DIR=$env:EDR_BACKEND_CONFIG_DIR"',
                          '--target storage_compat_cache storage_compat_queue',
                          'storage_compat/stage_native.py stage', '--harness-commit $env:GITHUB_SHA',
                          '--run-id $env:GITHUB_RUN_ID --run-attempt $env:GITHUB_RUN_ATTEMPT'):

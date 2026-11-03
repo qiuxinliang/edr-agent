@@ -46,6 +46,14 @@ architecture/triplet and the same locked dependency prefix. Build only
 use their original test owners' source, defines, includes and link dependencies.
 They do not rebuild, rewrite or replace the signed product artifacts.
 
+The original Windows release-gate configuration also requires canonical P0 test
+inputs even when only these two targets are selected. Reuse the existing private
+checkout and `windows_release_checkpoint.py verify-p0-inputs` owners with fixed
+input commit `1190a89c39c0fcf675626afe040ed11b93670f09`, the same input used for both
+candidate builds. Pass the verified `EDR_BACKEND_CONFIG_DIR` as
+`EDR_P0_TEST_CONFIG_DIR`. These inputs stay outside the exported sources and tool
+bundle; their presence does not claim that the unrelated P0 tests were run.
+
 `stage_native.py stage` takes `--repo`, `--legacy-build`, `--candidate-build`,
 `--source-manifests`, `--dependency-prefix`, `--msvc-redist-root`, `--compiler`,
 `--dumpbin`, `--architecture`, `--harness-commit`, `--run-id`, `--run-attempt`,

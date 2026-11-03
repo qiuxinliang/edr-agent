@@ -833,6 +833,7 @@ jobs:
     timeout-minutes: 90
     env:
       NATIVE_ARCH: ${{ matrix.arch }}
+      P0_TEST_INPUTS_REF: '1190a89c39c0fcf675626afe040ed11b93670f09'
       EDR_VCPKG_TRIPLET: ${{ matrix.triplet }}
       VCPKG_DEFAULT_TRIPLET: ${{ matrix.triplet }}
       VCPKG_DOWNLOADS: ${{ github.workspace }}/.cache/vcpkg-downloads
@@ -868,6 +869,21 @@ jobs:
         run: |
           & ./scripts/Initialize-VSEnvironment.ps1 -Architecture '${{ matrix.msvc_arch }}'
           & ./scripts/Ensure-WindowsBuildTools.ps1 -NinjaOnly
+      - name: Read the existing frozen private P0 test inputs
+        timeout-minutes: 5
+        shell: pwsh
+        env:
+          P0_TEST_INPUTS_SSH_KEY: ${{ secrets.P0_TEST_INPUTS_SSH_KEY }}
+        run: |
+          & ./scripts/checkout_private_p0_inputs.ps1 -Directory .p0-test-inputs -Ref $env:P0_TEST_INPUTS_REF
+      - name: Verify the frozen P0 inputs using the existing release owner
+        timeout-minutes: 5
+        shell: pwsh
+        run: |
+          python -m pip install --disable-pip-version-check --only-binary=:all: --requirement ./requirements-release.txt
+          if($LASTEXITCODE -ne 0){throw 'Pinned P0 verification dependency installation failed'}
+          python scripts/windows_release_checkpoint.py verify-p0-inputs --directory .p0-test-inputs
+          if($LASTEXITCODE -ne 0){throw 'Frozen P0 test input identity or pair verification failed'}
       - name: Identify the existing locked dependency cache
         id: storage-vcpkg-key
         shell: pwsh
@@ -919,6 +935,7 @@ jobs:
               -DEDR_BUILD_TESTS=ON -DEDR_REQUIRE_SQLITE=ON -DEDR_REQUIRE_PCRE2=ON `
               -DEDR_P0_RULE_IR_ALLOW_TEST_STUB=OFF '-DEDR_PCRE2_PRODUCER_TARGET=windows/${{ matrix.arch }}' `
               "-DEDR_PCRE2_VCPKG_ROOT=$PWD/vcpkg" -DEDR_WITH_YARA=OFF -DEDR_REQUIRE_YARA=OFF `
+              "-DEDR_P0_TEST_CONFIG_DIR=$env:EDR_BACKEND_CONFIG_DIR" `
               -DEDR_WITH_FORENSIC_COLLECTOR=OFF -DEDR_WITH_HTTP2_CURL=OFF
             if($LASTEXITCODE -ne 0){throw 'Real storage owner target configuration failed'}
             cmake --build $build --target storage_compat_cache storage_compat_queue --parallel 4
