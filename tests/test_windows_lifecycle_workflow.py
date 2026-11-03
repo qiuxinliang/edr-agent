@@ -306,7 +306,12 @@ class WindowsLifecycleWorkflowTests(unittest.TestCase):
             ('arm64', 'scheduled_task', 'windows-11-vs2026-arm'),
         ])
         self.assertIn('LIFECYCLE_RUNTIME_MODE: ${{ matrix.runtime_mode }}', signed)
+        # GitHub resolves job env before a runner exists. Keep the host guard's
+        # runner context at step scope so both dispatch and reusable calls parse.
+        self.assertNotIn('${{ runner.', signed.split('    steps:\n', 1)[0])
         clean = step(signed, 'Require a clean native hosted machine for signed acceptance')
+        self.assertIn('          VALIDATION_RUNNER_ENVIRONMENT: ${{ runner.environment }}', clean)
+        self.assertIn("$env:VALIDATION_RUNNER_ENVIRONMENT -cne 'github-hosted'", clean)
         self.assertIn('Get-ScheduledTask -TaskName FDSecurityAgent,EdrAgent', clean)
         invoke = step(signed, 'Execute signed migration upgrade timeout rollback and uninstall')
         for binding in ('RuntimeMode=$env:LIFECYCLE_RUNTIME_MODE',

@@ -838,7 +838,6 @@ jobs:
       VALIDATION_TARGET_TAG: ${{ inputs.target_tag }}
       VALIDATION_BASELINE_TAG: ${{ inputs.baseline_tag }}
       VALIDATION_CACHE_SUBSET: ${{ inputs.cache_recovery_subset }}
-      VALIDATION_RUNNER_ENVIRONMENT: ${{ runner.environment }}
       NATIVE_ARCH: ${{ matrix.arch }}
       LIFECYCLE_RUNTIME_MODE: ${{ matrix.runtime_mode }}
     steps:
@@ -852,6 +851,7 @@ jobs:
       - name: Require a clean native hosted machine for signed acceptance
         shell: pwsh
         env:
+          VALIDATION_RUNNER_ENVIRONMENT: ${{ runner.environment }}
           PRIVATE_ACTIONS_PRESENT: ${{ secrets.USB_SIGNING_TOKEN != '' }}
           PRIVATE_CONTENTS_PRESENT: ${{ secrets.USB_SIGNING_RELEASE_TOKEN != '' }}
         run: |
