@@ -361,11 +361,15 @@ class WindowsLifecycleWorkflowTests(unittest.TestCase):
                          '-DCMAKE_BUILD_TYPE:STRING=StorageCompat',
                          "'-DCMAKE_MAP_IMPORTED_CONFIG_STORAGECOMPAT:STRING=Release;'",
                          '-DCMAKE_MSVC_RUNTIME_LIBRARY:STRING=MultiThreadedDLL',
+                         '-DEDR_REQUIRE_PCRE2=ON', '-DEDR_P0_RULE_IR_ALLOW_TEST_STUB=OFF',
+                         "'-DEDR_PCRE2_PRODUCER_TARGET=windows/${{ matrix.arch }}'",
+                         '"-DEDR_PCRE2_VCPKG_ROOT=$PWD/vcpkg"',
                          '--target storage_compat_cache storage_compat_queue',
                          'storage_compat/stage_native.py stage', '--harness-commit $env:GITHUB_SHA',
                          '--run-id $env:GITHUB_RUN_ID --run-attempt $env:GITHUB_RUN_ATTEMPT'):
             self.assertIn(required, compile_step)
-        for forbidden in ('--target FDSensor', '-DCMAKE_BUILD_TYPE=Release', 'GH_TOKEN:'):
+        for forbidden in ('--target FDSensor', '-DCMAKE_BUILD_TYPE=Release', 'GH_TOKEN:',
+                          '-DEDR_REQUIRE_PCRE2=OFF', '-DEDR_P0_RULE_IR_ALLOW_TEST_STUB=ON'):
             self.assertNotIn(forbidden, compile_step)
         download = step(signed, 'Bind exact same-run native storage tools')
         self.assertIn('storage_compat/transfer.py download', download)

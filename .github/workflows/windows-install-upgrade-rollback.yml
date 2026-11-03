@@ -916,8 +916,9 @@ jobs:
               "-DCMAKE_TOOLCHAIN_FILE=$toolchain" "-DCMAKE_PREFIX_PATH=$prefix" `
               "-DVCPKG_INSTALLED_DIR=$PWD/vcpkg_installed" -DVCPKG_MANIFEST_INSTALL=OFF `
               '-DCMAKE_SYSTEM_PROCESSOR=${{ matrix.processor }}' '-DEDR_WINDOWS_TARGET_ARCH=${{ matrix.arch }}' `
-              -DEDR_BUILD_TESTS=ON -DEDR_REQUIRE_SQLITE=ON -DEDR_REQUIRE_PCRE2=OFF `
-              -DEDR_P0_RULE_IR_ALLOW_TEST_STUB=ON -DEDR_WITH_YARA=OFF -DEDR_REQUIRE_YARA=OFF `
+              -DEDR_BUILD_TESTS=ON -DEDR_REQUIRE_SQLITE=ON -DEDR_REQUIRE_PCRE2=ON `
+              -DEDR_P0_RULE_IR_ALLOW_TEST_STUB=OFF '-DEDR_PCRE2_PRODUCER_TARGET=windows/${{ matrix.arch }}' `
+              "-DEDR_PCRE2_VCPKG_ROOT=$PWD/vcpkg" -DEDR_WITH_YARA=OFF -DEDR_REQUIRE_YARA=OFF `
               -DEDR_WITH_FORENSIC_COLLECTOR=OFF -DEDR_WITH_HTTP2_CURL=OFF
             if($LASTEXITCODE -ne 0){throw 'Real storage owner target configuration failed'}
             cmake --build $build --target storage_compat_cache storage_compat_queue --parallel 4

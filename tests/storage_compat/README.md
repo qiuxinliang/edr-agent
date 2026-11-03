@@ -29,11 +29,19 @@ Release dependencies and CRT while preserving the original production gate.
 The trailing empty mapping element permits configuration-less imported targets
 such as FindSQLite3's `IMPORTED_LOCATION`, using the same locked dependency
 prefix; it does not select Debug libraries. Without that empty element CMake
-rejects those targets at generation time. The production gate remains intact:
-the existing `EDR_P0_RULE_IR_ALLOW_TEST_STUB=ON` / `EDR_REQUIRE_PCRE2=OFF` pair is
-permitted only in a non-production test configuration. Set `EDR_BUILD_TESTS=ON`,
-`EDR_REQUIRE_SQLITE=ON`, the correct Windows architecture/triplet and the same
-locked dependency prefix. Build only
+rejects those targets at generation time.
+
+Configure with the unchanged production matcher owner: `EDR_REQUIRE_PCRE2=ON`,
+`EDR_P0_RULE_IR_ALLOW_TEST_STUB=OFF`, `EDR_PCRE2_PRODUCER_TARGET=windows/ARCH`
+and `EDR_PCRE2_VCPKG_ROOT` pointing to the existing pinned vcpkg checkout.
+Original 723's Windows test-link loop requires the real PCRE2-dependent test
+targets to exist even when only the two storage targets are selected. The
+producer performs its normal fresh static PCRE2 build for each source export;
+no production gate or frozen CMake file is patched, and no placeholder target
+is introduced. The selected storage test owners retain their existing external
+I/O/rule stubs; this does not claim P0 integration coverage. Set
+`EDR_BUILD_TESTS=ON`, `EDR_REQUIRE_SQLITE=ON`, the correct Windows
+architecture/triplet and the same locked dependency prefix. Build only
 `storage_compat_cache` and `storage_compat_queue`. These root-level test targets
 use their original test owners' source, defines, includes and link dependencies.
 They do not rebuild, rewrite or replace the signed product artifacts.
