@@ -93,6 +93,97 @@ class WindowsReleaseWorkflowTests(unittest.TestCase):
             with self.subTest(boundary=before), self.assertRaises((AssertionError, IndexError)):
                 self.assert_client_build_architecture_contract(source.replace(before, after, 1))
 
+    def assert_client_build_retention_diagnostic_contract(self, source):
+        option = source.split('      retention_cost_diagnostic_only:\n', 1)[1].split('\npermissions:', 1)[0]
+        self.assertIn('type: boolean', option)
+        self.assertIn('default: false', option)
+        self.assertIn("EDR_RETENTION_COST_DIAGNOSTIC_ONLY: ${{ inputs.retention_cost_diagnostic_only && 'true' || 'false' }}", source)
+        steps = {}
+        for block in source.split('\n      - ')[1:]:
+            first, _, rest = block.partition('\n')
+            key = first.removeprefix('name: ').removeprefix('uses: ').strip('"')
+            self.assertNotIn(key, steps)
+            steps[key] = rest
+        guard = "if ($env:EDR_RETENTION_COST_DIAGNOSTIC_ONLY -eq 'true' -and $env:EDR_RELEASE_ARCH -cne 'arm64') { throw"
+        self.assertIn(guard, steps['Validate selected architecture'])
+        self.assertLess(source.index(guard), source.index('uses: actions/checkout'))
+        normal_only = (
+            'actions/setup-dotnet@v5', 'Validate release scripts with Windows PowerShell 5.1',
+            'Verify locked Setup UI NuGet closure and publish before native dependency build',
+            'Verify release gate build dependencies', 'Build (Ninja)',
+            'Verify native uninstall attestation capabilities', 'Verify HTTPS REST and SQLite compiled in',
+            'Stage vcpkg + MSVC runtime DLLs', 'Test', 'Package (setup exe + runtime zip)',
+            'Move artifact to workspace', 'actions/upload-artifact@v6')
+        diagnostic_only = ('Build the fixed ARM64 retention diagnostic',
+                           'Run the fixed ARM64 retention diagnostic once')
+        # Evaluate the two supported dispatch routes from their actual step
+        # predicates; mutations must not make product operations reachable.
+        for diagnostic in (False, True):
+            reached = set()
+            for key in normal_only + diagnostic_only:
+                condition = re.search(r'^        if: (.+)$', steps[key], re.M)
+                self.assertIsNotNone(condition, key)
+                expected = ('${{ !inputs.retention_cost_diagnostic_only }}' if key in normal_only
+                            else '${{ inputs.retention_cost_diagnostic_only }}')
+                self.assertEqual(condition[1], expected, key)
+                if diagnostic == (key in diagnostic_only):
+                    reached.add(key)
+            self.assertEqual(reached, set(diagnostic_only if diagnostic else normal_only))
+        for key in ('Initialize pinned Visual Studio environment', 'Bind canonical P0 test input directory',
+                    'Identify vcpkg cache toolchain', 'vcpkg install (manifest)', 'Configure (Ninja, Release)'):
+            self.assertNotRegex(steps[key], r'^        if:', key)
+        tools = steps['Install build tools']
+        self.assertIn("if ($env:EDR_RETENTION_COST_DIAGNOSTIC_ONLY -eq 'true') {\n            & .\\scripts\\Ensure-WindowsBuildTools.ps1 -NinjaOnly\n          } else {\n            & .\\scripts\\Ensure-WindowsBuildTools.ps1\n          }", tools)
+        build = steps[diagnostic_only[0]]
+        self.assertEqual(re.findall(r'--target (\S+)', build), ['test_local_evidence_cache_candidate'])
+        self.assertIn("if ($LASTEXITCODE -ne 0) { throw", build)
+        normal_targets = steps['Build (Ninja)'].split('$buildTargets = @(', 1)[1].split(')', 1)[0]
+        self.assertEqual(re.findall(r"'([^']+)'", normal_targets),
+                         ['edr_agent', 'forensic_collector', 'fd_installer_worker',
+                          'fd_headless_uninstaller', 'windows_release_gate_tests'])
+        run = steps[diagnostic_only[1]]
+        call = 'python -B tests/run_retention_cost_diagnostic.py --build-dir build --preserve-contract-volumes --output "$env:RUNNER_TEMP/retention-cost-diagnosis"'
+        self.assertEqual(source.count(call), 1)
+        self.assertIn(call, run)
+        self.assertIn('timeout-minutes: 3', run)
+        self.assertIn('$env:PATH = "$runtimeBin;$env:PATH"', run)
+        self.assertIn("Join-Path $env:VCPKG_INSTALLED_ROOT 'bin'", run)
+        self.assertLess(run.index('Get-FileHash -LiteralPath $sqlite'), run.index(call))
+        self.assertIn("if ($LASTEXITCODE -ne 0) { throw", run)
+        for forbidden in ('continue-on-error:', 'ctest ', 'Build-SetupUi.ps1', 'Build-BundledInstaller.ps1',
+                          'stage_retention_native_tools.py', '--timeout', '--runs', 'while (', 'for ('):
+            self.assertNotIn(forbidden, build + run)
+        upload = steps['Preserve only fixed retention diagnostic receipts']
+        self.assertIn("if: ${{ always() && inputs.retention_cost_diagnostic_only && (steps.retention-cost.outcome == 'success' || steps.retention-cost.outcome == 'failure') }}", upload)
+        self.assertEqual(re.findall(r'^            \$\{\{ runner.temp \}\}/retention-cost-diagnosis/(.+)$', upload, re.M),
+                         ['binding.json', 'execution.json', 'stdout.log', 'stderr.log'])
+        self.assertIn('if-no-files-found: error', upload)
+        self.assertNotIn('continue-on-error:', source)
+
+    def test_client_build_retention_diagnostic_is_isolated_and_opt_in(self):
+        source = (ROOT / '.github/workflows/edr-agent-client-build.yml').read_text(encoding='utf-8')
+        self.assert_client_build_retention_diagnostic_contract(source)
+
+    def test_client_build_rejects_diagnostic_route_regressions(self):
+        source = (ROOT / '.github/workflows/edr-agent-client-build.yml').read_text(encoding='utf-8')
+        changes = (
+            ('        default: false', '        default: true'),
+            ("-and $env:EDR_RELEASE_ARCH -cne 'arm64'", "-and $env:EDR_RELEASE_ARCH -cne 'amd64'"),
+            ('      - name: Test\n        if: ${{ !inputs.retention_cost_diagnostic_only }}', '      - name: Test'),
+            ('      - name: Package (setup exe + runtime zip)\n        if: ${{ !inputs.retention_cost_diagnostic_only }}', '      - name: Package (setup exe + runtime zip)'),
+            ('      - uses: actions/upload-artifact@v6\n        if: ${{ !inputs.retention_cost_diagnostic_only }}', '      - uses: actions/upload-artifact@v6'),
+            ('--target test_local_evidence_cache_candidate --parallel', '--target windows_release_gate_tests --parallel'),
+            ('            & .\\scripts\\Ensure-WindowsBuildTools.ps1 -NinjaOnly', '            & .\\scripts\\Ensure-WindowsBuildTools.ps1'),
+            ('run_retention_cost_diagnostic.py --build-dir build', 'run_retention_cost_diagnostic.py --runs 2 --build-dir build'),
+            ('--preserve-contract-volumes --output', '--output'),
+            ("(steps.retention-cost.outcome == 'success' || steps.retention-cost.outcome == 'failure')", "steps.retention-cost.outcome == 'success'"),
+            ('retention-cost-diagnosis/stderr.log', 'retention-cost-diagnosis/*'),
+        )
+        for before, after in changes:
+            self.assertIn(before, source)
+            with self.subTest(boundary=before), self.assertRaises((AssertionError, IndexError)):
+                self.assert_client_build_retention_diagnostic_contract(source.replace(before, after, 1))
+
     def assert_client_build_version_and_identity_contract(self, source):
         option = source.split('      agent_version:\n', 1)[1].split('      p0_test_inputs_ref:', 1)[0]
         self.assertIn("default: ''", option)

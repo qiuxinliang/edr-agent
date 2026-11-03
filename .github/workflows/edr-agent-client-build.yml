@@ -24,6 +24,11 @@ on:
         description: Fixed private P0 test input commit (40 hex); defaults to repository variable
         required: false
         type: string
+      retention_cost_diagnostic_only:
+        description: ARM64 only; run one fixed 150-second retention diagnostic, without product gates or packages
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -39,7 +44,7 @@ env:
 
 jobs:
   windows-build:
-    name: Build Windows ${{ inputs.architecture || 'amd64' }} (FDSensor.exe, fast by default)
+    name: ${{ inputs.retention_cost_diagnostic_only && 'Diagnose ARM64 retention (no product gate)' || format('Build Windows {0} (FDSensor.exe, fast by default)', inputs.architecture || 'amd64') }}
     runs-on: ${{ inputs.architecture == 'arm64' && 'windows-11-vs2026-arm' || 'windows-2022' }}
     timeout-minutes: 360
     env:
@@ -52,11 +57,13 @@ jobs:
       EDR_RUNTIME_IDENTIFIER: ${{ inputs.architecture == 'arm64' && 'win-arm64' || 'win-x64' }}
       EDR_CMAKE_PROCESSOR: ${{ inputs.architecture == 'arm64' && 'ARM64' || 'AMD64' }}
       EDR_INCLUDE_WINDIVERT: ${{ inputs.architecture == 'arm64' && 'false' || 'true' }}
+      EDR_RETENTION_COST_DIAGNOSTIC_ONLY: ${{ inputs.retention_cost_diagnostic_only && 'true' || 'false' }}
     steps:
       - name: Validate selected architecture
         shell: pwsh
         run: |
           if ($env:EDR_RELEASE_ARCH -cnotin @('amd64', 'arm64')) { throw 'Unsupported Windows product architecture' }
+          if ($env:EDR_RETENTION_COST_DIAGNOSTIC_ONLY -eq 'true' -and $env:EDR_RELEASE_ARCH -cne 'arm64') { throw 'Retention cost diagnosis requires the native ARM64 build owner' }
       - uses: actions/checkout@v6
       # Canonical backend rules are immutable integration-test inputs only;
       # keep this private checkout outside every product/package staging path.
@@ -92,12 +99,15 @@ jobs:
           }
           "EDR_BACKEND_CONFIG_DIR=$inputs" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
       - uses: actions/setup-dotnet@v5
+        if: ${{ !inputs.retention_cost_diagnostic_only }}
         with:
           global-json-file: global.json
       - name: Validate release scripts with Windows PowerShell 5.1
+        if: ${{ !inputs.retention_cost_diagnostic_only }}
         shell: powershell
         run: .\scripts\validate_windows_powershell_syntax.ps1
       - name: Verify locked Setup UI NuGet closure and publish before native dependency build
+        if: ${{ !inputs.retention_cost_diagnostic_only }}
         shell: pwsh
         run: .\scripts\Restore-SetupUiLocked.ps1 -RuntimeIdentifier $env:EDR_RUNTIME_IDENTIFIER -SelfContained true -PublishReadyToRun false -Configuration Release -VerifyPublish
       - name: AVE / behavior chain invariants (no vcpkg, bash)
@@ -173,7 +183,12 @@ jobs:
           python -c "from cryptography.hazmat.primitives.ciphers.aead import AESGCM; print('cryptography AESGCM ready')"
       - name: Install build tools
         shell: pwsh
-        run: .\scripts\Ensure-WindowsBuildTools.ps1
+        run: |
+          if ($env:EDR_RETENTION_COST_DIAGNOSTIC_ONLY -eq 'true') {
+            & .\scripts\Ensure-WindowsBuildTools.ps1 -NinjaOnly
+          } else {
+            & .\scripts\Ensure-WindowsBuildTools.ps1
+          }
       - name: Prepare vcpkg cache directories
         shell: pwsh
         run: |
@@ -291,6 +306,7 @@ jobs:
           if (-not $hasYara) { throw "Generated build files do not contain EDR_HAVE_YARA=1" }
 
       - name: Verify release gate build dependencies
+        if: ${{ !inputs.retention_cost_diagnostic_only }}
         env:
           # Nested CMake probes must use the same dependency prefix as Configure.
           CMAKE_PREFIX_PATH: ${{ env.VCPKG_INSTALLED_ROOT }}
@@ -302,6 +318,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "Windows PCRE2 header isolation regression failed" }
 
       - name: Build (Ninja)
+        if: ${{ !inputs.retention_cost_diagnostic_only }}
         shell: pwsh
         run: |
           $buildTargets = @(
@@ -317,7 +334,50 @@ jobs:
             throw "Windows product or gate-test build failed with exit code $LASTEXITCODE"
           }
 
+      - name: Build the fixed ARM64 retention diagnostic
+        if: ${{ inputs.retention_cost_diagnostic_only }}
+        shell: pwsh
+        run: |
+          cmake --build build --config Release --target test_local_evidence_cache_candidate --parallel $env:NUMBER_OF_PROCESSORS --verbose
+          if ($LASTEXITCODE -ne 0) { throw 'Native retention diagnostic build failed' }
+
+      - name: Run the fixed ARM64 retention diagnostic once
+        id: retention-cost
+        if: ${{ inputs.retention_cost_diagnostic_only }}
+        timeout-minutes: 3
+        shell: pwsh
+        run: |
+          $compiler = (Get-Command cl.exe -ErrorAction Stop).Source
+          $runtimeBin = Join-Path $env:VCPKG_INSTALLED_ROOT 'bin'
+          $sqlite = Join-Path $runtimeBin 'sqlite3.dll'
+          & .\scripts\Assert-WindowsPeArchitecture.ps1 -Path 'build/tests/test_local_evidence_cache_candidate.exe' -Architecture arm64
+          & .\scripts\Assert-WindowsPeArchitecture.ps1 -Path $sqlite -Architecture arm64
+          # A rolling hosted image is not proof of the same host/compiler.
+          # Preserve actual identities before the fixed diagnostic is started.
+          Write-Host "Retention diagnostic identity: image=$env:ImageOS/$env:ImageVersion MSVC=$env:VCToolsVersion"
+          Write-Host "Compiler SHA256=$((Get-FileHash -LiteralPath $compiler -Algorithm SHA256).Hash.ToLowerInvariant())"
+          Write-Host "SQLite SHA256=$((Get-FileHash -LiteralPath $sqlite -Algorithm SHA256).Hash.ToLowerInvariant())"
+          $env:PATH = "$runtimeBin;$env:PATH"
+          python -B tests/run_retention_cost_diagnostic.py --build-dir build --preserve-contract-volumes --output "$env:RUNNER_TEMP/retention-cost-diagnosis"
+          if ($LASTEXITCODE -ne 0) { throw 'Retention cost diagnosis failed or timed out; this is not a product gate result' }
+
+      - name: Preserve only fixed retention diagnostic receipts
+        if: ${{ always() && inputs.retention_cost_diagnostic_only && (steps.retention-cost.outcome == 'success' || steps.retention-cost.outcome == 'failure') }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: retention-cost-diagnostic-arm64-${{ github.sha }}
+          if-no-files-found: error
+          retention-days: 7
+          # The existing runner checks each log's 1MiB size after execution;
+          # this does not claim an execution-time log or storage hard limit.
+          path: |
+            ${{ runner.temp }}/retention-cost-diagnosis/binding.json
+            ${{ runner.temp }}/retention-cost-diagnosis/execution.json
+            ${{ runner.temp }}/retention-cost-diagnosis/stdout.log
+            ${{ runner.temp }}/retention-cost-diagnosis/stderr.log
+
       - name: Verify native uninstall attestation capabilities
+        if: ${{ !inputs.retention_cost_diagnostic_only }}
         shell: pwsh
         run: |
           $outDir = @("build\Release", "build") | Where-Object {
@@ -344,6 +404,7 @@ jobs:
           }
 
       - name: Verify HTTPS REST and SQLite compiled in
+        if: ${{ !inputs.retention_cost_diagnostic_only }}
         shell: pwsh
         run: |
           $exe = @("build\FDSensor.exe", "build\Release\FDSensor.exe") | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
@@ -365,6 +426,7 @@ jobs:
           }
 
       - name: Stage vcpkg + MSVC runtime DLLs
+        if: ${{ !inputs.retention_cost_diagnostic_only }}
         shell: pwsh
         run: |
           ./scripts/stage_vcpkg_runtime_dlls_build_release.ps1
@@ -383,6 +445,7 @@ jobs:
           }
 
       - name: Test
+        if: ${{ !inputs.retention_cost_diagnostic_only }}
         shell: pwsh
         run: |
           $opensslTools = Join-Path $env:VCPKG_INSTALLED_ROOT 'tools\openssl'
@@ -410,6 +473,7 @@ jobs:
           }
 
       - name: Package (setup exe + runtime zip)
+        if: ${{ !inputs.retention_cost_diagnostic_only }}
         shell: pwsh
         run: |
           $zip = "edr-agent-${{ github.sha }}-windows-$env:EDR_RELEASE_ARCH-exe.zip"
@@ -684,6 +748,7 @@ jobs:
           }
 
       - name: Move artifact to workspace
+        if: ${{ !inputs.retention_cost_diagnostic_only }}
         shell: pwsh
         run: |
           $src = "edr-agent-${{ github.sha }}-windows-$env:EDR_RELEASE_ARCH-exe.zip"
@@ -693,6 +758,7 @@ jobs:
           if (-not (Test-Path -LiteralPath "edr_agent_setup_ui.zip")) { throw "missing edr_agent_setup_ui.zip" }
 
       - uses: actions/upload-artifact@v6
+        if: ${{ !inputs.retention_cost_diagnostic_only }}
         with:
           name: edr-agent-windows-${{ github.sha }}
           path: |
