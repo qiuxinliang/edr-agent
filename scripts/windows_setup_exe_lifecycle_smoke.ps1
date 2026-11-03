@@ -14,7 +14,11 @@ param(
   [Parameter(Mandatory = $true)] [string] $UpgradeInput,
   [Parameter(Mandatory = $true)] [string] $BaselineConfigTemplate,
   [switch] $ExerciseInstallerTimeout,
-  [switch] $SkipSetupRollback
+  [switch] $SkipSetupRollback,
+  [switch] $SignedPublisherValidation,
+  [string] $LegacySetupExe = '',
+  [string] $LegacyVersion = '',
+  [string] $MigrationInput = ''
 )
 
 $ErrorActionPreference = "Stop"
@@ -42,6 +46,17 @@ if (Test-Path -LiteralPath $InstallDir) {
 
 & $bootstrapVerifier -Path $BaselineSetupExe -PayloadArchitecture $Architecture
 & $bootstrapVerifier -Path $TargetSetupExe -PayloadArchitecture $Architecture
+if ($SignedPublisherValidation) {
+  if ($env:GITHUB_ACTIONS -cne 'true' -or -not $LegacySetupExe -or -not $MigrationInput -or
+      $LegacyVersion -cne '3.2.723' -or [version]$BaselineVersion -ge [version]$TargetVersion -or
+      [version]$LegacyVersion -ge [version]$BaselineVersion -or $SkipSetupRollback) {
+    throw 'signed publisher validation requires disposable CI, original 3.2.723, two increasing candidates and full rollback'
+  }
+  $LegacySetupExe = (Resolve-Path -LiteralPath $LegacySetupExe).Path
+  & $bootstrapVerifier -Path $LegacySetupExe -PayloadArchitecture $Architecture
+} elseif ($LegacySetupExe -or $LegacyVersion -or $MigrationInput) {
+  throw 'legacy migration inputs require signed publisher validation'
+}
 
 $events = New-Object System.Collections.Generic.List[object]
 function Add-Evidence([string] $Stage, [string] $Status, [string] $Detail) {
@@ -367,7 +382,36 @@ function Assert-LifecycleUpgradeResult($InputBinding, $Report) {
   }
 }
 
+function Assert-LifecyclePublisherProtocol([string] $Updater, [string] $ExpectedSha256, $Publisher) {
+  if (-not $Publisher.SubjectDerSha256) { return }
+  if ((Get-FileHash -LiteralPath $Updater -Algorithm SHA256).Hash.ToLowerInvariant() -cne $ExpectedSha256) {
+    throw 'publisher protocol inspection requires the immutable installed updater'
+  }
+  $tokens=$null; $errors=$null
+  $ast=[Management.Automation.Language.Parser]::ParseFile($Updater,[ref]$tokens,[ref]$errors)
+  $declarations=@($ast.EndBlock.Statements | Where-Object {
+    $_ -is [Management.Automation.Language.AssignmentStatementAst] -and
+    $_.Left -is [Management.Automation.Language.VariableExpressionAst] -and
+    $_.Left.VariablePath.UserPath -ceq 'AgentUpdateUpdaterProtocolVersion'
+  })
+  $parameters=@($ast.ParamBlock.Parameters | Where-Object {
+    $_.Name.VariablePath.UserPath -ceq 'TrustedPublisherSubjectDerSha256'
+  })
+  if ($errors.Count -ne 0 -or $declarations.Count -ne 1 -or $parameters.Count -ne 1 -or
+      $declarations[0].Right.Extent.Text -cnotmatch '^[0-9]+$' -or [int]$declarations[0].Right.Extent.Text -lt 6) {
+    throw 'installed original updater does not declare publisher identity protocol 6'
+  }
+}
+
 function Get-LifecycleTrustedPublisher($InputBinding) {
+  $subjectDer = ''
+  $verification = $null
+  if ($InputBinding.PSObject.Properties['publisher_subject_der_sha256']) {
+    $subjectDer = [string]$InputBinding.publisher_subject_der_sha256
+  }
+  if ($InputBinding.PSObject.Properties['publisher_verification']) {
+    $verification = $InputBinding.publisher_verification
+  }
   if ($InputBinding.signature_status -cnotin @('unsigned','signed')) {
     throw 'lifecycle release signature policy is missing or unsupported'
   }
@@ -377,8 +421,31 @@ function Get-LifecycleTrustedPublisher($InputBinding) {
     throw 'signed lifecycle release is missing its pinned publisher identity'
   }
   if ($InputBinding.signature_status -ceq 'unsigned' -and
-      ($InputBinding.publisher_thumbprint -or $InputBinding.publisher_subject)) {
+      ($InputBinding.publisher_thumbprint -or $InputBinding.publisher_subject -or $subjectDer -or $verification)) {
     throw 'unsigned lifecycle release contains a publisher identity'
+  }
+  if ($subjectDer -or $verification) {
+    if ($subjectDer -cnotmatch '^[a-f0-9]{64}$' -or -not $verification -or
+        $verification.schema -cne 'edr.windows.publisher-verification.v1' -or
+        $verification.version -cne $InputBinding.target_version -or $verification.arch -cne $InputBinding.architecture -or
+        $verification.subject -cne $InputBinding.publisher_subject -or
+        $verification.thumbprint -cne $InputBinding.publisher_thumbprint -or
+        $verification.subject_der_sha256 -cne $subjectDer -or
+        $verification.manifest_sha256 -cne $InputBinding.target_manifest_sha256 -or
+        $verification.signature_sha256 -cne $InputBinding.target_signature_sha256 -or
+        $verification.artifact_sha256 -cne $InputBinding.binary_sha256 -or
+        $verification.verifier_source_commit -cnotmatch '^[a-f0-9]{40}$' -or
+        -not $InputBinding.target_manifest_path -or -not $InputBinding.target_signature_path) {
+      throw 'lifecycle publisher proof is not bound to the verified release'
+    }
+    foreach ($item in @(
+        @{Path=$InputBinding.target_manifest_path;Hash=$verification.manifest_sha256},
+        @{Path=$InputBinding.target_signature_path;Hash=$verification.signature_sha256})) {
+      if ($item.Hash -cnotmatch '^[a-f0-9]{64}$' -or
+          (Get-FileHash -LiteralPath $item.Path -Algorithm SHA256).Hash.ToLowerInvariant() -cne $item.Hash) {
+        throw 'lifecycle manifest or CMS differs from the verified publisher proof'
+      }
+    }
   }
   $paths = @([pscustomobject]@{Path=$InputBinding.binary_path;Sha256=$InputBinding.binary_sha256})
   if ($InputBinding.upgrade_class -ceq 'installer_required') {
@@ -399,16 +466,25 @@ function Get-LifecycleTrustedPublisher($InputBinding) {
         throw "signed lifecycle release requires Valid, got $($signature.Status)"
       }
       $thumbprint = ($signature.SignerCertificate.Thumbprint -replace '\s','').ToUpperInvariant()
-      if ($thumbprint -cne $InputBinding.publisher_thumbprint -or
-          $signature.SignerCertificate.Subject -cne $InputBinding.publisher_subject) {
+      if ($thumbprint -cne $InputBinding.publisher_thumbprint) {
+        throw 'lifecycle Authenticode publisher differs from the release publisher'
+      }
+      if ($subjectDer) {
+        [byte[]]$rawSubject=$signature.SignerCertificate.SubjectName.RawData
+        if (-not $rawSubject -or $rawSubject.Length -eq 0) { throw 'lifecycle publisher subject DER is missing' }
+        $hasher=[Security.Cryptography.SHA256]::Create()
+        try { $actual=([BitConverter]::ToString($hasher.ComputeHash($rawSubject))).Replace('-','').ToLowerInvariant() }
+        finally { $hasher.Dispose() }
+        if ($actual -cne $subjectDer) { throw 'lifecycle Authenticode subject DER differs from the verified release publisher' }
+      } elseif ($signature.SignerCertificate.Subject -cne $InputBinding.publisher_subject) {
         throw 'lifecycle Authenticode publisher differs from the release publisher'
       }
     }
   }
   if ($InputBinding.signature_status -ceq 'unsigned') {
-    return @{Thumbprint='SHA256_ONLY_UNSIGNED';Subject='Unsigned release; SHA-256 integrity only'}
+    return @{Thumbprint='SHA256_ONLY_UNSIGNED';Subject='Unsigned release; SHA-256 integrity only';SubjectDerSha256=''}
   }
-  return @{Thumbprint=$InputBinding.publisher_thumbprint;Subject=$InputBinding.publisher_subject}
+  return @{Thumbprint=$InputBinding.publisher_thumbprint;Subject=$InputBinding.publisher_subject;SubjectDerSha256=$subjectDer}
 }
 
 function Invoke-BaselineUpdaterUpgrade($InputBinding) {
@@ -419,6 +495,7 @@ function Invoke-BaselineUpdaterUpgrade($InputBinding) {
       $InputBinding.service_name -cne $ServiceName) { throw 'old updater lifecycle input identity/mode mismatch' }
   $updater = Wait-LifecycleEmbeddedUpdater $BaselineVersion $InputBinding.baseline_updater_sha256
   $publisher = Get-LifecycleTrustedPublisher $InputBinding
+  Assert-LifecyclePublisherProtocol $updater $InputBinding.baseline_updater_sha256 $publisher
   $commandId = 'ci-old-updater-' + [Guid]::NewGuid().ToString('N')
   # The original updater consumes StagedBinary on success. Keep the immutable
   # transition input for subsequent repair checks, while preserving its parent
@@ -445,6 +522,9 @@ function Invoke-BaselineUpdaterUpgrade($InputBinding) {
   if ($InputBinding.runtime_package) {
     $parameters.RuntimeManifest = $InputBinding.runtime_package
     $parameters.RuntimeManifestSha256 = $InputBinding.runtime_package_sha256
+  }
+  if ($publisher.SubjectDerSha256) {
+    $parameters.TrustedPublisherSubjectDerSha256=$publisher.SubjectDerSha256
   }
   # Use Windows PowerShell 5.1, as the Agent's real detached updater does. No
   # current-source script or patched baseline script enters this invocation.
@@ -487,10 +567,67 @@ function Invoke-BaselineUpdaterUpgrade($InputBinding) {
   }
 }
 
+function New-LifecyclePreservationSnapshot([string] $Stage) {
+  $service=Get-CimInstance Win32_Service -Filter ("Name='{0}'" -f $ServiceName) -ErrorAction Stop
+  if (-not $service -or $service.PathName.IndexOf($InstallDir,[StringComparison]::OrdinalIgnoreCase) -lt 0 -or
+      $service.State -cne 'Running') { throw 'preservation snapshot requires the running lifecycle service' }
+  $files=@()
+  foreach ($name in @('edr_queue.db.signed-lifecycle-preserve','local_evidence_cache.db.signed-lifecycle-preserve')) {
+    $path=Join-Path $InstallDir $name
+    if (Test-Path -LiteralPath $path) { throw 'preservation marker already exists' }
+    [IO.File]::WriteAllText($path,('isolated preservation marker '+[Guid]::NewGuid().ToString('N')),[Text.UTF8Encoding]::new($false))
+    $files+=@{name=$name;sha256=(Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()}
+  }
+  $snapshot=[pscustomobject]@{
+    config_sha256=(Get-FileHash -LiteralPath (Join-Path $InstallDir 'agent.toml') -Algorithm SHA256).Hash.ToLowerInvariant()
+    deployment_mode='service';service_path=$service.PathName;service_account=$service.StartName;service_start_mode=$service.StartMode
+    markers=$files;scope='Actual configuration and service identity; synthetic queue/evidence marker bytes, not business database readback'
+  }
+  [IO.File]::WriteAllText((Join-Path $EvidenceDir ($Stage+'-preservation.json')),($snapshot|ConvertTo-Json -Depth 5),[Text.UTF8Encoding]::new($false))
+  return $snapshot
+}
+
+function Assert-LifecyclePreservationSnapshot($Snapshot, [string] $Stage) {
+  if ((Get-FileHash -LiteralPath (Join-Path $InstallDir 'agent.toml') -Algorithm SHA256).Hash.ToLowerInvariant() -cne $Snapshot.config_sha256) {
+    throw "$Stage changed the original configuration or identity"
+  }
+  $service=Get-CimInstance Win32_Service -Filter ("Name='{0}'" -f $ServiceName) -ErrorAction Stop
+  if (-not $service -or $service.State -cne 'Running' -or $service.PathName -cne $Snapshot.service_path -or
+      $service.StartName -cne $Snapshot.service_account -or $service.StartMode -cne $Snapshot.service_start_mode) {
+    throw "$Stage changed the original service deployment identity"
+  }
+  foreach ($item in $Snapshot.markers) {
+    if ((Get-FileHash -LiteralPath (Join-Path $InstallDir $item.name) -Algorithm SHA256).Hash.ToLowerInvariant() -cne $item.sha256) {
+      throw "$Stage changed the original queue/evidence marker bytes"
+    }
+  }
+  Add-Evidence $Stage 'preserved' 'original_config=true service_identity=true synthetic_queue_evidence_markers=true business_database_readback=false'
+}
+
 $status = "failed"
 $script:LastLifecycleStage = "lifecycle"
 $script:LastSetupLog = ""
 try {
+  $upgradeBinding = Get-Content -LiteralPath $UpgradeInput -Raw | ConvertFrom-Json
+  if ($SignedPublisherValidation) {
+    $migrationBinding=Get-Content -LiteralPath $MigrationInput -Raw | ConvertFrom-Json
+    foreach ($binding in @($migrationBinding,$upgradeBinding)) {
+      if ($binding.signature_status -cne 'signed' -or -not $binding.publisher_subject_der_sha256 -or
+          $binding.upgrade_class -cne 'installer_required' -or $binding.deployment_mode -cne 'service' -or
+          $binding.architecture -cne $Architecture -or $binding.service_name -cne $ServiceName) {
+        throw 'signed publisher validation requires two verified full-installer service inputs'
+      }
+      $null=Get-LifecycleTrustedPublisher $binding
+    }
+    if ($migrationBinding.baseline_version -cne $LegacyVersion -or $migrationBinding.target_version -cne $BaselineVersion -or
+        $upgradeBinding.baseline_version -cne $BaselineVersion -or $upgradeBinding.target_version -cne $TargetVersion -or
+        $migrationBinding.target_updater_sha256 -cne $upgradeBinding.baseline_updater_sha256 -or
+        (Get-FileHash -LiteralPath $BaselineSetupExe -Algorithm SHA256).Hash.ToLowerInvariant() -cne $migrationBinding.installer_sha256 -or
+        (Get-FileHash -LiteralPath $TargetSetupExe -Algorithm SHA256).Hash.ToLowerInvariant() -cne $upgradeBinding.installer_sha256 -or
+        (Get-FileHash -LiteralPath $LegacySetupExe -Algorithm SHA256).Hash.ToLowerInvariant() -cne $migrationBinding.baseline_setup_sha256) {
+      throw 'signed publisher migration and upgrade inputs do not form one immutable version chain'
+    }
+  }
   # Validate the target independently first. A broken historical baseline must
   # not hide whether the candidate can install and uninstall on a clean host.
   Invoke-Installer $TargetSetupExe "install-target-fresh" $false
@@ -499,15 +636,30 @@ try {
 
   # Start with the immutable old Setup and the updater materialized by that
   # actual old Agent. Keep the separate direct-Setup path below unchanged.
-  $upgradeBinding = Get-Content -LiteralPath $UpgradeInput -Raw | ConvertFrom-Json
   $offlineConfigHash = Initialize-LifecycleOfflineConfig $BaselineConfigTemplate
-  Invoke-Installer $BaselineSetupExe 'install-old-updater-baseline' $false
+  if ($SignedPublisherValidation) {
+    Invoke-Installer $LegacySetupExe 'install-legacy-migration-baseline' $false
+    Assert-InstalledRuntime $LegacyVersion 'install-legacy-migration-baseline' $true
+    $null=Wait-LifecycleEmbeddedUpdater $LegacyVersion $migrationBinding.baseline_updater_sha256
+    $chainSnapshot=New-LifecyclePreservationSnapshot 'legacy-migration'
+    # This is the supported full-Setup migration. The old command contract
+    # rejects this publisher before PS starts; do not bypass it with a patched
+    # old updater, new fields, or a direct PS invocation counted as that hop.
+    Invoke-Installer $BaselineSetupExe 'migrate-legacy-full-setup' $true
+    Assert-InstalledRuntime $BaselineVersion 'migrate-legacy-full-setup' $true $true
+    Assert-LifecyclePreservationSnapshot $chainSnapshot 'migrate-legacy-full-setup'
+    $migratedUpdater=Wait-LifecycleEmbeddedUpdater $BaselineVersion $upgradeBinding.baseline_updater_sha256
+    Assert-LifecyclePublisherProtocol $migratedUpdater $upgradeBinding.baseline_updater_sha256 (Get-LifecycleTrustedPublisher $migrationBinding)
+  } else {
+    Invoke-Installer $BaselineSetupExe 'install-old-updater-baseline' $false
+  }
   Assert-InstalledRuntime $BaselineVersion 'install-old-updater-baseline' (-not $SkipSetupRollback)
   if ((Get-FileHash -LiteralPath (Join-Path $InstallDir 'agent.toml') -Algorithm SHA256).Hash.ToLowerInvariant() -cne $offlineConfigHash) {
     throw 'baseline Setup changed the prepared offline lifecycle configuration'
   }
   Invoke-BaselineUpdaterUpgrade $upgradeBinding
   Assert-InstalledRuntime $TargetVersion 'old-updater-upgrade' $true $true
+  if ($SignedPublisherValidation) { Assert-LifecyclePreservationSnapshot $chainSnapshot 'signed-updater-upgrade' }
   if ($ExerciseInstallerTimeout) {
     $script:LastLifecycleStage = 'candidate-installer-timeout'
     Add-Evidence 'candidate-installer-timeout' 'started' 'same-version repair with original candidate updater and Setup bytes'
@@ -516,6 +668,7 @@ try {
     & (Join-Path $repoRoot 'tests\Invoke-RealInstallerTimeoutRecovery.ps1') -InputBinding $upgradeBinding `
       -InstallDir $InstallDir -EvidenceDir $EvidenceDir -Updater $candidateUpdater -Publisher $candidatePublisher
     Assert-InstalledRuntime $TargetVersion 'candidate-installer-timeout' $true $true
+    if ($SignedPublisherValidation) { Assert-LifecyclePreservationSnapshot $chainSnapshot 'signed-installer-timeout' }
     Add-Evidence 'candidate-installer-timeout' 'verified' 'original Setup timed out; Job empty; runtime/config/service/uninstall identity restored; queue/evidence marker bytes preserved'
   }
   Invoke-UninstallerAndAssertCleanup 'uninstall-old-updater-target'
@@ -525,14 +678,17 @@ try {
   Invoke-Installer $BaselineSetupExe "install-baseline" $false
   Assert-InstalledRuntime $BaselineVersion "install-baseline" (-not $SkipSetupRollback)
   Assert-BaselineRepair $BaselineSetupExe
+  if ($SignedPublisherValidation) { $rollbackSnapshot=New-LifecyclePreservationSnapshot 'signed-setup-rollback' }
   Invoke-Installer $TargetSetupExe "upgrade-target" $true
   Assert-InstalledRuntime $TargetVersion "upgrade-target" $true $true
+  if ($SignedPublisherValidation) { Assert-LifecyclePreservationSnapshot $rollbackSnapshot 'signed-setup-upgrade' }
   if ($SkipSetupRollback) {
     Add-Evidence "rollback-baseline" "skipped" "legacy baseline predates the immutable full-Setup rollback contract; native runtime rollback remains mandatory"
     Invoke-UninstallerAndAssertCleanup "uninstall-after-upgrade"
   } else {
     Invoke-Installer $BaselineSetupExe "rollback-baseline" $true
     Assert-InstalledRuntime $BaselineVersion "rollback-baseline"
+    if ($SignedPublisherValidation) { Assert-LifecyclePreservationSnapshot $rollbackSnapshot 'signed-setup-rollback' }
     Invoke-UninstallerAndAssertCleanup "uninstall-after-rollback"
   }
   $status = "succeeded"
@@ -553,6 +709,8 @@ try {
     architecture = $Architecture
     baseline_version = $BaselineVersion
     target_version = $TargetVersion
+    signed_publisher_validation = [bool]$SignedPublisherValidation
+    legacy_migration_version = $LegacyVersion
     setup_rollback_skipped = [bool]$SkipSetupRollback
     installer_timeout_requested = [bool]$ExerciseInstallerTimeout
     install_dir = $InstallDir

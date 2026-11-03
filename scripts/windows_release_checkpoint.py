@@ -791,7 +791,8 @@ def stage_headless(directory, destination, metadata, tag, arch, tag_commit, repo
     return result
 
 
-def prepare_lifecycle_upgrade(directory, baseline_directory, destination, tag, baseline_tag, arch):
+def prepare_lifecycle_upgrade(directory, baseline_directory, destination, tag, baseline_tag, arch,
+                              publisher_verification=None):
     """Bind the existing native lifecycle to release bytes and the old updater.
 
     This is a local test envelope, not platform admission or a signed command.
@@ -809,7 +810,8 @@ def prepare_lifecycle_upgrade(directory, baseline_directory, destination, tag, b
     prefix = f"edr-agent-{tag}-windows-{arch}-"
     archive_path = directory / (prefix + "exe.zip")
     baseline_archive = baseline_directory / f"edr-agent-{baseline_tag}-windows-{arch}-exe.zip"
-    manifest = read_json(directory / (prefix + "artifact-manifest.json"))
+    manifest_path = directory / (prefix + "artifact-manifest.json")
+    manifest = read_json(manifest_path)
     if manifest.get("schema_version") != 1 or manifest.get("version") != version:
         raise ValueError("Lifecycle artifact manifest version/schema mismatch")
     signature = manifest.get("signature")
@@ -818,7 +820,23 @@ def prepare_lifecycle_upgrade(directory, baseline_directory, destination, tag, b
     signature_status = signature["status"]
     provenance = manifest.get("build_provenance")
     mode = provenance.get("mode") if isinstance(provenance, dict) else None
-    if mode not in ("unsigned", "signed", "usb") or (mode == "unsigned") != (signature_status == "unsigned"):
+    verification = read_json(publisher_verification) if publisher_verification else None
+    signature_path = directory / (prefix + "artifact-manifest.json.p7s")
+    if verification is not None:
+        if (not isinstance(verification, dict) or
+                verification.get("schema") != "edr.windows.publisher-verification.v1" or
+                signature_status != "signed" or not signature_path.is_file() or
+                verification.get("manifest_sha256") != digest(manifest_path) or
+                verification.get("signature_sha256") != digest(signature_path) or
+                verification.get("version") != version or verification.get("arch") != arch or
+                verification.get("thumbprint") != signature.get("signer_thumbprint") or
+                verification.get("subject") != signature.get("signer_subject") or
+                not re.fullmatch(r"[a-f0-9]{64}", str(verification.get("subject_der_sha256", ""))) or
+                not re.fullmatch(r"[a-f0-9]{40}", str(verification.get("verifier_source_commit", "")))):
+            raise ValueError("Lifecycle publisher verification is not bound to the original signed release")
+    verified_repack = (verification is not None and isinstance(manifest.get("repack_provenance"), dict)
+                       and signature_status == "signed" and mode == "unsigned")
+    if mode not in ("unsigned", "signed", "usb") or ((mode == "unsigned") != (signature_status == "unsigned") and not verified_repack):
         raise ValueError("Lifecycle release signature policy contradicts its build mode")
     publisher_thumbprint = signature.get("signer_thumbprint", "")
     publisher_subject = signature.get("signer_subject", "")
@@ -844,6 +862,8 @@ def prepare_lifecycle_upgrade(directory, baseline_directory, destination, tag, b
     if package.get("sha256") != digest(archive_path) or package.get("size") != archive_path.stat().st_size:
         raise ValueError("Lifecycle runtime ZIP identity mismatch")
     agent = artifact(prefix + "FDSensor.exe")
+    if verification is not None and verification.get("artifact_sha256") != agent.get("sha256"):
+        raise ValueError("Lifecycle publisher verification is not bound to the target Agent")
     update = agent.get("update")
     if (agent.get("version") != version or agent.get("platform") != "windows" or agent.get("arch") != arch or
             not isinstance(update, dict) or update.get("internal_name") != "FDSensor" or
@@ -876,6 +896,8 @@ def prepare_lifecycle_upgrade(directory, baseline_directory, destination, tag, b
             raise ValueError("Lifecycle target binary/runtime does not match its manifest")
         old_updater = baseline.read("edr_agent_inplace_update.ps1")
         new_updater = target.read("edr_agent_inplace_update.ps1")
+        baseline_setup_sha256 = (hashlib.sha256(baseline.read("edr_agent_setup.exe")).hexdigest()
+                                 if "edr_agent_setup.exe" in baseline.namelist() else "")
         members = []
         setup = None
         if upgrade_class == "installer_required":
@@ -918,6 +940,7 @@ def prepare_lifecycle_upgrade(directory, baseline_directory, destination, tag, b
         service_name=update["service_name"], upgrade_class=upgrade_class,
         target_runtime_zip_sha256=digest(archive_path), baseline_runtime_zip_sha256=digest(baseline_archive),
         target_manifest_sha256=digest(directory / (prefix + "artifact-manifest.json")),
+        baseline_setup_sha256=baseline_setup_sha256,
         min_free_bytes=min_free_bytes,
         signature_status=signature_status, publisher_thumbprint=publisher_thumbprint, publisher_subject=publisher_subject,
         binary_path=str(binary_path), binary_sha256=agent["sha256"],
@@ -930,6 +953,12 @@ def prepare_lifecycle_upgrade(directory, baseline_directory, destination, tag, b
         runtime_package_sha256=digest(runtime_package) if runtime_package else "",
         min_current_version=update.get("min_current_version", ""),
         max_current_version=update.get("max_current_version", ""))
+    if verification is not None:
+        result.update(publisher_subject_der_sha256=verification["subject_der_sha256"],
+                      publisher_verification=verification,
+                      target_manifest_path=str(manifest_path.resolve()),
+                      target_signature_path=str(signature_path.resolve()),
+                      target_signature_sha256=digest(signature_path))
     (destination / "transition.json").write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
     return result
 
@@ -950,6 +979,7 @@ def main():
     parser.add_argument("--expected-source-commit")
     parser.add_argument("--expected-run-id")
     parser.add_argument("--published-baseline", action="store_true")
+    parser.add_argument("--publisher-verification", type=Path)
     args = parser.parse_args()
     if args.command == "get-release":
         if not args.tag:
@@ -968,7 +998,7 @@ def main():
         if not all((args.tag, args.baseline_tag, args.arch, args.destination, args.baseline_directory)):
             parser.error("prepare-lifecycle-upgrade requires tag, baseline-tag, arch, destination and baseline-directory")
         print(json.dumps(prepare_lifecycle_upgrade(args.directory, args.baseline_directory, args.destination,
-            args.tag, args.baseline_tag, args.arch), sort_keys=True))
+            args.tag, args.baseline_tag, args.arch, args.publisher_verification), sort_keys=True))
         return
     if args.command == "validate-scope":
         print(validate_scope(env))

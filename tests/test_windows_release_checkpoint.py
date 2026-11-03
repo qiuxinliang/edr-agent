@@ -1185,7 +1185,7 @@ class LifecycleUpgradeInputTests(unittest.TestCase):
         with zipfile.ZipFile(path, 'w') as archive:
             for name, value in data.items(): archive.writestr(name, value)
 
-    def prepare(self):
+    def prepare(self, verification_edit=None):
         self.data['full-installer-manifest.json'] = json.dumps(self.full).encode()
         prefix = f'edr-agent-win_{self.version}-windows-{self.arch}-'
         archive = self.target / (prefix+'exe.zip'); self.write_zip(archive, self.data)
@@ -1193,9 +1193,56 @@ class LifecycleUpgradeInputTests(unittest.TestCase):
             dict(name=archive.name,size=archive.stat().st_size,sha256=cp.digest(archive)),
             dict(name=prefix+'FDSensor.exe',size=len(self.data['FDSensor.exe']),sha256=hashlib.sha256(self.data['FDSensor.exe']).hexdigest(),
                  version=self.version,platform='windows',arch=self.arch,update=self.update)])
-        (self.target / (prefix+'artifact-manifest.json')).write_text(json.dumps(manifest))
+        if verification_edit is not None:
+            manifest['repack_provenance'] = {'schema': 'fixture-repack'}
+        manifest_path = self.target / (prefix+'artifact-manifest.json')
+        manifest_path.write_text(json.dumps(manifest))
+        verification_path = None
+        if verification_edit is not None:
+            # Boundary fixture only: the actual backend CMS verifier is exercised
+            # separately. This test proves exact receipt-to-byte binding.
+            signature_path = self.target / (prefix+'artifact-manifest.json.p7s')
+            signature_path.write_bytes(b'original fixture CMS bytes')
+            proof = dict(schema='edr.windows.publisher-verification.v1',
+                manifest_sha256=cp.digest(manifest_path), signature_sha256=cp.digest(signature_path),
+                version=self.version, arch=self.arch, subject_der_sha256='b'*64,
+                thumbprint=self.signature['signer_thumbprint'], subject=self.signature['signer_subject'],
+                verifier_source_commit='c'*40, artifact_sha256=hashlib.sha256(self.data['FDSensor.exe']).hexdigest())
+            verification_edit(proof)
+            verification_path = self.root/'publisher.json'
+            verification_path.write_text(json.dumps(proof))
         return cp.prepare_lifecycle_upgrade(self.target,self.baseline,self.destination,
-            'win_'+self.version,'win_'+self.old_version,self.arch)
+            'win_'+self.version,'win_'+self.old_version,self.arch,verification_path)
+
+    def signed_repack(self):
+        self.update['upgrade_class'] = 'installer_required'
+        self.signature=dict(format='cms-detached-sha256',status='signed',signer_thumbprint='A'*40,signer_subject='CN='+('P'*375))
+        self.full.update(setup_exe_signed=True,publisher_thumbprint='A'*40,capabilities=dict(signature_status='signed'))
+        self.data['full-installer-manifest.p7s'] = b'original CMS bytes'
+
+    def test_verified_signed_repack_preserves_manifest_source_and_binds_both_steps(self):
+        self.signed_repack()
+        value = self.prepare(lambda proof: None)
+        self.assertEqual(value['publisher_subject_der_sha256'], 'b'*64)
+        self.assertEqual(value['publisher_verification']['artifact_sha256'], value['binary_sha256'])
+        self.assertEqual(value['target_signature_sha256'], cp.digest(Path(value['target_signature_path'])))
+        self.assertEqual(value['baseline_setup_sha256'], hashlib.sha256(b'original installer').hexdigest())
+        original = json.loads(Path(value['target_manifest_path']).read_text())
+        self.assertEqual(original['build_provenance']['mode'], 'unsigned')
+        self.assertEqual(len(value['publisher_subject'].encode()), 378)
+
+    def test_signed_repack_receipt_cannot_be_rebound_or_downgraded(self):
+        self.signed_repack()
+        bad = dict(schema='wrong', manifest_sha256='0'*64, signature_sha256='0'*64,
+                   version='3.2.1', arch='amd64', subject_der_sha256='g'*64,
+                   thumbprint='B'*40, subject='different', verifier_source_commit='', artifact_sha256='0'*64)
+        for key, value in bad.items():
+            with self.subTest(key=key):
+                with self.assertRaises(ValueError):
+                    self.prepare(lambda proof: proof.update({key:value}))
+                self.assertFalse(self.destination.exists())
+        with self.assertRaisesRegex(ValueError, 'signature policy contradicts'):
+            self.prepare()
 
     def test_runtime_bundle_preserves_original_zip_and_distinct_updater_identities(self):
         old_hash = cp.digest(self.old_archive)

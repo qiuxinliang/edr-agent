@@ -58,6 +58,22 @@ def inventory(root):
     return {p.relative_to(root).as_posix(): cp.digest(p) for p in root.rglob('*') if p.is_file()}
 
 
+def headless_manifest(runtime, original, thumbprint, generated_at):
+    """Existing protocol-5 consumers need a signed installer, not a GUI shell."""
+    return dict(
+        name='FDSecurity Headless Installer', version=original['version'],
+        target_arch=original['target_arch'], setup_target_arch=original['setup_target_arch'],
+        setup_exe='FDSecuritySetup.exe', setup_exe_sha256=cp.digest(runtime / 'edr_agent_setup.exe'),
+        setup_exe_signed=True, agent_binary_sha256=cp.digest(runtime / 'FDSensor.exe'),
+        runtime_identity_sha256=cp.digest(runtime / 'native-package-integrity.json'),
+        publisher_thumbprint=thumbprint, capabilities=read(runtime / 'package-capabilities.json'),
+        upgrade_protocol=original['upgrade_protocol'],
+        preserves_existing_identity=original['preserves_existing_identity'],
+        preserves_offline_queue=original['preserves_offline_queue'],
+        preserves_evidence_cache=original['preserves_evidence_cache'],
+        generated_at_utc=generated_at)
+
+
 def stage(assets, destination, expected, arch, candidate):
     (cp.verify_checkpoint if candidate else cp.inspect_bundle)(assets, expected, arch, candidate=candidate)
     if destination.exists():

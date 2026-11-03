@@ -30,11 +30,11 @@ function Read-ModuleProbeDiagnostic([string]$Path) {
   } finally { $stream.Dispose() }
 }
 try {
-  . (Join-Path $RepoRoot 'scripts/Start-LifecycleWindowsPowerShell.ps1')
+  . ([scriptblock]::Create([IO.File]::ReadAllText((Join-Path $RepoRoot 'scripts/Start-LifecycleWindowsPowerShell.ps1'))))
   $tokens=$null; $errors=$null
   $ast = [Management.Automation.Language.Parser]::ParseFile((Join-Path $RepoRoot 'scripts/windows_setup_exe_lifecycle_smoke.ps1'),[ref]$tokens,[ref]$errors)
   Check ($errors.Count -eq 0) 'native parser'
-  foreach ($name in @('Initialize-LifecycleOfflineConfig','Wait-LifecycleEmbeddedUpdater','Assert-LifecycleUpgradeResult','Get-LifecycleTrustedPublisher','Invoke-BaselineUpdaterUpgrade')) {
+  foreach ($name in @('Initialize-LifecycleOfflineConfig','Wait-LifecycleEmbeddedUpdater','Assert-LifecycleUpgradeResult','Assert-LifecyclePublisherProtocol','Get-LifecycleTrustedPublisher','Invoke-BaselineUpdaterUpgrade')) {
     $functions=@($ast.FindAll({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq $name},$true))
     Check ($functions.Count -eq 1) ('unique owner '+$name)
     . ([scriptblock]::Create($functions[0].Extent.Text))

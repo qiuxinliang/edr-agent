@@ -193,6 +193,10 @@ $parameters = [ordered]@{
   IssuedAtUnixMs=$issued; DeadlineUnixMs=$issued+120000; HealthObserveMs=30000; StartupTimeoutSeconds=60
   MinFreeBytes=$InputBinding.min_free_bytes; RuntimeManifest=$package; RuntimeManifestSha256=$InputBinding.runtime_package_sha256
 }
+if ($Publisher.SubjectDerSha256) {
+  Assert-LifecyclePublisherProtocol $Updater $InputBinding.target_updater_sha256 $Publisher
+  $parameters.TrustedPublisherSubjectDerSha256=$Publisher.SubjectDerSha256
+}
 $entries = @($parameters.GetEnumerator() | ForEach-Object { "'{0}'='{1}'" -f $_.Key, ([string]$_.Value).Replace("'", "''") })
 # Use the Agent launcher's script-success contract, not a prior native exit.
 $source = "`$ErrorActionPreference='Stop'; `$parameters=@{" + ($entries -join ';') + "}; & '" + $Updater.Replace("'", "''") + "' @parameters; `$updaterSucceeded=`$?; if (`$updaterSucceeded) { exit 0 }; if ((Test-Path variable:LASTEXITCODE) -and `$LASTEXITCODE -is [int] -and `$LASTEXITCODE -ne 0) { exit `$LASTEXITCODE }; exit 1"

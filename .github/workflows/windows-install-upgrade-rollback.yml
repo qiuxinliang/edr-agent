@@ -95,6 +95,11 @@ on:
         required: false
         default: '0'
         type: string
+      publisher_validation_request:
+        description: Explicit two-version signed validation request with backend verification receipts; disposable native hosts only
+        required: false
+        default: ''
+        type: string
 
 permissions:
   # GitHub hides draft releases from tokens without push-level contents access.
@@ -111,7 +116,7 @@ concurrency:
 
 jobs:
   native-lifecycle:
-    if: ${{ !inputs.cache_recovery_subset }}
+    if: ${{ !inputs.cache_recovery_subset && !inputs.publisher_validation_request }}
     strategy:
       fail-fast: false
       matrix:
@@ -630,7 +635,7 @@ jobs:
           retention-days: 7
 
   recover-synthetic-owner:
-    if: github.event_name == 'workflow_dispatch' && inputs.cache_recovery_subset == true && github.repository == 'qiuxinliang/edr-agent'
+    if: github.event_name == 'workflow_dispatch' && inputs.cache_recovery_subset == true && !inputs.publisher_validation_request && github.repository == 'qiuxinliang/edr-agent'
     permissions:
       contents: read
       actions: read
@@ -806,3 +811,131 @@ jobs:
           path: ${{ steps.collect-cache-qa.outputs.directory }}
 # Manual subset does not register/promote packages, upload Release assets, use
 # platform API auth, migrate real data, or claim the immutable 695 clock fixed.
+
+  signed-publisher-lifecycle:
+    if: github.event_name == 'workflow_dispatch' && inputs.publisher_validation_request && github.repository == 'qiuxinliang/edr-agent'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: windows-2022
+          - arch: arm64
+            runner: windows-11-vs2026-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    env:
+      PUBLISHER_VALIDATION_REQUEST: ${{ inputs.publisher_validation_request }}
+      VALIDATION_TARGET_TAG: ${{ inputs.target_tag }}
+      VALIDATION_BASELINE_TAG: ${{ inputs.baseline_tag }}
+      VALIDATION_CACHE_SUBSET: ${{ inputs.cache_recovery_subset }}
+      VALIDATION_RUNNER_ENVIRONMENT: ${{ runner.environment }}
+      NATIVE_ARCH: ${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12.10'
+          architecture: x64
+      - name: Require a clean native hosted machine for signed acceptance
+        shell: pwsh
+        env:
+          PRIVATE_ACTIONS_PRESENT: ${{ secrets.USB_SIGNING_TOKEN != '' }}
+          PRIVATE_CONTENTS_PRESENT: ${{ secrets.USB_SIGNING_RELEASE_TOKEN != '' }}
+        run: |
+          $ErrorActionPreference='Stop'
+          if ($env:VALIDATION_RUNNER_ENVIRONMENT -cne 'github-hosted' -or $env:VALIDATION_CACHE_SUBSET -eq 'true') {
+            throw 'Signed acceptance requires its own disposable GitHub-hosted machine'
+          }
+          if ($env:PRIVATE_ACTIONS_PRESENT -ne 'true' -or $env:PRIVATE_CONTENTS_PRESENT -ne 'true') { throw 'Private signing read/evidence credentials are required' }
+          $admin=[Security.Principal.WindowsPrincipal]::new([Security.Principal.WindowsIdentity]::GetCurrent())
+          if (-not $admin.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'Elevated native host required' }
+          $expected=if($env:NATIVE_ARCH -eq 'arm64'){'Arm64'}else{'X64'}
+          if ([Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString() -cne $expected) { throw 'Runner OS architecture is not native' }
+          if (Get-Service -Name FDSecurityAgent,EdrAgent,FDSecurityAgentCISmoke -ErrorAction SilentlyContinue) { throw 'Existing Agent service; refusing test' }
+          if (Get-Process -Name FDSensor,EDRAgent,FDSecurityInstallerWorker -ErrorAction SilentlyContinue) { throw 'Existing Agent process; refusing test' }
+          foreach($path in @('C:\Program Files\FDSecurity','C:\ProgramData\FDSecurity','C:\edr-agent-setup-lifecycle-smoke')) {
+            if(Test-Path -LiteralPath $path){throw 'Existing Agent state; refusing test'}
+          }
+          if ([Text.Encoding]::UTF8.GetByteCount($env:PUBLISHER_VALIDATION_REQUEST) -gt 32768) { throw 'Validation request too large' }
+          $request=$env:PUBLISHER_VALIDATION_REQUEST|ConvertFrom-Json
+          if($request.target.tag -cne $env:VALIDATION_TARGET_TAG -or $request.baseline.tag -cne $env:VALIDATION_BASELINE_TAG){throw 'Dispatch and signed request versions differ'}
+          [IO.File]::WriteAllText((Join-Path $PWD 'publisher-validation-request.json'),$env:PUBLISHER_VALIDATION_REQUEST,[Text.UTF8Encoding]::new($false))
+      - name: Check signed lifecycle admission and preservation regressions
+        shell: pwsh
+        run: |
+          python tests/test_headless_repack_lifecycle.py
+          if($LASTEXITCODE -ne 0){throw 'Signed package admission regression failed'}
+          python tests/test_signed_publisher_lifecycle.py
+          if($LASTEXITCODE -ne 0){throw 'Signed validation request regression failed'}
+          python tests/test_windows_release_checkpoint.py LifecycleUpgradeInputTests
+          if($LASTEXITCODE -ne 0){throw 'Publisher receipt binding regression failed'}
+      - name: Check native Windows publisher and old invocation boundaries
+        shell: powershell
+        run: |
+          & ([scriptblock]::Create([IO.File]::ReadAllText((Join-Path $PWD 'tests/test_windows_lifecycle_publisher.ps1')))) -RepoRoot $PWD
+          & ([scriptblock]::Create([IO.File]::ReadAllText((Join-Path $PWD 'tests/test_windows_lifecycle_first_hop.ps1')))) -RepoRoot $PWD
+      - name: Admit both immutable signed candidates and original legacy package
+        timeout-minutes: 25
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          USB_SIGNING_ACTIONS_TOKEN: ${{ secrets.USB_SIGNING_TOKEN }}
+          USB_SIGNING_RELEASE_TOKEN: ${{ secrets.USB_SIGNING_RELEASE_TOKEN }}
+        run: |
+          python tests/stage_signed_publisher_lifecycle.py --request publisher-validation-request.json --arch $env:NATIVE_ARCH --root signed-lifecycle-input
+          if($LASTEXITCODE -ne 0){throw 'Signed candidate admission failed before installation'}
+          $request=Get-Content publisher-validation-request.json -Raw|ConvertFrom-Json
+          foreach($label in @('baseline','target')){
+            $proof=$request.$label.publisher_verification.($env:NATIVE_ARCH)
+            & ./scripts/Verify-HeadlessRepackLifecycle.ps1 -Root (Join-Path signed-lifecycle-input $label) -Architecture $env:NATIVE_ARCH -Thumbprint $proof.thumbprint -Subject $proof.subject
+          }
+      - name: Execute signed migration upgrade timeout rollback and uninstall
+        timeout-minutes: 40
+        shell: pwsh
+        run: |
+          $stage=Get-Content signed-lifecycle-input/stage.json -Raw|ConvertFrom-Json
+          $parameters=@{
+            SignedPublisherValidation=$true; ExerciseInstallerTimeout=$true
+            LegacySetupExe=$stage.legacy_setup_exe; LegacyVersion=$stage.legacy_version
+            BaselineSetupExe=$stage.baseline_setup_exe; BaselineVersion=$stage.baseline_version
+            TargetSetupExe=$stage.target_setup_exe; TargetVersion=$stage.target_version
+            MigrationInput=$stage.migration_input; UpgradeInput=$stage.upgrade_input
+            BaselineConfigTemplate=$stage.legacy_config_template
+            Architecture=$env:NATIVE_ARCH; EvidenceDir='setup-exe-evidence'
+          }
+          & ./scripts/windows_setup_exe_lifecycle_smoke.ps1 @parameters
+      - name: Preserve signed acceptance scope and source identities
+        if: always()
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force setup-exe-evidence,runtime-evidence|Out-Null
+          foreach($path in @('signed-lifecycle-input/stage.json','signed-lifecycle-input/request.json')){
+            if(Test-Path -LiteralPath $path){Copy-Item -LiteralPath $path -Destination setup-exe-evidence}
+          }
+          foreach($label in @('baseline','target')){
+            foreach($name in @('admission.json','signature-verification.json','publisher-verification.json','result.json')){
+              $path=Join-Path (Join-Path signed-lifecycle-input $label) $name
+              if(Test-Path -LiteralPath $path){Copy-Item -LiteralPath $path -Destination (Join-Path setup-exe-evidence ($label+'-'+$name))}
+            }
+          }
+          foreach($name in @('old-updater-report.json','old-updater-journal.json')){
+            $path=Join-Path setup-exe-evidence $name
+            if(Test-Path -LiteralPath $path){Copy-Item -LiteralPath $path -Destination runtime-evidence}
+          }
+          @'
+          Native service-mode signed full-installer acceptance. Real backend CMS verification receipts bind both candidates. Original 723 migrates via full Setup; original protocol-6 embedded updater performs the next-version upgrade. Candidate installer hang, Job termination, recovery, old-version Setup rollback and uninstall are checked. Preservation covers actual configuration/service identity and synthetic queue/evidence markers. This does not claim platform command transport, real business database readback, or scheduled-task deployment acceptance.
+          '@ | Set-Content runtime-evidence/scope.txt -Encoding utf8
+          if(Test-Path setup-exe-evidence/summary.json){Get-Content setup-exe-evidence/summary.json|Out-File $env:GITHUB_STEP_SUMMARY -Append}
+      - name: Retain signed lifecycle evidence in the private evidence owner
+        if: always()
+        timeout-minutes: 15
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.USB_SIGNING_RELEASE_TOKEN }}
+          SIGNED_LIFECYCLE_STATUS: ${{ job.status }}
+        run: |
+          python scripts/upload_windows_lifecycle_evidence.py --target-tag $env:VALIDATION_TARGET_TAG --arch $env:NATIVE_ARCH --job-status $env:SIGNED_LIFECYCLE_STATUS --workspace $env:GITHUB_WORKSPACE --output-dir "$env:RUNNER_TEMP/signed-lifecycle-evidence-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT-$env:NATIVE_ARCH"
+          if($LASTEXITCODE -ne 0){throw 'Signed lifecycle evidence was not retained'}
