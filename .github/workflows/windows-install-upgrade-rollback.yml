@@ -812,9 +812,135 @@ jobs:
 # Manual subset does not register/promote packages, upload Release assets, use
 # platform API auth, migrate real data, or claim the immutable 695 clock fixed.
 
+  storage-compat-native-tools:
+    name: Storage compatibility tools (${{ matrix.arch }})
+    if: github.event_name == 'workflow_dispatch' && inputs.publisher_validation_request && github.repository == 'qiuxinliang/edr-agent'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: windows-2022
+            msvc_arch: x64
+            triplet: x64-windows
+            processor: AMD64
+          - arch: arm64
+            runner: windows-11-vs2026-arm
+            msvc_arch: arm64
+            triplet: arm64-windows
+            processor: ARM64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    env:
+      NATIVE_ARCH: ${{ matrix.arch }}
+      EDR_VCPKG_TRIPLET: ${{ matrix.triplet }}
+      VCPKG_DEFAULT_TRIPLET: ${{ matrix.triplet }}
+      VCPKG_DOWNLOADS: ${{ github.workspace }}/.cache/vcpkg-downloads
+      VCPKG_BINARY_SOURCES: clear;files,${{ github.workspace }}/.cache/vcpkg-bincache,readwrite
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12.10'
+          architecture: x64
+      - name: Bind the native tools to the signed acceptance request
+        shell: pwsh
+        env:
+          REQUEST: ${{ inputs.publisher_validation_request }}
+          HOST_ENVIRONMENT: ${{ runner.environment }}
+        run: |
+          $ErrorActionPreference='Stop'
+          if($env:HOST_ENVIRONMENT -cne 'github-hosted'){throw 'Native storage tools require a disposable hosted machine'}
+          $expected=if($env:NATIVE_ARCH -eq 'arm64'){'Arm64'}else{'X64'}
+          if([Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString() -cne $expected){throw 'Native storage tool host architecture mismatch'}
+          $request=$env:REQUEST|ConvertFrom-Json
+          if($request.schema -cne 'edr.signed-publisher-validation.v1' -or $request.legacy_tag -cne 'win_3.2.723' -or
+             $request.source_commit -cne 'd4e837790c53861c99d31ee127c55a5ef1f06f4a'){throw 'Storage source pins differ from the signed candidates'}
+          python tests/test_storage_compat_transfer.py
+          if($LASTEXITCODE -ne 0){throw 'Storage tool transport regression failed'}
+          python tests/storage_compat/test_stage_native.py
+          if($LASTEXITCODE -ne 0){throw 'Storage native closure regression failed'}
+      - name: Initialize existing native compiler and build tools
+        shell: pwsh
+        run: |
+          & ./scripts/Initialize-VSEnvironment.ps1 -Architecture '${{ matrix.msvc_arch }}'
+          & ./scripts/Ensure-WindowsBuildTools.ps1 -NinjaOnly
+      - name: Identify the existing locked dependency cache
+        id: storage-vcpkg-key
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force .cache/vcpkg-downloads,.cache/vcpkg-bincache|Out-Null
+          python scripts/vcpkg_cache_key.py --triplet '${{ matrix.triplet }}'
+          if($LASTEXITCODE -ne 0){throw 'Storage dependency cache identity failed'}
+      - uses: actions/cache/restore@v5
+        id: storage-vcpkg-cache
+        with:
+          path: |
+            .cache/vcpkg-downloads
+            .cache/vcpkg-bincache
+          key: ${{ steps.storage-vcpkg-key.outputs.key }}
+          restore-keys: |
+            ${{ steps.storage-vcpkg-key.outputs.restore-prefix }}
+            vcpkg-${{ matrix.triplet }}-release-yara-fast-nogrpc-
+      - name: Restore and materialize the existing pinned dependencies
+        timeout-minutes: 45
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference='Stop'
+          python scripts/vcpkg_release_cache.py restore --key '${{ steps.storage-vcpkg-key.outputs.key }}' --actions-cache-hit '${{ steps.storage-vcpkg-cache.outputs.cache-hit }}'
+          if($LASTEXITCODE -ne 0){throw 'Existing shared dependency cache restore failed'}
+          & ./scripts/bootstrap_pinned_vcpkg.ps1
+          $vcpkg=Join-Path $PWD 'vcpkg/vcpkg.exe'
+          & ./scripts/Invoke-VcpkgInstallWithRetry.ps1 -VcpkgExe $vcpkg -FeatureArgs @('--x-feature=sqlite','--x-feature=yara') -MaxAttempts 6 -InitialBackoffSeconds 30
+      - name: Compile the frozen original and candidate storage consumers
+        timeout-minutes: 25
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          $root=Join-Path $env:RUNNER_TEMP 'storage-compat-native'
+          New-Item -ItemType Directory -Path $root -ErrorAction Stop|Out-Null
+          $prefix=Join-Path $PWD 'vcpkg_installed/${{ matrix.triplet }}'
+          $toolchain=Join-Path $PWD 'vcpkg/scripts/buildsystems/vcpkg.cmake'
+          foreach($role in @('legacy','candidate')) {
+            $source=Join-Path $root ('source-'+$role)
+            $build=Join-Path $root ('build-'+$role)
+            python tests/storage_compat/prepare.py --repo $PWD --output $source --role $role
+            if($LASTEXITCODE -ne 0){throw 'Frozen storage source export failed'}
+            cmake -S $source -B $build -G Ninja -DCMAKE_BUILD_TYPE:STRING=StorageCompat `
+              '-DCMAKE_MAP_IMPORTED_CONFIG_STORAGECOMPAT:STRING=Release;' -DCMAKE_MSVC_RUNTIME_LIBRARY:STRING=MultiThreadedDLL `
+              "-DCMAKE_TOOLCHAIN_FILE=$toolchain" "-DCMAKE_PREFIX_PATH=$prefix" `
+              "-DVCPKG_INSTALLED_DIR=$PWD/vcpkg_installed" -DVCPKG_MANIFEST_INSTALL=OFF `
+              '-DCMAKE_SYSTEM_PROCESSOR=${{ matrix.processor }}' '-DEDR_WINDOWS_TARGET_ARCH=${{ matrix.arch }}' `
+              -DEDR_BUILD_TESTS=ON -DEDR_REQUIRE_SQLITE=ON -DEDR_REQUIRE_PCRE2=OFF `
+              -DEDR_P0_RULE_IR_ALLOW_TEST_STUB=ON -DEDR_WITH_YARA=OFF -DEDR_REQUIRE_YARA=OFF `
+              -DEDR_WITH_FORENSIC_COLLECTOR=OFF -DEDR_WITH_HTTP2_CURL=OFF
+            if($LASTEXITCODE -ne 0){throw 'Real storage owner target configuration failed'}
+            cmake --build $build --target storage_compat_cache storage_compat_queue --parallel 4
+            if($LASTEXITCODE -ne 0){throw 'Real storage consumer compilation failed'}
+          }
+          $compiler=(Get-Command cl.exe -ErrorAction Stop).Source
+          $dumpbin=Join-Path (Split-Path $compiler) 'dumpbin.exe'
+          python tests/storage_compat/stage_native.py stage --repo $PWD --legacy-build "$root/build-legacy" --candidate-build "$root/build-candidate" --source-manifests $root --dependency-prefix $prefix --msvc-redist-root $env:VCToolsRedistDir --compiler $compiler --dumpbin $dumpbin --architecture $env:NATIVE_ARCH --harness-commit $env:GITHUB_SHA --run-id $env:GITHUB_RUN_ID --run-attempt $env:GITHUB_RUN_ATTEMPT --output "$root/bundle"
+          if($LASTEXITCODE -ne 0){throw 'Native cross-version storage readback or dependency closure failed'}
+      - name: Retain exact native storage tools as private same-run evidence
+        timeout-minutes: 15
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.USB_SIGNING_RELEASE_TOKEN }}
+        run: |
+          if(-not $env:GH_TOKEN){throw 'Private evidence credential is required'}
+          python tests/storage_compat/transfer.py upload --architecture $env:NATIVE_ARCH --bundle "$env:RUNNER_TEMP/storage-compat-native/bundle" --output "$env:RUNNER_TEMP/storage-compat-native/upload"
+          if($LASTEXITCODE -ne 0){throw 'Native storage tools were not retained'}
+
   signed-publisher-lifecycle:
     name: Signed publisher (${{ matrix.arch }}, ${{ matrix.runtime_mode }})
     if: github.event_name == 'workflow_dispatch' && inputs.publisher_validation_request && github.repository == 'qiuxinliang/edr-agent'
+    needs: storage-compat-native-tools
     strategy:
       fail-fast: false
       matrix:
@@ -883,11 +1009,27 @@ jobs:
           if($LASTEXITCODE -ne 0){throw 'Signed validation request regression failed'}
           python tests/test_windows_release_checkpoint.py LifecycleUpgradeInputTests
           if($LASTEXITCODE -ne 0){throw 'Publisher receipt binding regression failed'}
+          python tests/test_windows_lifecycle_storage.py
+          if($LASTEXITCODE -ne 0){throw 'Readonly SQLite snapshot regression failed'}
+      - name: Bind exact same-run native storage tools
+        timeout-minutes: 15
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.USB_SIGNING_RELEASE_TOKEN }}
+        run: |
+          $ErrorActionPreference='Stop'
+          $directory=Join-Path $env:RUNNER_TEMP 'signed-storage-tools'
+          python tests/storage_compat/transfer.py download --architecture $env:NATIVE_ARCH --output $directory
+          if($LASTEXITCODE -ne 0){throw 'Native storage tool download or identity failed'}
+          $python=(Get-Command python -ErrorAction Stop).Source
+          python tests/storage_compat/stage_native.py bind --repo $PWD --bundle "$directory/bundle" --architecture $env:NATIVE_ARCH --harness-commit $env:GITHUB_SHA --run-id $env:GITHUB_RUN_ID --run-attempt $env:GITHUB_RUN_ATTEMPT --python-path $python --output "$PWD/storage-tools-input.json"
+          if($LASTEXITCODE -ne 0){throw 'Native storage tools did not bind to this host'}
       - name: Check native Windows publisher and old invocation boundaries
         shell: powershell
         run: |
           & ([scriptblock]::Create([IO.File]::ReadAllText((Join-Path $PWD 'tests/test_windows_lifecycle_publisher.ps1')))) -RepoRoot $PWD
           & ([scriptblock]::Create([IO.File]::ReadAllText((Join-Path $PWD 'tests/test_windows_lifecycle_runtime_mode.ps1')))) -RepoRoot $PWD
+          & ([scriptblock]::Create([IO.File]::ReadAllText((Join-Path $PWD 'tests/test_windows_lifecycle_storage.ps1')))) -RepoRoot $PWD
           & ([scriptblock]::Create([IO.File]::ReadAllText((Join-Path $PWD 'tests/test_windows_lifecycle_first_hop.ps1')))) -RepoRoot $PWD
       - name: Admit both immutable signed candidates and original legacy package
         timeout-minutes: 25
@@ -917,6 +1059,7 @@ jobs:
             MigrationInput=$stage.migration_input; UpgradeInput=$stage.upgrade_input
             BaselineConfigTemplate=$stage.legacy_config_template
             Architecture=$env:NATIVE_ARCH; RuntimeMode=$env:LIFECYCLE_RUNTIME_MODE; EvidenceDir='setup-exe-evidence'
+            StorageToolsInput=(Join-Path $PWD 'storage-tools-input.json')
           }
           & ./scripts/windows_setup_exe_lifecycle_smoke.ps1 @parameters
       - name: Preserve signed acceptance scope and source identities
@@ -938,7 +1081,7 @@ jobs:
             if(Test-Path -LiteralPath $path){Copy-Item -LiteralPath $path -Destination runtime-evidence}
           }
           @"
-          Native $env:LIFECYCLE_RUNTIME_MODE signed full-installer acceptance. Real backend CMS verification receipts bind both candidates. Original 723 migrates via full Setup; original protocol-6 embedded updater performs the next-version upgrade. Candidate installer hang, Job termination, recovery, old-version Setup rollback and uninstall are checked. Preservation covers actual configuration and service/task identity (including task XML and permissions) plus synthetic queue/evidence markers. This does not claim platform command transport or real business database readback.
+          Native $env:LIFECYCLE_RUNTIME_MODE signed full-installer acceptance. Real backend CMS verification receipts bind both candidates. Original 723 migrates via full Setup; original protocol-6 embedded updater performs the next-version upgrade. Candidate installer hang, Job termination, recovery, baseline Setup rollback and uninstall are checked. Preservation covers actual configuration and service/task identity (including task XML and permissions), plus representative records written through the frozen original storage APIs into each installed chain's actual queue/evidence databases. Both original and candidate consumers read independent SQLite-consistent copies after each transition, including candidate-written records after rollback. Queue readback advances only the existing test delivery clock by 301 seconds on disposable copies; it does not prove retry timing. This does not claim sensor capture, live in-process cache health, platform command transport, or Setup rollback to 723.
           "@ | Set-Content runtime-evidence/scope.txt -Encoding utf8
           if(Test-Path setup-exe-evidence/summary.json){Get-Content setup-exe-evidence/summary.json|Out-File $env:GITHUB_STEP_SUMMARY -Append}
       - name: Retain signed lifecycle evidence in the private evidence owner

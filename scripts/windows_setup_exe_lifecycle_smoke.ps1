@@ -19,7 +19,8 @@ param(
   [switch] $SignedPublisherValidation,
   [string] $LegacySetupExe = '',
   [string] $LegacyVersion = '',
-  [string] $MigrationInput = ''
+  [string] $MigrationInput = '',
+  [string] $StorageToolsInput = ''
 )
 
 $ErrorActionPreference = "Stop"
@@ -50,12 +51,14 @@ if (Test-Path -LiteralPath $InstallDir) {
 if ($SignedPublisherValidation) {
   if ($env:GITHUB_ACTIONS -cne 'true' -or -not $LegacySetupExe -or -not $MigrationInput -or
       $LegacyVersion -cne '3.2.723' -or [version]$BaselineVersion -ge [version]$TargetVersion -or
-      [version]$LegacyVersion -ge [version]$BaselineVersion -or $SkipSetupRollback) {
-    throw 'signed publisher validation requires disposable CI, original 3.2.723, two increasing candidates and full rollback'
+      [version]$LegacyVersion -ge [version]$BaselineVersion -or $SkipSetupRollback -or -not $StorageToolsInput) {
+    throw 'signed publisher validation requires disposable CI, original 3.2.723, two increasing candidates, storage consumer tools and full rollback'
   }
   $LegacySetupExe = (Resolve-Path -LiteralPath $LegacySetupExe).Path
   & $bootstrapVerifier -Path $LegacySetupExe -PayloadArchitecture $Architecture
-} elseif ($LegacySetupExe -or $LegacyVersion -or $MigrationInput) {
+  . (Join-Path $repoRoot 'tests\Invoke-LifecycleStorageCompatibility.ps1')
+  $storageTools=Import-LifecycleStorageTools $StorageToolsInput $Architecture $archVerifier
+} elseif ($LegacySetupExe -or $LegacyVersion -or $MigrationInput -or $StorageToolsInput) {
   throw 'legacy migration inputs require signed publisher validation'
 }
 if ($RuntimeMode -ceq 'scheduled_task' -and -not $SignedPublisherValidation) {
@@ -722,6 +725,9 @@ try {
     Invoke-Installer $LegacySetupExe 'install-legacy-migration-baseline' $false
     Assert-InstalledRuntime $LegacyVersion 'install-legacy-migration-baseline' $true
     $null=Wait-LifecycleEmbeddedUpdater $LegacyVersion $migrationBinding.baseline_updater_sha256
+    $chainStorage=New-LifecycleStorageChain $storageTools 'legacy-updater'
+    Write-LifecycleStorageFixture $chainStorage 'seed' 'legacy-seed'
+    Test-LifecycleStorageReadback $chainStorage 'legacy-installed'
     $chainSnapshot=New-LifecyclePreservationSnapshot 'legacy-migration'
     # This is the supported full-Setup migration. The old command contract
     # rejects this publisher before PS starts; do not bypass it with a patched
@@ -729,6 +735,7 @@ try {
     Invoke-Installer $BaselineSetupExe 'migrate-legacy-full-setup' $true
     Assert-InstalledRuntime $BaselineVersion 'migrate-legacy-full-setup' $true $true
     Assert-LifecyclePreservationSnapshot $chainSnapshot 'migrate-legacy-full-setup'
+    Test-LifecycleStorageReadback $chainStorage 'migrated-baseline'
     $migratedUpdater=Wait-LifecycleEmbeddedUpdater $BaselineVersion $upgradeBinding.baseline_updater_sha256
     Assert-LifecyclePublisherProtocol $migratedUpdater $upgradeBinding.baseline_updater_sha256 (Get-LifecycleTrustedPublisher $migrationBinding)
   } else {
@@ -740,7 +747,12 @@ try {
   }
   Invoke-BaselineUpdaterUpgrade $upgradeBinding
   Assert-InstalledRuntime $TargetVersion 'old-updater-upgrade' $true $true
-  if ($SignedPublisherValidation) { Assert-LifecyclePreservationSnapshot $chainSnapshot 'signed-updater-upgrade' }
+  if ($SignedPublisherValidation) {
+    Assert-LifecyclePreservationSnapshot $chainSnapshot 'signed-updater-upgrade'
+    Test-LifecycleStorageReadback $chainStorage 'updater-target'
+    Write-LifecycleStorageFixture $chainStorage 'append' 'updater-target-append'
+    Test-LifecycleStorageReadback $chainStorage 'updater-target-new-data'
+  }
   if ($ExerciseInstallerTimeout) {
     $script:LastLifecycleStage = 'candidate-installer-timeout'
     Add-Evidence 'candidate-installer-timeout' 'started' 'same-version repair with original candidate updater and Setup bytes'
@@ -749,27 +761,44 @@ try {
     & (Join-Path $repoRoot 'tests\Invoke-RealInstallerTimeoutRecovery.ps1') -InputBinding $upgradeBinding `
       -InstallDir $InstallDir -EvidenceDir $EvidenceDir -Updater $candidateUpdater -Publisher $candidatePublisher -RuntimeMode $RuntimeMode
     Assert-InstalledRuntime $TargetVersion 'candidate-installer-timeout' $true $true
-    if ($SignedPublisherValidation) { Assert-LifecyclePreservationSnapshot $chainSnapshot 'signed-installer-timeout' }
+    if ($SignedPublisherValidation) {
+      Assert-LifecyclePreservationSnapshot $chainSnapshot 'signed-installer-timeout'
+      Test-LifecycleStorageReadback $chainStorage 'timeout-recovered'
+    }
     Add-Evidence 'candidate-installer-timeout' 'verified' 'original Setup timed out; Job empty; runtime/config/owner/uninstall identity restored; queue/evidence marker bytes preserved'
   }
   Invoke-UninstallerAndAssertCleanup 'uninstall-old-updater-target'
 
   # Then verify the cross-version compatibility path using a baseline that is
   # freshly installed and validated in this same native-runner job.
+  if ($SignedPublisherValidation) { $null=Initialize-LifecycleOfflineConfig $BaselineConfigTemplate }
   Invoke-Installer $BaselineSetupExe "install-baseline" $false
   Assert-InstalledRuntime $BaselineVersion "install-baseline" (-not $SkipSetupRollback)
   Assert-BaselineRepair $BaselineSetupExe
-  if ($SignedPublisherValidation) { $rollbackSnapshot=New-LifecyclePreservationSnapshot 'signed-setup-rollback' }
+  if ($SignedPublisherValidation) {
+    $rollbackStorage=New-LifecycleStorageChain $storageTools 'setup-rollback'
+    Write-LifecycleStorageFixture $rollbackStorage 'seed' 'rollback-baseline-seed'
+    Test-LifecycleStorageReadback $rollbackStorage 'rollback-baseline'
+    $rollbackSnapshot=New-LifecyclePreservationSnapshot 'signed-setup-rollback'
+  }
   Invoke-Installer $TargetSetupExe "upgrade-target" $true
   Assert-InstalledRuntime $TargetVersion "upgrade-target" $true $true
-  if ($SignedPublisherValidation) { Assert-LifecyclePreservationSnapshot $rollbackSnapshot 'signed-setup-upgrade' }
+  if ($SignedPublisherValidation) {
+    Assert-LifecyclePreservationSnapshot $rollbackSnapshot 'signed-setup-upgrade'
+    Test-LifecycleStorageReadback $rollbackStorage 'setup-target'
+    Write-LifecycleStorageFixture $rollbackStorage 'append' 'setup-target-append'
+    Test-LifecycleStorageReadback $rollbackStorage 'setup-target-new-data'
+  }
   if ($SkipSetupRollback) {
     Add-Evidence "rollback-baseline" "skipped" "legacy baseline predates the immutable full-Setup rollback contract; native runtime rollback remains mandatory"
     Invoke-UninstallerAndAssertCleanup "uninstall-after-upgrade"
   } else {
     Invoke-Installer $BaselineSetupExe "rollback-baseline" $true
     Assert-InstalledRuntime $BaselineVersion "rollback-baseline"
-    if ($SignedPublisherValidation) { Assert-LifecyclePreservationSnapshot $rollbackSnapshot 'signed-setup-rollback' }
+    if ($SignedPublisherValidation) {
+      Assert-LifecyclePreservationSnapshot $rollbackSnapshot 'signed-setup-rollback'
+      Test-LifecycleStorageReadback $rollbackStorage 'setup-rollback-completed'
+    }
     Invoke-UninstallerAndAssertCleanup "uninstall-after-rollback"
   }
   $status = "succeeded"

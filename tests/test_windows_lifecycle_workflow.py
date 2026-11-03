@@ -326,6 +326,54 @@ class WindowsLifecycleWorkflowTests(unittest.TestCase):
         self.assertIn('tests/test_windows_lifecycle_runtime_mode.ps1',
                       step(signed, 'Check native Windows publisher and old invocation boundaries'))
 
+    def test_signed_storage_uses_actual_installation_chains_before_uninstall(self):
+        owner = (ROOT / 'scripts/windows_setup_exe_lifecycle_smoke.ps1').read_text(encoding='utf-8')
+        self.assertIn('-or -not $StorageToolsInput', owner)
+        self.assertLess(owner.index('Import-LifecycleStorageTools $StorageToolsInput'),
+                        owner.index('  Invoke-Installer $TargetSetupExe "install-target-fresh"'))
+        first = owner.split("$chainStorage=New-LifecycleStorageChain $storageTools 'legacy-updater'", 1)[1]
+        first = first.split("Invoke-UninstallerAndAssertCleanup 'uninstall-old-updater-target'", 1)[0]
+        for hook in ("Write-LifecycleStorageFixture $chainStorage 'seed'",
+                     "Test-LifecycleStorageReadback $chainStorage 'legacy-installed'",
+                     "Test-LifecycleStorageReadback $chainStorage 'migrated-baseline'",
+                     "Write-LifecycleStorageFixture $chainStorage 'append'",
+                     "Test-LifecycleStorageReadback $chainStorage 'timeout-recovered'"):
+            self.assertIn(hook, first)
+        second = owner.split("$rollbackStorage=New-LifecycleStorageChain $storageTools 'setup-rollback'", 1)[1]
+        second = second.split('Invoke-UninstallerAndAssertCleanup "uninstall-after-rollback"', 1)[0]
+        self.assertNotIn('$chainStorage', second)
+        for hook in ("Write-LifecycleStorageFixture $rollbackStorage 'seed'",
+                     "Write-LifecycleStorageFixture $rollbackStorage 'append'",
+                     "Test-LifecycleStorageReadback $rollbackStorage 'setup-rollback-completed'"):
+            self.assertIn(hook, second)
+
+    def test_signed_storage_uses_same_run_native_tools_from_frozen_sources(self):
+        tools, signed = self.text.split('  storage-compat-native-tools:\n', 1)[1].split('  signed-publisher-lifecycle:\n', 1)
+        self.assertIn('needs: storage-compat-native-tools', signed)
+        self.assertNotIn('${{ runner.', tools.split('    steps:\n', 1)[0])
+        self.assertIn("github.event_name == 'workflow_dispatch' && inputs.publisher_validation_request", tools)
+        self.assertIn('fetch-depth: 0', tools)
+        for arch, triplet in [('amd64', 'x64-windows'), ('arm64', 'arm64-windows')]:
+            self.assertIn('- arch: '+arch, tools)
+            self.assertIn('triplet: '+triplet, tools)
+        compile_step = step(tools, 'Compile the frozen original and candidate storage consumers')
+        for required in ("foreach($role in @('legacy','candidate'))", 'storage_compat/prepare.py',
+                         '-DCMAKE_BUILD_TYPE:STRING=StorageCompat',
+                         "'-DCMAKE_MAP_IMPORTED_CONFIG_STORAGECOMPAT:STRING=Release;'",
+                         '-DCMAKE_MSVC_RUNTIME_LIBRARY:STRING=MultiThreadedDLL',
+                         '--target storage_compat_cache storage_compat_queue',
+                         'storage_compat/stage_native.py stage', '--harness-commit $env:GITHUB_SHA',
+                         '--run-id $env:GITHUB_RUN_ID --run-attempt $env:GITHUB_RUN_ATTEMPT'):
+            self.assertIn(required, compile_step)
+        for forbidden in ('--target FDSensor', '-DCMAKE_BUILD_TYPE=Release', 'GH_TOKEN:'):
+            self.assertNotIn(forbidden, compile_step)
+        download = step(signed, 'Bind exact same-run native storage tools')
+        self.assertIn('storage_compat/transfer.py download', download)
+        self.assertIn('storage_compat/stage_native.py bind', download)
+        self.assertIn('GH_TOKEN: ${{ secrets.USB_SIGNING_RELEASE_TOKEN }}', download)
+        invoke = step(signed, 'Execute signed migration upgrade timeout rollback and uninstall')
+        self.assertIn("StorageToolsInput=(Join-Path $PWD 'storage-tools-input.json')", invoke)
+
 
 if __name__ == '__main__':
     unittest.main()
