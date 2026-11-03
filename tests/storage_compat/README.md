@@ -140,6 +140,19 @@ endpoint/63-byte tenant limits, across both tools and source versions. Another
 12 negative cases reject 48- and 51-byte endpoints and 64-byte tenants with the
 specific identity cause and verify that no database or sidecar was created.
 The summary reports boundary reads/writes separately and 22 total negatives.
+Cache queries use the frozen owner's existing maximum `limit=1000` (at most
+20,100 SQL candidates before identity filtering). Missing data distinguishes a
+full scan from a target that was not found; a full empty scan cannot authorize a
+seed or append. Both fixture identities are checked before either write. Exact
+integer event time, one matching row and every selected record field remain
+required. No production query, SQL or authorization is changed.
+
+Each standalone cache `create` also writes exactly 320 newer, unrelated records
+through the original owner API, closes and reopens the cache, and proves that
+the former `limit=10` scan returns zero target rows after scanning 300. Fresh
+old/new consumers must then retrieve the complete selected records with the
+bounded larger request. The three standalone creates report 960 background
+writes separately; installed `seed`/`append` paths never inject this noise.
 This standalone result is explicitly not an installed Agent lifecycle result.
 The signed lifecycle helper must still seed the actual installed DBs, start the
 original runtime and validate snapshots after upgrade and timeout/rollback.

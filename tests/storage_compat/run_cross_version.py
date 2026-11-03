@@ -14,7 +14,7 @@ def main():
     a=p.parse_args();a.output.mkdir(parents=True,exist_ok=False)
     deadline=time.monotonic()+120
     epoch=str(int(time.time()));tenant='synthetic-storage-tenant';endpoint='synthetic-storage-endpoint'
-    receipts=[];negatives=[];identities={};native_machines=set()
+    receipts=[];negatives=[];identities={};native_machines=set();cache_scan_cases=[]
     suffix='.exe' if platform.system()=='Windows' else ''
     tools={role:{kind:folder/('storage_compat_'+kind+suffix) for kind in ('cache','queue')}
            for role,folder in [('legacy',a.legacy_bin),('candidate',a.candidate_bin)]}
@@ -58,6 +58,21 @@ def main():
         records=receipt['records']
         if len(records)!=(generation*2 if action=='read' else 2):
             raise ValueError('missing records')
+        if kind=='cache':
+            if receipt.get('query_limit')!=1000 or receipt.get('query_scan_bound')!=20100:
+                raise ValueError('cache query escaped the existing owner bound')
+            noise=receipt.get('standalone_noise_records_written')
+            if noise!=(320 if action=='create' else 0):
+                raise ValueError('unexpected background fixture writes')
+            counterfactual=receipt.get('standalone_limit10_counterfactual')
+            if action=='create':
+                if not isinstance(counterfactual,dict) or any(counterfactual.get(k)!=v for k,v in
+                        {'rows':[],'rows_scanned':300,'rows_returned':0,'partial':False}.items()):
+                    raise ValueError('original small scan did not miss the retained fixture')
+                cache_scan_cases.append({'label':label,'noise_records_written':noise,
+                    'limit10_rows_scanned':300,'limit10_rows_returned':0,'reopened_original_owner':True})
+            elif counterfactual is not None:
+                raise ValueError('counterfactual noise is standalone create only')
         receipts.append({'label':label,'file':label+'.stdout.json','sha256':sha(a.output/(label+'.stdout.json'))})
         return records
 
@@ -126,6 +141,7 @@ def main():
                 if list(a.output.glob(database.name+'*')):
                     raise ValueError('rejected identity created database state: '+negative)
                 boundary_negatives.append(negative)
+    if len(cache_scan_cases)!=3:raise ValueError('missing old/new cache scan counterfactuals')
     summary={'schema':'edr.test.storage-cross-version.v1','passed':True,'platform':platform.system(),
              'machine':platform.machine(),'source_commits':PINS,'tools':identities,'epoch':int(epoch),
              'native_windows':platform.system()=='Windows','installed_agent_lifecycle':False,
@@ -137,6 +153,9 @@ def main():
              'identity_boundaries':{'endpoint_max_bytes':47,'tenant_max_bytes':63,
                                     'reads':4,'write_phases':4,'receipt_labels':boundary_receipts,
                                     'negative_cases':boundary_negatives,'rejection_before_database_open':True},
+             'cache_query_scan':{'query_limit':1000,'scan_bound':20100,'standalone_create_only':True,
+                                 'noise_records_written':sum(x['noise_records_written'] for x in cache_scan_cases),
+                                 'counterfactual_cases':cache_scan_cases},
              'receipts':receipts,'negatives':negatives}
     (a.output/'summary.json').write_text(json.dumps(summary,indent=2,sort_keys=True)+'\n')
     print(json.dumps({'passed':True,'platform':platform.system(),'reads':8,'write_phases':4,
