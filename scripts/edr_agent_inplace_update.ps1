@@ -84,15 +84,21 @@ function Assert-UpdateFreeSpace {
   if ($GrowthBytes -gt ([UInt64]::MaxValue - $MinFreeBytes)) { throw 'update space arithmetic overflow' }
   $required = [UInt64]($GrowthBytes + $MinFreeBytes)
   if (-not ('FDSecurityUpdateDiskSpace' -as [type])) {
-    Add-Type -TypeDefinition @'
-using System;
-using System.Runtime.InteropServices;
-public static class FDSecurityUpdateDiskSpace {
-  [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
-  [return: MarshalAs(UnmanagedType.Bool)]
-  public static extern bool GetDiskFreeSpaceExW(string path, out ulong available, out ulong total, out ulong free);
-}
-'@
+    # Bind the same Windows API in memory. Add-Type starts a compiler whose
+    # commit charge is shared with the updater under a constrained Windows Job.
+    $assembly = [AppDomain]::CurrentDomain.DefineDynamicAssembly(
+      [Reflection.AssemblyName]::new('FDSecurity.UpdateDiskSpace'), [Reflection.Emit.AssemblyBuilderAccess]::Run)
+    $module = $assembly.DefineDynamicModule('DiskSpace')
+    $type = $module.DefineType('FDSecurityUpdateDiskSpace', 'Public, Abstract, Sealed')
+    $outSize = [UInt64].MakeByRefType()
+    $method = $type.DefineMethod('GetDiskFreeSpaceExW', 'Public, Static, PinvokeImpl',
+      [int], [type[]]@([string], $outSize, $outSize, $outSize))
+    $import = [Runtime.InteropServices.DllImportAttribute]
+    $fields = [Reflection.FieldInfo[]]@($import.GetField('CharSet'), $import.GetField('ExactSpelling'), $import.GetField('SetLastError'))
+    $method.SetCustomAttribute([Reflection.Emit.CustomAttributeBuilder]::new(
+      $import.GetConstructor([type[]]@([string])), [object[]]@('kernel32.dll'),
+      $fields, [object[]]@([Runtime.InteropServices.CharSet]::Unicode, $true, $true)))
+    [void]$type.CreateType()
   }
   $directory = [System.IO.Path]::GetFullPath($Path)
   $depth = 0
