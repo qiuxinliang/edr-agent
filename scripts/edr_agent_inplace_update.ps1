@@ -675,6 +675,18 @@ function Assert-InstalledRuntimeIdentity {
   }
 }
 
+function Assert-RollbackRuntimeIdentity {
+  param([string]$Directory, [hashtable]$Journal)
+  if ([string]$Journal['previous_sha256'] -notmatch '^[0-9a-f]{64}$' -or
+      [string]$Journal['previous_runtime_identity_sha256'] -notmatch '^[0-9a-f]{64}$') {
+    throw 'full installer rollback requires the pre-update Agent and component manifest digests'
+  }
+  if ((Get-Sha256 -Path (Join-Path $Directory 'FDSensor.exe')) -ne $Journal.previous_sha256) {
+    throw 'full installer rollback Agent hash differs from the pre-update Agent'
+  }
+  Assert-InstalledRuntimeIdentity -InstallDirectory $Directory -ExpectedIdentitySha256 $Journal.previous_runtime_identity_sha256
+}
+
 function Convert-SemVer {
   param([Parameter(Mandatory = $true)][string]$Version)
   if ($Version -notmatch '^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$') {
@@ -1527,6 +1539,7 @@ $journal = [ordered]@{
   full_installer_backup_path = if ($UpgradeClass -eq 'installer_required') { $fullInstallerBackupPath } else { $null }
   full_installer_config_backup_path = if ($UpgradeClass -eq 'installer_required') { $fullInstallerConfigBackupPath } else { $null }
   full_installer_task_backup_sha256 = ''
+  previous_runtime_identity_sha256 = $null
   expected_runtime_identity_sha256 = $null
   installer_log_file = $null
   installer_log_sha256 = $null
@@ -1725,7 +1738,7 @@ try {
     foreach ($field in @('backup_path','failed_path','resolved_deployment_mode','previous_sha256',
         'health_observation_clock_version','health_observation_started_at_unix_ms','health_observation_deadline_unix_ms',
         'health_observation_utc_deadline_unix_ms','health_last_checked_unix_ms',
-        'expected_runtime_identity_sha256','full_installer_task_backup_sha256','failed_stage','error_code','first_error',
+        'expected_runtime_identity_sha256','previous_runtime_identity_sha256','full_installer_task_backup_sha256','failed_stage','error_code','first_error',
         'installer_job_name','installer_owner_started_at','installer_owner_uptime_ms','installer_quiesced')) {
       if ($priorProperties -contains $field) { $journal[$field] = $prior.$field }
     }
@@ -1958,6 +1971,11 @@ try {
     Set-UpdateStage -Stage 'full_installer_verified'
     Set-UpdateStage -Stage 'full_installer_backup'
     Invoke-FullInstallerRuntimeMirror -Source $installFull -Destination $fullInstallerBackupPath -Stage 'backup'
+    # Bind to the still-installed source before stop intent is committed.
+    # Taking these hashes after copying keeps hashing out of the mirror's peak.
+    $journal['previous_sha256'] = Get-Sha256 -Path $currentPath
+    $journal['previous_runtime_identity_sha256'] = Get-Sha256 -Path (Join-Path $installFull 'native-package-integrity.json')
+    Assert-RollbackRuntimeIdentity -Directory $fullInstallerBackupPath -Journal $journal
     Copy-Item -LiteralPath (Join-Path $installFull 'agent.toml') -Destination (Join-Path $fullInstallerBackupPath 'agent.toml') -Force
     Copy-Item -LiteralPath (Join-Path $installFull 'agent.toml') -Destination $fullInstallerConfigBackupPath -Force
     if ($resolvedDeploymentMode -eq 'scheduled_task') {
@@ -2156,6 +2174,7 @@ try {
       Set-UpdateStage -Stage 'rollback_full_installer_started'
       Stop-AgentRuntime -Mode $resolvedDeploymentMode -TaskName $ScheduledTaskName -TaskPath $ScheduledTaskPath -WindowsServiceName $ServiceName -ExecutablePath $currentPath
       Invoke-FullInstallerRuntimeMirror -Source $fullInstallerBackupPath -Destination $installFull -Stage 'restore'
+      Assert-RollbackRuntimeIdentity -Directory $installFull -Journal $journal
       if (Test-Path -LiteralPath $fullInstallerConfigBackupPath -PathType Leaf) {
         Copy-Item -LiteralPath $fullInstallerConfigBackupPath -Destination (Join-Path $installFull 'agent.toml') -Force
       }
