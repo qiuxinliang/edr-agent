@@ -206,4 +206,51 @@ foreach($upgradeClass in @('binary_hot','runtime_bundle','installer_required')) 
   Check ($journal.error_code -ceq 'UPDATE_DEADLINE_EXPIRED' -and $journal.failed_stage -ceq 'drain') 'deadline_cause_retained_locally'
   Check (-not $journal.events[0].detail.ContainsKey('failed_stage') -and -not $journal.events[0].detail.ContainsKey('error_code')) 'deadline_wire_keeps_legacy_shape'
 }
+# A failed Replace and a lost acknowledgement have opposite durable states.
+# Both must leave the decision to the next journal reader.
+function Test-UnconfirmedStopIntent {
+  param($Tree)
+  $handler=[scriptblock]::Create(($Tree.CatchClauses[0].Body.Statements | ForEach-Object {$_.Extent.Text}) -join "`n")
+  $clean=@()
+  foreach($s in $Tree.Finally.Statements){
+    if($s -is [Management.Automation.Language.AssignmentStatementAst] -and $s.Left.Extent.Text -eq '$report["runtime_files"]'){break}
+    $clean+=$s.Extent.Text
+  }
+  $cleanup=[scriptblock]::Create($clean -join "`n")
+  function Remove-Item {throw 'unexpected_staging_cleanup'}
+  function Stop-AgentRuntime {throw 'unexpected_runtime_stop'}
+  function Start-AgentRuntime {throw 'unexpected_runtime_start'}
+  function Write-AtomicJson {
+    param($Path,$Value)
+    if($Value.stage -ne $intentStage){throw 'unexpected_journal_rewrite'}
+    if($replaceSucceeded){$disk.stage=$Value.stage;$disk.intent=$Value.stop_intent}
+    throw 'fixture_intent_write_unconfirmed'
+  }
+  $DeadlineUnixMs=1001;$updateDeadlineProvided=$true;$recoveringUpdate=$false
+  $runtimePlan=@([pscustomobject]@{Committed=$false;CandidatePath='candidate';BackupPath='backup'})
+  $fullInstallerOwner=$null;$fullInstallerStarted=$false;$replacementCommitted=$false;$resumeRollback=$false
+  $journalPath='synthetic';$candidatePath='candidate';$ScheduledTaskName='synthetic';$ScheduledTaskPath='\';$ServiceName='unused';$currentPath='old.exe';$resolvedDeploymentMode='scheduled_task'
+  foreach($intentStage in @('full_installer_upgrade','prepare_runtime')){
+    $UpgradeClass=if($intentStage -eq 'prepare_runtime'){'runtime_bundle'}else{'installer_required'}
+    $nodes=@($Tree.Body.FindAll({param($n) $n -is [Management.Automation.Language.CommandAst] -and
+      $n.GetCommandName() -eq 'Set-UpdateStage' -and $n.CommandElements[-1] -is [Management.Automation.Language.StringConstantExpressionAst] -and $n.CommandElements[-1].Value -eq $intentStage},$true))
+    Check ($nodes.Count -eq 1) 'unique_intent_transition'
+    $body=@();$copy=$false
+    foreach($s in $nodes[0].Parent.Parent.Statements){
+      if($s.Extent.Text -like 'Assert-UpdateStartDeadline *'){$body=@();$copy=$true}
+      if($copy){$body+=$s.Extent.Text;if($s.Extent.Text -like 'Stop-AgentRuntime *'){break}}
+    }
+    Check ($body.Count -gt 2 -and $body[-1] -like 'Stop-AgentRuntime *') 'transition_reaches_runtime_stop'
+    $transition=[scriptblock]::Create($body -join "`n")
+    foreach($replaceSucceeded in @($false,$true)){
+      $journal=@{stop_intent=$false;last_event_seq=2;events=@()};$report=@{stage='verified';error=$null;error_code=$null}
+      $disk=@{stage='verified';intent=$false};$journalRecoveryUnverified=$false
+      try{. $transition}catch{. $handler}
+      . $cleanup
+      Check ($report.stage -ceq 'journal_recovery_unverified' -and $report.error -ceq 'fixture_intent_write_unconfirmed') 'failed_write_preserves_cause'
+      Check ($disk.intent -eq $replaceSucceeded -and $disk.stage -ceq $(if($replaceSucceeded){$intentStage}else{'verified'})) 'fresh_reader_owns_stop_decision'
+    }
+  }
+}
+Test-UnconfirmedStopIntent $main[0]
 @{schema='edr.updater-admission-tests.v1';status='passed';checks=$script:checks;updater_main_executed=$false;runtime_effects='forbidden';journal_io='synthetic'}|ConvertTo-Json -Compress

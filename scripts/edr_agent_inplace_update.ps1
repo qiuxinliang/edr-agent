@@ -1994,8 +1994,11 @@ try {
     }
     Assert-UpdateStartDeadline -Deadline $DeadlineUnixMs -Provided $updateDeadlineProvided -Recovering $recoveringUpdate
     Add-UpdateEvent -Status 'installing' -Progress 50 -Detail @{ stage = 'full_installer_upgrade'; preserves_identity = $true; preserves_queue = $true; preserves_evidence = $true }
+    # Until the write returns, only the on-disk journal can decide whether stop is owed.
+    $journalRecoveryUnverified = $true
     $journal['stop_intent'] = $true
     Set-UpdateStage -Stage 'full_installer_upgrade'
+    $journalRecoveryUnverified = $false
     $fullInstallerStarted = $true
     # The installer calibrates command-state commitments under the owner's
     # exclusive lock. Quiesce the existing runtime after its recovery backup
@@ -2079,8 +2082,11 @@ try {
     Start-Sleep -Seconds $DrainDelaySeconds
   }
   Assert-UpdateStartDeadline -Deadline $DeadlineUnixMs -Provided $updateDeadlineProvided -Recovering $recoveringUpdate
+  # Until the write returns, only the on-disk journal can decide whether stop is owed.
+  $journalRecoveryUnverified = $true
   $journal['stop_intent'] = $true
   Set-UpdateStage -Stage "prepare_runtime"
+  $journalRecoveryUnverified = $false
   Stop-AgentRuntime -Mode $resolvedDeploymentMode -TaskName $ScheduledTaskName `
     -TaskPath $ScheduledTaskPath -WindowsServiceName $ServiceName -ExecutablePath $currentPath
   $report["runtime_preparation"] = "$resolvedDeploymentMode-stopped"
@@ -2313,14 +2319,16 @@ try {
   }
 } finally {
   if ($fullInstallerOwner) { $fullInstallerOwner.Dispose() }
-  if (-not $journalRecoveryUnverified) { Remove-Item -LiteralPath $candidatePath -Force -ErrorAction SilentlyContinue }
+  if (-not $journalRecoveryUnverified) {
+    Remove-Item -LiteralPath $candidatePath -Force -ErrorAction SilentlyContinue
+    foreach ($item in @($runtimePlan)) {
+      Remove-Item -LiteralPath $item.CandidatePath -Force -ErrorAction SilentlyContinue
+      Remove-Item -LiteralPath "$($item.BackupPath).restore" -Force -ErrorAction SilentlyContinue
+    }
+  }
   if ($report['status'] -in @('succeeded','failed_rolled_back')) {
     Remove-Item -LiteralPath $fullInstallerConfigBackupPath -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $fullInstallerTaskBackupPath -Force -ErrorAction SilentlyContinue
-  }
-  foreach ($item in @($runtimePlan)) {
-    Remove-Item -LiteralPath $item.CandidatePath -Force -ErrorAction SilentlyContinue
-    Remove-Item -LiteralPath "$($item.BackupPath).restore" -Force -ErrorAction SilentlyContinue
   }
   $report["runtime_files"] = @($runtimePlan | ForEach-Object {
     [ordered]@{
