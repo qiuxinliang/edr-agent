@@ -369,6 +369,23 @@ int main(void) {
                "Setup uninstall must not recursively erase unknown app-root residue");
   free(inno);
 
+  const char *setup_definitions[] = {"EDRAgentSetup.bundled.iss", "EDRAgentSetup.iss"};
+  const char *owned_updater_cleanup = "Type: files; Name: \"{app}\\edr_agent_inplace_update-*.ps1\"";
+  for (size_t i = 0; i < sizeof(setup_definitions) / sizeof(setup_definitions[0]); ++i) {
+    snprintf(path, sizeof(path), "%s/install/windows-inno/%s", root, setup_definitions[i]);
+    char *setup_definition = read_file(path);
+    require_true(setup_definition != NULL, "read supported Windows Setup definition");
+    contains_before(setup_definition, "[UninstallDelete]", owned_updater_cleanup,
+                    "Setup uninstall owns dynamically materialized updater versions");
+    contains_before(setup_definition, owned_updater_cleanup, "[Code]",
+                    "versioned updater cleanup remains in the uninstall file section");
+    require_true(count_occurrences(setup_definition, owned_updater_cleanup) == 1u &&
+                     !strstr(setup_definition, "Name: \"{app}\\*.ps1\"") &&
+                     !strstr(setup_definition, "Type: filesandordirs; Name: \"{app}\""),
+                 "updater cleanup must not expand to unrelated scripts or the entire app directory");
+    free(setup_definition);
+  }
+
   snprintf(path, sizeof(path), "%s/install/windows-inno/Build-BundledInstaller.ps1", root);
   char *inno_builder = read_file(path);
   require_true(inno_builder != NULL, "read Windows bundled installer builder");
