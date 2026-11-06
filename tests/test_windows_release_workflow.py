@@ -15,6 +15,13 @@ class WindowsReleaseWorkflowTests(unittest.TestCase):
         self.jobs = dict(re.findall(r'^  ([\w-]+):\n(.*?)(?=^  [\w-]+:\n|\Z)',
                                    self.text.split('\njobs:\n', 1)[1], re.M | re.S))
 
+    def test_installer_owner_is_rebuilt_before_release_mutation(self):
+        prepare = self.jobs['prepare-release']
+        build = prepare.index('scripts/installer_job/embed.py --dotnet-root')
+        self.assertLess(prepare.index('sha256sum --check --status'), build)
+        self.assertLess(build, prepare.index('windows_release_checkpoint.py prepare'))
+        self.assertNotIn('--write', prepare[build:prepare.index('\n', build)])
+
     def assert_client_build_architecture_contract(self, source):
         jobs = dict(re.findall(r'^  ([\w-]+):\n(.*?)(?=^  [\w-]+:\n|\Z)',
                                source.split('\njobs:\n', 1)[1], re.M | re.S))

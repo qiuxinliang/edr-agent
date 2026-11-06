@@ -254,161 +254,35 @@ function New-InstallerDiagnosticEvidence {
 }
 
 function Initialize-InstallerJobType {
-  if ('FDSecurity.InstallerJob' -as [type]) { return }
-  # Keep the owner inside the embedded updater: installed sidecars can belong
-  # to either version during replacement. No handles are inherited by Setup.
-  Add-Type -ErrorAction Stop -TypeDefinition @'
-using System;
-using System.ComponentModel;
-using System.Diagnostics;
-using System.Runtime.InteropServices;
-using System.Text;
-using System.Threading;
-namespace FDSecurity {
-  public sealed class InstallerJob : IDisposable {
-    [StructLayout(LayoutKind.Sequential)] struct SECURITY_ATTRIBUTES {
-      public int Length; public IntPtr Descriptor; public int Inherit;
-    }
-    [StructLayout(LayoutKind.Sequential)] struct BASIC_LIMIT {
-      public long ProcessTime, JobTime; public uint Flags;
-      public UIntPtr MinimumWorkingSet, MaximumWorkingSet;
-      public uint ActiveLimit; public UIntPtr Affinity; public uint Priority, Scheduling;
-    }
-    [StructLayout(LayoutKind.Sequential)] struct IO_COUNTERS {
-      public ulong ReadOps, WriteOps, OtherOps, ReadBytes, WriteBytes, OtherBytes;
-    }
-    [StructLayout(LayoutKind.Sequential)] struct EXTENDED_LIMIT {
-      public BASIC_LIMIT Basic; public IO_COUNTERS Io;
-      public UIntPtr ProcessMemory, JobMemory, PeakProcessMemory, PeakJobMemory;
-    }
-    [StructLayout(LayoutKind.Sequential)] struct ACCOUNTING {
-      public long User, Kernel, PeriodUser, PeriodKernel;
-      public uint Faults, Total, Active, Terminated;
-    }
-    [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Unicode)] struct STARTUPINFO {
-      public int Size; public string Reserved, Desktop, Title;
-      public uint X, Y, XSize, YSize, XCount, YCount, Fill, Flags;
-      public ushort Show, ReservedSize; public IntPtr ReservedBytes, Input, Output, Error;
-    }
-    [StructLayout(LayoutKind.Sequential)] struct STARTUPINFOEX {
-      public STARTUPINFO Startup; public IntPtr Attributes;
-    }
-    [StructLayout(LayoutKind.Sequential)] struct PROCESS_INFORMATION {
-      public IntPtr Process, Thread; public uint ProcessId, ThreadId;
-    }
-    [DllImport("advapi32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
-    static extern bool ConvertStringSecurityDescriptorToSecurityDescriptor(string value, uint revision, out IntPtr descriptor, out uint size);
-    [DllImport("kernel32.dll")] static extern IntPtr LocalFree(IntPtr value);
-    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
-    static extern IntPtr CreateJobObject(ref SECURITY_ATTRIBUTES security, string name);
-    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
-    static extern IntPtr OpenJobObject(uint access, bool inherit, string name);
-    [DllImport("kernel32.dll", SetLastError=true)]
-    static extern bool SetInformationJobObject(IntPtr job, int kind, ref EXTENDED_LIMIT limits, uint size);
-    [DllImport("kernel32.dll", SetLastError=true)]
-    static extern bool QueryInformationJobObject(IntPtr job, int kind, out ACCOUNTING info, uint size, IntPtr returned);
-    [DllImport("kernel32.dll", SetLastError=true)] static extern bool TerminateJobObject(IntPtr job, uint code);
-    [DllImport("kernel32.dll", SetLastError=true)] static extern bool CloseHandle(IntPtr handle);
-    [DllImport("kernel32.dll", SetLastError=true)]
-    static extern bool InitializeProcThreadAttributeList(IntPtr list, int count, uint flags, ref IntPtr size);
-    [DllImport("kernel32.dll", SetLastError=true)]
-    static extern bool UpdateProcThreadAttribute(IntPtr list, uint flags, IntPtr attribute, IntPtr value, IntPtr size, IntPtr previous, IntPtr returned);
-    [DllImport("kernel32.dll")] static extern void DeleteProcThreadAttributeList(IntPtr list);
-    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
-    static extern bool CreateProcess(string application, StringBuilder command, IntPtr processSecurity, IntPtr threadSecurity,
-      bool inherit, uint flags, IntPtr environment, string directory, ref STARTUPINFOEX startup, out PROCESS_INFORMATION process);
-    [DllImport("kernel32.dll", SetLastError=true)] static extern uint WaitForSingleObject(IntPtr handle, uint milliseconds);
-    [DllImport("kernel32.dll", SetLastError=true)] static extern bool GetExitCodeProcess(IntPtr process, out uint code);
-    [DllImport("kernel32.dll")] public static extern ulong GetTickCount64();
-    IntPtr job, process, attributes, jobList;
-    bool attributesInitialized;
-    public string Name { get; private set; }
-    InstallerJob() { }
-    static void Error(string operation) { throw new Win32Exception(Marshal.GetLastWin32Error(), operation); }
-    public static InstallerJob Create(string name) {
-      var owner = new InstallerJob(); owner.Name = name;
-      IntPtr descriptor = IntPtr.Zero; uint size;
-      try {
-        if (!ConvertStringSecurityDescriptorToSecurityDescriptor("D:P(A;;GA;;;SY)(A;;GA;;;BA)", 1, out descriptor, out size)) Error("installer_job_acl");
-        var security = new SECURITY_ATTRIBUTES { Length=Marshal.SizeOf(typeof(SECURITY_ATTRIBUTES)), Descriptor=descriptor };
-        owner.job = CreateJobObject(ref security, name);
-        int error = Marshal.GetLastWin32Error();
-        if (owner.job == IntPtr.Zero) throw new Win32Exception(error, "installer_job_create");
-        // Never adopt or terminate an existing object, even on a GUID collision.
-        if (error == 183) throw new InvalidOperationException("installer_job_name_collision");
-        var limits = new EXTENDED_LIMIT(); limits.Basic.Flags = 0x2000; // KILL_ON_JOB_CLOSE; no breakaway
-        if (!SetInformationJobObject(owner.job, 9, ref limits, (uint)Marshal.SizeOf(typeof(EXTENDED_LIMIT)))) Error("installer_job_limits");
-        IntPtr length = IntPtr.Zero;
-        InitializeProcThreadAttributeList(IntPtr.Zero, 1, 0, ref length);
-        if (length == IntPtr.Zero) Error("installer_job_attribute_size");
-        owner.attributes = Marshal.AllocHGlobal(length);
-        if (!InitializeProcThreadAttributeList(owner.attributes, 1, 0, ref length)) Error("installer_job_attributes");
-        owner.attributesInitialized = true;
-        owner.jobList = Marshal.AllocHGlobal(IntPtr.Size); Marshal.WriteIntPtr(owner.jobList, owner.job);
-        // Atomic creation in the job avoids the crash gap between suspended
-        // CreateProcess and AssignProcessToJobObject. Probe before runtime stop.
-        if (!UpdateProcThreadAttribute(owner.attributes, 0, new IntPtr(0x2000D), owner.jobList, new IntPtr(IntPtr.Size), IntPtr.Zero, IntPtr.Zero)) Error("installer_job_atomic_launch_unsupported");
-        return owner;
-      } catch { owner.Dispose(); throw; }
-      finally { if (descriptor != IntPtr.Zero) LocalFree(descriptor); }
-    }
-    public static InstallerJob Open(string name) {
-      IntPtr handle = OpenJobObject(0x0C, false, name); // QUERY | TERMINATE
-      if (handle == IntPtr.Zero) {
-        int error = Marshal.GetLastWin32Error();
-        if (error == 2) return null; // Absence is NOT evidence that writers exited.
-        throw new Win32Exception(error, "installer_job_open");
-      }
-      return new InstallerJob { job=handle, Name=name };
-    }
-    public void Launch(string executable, string arguments, string directory) {
-      if (process != IntPtr.Zero || !attributesInitialized) throw new InvalidOperationException("installer_job_launch_state");
-      var startup = new STARTUPINFOEX(); startup.Startup.Size = Marshal.SizeOf(typeof(STARTUPINFOEX)); startup.Attributes = attributes;
-      PROCESS_INFORMATION created;
-      if (!CreateProcess(executable, new StringBuilder("\"" + executable + "\" " + arguments), IntPtr.Zero, IntPtr.Zero, false,
-          0x00080000, IntPtr.Zero, directory, ref startup, out created)) Error("installer_job_launch");
-      process = created.Process; CloseHandle(created.Thread);
-    }
-    public uint ActiveProcesses() {
-      ACCOUNTING info;
-      if (!QueryInformationJobObject(job, 1, out info, (uint)Marshal.SizeOf(typeof(ACCOUNTING)), IntPtr.Zero)) Error("installer_job_query");
-      return info.Active;
-    }
-    bool RootExited() {
-      if (process == IntPtr.Zero) return true;
-      uint result = WaitForSingleObject(process, 0);
-      if (result == 0xFFFFFFFF) Error("installer_root_wait");
-      return result == 0;
-    }
-    public bool WaitForEmpty(long timeoutMilliseconds) {
-      var clock = Stopwatch.StartNew();
-      do {
-        if (ActiveProcesses() == 0 && RootExited()) return true;
-        if (clock.ElapsedMilliseconds >= timeoutMilliseconds) return false;
-        Thread.Sleep(50);
-      } while (true);
-    }
-    public void StopAndDrain(int timeoutMilliseconds) {
-      if (ActiveProcesses() == 0 && RootExited()) return;
-      if (!TerminateJobObject(job, 1460)) Error("installer_job_terminate");
-      if (!WaitForEmpty(timeoutMilliseconds)) throw new TimeoutException("installer_job_writers_unconfirmed");
-    }
-    public int ExitCode() {
-      uint code;
-      if (process == IntPtr.Zero || !RootExited()) throw new InvalidOperationException("installer_root_not_exited");
-      if (!GetExitCodeProcess(process, out code)) Error("installer_root_exit_code");
-      return unchecked((int)code);
-    }
-    public void Dispose() {
-      if (attributesInitialized) { DeleteProcThreadAttributeList(attributes); attributesInitialized=false; }
-      if (attributes != IntPtr.Zero) { Marshal.FreeHGlobal(attributes); attributes=IntPtr.Zero; }
-      if (jobList != IntPtr.Zero) { Marshal.FreeHGlobal(jobList); jobList=IntPtr.Zero; }
-      if (process != IntPtr.Zero) { CloseHandle(process); process=IntPtr.Zero; }
-      if (job != IntPtr.Zero) { CloseHandle(job); job=IntPtr.Zero; }
-    }
+  $existing = 'FDSecurity.InstallerJob' -as [type]
+  if ($existing) {
+    $cached = Get-Variable -Scope Script -Name VerifiedInstallerJobType -ValueOnly -ErrorAction SilentlyContinue
+    if ($existing -ne $cached) { throw 'installer_job_type_conflict' }
+    return
   }
-}
-'@
+  # InstallerJob.cs SHA-256: 5fbdbba734c8c254c9c7e21355da0ff303d16a583b985404523cc212b5376769
+  $packed = [Convert]::FromBase64String('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')
+  $hash = [Security.Cryptography.SHA256]::Create()
+  try { $actual = [BitConverter]::ToString($hash.ComputeHash($packed)).Replace('-', '').ToLowerInvariant() }
+  finally { $hash.Dispose() }
+  if ($actual -cne '2b6c8cd3fd4238815a8070db980c5f5e89fa9ab687b38e920aae5ca61f4d2716') { throw 'installer_job_image_digest_mismatch' }
+  $image = [byte[]]::new(9216)
+  $inputStream = [IO.MemoryStream]::new($packed, $false)
+  try {
+    $inflater = [IO.Compression.DeflateStream]::new($inputStream, [IO.Compression.CompressionMode]::Decompress)
+    try {
+      $offset = 0
+      while ($offset -lt $image.Length) {
+        $read = $inflater.Read($image, $offset, $image.Length - $offset)
+        if ($read -eq 0) { throw 'installer_job_image_length_mismatch' }
+        $offset += $read
+      }
+      if ($inflater.ReadByte() -ne -1) { throw 'installer_job_image_length_mismatch' }
+    } finally { $inflater.Dispose() }
+  } finally { $inputStream.Dispose() }
+  $type = [Reflection.Assembly]::Load($image).GetType('FDSecurity.InstallerJob', $true)
+  if (('FDSecurity.InstallerJob' -as [type]) -ne $type) { throw 'installer_job_type_conflict' }
+  $script:VerifiedInstallerJobType = $type
 }
 
 function Get-InstallerUptimeMilliseconds {

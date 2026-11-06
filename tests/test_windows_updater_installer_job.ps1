@@ -15,7 +15,21 @@ foreach($name in @('Initialize-InstallerJobType','Confirm-FullInstallerQuiesced'
   Check ($function.Count -eq 1) ('owner_'+$name)
   Invoke-Expression $function[0].Extent.Text
 }
+# Exercise the generated initializer before the first load. A changed image
+# must fail before its type can enter this PowerShell process.
+$initializer=(Get-Command Initialize-InstallerJobType).ScriptBlock.ToString()
+$corrupt=[regex]::Replace($initializer, "FromBase64String\('([A-Za-z0-9+/])", {
+  param($m)
+  $first=if($m.Groups[1].Value -ceq 'A'){'B'}else{'A'}
+  "FromBase64String('"+$first
+})
+Check ($corrupt -cne $initializer) 'installer_image_mutation_applied'
+$cause=$null
+try{& ([scriptblock]::Create($corrupt))}catch{$cause=$_.Exception.Message}
+Check ($cause -ceq 'installer_job_image_digest_mismatch' -and -not ('FDSecurity.InstallerJob' -as [type])) 'changed_image_rejected_before_load'
 Initialize-InstallerJobType
+Initialize-InstallerJobType
+Check (([FDSecurity.InstallerJob]).Assembly.Location -ceq '') 'verified_owner_loaded_from_memory'
 $root=Join-Path ([IO.Path]::GetTempPath()) ('edr-upgrade-installer-job-'+[Guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $root|Out-Null
 $powershell=Join-Path $PSHOME 'powershell.exe'
