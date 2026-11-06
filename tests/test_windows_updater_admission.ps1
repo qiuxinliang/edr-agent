@@ -10,6 +10,43 @@ $ast=[Management.Automation.Language.Parser]::ParseFile($UpdaterPath,[ref]$token
 if($errors.Count){throw 'updater_parse_failed'}
 $script:checks=0
 function Check($Condition,[string]$Cause){$script:checks++;if(-not $Condition){throw $Cause}}
+function Test-JournalClassAdmission {
+  $guard=$ast.Find({param($n)
+    $n -is [Management.Automation.Language.IfStatementAst] -and
+    $n.Clauses[0].Item2.Statements.Count -eq 1 -and
+    $n.Clauses[0].Item2.Statements[0].Extent.Text -ceq "throw 'recovered update journal identity does not match launch arguments'"
+  },$true)
+  Check ($null -ne $guard) 'journal_identity_owner'
+  $statements=$guard.Parent.Statements | Where-Object {$_.Extent.EndOffset -le $guard.Extent.EndOffset}
+  $admit=[scriptblock]::Create(($statements | ForEach-Object {$_.Extent.Text}) -join "`n")
+  $journalPath=[IO.Path]::GetTempFileName()
+  $TaskId='source-id';$CommandId='command-id';$Operation='upgrade';$ArtifactId='release';$TargetVersion='3.2.740';$expectedHash='a'*64
+  try {
+    foreach($case in @(
+      @{stored='installer_required';launch='installer_required';ok=$true},
+      @{stored='installer_required';launch='binary_hot';ok=$false},
+      @{stored='runtime_bundle';launch='installer_required';ok=$false},
+      @{stored=$null;launch='binary_hot';ok=$false},@{stored=7;launch='binary_hot';ok=$false},
+      @{launch='binary_hot';ok=$true},@{launch='runtime_bundle';ok=$true},
+      @{launch='installer_required';ok=$false},@{backup='old-backup';launch='binary_hot';ok=$false},
+      @{backup=$null;launch='runtime_bundle';ok=$false}
+    )){
+      $UpgradeClass=$case.launch
+      $j=@{schema_version=2;task_id=$TaskId;command_id=$CommandId;operation=$Operation;artifact_id=$ArtifactId;hash=$expectedHash;version=$TargetVersion}
+      if($case.ContainsKey('stored')){$j.upgrade_class=$case.stored}
+      if($case.ContainsKey('backup')){$j.full_installer_backup_path=$case.backup}
+      $raw=$j|ConvertTo-Json -Compress
+      [IO.File]::WriteAllText($journalPath,$raw)
+      $accepted=$true
+      try{& $admit}catch{
+        if($_.Exception.Message -ne 'recovered update journal identity does not match launch arguments'){throw}
+        $accepted=$false
+      }
+      Check ($accepted -eq $case.ok -and [IO.File]::ReadAllText($journalPath) -ceq $raw) 'class_bound_before_journal_mutation'
+    }
+  } finally {[IO.File]::Delete($journalPath)}
+}
+Test-JournalClassAdmission
 foreach($name in @('Assert-UpdateStartDeadline','Add-UpdateEvent','Set-UpdateStage')) {
   $definition=@($ast.FindAll({param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name},$true))
   Check ($definition.Count -eq 1) ('unique_owner_'+$name)

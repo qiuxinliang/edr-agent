@@ -1688,11 +1688,17 @@ try {
   }
   if ($journalRecoveryUnverified) {
     $prior = Get-Content -LiteralPath $journalPath -Raw | ConvertFrom-Json
+    # Pre-class journals predate full installers. Only their original binary
+    # and runtime-package recovery paths can consume a journal without a class.
+    $storedClass = $prior.PSObject.Properties['upgrade_class']
+    $installerBackup = $prior.PSObject.Properties['full_installer_backup_path']
     if ([int]$prior.schema_version -ne 2 -or [string]$prior.task_id -ne $TaskId -or
         [string]$prior.command_id -ne $CommandId -or [string]$prior.operation -ne $Operation -or
         [string]$prior.artifact_id -ne $ArtifactId -or
         ([string]$prior.hash).ToLowerInvariant() -ne $expectedHash -or
-        [string]$prior.version -ne $TargetVersion) {
+        [string]$prior.version -ne $TargetVersion -or
+        ($storedClass -and ($storedClass.Value -isnot [string] -or $storedClass.Value -ne $UpgradeClass)) -or
+        (-not $storedClass -and ($UpgradeClass -eq 'installer_required' -or $null -ne $installerBackup))) {
       throw 'recovered update journal identity does not match launch arguments'
     }
     if ($prior.status -isnot [string] -or $prior.status -notin @('running','succeeded','failed_rolled_back','failed_recovered','failed')) {
