@@ -2179,6 +2179,10 @@ try {
       if ($report['error_code'] -in @('INSTALL_TIMEOUT','INSTALL_INTERRUPTED')) { Save-FullInstallerFailureLog }
       Set-UpdateStage -Stage 'rollback_full_installer_started'
       Stop-AgentRuntime -Mode $resolvedDeploymentMode -TaskName $ScheduledTaskName -TaskPath $ScheduledTaskPath -WindowsServiceName $ServiceName -ExecutablePath $currentPath
+      if ($resolvedDeploymentMode -eq 'scheduled_task') {
+        # Release temporary PowerShell objects before starting robocopy and restoring the scheduled task.
+        [GC]::Collect()
+      }
       Invoke-FullInstallerRuntimeMirror -Source $fullInstallerBackupPath -Destination $installFull -Stage 'restore'
       Assert-RollbackRuntimeIdentity -Directory $installFull -Journal $journal
       if (Test-Path -LiteralPath $fullInstallerConfigBackupPath -PathType Leaf) {
