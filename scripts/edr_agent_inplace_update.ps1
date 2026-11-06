@@ -1977,6 +1977,10 @@ try {
     Set-UpdateStage -Stage 'full_installer_verified'
     Set-UpdateStage -Stage 'full_installer_backup'
     Invoke-FullInstallerRuntimeMirror -Source $installFull -Destination $fullInstallerBackupPath -Stage 'backup'
+    if ($resolvedDeploymentMode -eq 'scheduled_task') {
+      # Release mirror temporaries before hashing the backup and saving the task snapshot.
+      [GC]::Collect()
+    }
     # Bind to the still-installed source before stop intent is committed.
     # Taking these hashes after copying keeps hashing out of the mirror's peak.
     $journal['previous_sha256'] = Get-Sha256 -Path $currentPath
