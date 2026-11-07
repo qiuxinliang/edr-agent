@@ -344,6 +344,10 @@ jobs:
       - name: Run the fixed ARM64 retention diagnostic once
         id: retention-cost
         if: ${{ inputs.retention_cost_diagnostic_only }}
+        # Match the GetTempPath environment of run_telemetry_windows_native.ps1.
+        env:
+          TMP: ${{ runner.temp }}
+          TEMP: ${{ runner.temp }}
         timeout-minutes: 3
         shell: pwsh
         run: |

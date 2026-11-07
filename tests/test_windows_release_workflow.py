@@ -152,6 +152,8 @@ class WindowsReleaseWorkflowTests(unittest.TestCase):
         call = 'python -B tests/run_retention_cost_diagnostic.py --build-dir build --preserve-contract-volumes --sync-attribution --output "$env:RUNNER_TEMP/retention-cost-diagnosis"'
         self.assertEqual(source.count(call), 1)
         self.assertIn(call, run)
+        for variable in ('TEMP', 'TMP'):
+            self.assertIn('          ' + variable + ': ${{ runner.temp }}\n', run)
         self.assertIn('timeout-minutes: 3', run)
         self.assertIn('$env:PATH = "$runtimeBin;$env:PATH"', run)
         self.assertIn("Join-Path $env:VCPKG_INSTALLED_ROOT 'bin'", run)
