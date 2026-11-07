@@ -450,11 +450,15 @@ jobs:
 
       - name: Test
         if: ${{ !inputs.retention_cost_diagnostic_only }}
+        env:
+          TMP: ${{ runner.temp }}
+          TEMP: ${{ runner.temp }}
         shell: pwsh
         run: |
           $opensslTools = Join-Path $env:VCPKG_INSTALLED_ROOT 'tools\openssl'
           if (-not (Test-Path -LiteralPath (Join-Path $opensslTools 'openssl.exe') -PathType Leaf)) { throw 'Pinned vcpkg OpenSSL executable is required for isolated TLS gate fixtures' }
           $env:PATH = "$opensslTools;$env:PATH"
+          Write-Host "Native CTest build=$((Resolve-Path 'build').Path) temp=$([IO.Path]::GetTempPath())"
           & ctest --test-dir build -C Release --output-on-failure --no-tests=error --label-regex '^windows-release-gate$'
           if ($LASTEXITCODE -ne 0) { throw "Client build gate tests failed" }
 

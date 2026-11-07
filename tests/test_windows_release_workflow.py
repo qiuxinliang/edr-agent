@@ -154,6 +154,7 @@ class WindowsReleaseWorkflowTests(unittest.TestCase):
         self.assertIn(call, run)
         for variable in ('TEMP', 'TMP'):
             self.assertIn('          ' + variable + ': ${{ runner.temp }}\n', run)
+            self.assertIn('          ' + variable + ': ${{ runner.temp }}\n', steps['Test'])
         self.assertIn('timeout-minutes: 3', run)
         self.assertIn('$env:PATH = "$runtimeBin;$env:PATH"', run)
         self.assertIn("Join-Path $env:VCPKG_INSTALLED_ROOT 'bin'", run)
