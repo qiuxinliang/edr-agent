@@ -1,4 +1,5 @@
 #Requires -Version 5.1
+#Requires -PSEdition Desktop
 [CmdletBinding()]
 param(
   [Parameter(Mandatory = $true)][string]$BaselinePackageDir,
@@ -410,8 +411,10 @@ try {
     }
     $installedEntry[0].sha256 = $targetNativeHashes[$componentName]
   }
-  $installedNativeIntegrity | ConvertTo-Json -Depth 4 | Set-Content `
-    -LiteralPath $installedNativeIntegrityPath -Encoding UTF8
+  # Preserve the manifest bytes previously emitted by the PowerShell 7 harness.
+  [IO.File]::WriteAllText($installedNativeIntegrityPath,
+      (($installedNativeIntegrity | ConvertTo-Json -Depth 4) + [Environment]::NewLine),
+      [Text.UTF8Encoding]::new($false))
   $finalizersBefore = Get-UninstallFinalizerSnapshot
   $finalizerProcessesBefore = Get-UninstallFinalizerProcesses -Finalizers $finalizersBefore
   $nativeFailureBefore = Get-NativeUninstallFailureSnapshot
@@ -476,6 +479,6 @@ try {
   Remove-Item -LiteralPath $installDir -Recurse -Force -ErrorAction SilentlyContinue
 }
 
-# GitHub's pwsh wrapper propagates a stale native-command LASTEXITCODE even
+# GitHub's PowerShell wrapper propagates a stale native-command LASTEXITCODE even
 # when every lifecycle assertion passed. Make successful completion explicit.
 exit 0

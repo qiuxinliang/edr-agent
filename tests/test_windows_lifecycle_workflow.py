@@ -201,6 +201,12 @@ class WindowsLifecycleWorkflowTests(unittest.TestCase):
         self.assertNotIn('continue', setup)
         self.assertNotIn('exit 0', setup)
 
+    def test_in_process_packaged_updater_uses_the_windows_powershell_host(self):
+        runtime = step(self.text, 'Execute native runtime update lifecycle')
+        self.assertRegex(runtime, r'(?m)^        shell: powershell$')
+        smoke = (ROOT / 'scripts/windows_release_lifecycle_smoke.ps1').read_text(encoding='utf-8')
+        self.assertRegex(smoke, r'(?im)^#Requires -PSEdition Desktop$')
+
     def test_original_native_update_rounds_and_evidence_remain_required(self):
         runtime = step(self.text, 'Execute native runtime update lifecycle')
         self.assertNotIn('if:', runtime)
