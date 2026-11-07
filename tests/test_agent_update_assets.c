@@ -1015,8 +1015,8 @@ int main(void) {
   contains(client_build, "--only-binary=:all: --requirement .\\requirements-release.txt",
            "client build forbids cryptography source builds");
   contains(client_build, "Verify locked Setup UI NuGet closure and publish before native dependency build",
-           "client build verifies the AMD64 Setup UI lock and real publish before native work");
-  contains(client_build, "-RuntimeIdentifier win-x64 -SelfContained true -PublishReadyToRun false -Configuration Release -VerifyPublish",
+           "client build verifies the selected Setup UI lock and real publish before native work");
+  contains(client_build, "-RuntimeIdentifier $env:EDR_RUNTIME_IDENTIFIER -SelfContained true -PublishReadyToRun false -Configuration Release -VerifyPublish",
            "client build supplies one complete compact Setup UI build profile to the shared gate");
   contains_before(client_build,
                   "Verify locked Setup UI NuGet closure and publish before native dependency build",

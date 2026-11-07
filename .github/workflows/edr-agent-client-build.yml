@@ -7,10 +7,28 @@ name: edr-agent client build (Windows)
 on:
   workflow_dispatch:
     inputs:
+      architecture:
+        description: Single Windows product architecture (uses the release toolchain)
+        required: false
+        type: choice
+        default: amd64
+        options:
+          - amd64
+          - arm64
+      agent_version:
+        description: Optional test build version a.b.c (each component 0..65534); no tag or release
+        required: false
+        type: string
+        default: ''
       p0_test_inputs_ref:
         description: Fixed private P0 test input commit (40 hex); defaults to repository variable
         required: false
         type: string
+      retention_cost_diagnostic_only:
+        description: ARM64 only; run one fixed 150-second retention diagnostic, without product gates or packages
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -21,18 +39,31 @@ concurrency:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
-  VCPKG_DEFAULT_TRIPLET: x64-windows
   VCPKG_DOWNLOADS: ${{ github.workspace }}/.cache/vcpkg-downloads
   VCPKG_BINARY_SOURCES: "clear;files,${{ github.workspace }}/.cache/vcpkg-bincache,readwrite"
 
 jobs:
   windows-build:
-    name: Build Windows (FDSensor.exe, fast by default)
-    runs-on: windows-2022
+    name: ${{ inputs.retention_cost_diagnostic_only && 'Diagnose ARM64 retention (no product gate)' || format('Build Windows {0} (FDSensor.exe, fast by default)', inputs.architecture || 'amd64') }}
+    runs-on: ${{ inputs.architecture == 'arm64' && 'windows-11-vs2026-arm' || 'windows-2022' }}
     timeout-minutes: 360
     env:
       VCPKG_ROOT: ${{ github.workspace }}/vcpkg
+      # One job, with the same supported mapping as the release owner.
+      EDR_RELEASE_ARCH: ${{ inputs.architecture || 'amd64' }}
+      EDR_MSVC_ARCH: ${{ inputs.architecture == 'arm64' && 'arm64' || 'x64' }}
+      VCPKG_DEFAULT_TRIPLET: ${{ inputs.architecture == 'arm64' && 'arm64-windows' || 'x64-windows' }}
+      EDR_VCPKG_TRIPLET: ${{ inputs.architecture == 'arm64' && 'arm64-windows' || 'x64-windows' }}
+      EDR_RUNTIME_IDENTIFIER: ${{ inputs.architecture == 'arm64' && 'win-arm64' || 'win-x64' }}
+      EDR_CMAKE_PROCESSOR: ${{ inputs.architecture == 'arm64' && 'ARM64' || 'AMD64' }}
+      EDR_INCLUDE_WINDIVERT: ${{ inputs.architecture == 'arm64' && 'false' || 'true' }}
+      EDR_RETENTION_COST_DIAGNOSTIC_ONLY: ${{ inputs.retention_cost_diagnostic_only && 'true' || 'false' }}
     steps:
+      - name: Validate selected architecture
+        shell: pwsh
+        run: |
+          if ($env:EDR_RELEASE_ARCH -cnotin @('amd64', 'arm64')) { throw 'Unsupported Windows product architecture' }
+          if ($env:EDR_RETENTION_COST_DIAGNOSTIC_ONLY -eq 'true' -and $env:EDR_RELEASE_ARCH -cne 'arm64') { throw 'Retention cost diagnosis requires the native ARM64 build owner' }
       - uses: actions/checkout@v6
       # Canonical backend rules are immutable integration-test inputs only;
       # keep this private checkout outside every product/package staging path.
@@ -68,14 +99,17 @@ jobs:
           }
           "EDR_BACKEND_CONFIG_DIR=$inputs" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
       - uses: actions/setup-dotnet@v5
+        if: ${{ !inputs.retention_cost_diagnostic_only }}
         with:
           global-json-file: global.json
       - name: Validate release scripts with Windows PowerShell 5.1
+        if: ${{ !inputs.retention_cost_diagnostic_only }}
         shell: powershell
         run: .\scripts\validate_windows_powershell_syntax.ps1
       - name: Verify locked Setup UI NuGet closure and publish before native dependency build
+        if: ${{ !inputs.retention_cost_diagnostic_only }}
         shell: pwsh
-        run: .\scripts\Restore-SetupUiLocked.ps1 -RuntimeIdentifier win-x64 -SelfContained true -PublishReadyToRun false -Configuration Release -VerifyPublish
+        run: .\scripts\Restore-SetupUiLocked.ps1 -RuntimeIdentifier $env:EDR_RUNTIME_IDENTIFIER -SelfContained true -PublishReadyToRun false -Configuration Release -VerifyPublish
       - name: AVE / behavior chain invariants (no vcpkg, bash)
         shell: bash
         run: |
@@ -84,9 +118,31 @@ jobs:
 
       - name: Resolve agent version
         shell: pwsh
+        env:
+          EDR_BUILD_AGENT_VERSION: ${{ inputs.agent_version }}
         run: |
-          $ref = '${{ github.ref_name }}'
-          if ($ref -match '_(\d+\.\d+\.\d+)$') {
+          $ErrorActionPreference = 'Stop'
+          $ref = $env:GITHUB_REF_NAME
+          $requestedVersion = [string]$env:EDR_BUILD_AGENT_VERSION
+          if ($requestedVersion -ne '') {
+            $ver = $requestedVersion
+            # The old updater requires canonical SemVer; Setup UI's .NET
+            # assembly components are limited to UInt16.MaxValue - 1.
+            if ($ver -cnotmatch '\A(0|[1-9][0-9]{0,4})\.(0|[1-9][0-9]{0,4})\.(0|[1-9][0-9]{0,4})\z') {
+              throw 'agent_version must be canonical a.b.c with components 0..65534'
+            }
+            foreach ($component in $ver.Split('.')) {
+              if ([int]$component -gt 65534) { throw 'agent_version component exceeds the Setup UI assembly limit 65534' }
+            }
+            # Same release owner, only in this CI checkout: PE ProductVersion
+            # and runtime/installer version must all name the selected build.
+            & ./scripts/update-version.ps1 $ver
+            if (-not $?) { throw 'Test build version update failed' }
+            $updatedCmake = [System.IO.File]::ReadAllText((Join-Path $env:GITHUB_WORKSPACE "CMakeLists.txt"))
+            if ($updatedCmake -notmatch '(?s)project\(\s*edr_agent\b.*?\bVERSION\s+([0-9]+\.[0-9]+\.[0-9]+)(?=\s|\))' -or $Matches[1] -cne $ver) {
+              throw 'Test build CMake project version does not match agent_version'
+            }
+          } elseif ($ref -match '_(\d+\.\d+\.\d+)$') {
             $ver = $Matches[1]
           } elseif ($ref -match '^(\d+\.\d+\.\d+)$') {
             $ver = $Matches[1]
@@ -105,7 +161,7 @@ jobs:
 
       - name: Initialize pinned Visual Studio environment
         shell: pwsh
-        run: .\scripts\Initialize-VSEnvironment.ps1 -Architecture x64
+        run: .\scripts\Initialize-VSEnvironment.ps1 -Architecture $env:EDR_MSVC_ARCH
       - name: Preflight native P0 test compiler before dependencies
         shell: pwsh
         run: |
@@ -127,7 +183,12 @@ jobs:
           python -c "from cryptography.hazmat.primitives.ciphers.aead import AESGCM; print('cryptography AESGCM ready')"
       - name: Install build tools
         shell: pwsh
-        run: .\scripts\Ensure-WindowsBuildTools.ps1
+        run: |
+          if ($env:EDR_RETENTION_COST_DIAGNOSTIC_ONLY -eq 'true') {
+            & .\scripts\Ensure-WindowsBuildTools.ps1 -NinjaOnly
+          } else {
+            & .\scripts\Ensure-WindowsBuildTools.ps1
+          }
       - name: Prepare vcpkg cache directories
         shell: pwsh
         run: |
@@ -146,7 +207,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'vcpkg cache regression failed' }
           & .\tests\test_vcpkg_install_retry.ps1
           & .\tests\test_vs_host_architecture.ps1
-          python .\scripts\vcpkg_cache_key.py --triplet x64-windows
+          python .\scripts\vcpkg_cache_key.py --triplet $env:EDR_VCPKG_TRIPLET
       - name: Cache vcpkg source and binary downloads
         id: vcpkg-cache
         uses: actions/cache/restore@v5
@@ -157,8 +218,8 @@ jobs:
           key: ${{ steps.vcpkg-key.outputs.key }}
           restore-keys: |
             ${{ steps.vcpkg-key.outputs.restore-prefix }}
-            vcpkg-x64-win-yara-
-            vcpkg-prebuild-yara-x64-windows-
+            ${{ inputs.architecture != 'arm64' && 'vcpkg-x64-win-yara-' || '' }}
+            vcpkg-prebuild-yara-${{ env.EDR_VCPKG_TRIPLET }}-
 
       - name: Restore shared vcpkg dependency cache
         shell: pwsh
@@ -182,8 +243,6 @@ jobs:
 
       - name: vcpkg install (manifest)
         working-directory: ${{ github.workspace }}
-        env:
-          VCPKG_DEFAULT_TRIPLET: x64-windows
         shell: pwsh
         run: |
           if (-not (Test-Path "vcpkg.json")) { throw "missing vcpkg.json" }
@@ -198,7 +257,7 @@ jobs:
           if (-not (Test-Path -LiteralPath $tc)) { throw "missing vcpkg.exe" }
           Write-Host "[vcpkg] Windows product build: sqlite + yara (no gRPC)"
           & .\scripts\Invoke-VcpkgInstallWithRetry.ps1 -VcpkgExe $tc -FeatureArgs @('--x-feature=sqlite', '--x-feature=yara') -MaxAttempts 6 -InitialBackoffSeconds 30
-          "VCPKG_INSTALLED_X64=" + (Join-Path $env:GITHUB_WORKSPACE "vcpkg_installed\x64-windows") | Out-File -FilePath $env:GITHUB_ENV -Append
+          "VCPKG_INSTALLED_ROOT=" + (Join-Path $env:GITHUB_WORKSPACE "vcpkg_installed\$env:EDR_VCPKG_TRIPLET") | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Save completed vcpkg dependencies
         if: steps.vcpkg-cache.outputs.cache-hit != 'true' && hashFiles('.cache/vcpkg-bincache/**/*.zip') != ''
@@ -218,10 +277,12 @@ jobs:
           if (-not (Test-Path -LiteralPath $tcf)) { throw "toolchain: $tcf" }
           cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release `
             -DCMAKE_TOOLCHAIN_FILE="$tcf" `
-            "-DCMAKE_PREFIX_PATH=$env:GITHUB_WORKSPACE/vcpkg_installed/x64-windows" `
+            "-DCMAKE_PREFIX_PATH=$env:VCPKG_INSTALLED_ROOT" `
+            "-DCMAKE_SYSTEM_PROCESSOR=$env:EDR_CMAKE_PROCESSOR" `
+            "-DEDR_WINDOWS_TARGET_ARCH=$env:EDR_RELEASE_ARCH" `
             "-DVCPKG_MANIFEST_FEATURES=yara" `
             "-DEDR_AGENT_VERSION_STRING=$env:EDR_AGENT_VERSION" `
-            "-DEDR_PCRE2_PRODUCER_TARGET=windows/amd64" `
+            "-DEDR_PCRE2_PRODUCER_TARGET=windows/$env:EDR_RELEASE_ARCH" `
             "-DEDR_PCRE2_VCPKG_ROOT=$env:VCPKG_ROOT" `
             -DEDR_WITH_INGEST_HTTPS_OPENSSL=ON `
             -DEDR_WITH_P0_RULES_OPENSSL=ON `
@@ -245,9 +306,10 @@ jobs:
           if (-not $hasYara) { throw "Generated build files do not contain EDR_HAVE_YARA=1" }
 
       - name: Verify release gate build dependencies
+        if: ${{ !inputs.retention_cost_diagnostic_only }}
         env:
           # Nested CMake probes must use the same dependency prefix as Configure.
-          CMAKE_PREFIX_PATH: ${{ env.VCPKG_INSTALLED_X64 }}
+          CMAKE_PREFIX_PATH: ${{ env.VCPKG_INSTALLED_ROOT }}
         shell: pwsh
         run: |
           python -m unittest discover -s tests -p test_windows_release_gate.py -v
@@ -256,6 +318,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "Windows PCRE2 header isolation regression failed" }
 
       - name: Build (Ninja)
+        if: ${{ !inputs.retention_cost_diagnostic_only }}
         shell: pwsh
         run: |
           $buildTargets = @(
@@ -271,7 +334,50 @@ jobs:
             throw "Windows product or gate-test build failed with exit code $LASTEXITCODE"
           }
 
+      - name: Build the fixed ARM64 retention diagnostic
+        if: ${{ inputs.retention_cost_diagnostic_only }}
+        shell: pwsh
+        run: |
+          cmake --build build --config Release --target test_retention_sync_attribution --parallel $env:NUMBER_OF_PROCESSORS --verbose
+          if ($LASTEXITCODE -ne 0) { throw 'Native retention diagnostic build failed' }
+
+      - name: Run the fixed ARM64 retention diagnostic once
+        id: retention-cost
+        if: ${{ inputs.retention_cost_diagnostic_only }}
+        timeout-minutes: 3
+        shell: pwsh
+        run: |
+          $compiler = (Get-Command cl.exe -ErrorAction Stop).Source
+          $runtimeBin = Join-Path $env:VCPKG_INSTALLED_ROOT 'bin'
+          $sqlite = Join-Path $runtimeBin 'sqlite3.dll'
+          & .\scripts\Assert-WindowsPeArchitecture.ps1 -Path 'build/tests/test_retention_sync_attribution.exe' -Architecture arm64
+          & .\scripts\Assert-WindowsPeArchitecture.ps1 -Path $sqlite -Architecture arm64
+          # A rolling hosted image is not proof of the same host/compiler.
+          # Preserve actual identities before the fixed diagnostic is started.
+          Write-Host "Retention diagnostic identity: image=$env:ImageOS/$env:ImageVersion MSVC=$env:VCToolsVersion"
+          Write-Host "Compiler SHA256=$((Get-FileHash -LiteralPath $compiler -Algorithm SHA256).Hash.ToLowerInvariant())"
+          Write-Host "SQLite SHA256=$((Get-FileHash -LiteralPath $sqlite -Algorithm SHA256).Hash.ToLowerInvariant())"
+          $env:PATH = "$runtimeBin;$env:PATH"
+          python -B tests/run_retention_cost_diagnostic.py --build-dir build --preserve-contract-volumes --sync-attribution --output "$env:RUNNER_TEMP/retention-cost-diagnosis"
+          if ($LASTEXITCODE -ne 0) { throw 'Retention cost diagnosis failed or timed out; this is not a product gate result' }
+
+      - name: Preserve only fixed retention diagnostic receipts
+        if: ${{ always() && inputs.retention_cost_diagnostic_only && (steps.retention-cost.outcome == 'success' || steps.retention-cost.outcome == 'failure') }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: retention-cost-diagnostic-arm64-${{ github.sha }}
+          if-no-files-found: error
+          retention-days: 7
+          # The existing runner checks each log's 1MiB size after execution;
+          # this does not claim an execution-time log or storage hard limit.
+          path: |
+            ${{ runner.temp }}/retention-cost-diagnosis/binding.json
+            ${{ runner.temp }}/retention-cost-diagnosis/execution.json
+            ${{ runner.temp }}/retention-cost-diagnosis/stdout.log
+            ${{ runner.temp }}/retention-cost-diagnosis/stderr.log
+
       - name: Verify native uninstall attestation capabilities
+        if: ${{ !inputs.retention_cost_diagnostic_only }}
         shell: pwsh
         run: |
           $outDir = @("build\Release", "build") | Where-Object {
@@ -298,6 +404,7 @@ jobs:
           }
 
       - name: Verify HTTPS REST and SQLite compiled in
+        if: ${{ !inputs.retention_cost_diagnostic_only }}
         shell: pwsh
         run: |
           $exe = @("build\FDSensor.exe", "build\Release\FDSensor.exe") | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
@@ -319,24 +426,29 @@ jobs:
           }
 
       - name: Stage vcpkg + MSVC runtime DLLs
+        if: ${{ !inputs.retention_cost_diagnostic_only }}
         shell: pwsh
         run: |
-          $env:VCPKG_INSTALLED_X64 = (Join-Path $env:GITHUB_WORKSPACE "vcpkg_installed\x64-windows")
           ./scripts/stage_vcpkg_runtime_dlls_build_release.ps1
-          ./scripts/stage_msvc_runtime_dlls_build_release.ps1 -Architecture amd64
-          ./scripts/stage_windivert_runtime.ps1 -DestinationDir "build\Release"
+          ./scripts/stage_msvc_runtime_dlls_build_release.ps1 -Architecture $env:EDR_RELEASE_ARCH
+          if ($env:EDR_INCLUDE_WINDIVERT -eq 'true') {
+            ./scripts/stage_windivert_runtime.ps1 -DestinationDir "build\Release"
+          } else {
+            Write-Host "WinDivert is intentionally omitted from ARM64: upstream WinDivert 2.2.2 has no ARM64 driver."
+          }
 
           $stagedYara = @(Get-ChildItem -Path "build\Release" -Filter "*.dll" -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '(?i)yara.*\.dll$' })
           if (-not $stagedYara -or $stagedYara.Count -lt 1) {
-            Write-Warning "No YARA runtime DLL staged; vcpkg libyara may be static for x64-windows."
+            Write-Warning "No YARA runtime DLL staged; vcpkg libyara may be static for $env:EDR_VCPKG_TRIPLET."
           } else {
             Write-Host "Verified staged YARA runtime DLL(s): $($stagedYara.Name -join ', ')"
           }
 
       - name: Test
+        if: ${{ !inputs.retention_cost_diagnostic_only }}
         shell: pwsh
         run: |
-          $opensslTools = Join-Path $env:GITHUB_WORKSPACE 'vcpkg_installed\x64-windows\tools\openssl'
+          $opensslTools = Join-Path $env:VCPKG_INSTALLED_ROOT 'tools\openssl'
           if (-not (Test-Path -LiteralPath (Join-Path $opensslTools 'openssl.exe') -PathType Leaf)) { throw 'Pinned vcpkg OpenSSL executable is required for isolated TLS gate fixtures' }
           $env:PATH = "$opensslTools;$env:PATH"
           & ctest --test-dir build -C Release --output-on-failure --no-tests=error --label-regex '^windows-release-gate$'
@@ -361,9 +473,10 @@ jobs:
           }
 
       - name: Package (setup exe + runtime zip)
+        if: ${{ !inputs.retention_cost_diagnostic_only }}
         shell: pwsh
         run: |
-          $zip = "edr-agent-${{ github.sha }}-windows-amd64-exe.zip"
+          $zip = "edr-agent-${{ github.sha }}-windows-$env:EDR_RELEASE_ARCH-exe.zip"
           $outDir = $null
           $agentExe = $null
           foreach ($c in @("build\Release", "build")) {
@@ -383,7 +496,7 @@ jobs:
           New-Item -ItemType Directory -Path $collectorPackageDir -Force | Out-Null
           $builtinCollectorPackagePath = Join-Path $collectorPackageDir "forensic_collector_builtin.exe"
           Copy-Item -LiteralPath $builtinCollectorSource -Destination $builtinCollectorPackagePath -Force
-          & .\scripts\Assert-WindowsPeArchitecture.ps1 -Path $builtinCollectorPackagePath -Architecture amd64
+          & .\scripts\Assert-WindowsPeArchitecture.ps1 -Path $builtinCollectorPackagePath -Architecture $env:EDR_RELEASE_ARCH
           $workerExe = Join-Path $outDir "FDSecurityInstallerWorker.exe"
           if (-not (Test-Path -LiteralPath $workerExe)) {
             $foundWorker = Get-ChildItem -Path build -Recurse -Filter "FDSecurityInstallerWorker.exe" -File -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName -First 1
@@ -423,6 +536,13 @@ jobs:
             name = "collector/forensic_collector_builtin.exe"
             sha256 = (Get-FileHash -LiteralPath $builtinCollectorPackagePath -Algorithm SHA256).Hash.ToLowerInvariant()
           })
+          Get-ChildItem -LiteralPath $outDir -Filter "*.dll" -File -ErrorAction SilentlyContinue |
+            Sort-Object Name | ForEach-Object {
+              $null = $nativeIntegrityFiles.Add([ordered]@{
+                name = $_.Name
+                sha256 = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+              })
+            }
           [object[]]$nativeIntegrityFileArray = $nativeIntegrityFiles.ToArray()
           [ordered]@{
             schema = "edr.windows.native-package-integrity.v1"
@@ -432,10 +552,21 @@ jobs:
           $null = $items.Add($collectorPackageDir)
           $null = $items.Add((Join-Path $env:GITHUB_WORKSPACE "VERSION"))
           Get-ChildItem $outDir -Filter "*.dll" -File -ErrorAction SilentlyContinue | ForEach-Object { $null = $items.Add($_.FullName) }
-          foreach ($p in @("WinDivert64.sys", "licenses\WinDivert-LICENSE.txt", "licenses\WinDivert-SOURCE.json")) {
-            $asset = Join-Path $outDir $p
-            if (-not (Test-Path -LiteralPath $asset)) { throw "missing staged WinDivert asset: $asset" }
-            $null = $items.Add($asset)
+          $runtimePeFiles = @(Get-ChildItem -LiteralPath $outDir -File -ErrorAction Stop | Where-Object {
+              $_.Extension -ieq '.exe' -or $_.Extension -ieq '.dll'
+            })
+          $runtimePeFiles += Get-Item -LiteralPath $builtinCollectorPackagePath
+          if ($runtimePeFiles.Count -lt 1) { throw "Runtime PE closure is empty: $outDir" }
+          foreach ($runtimePeFile in $runtimePeFiles) {
+            & .\scripts\Assert-WindowsPeArchitecture.ps1 -Path $runtimePeFile.FullName -Architecture $env:EDR_RELEASE_ARCH
+          }
+          Write-Host "Verified Runtime PE closure: arch=$env:EDR_RELEASE_ARCH files=$($runtimePeFiles.Count)"
+          if ($env:EDR_INCLUDE_WINDIVERT -eq 'true') {
+            foreach ($p in @("WinDivert64.sys", "licenses\WinDivert-LICENSE.txt", "licenses\WinDivert-SOURCE.json")) {
+              $asset = Join-Path $outDir $p
+              if (-not (Test-Path -LiteralPath $asset)) { throw "missing staged WinDivert asset: $asset" }
+              $null = $items.Add($asset)
+            }
           }
           foreach ($p in @(
             "scripts\edr_agent_install.ps1",
@@ -467,7 +598,7 @@ jobs:
 
           $innoOut = "install\windows-inno\Output"
           Remove-Item -LiteralPath $innoOut -Recurse -Force -ErrorAction SilentlyContinue
-          & ".\install\windows-inno\Build-BundledInstaller.ps1" -BinDir (Resolve-Path $outDir).Path -AppVersion $env:EDR_AGENT_VERSION -TargetArch amd64
+          & ".\install\windows-inno\Build-BundledInstaller.ps1" -BinDir (Resolve-Path $outDir).Path -AppVersion $env:EDR_AGENT_VERSION -TargetArch $env:EDR_RELEASE_ARCH
           if ($LASTEXITCODE -ne 0) { throw "Inno setup build failed" }
           $setupSrc = Join-Path $innoOut "FDSecuritySetup-bundled.exe"
           if (-not (Test-Path -LiteralPath $setupSrc)) {
@@ -483,7 +614,8 @@ jobs:
 
           $setupUiZip = Join-Path $env:GITHUB_WORKSPACE "edr_agent_setup_ui.zip"
           $agentBinarySha256 = (Get-FileHash -LiteralPath (Join-Path $outDir "FDSensor.exe") -Algorithm SHA256).Hash.ToLowerInvariant()
-          & ".\install\windows-setup-ui\Build-SetupUi.ps1" -SetupExe $setupDest -AppVersion $env:EDR_AGENT_VERSION -AgentBinarySha256 $agentBinarySha256 -RuntimeIdentifier win-x64 -SetupTargetArch amd64 -ExpectedSignatureStatus unsigned -OutputZip $setupUiZip
+          $runtimeIdentitySha256 = (Get-FileHash -LiteralPath $nativeIntegrityPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          & ".\install\windows-setup-ui\Build-SetupUi.ps1" -SetupExe $setupDest -AppVersion $env:EDR_AGENT_VERSION -AgentBinarySha256 $agentBinarySha256 -RuntimeIdentitySha256 $runtimeIdentitySha256 -RuntimeIdentifier $env:EDR_RUNTIME_IDENTIFIER -SetupTargetArch $env:EDR_RELEASE_ARCH -ExpectedSignatureStatus unsigned -OutputZip $setupUiZip
           if ($LASTEXITCODE -ne 0) { throw "Setup UI build failed" }
           if (-not (Test-Path -LiteralPath $setupUiZip)) { throw "missing setup UI package: $setupUiZip" }
           Write-Host "Setup UI package is uploaded as a separate artifact and is not nested into the runtime zip."
@@ -572,9 +704,13 @@ jobs:
             }
 
             if (-not ($entries -match '(?i)(^|/|\\)(lib)?yara.*\.dll$')) {
-              Write-Warning "No YARA runtime DLL in package; vcpkg libyara may be statically linked for x64-windows."
+              Write-Warning "No YARA runtime DLL in package; vcpkg libyara may be statically linked for $env:EDR_VCPKG_TRIPLET."
             }
-            foreach ($runtimeDll in @('vcruntime140.dll', 'vcruntime140_1.dll', 'msvcp140.dll')) {
+            $requiredRuntimeDlls = @('vcruntime140.dll', 'msvcp140.dll')
+            if ($env:EDR_RELEASE_ARCH -eq 'amd64') {
+              $requiredRuntimeDlls += 'vcruntime140_1.dll'
+            }
+            foreach ($runtimeDll in $requiredRuntimeDlls) {
               $escapedRuntimeDll = [Regex]::Escape($runtimeDll)
               if (-not ($entries -match "(?i)(^|/|\\)$escapedRuntimeDll$")) {
                 throw "required app-local MSVC runtime DLL missing from package: $runtimeDll"
@@ -583,7 +719,7 @@ jobs:
             if (-not ($entries -match '(^|/|\\)edr_agent_setup\.exe$')) {
               throw "edr_agent_setup.exe missing from package"
             }
-            foreach ($required in @(
+            $requiredEntries = @(
               'edr_agent_install\.ps1',
               'edr_windows_autorun\.ps1',
               'edr_agent_preflight\.ps1',
@@ -594,11 +730,14 @@ jobs:
               'uninstall\.exe',
               'collector[/\\]forensic_collector_builtin\.exe',
               'native-package-integrity\.json',
-              'WinDivert\.dll',
-              'WinDivert64\.sys',
-              'WinDivert-LICENSE\.txt',
               'agent_windows_production\.example\.toml'
-            )) {
+            )
+            if ($env:EDR_INCLUDE_WINDIVERT -eq 'true') {
+              $requiredEntries += @('WinDivert\.dll', 'WinDivert64\.sys', 'WinDivert-LICENSE\.txt')
+            } elseif ($entries -match '(?i)(^|/|\\)WinDivert(64\.sys|\.dll)$') {
+              throw "ARM64 package must not include unsupported WinDivert binaries"
+            }
+            foreach ($required in $requiredEntries) {
               if (-not ($entries -match "(^|/|\\)${required}$")) {
                 throw "required package entry missing: $required"
               }
@@ -609,15 +748,17 @@ jobs:
           }
 
       - name: Move artifact to workspace
+        if: ${{ !inputs.retention_cost_diagnostic_only }}
         shell: pwsh
         run: |
-          $src = "edr-agent-${{ github.sha }}-windows-amd64-exe.zip"
+          $src = "edr-agent-${{ github.sha }}-windows-$env:EDR_RELEASE_ARCH-exe.zip"
           if (-not (Test-Path -LiteralPath $src)) { throw "missing $src" }
           Copy-Item -Path $src -Destination (Join-Path $env:GITHUB_WORKSPACE "edr-agent-win-exe.zip") -Force
           if (-not (Test-Path -LiteralPath "edr_agent_setup.exe")) { throw "missing edr_agent_setup.exe" }
           if (-not (Test-Path -LiteralPath "edr_agent_setup_ui.zip")) { throw "missing edr_agent_setup_ui.zip" }
 
       - uses: actions/upload-artifact@v6
+        if: ${{ !inputs.retention_cost_diagnostic_only }}
         with:
           name: edr-agent-windows-${{ github.sha }}
           path: |

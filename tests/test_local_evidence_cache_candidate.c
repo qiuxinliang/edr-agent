@@ -53,6 +53,13 @@ static void test_unsetenv(const char *name) { assert(unsetenv(name) == 0); }
 #if defined(EDR_HAVE_SQLITE)
 #include <sqlite3.h>
 #include "../src/storage/evidence_context_store.h"
+#ifdef EDR_RETENTION_SYNC_ATTRIBUTION
+#define RETENTION_SYNC_PROBE_IMPLEMENTATION
+#include "retention_sync_probe.h"
+static void retention_sync_phase_begin(unsigned round);
+static void retention_sync_phase_end(const EdrEvidenceCacheStatus *before,
+                                     const EdrEvidenceCacheStatus *after);
+#endif
 
 /* Explicit old-layout fixtures keep exercising the supported legacy writer.
  * The seam is restored immediately; all other opens use production defaults. */
@@ -518,6 +525,38 @@ static int64_t sqlite_scalar_integer(const char *path, const char *sql) {
   return result;
 }
 
+/* Only the explicit capacity contract uses these observations. File sizes are
+ * the public status sample; live pages come from a later readonly connection.
+ * Neither is the writer's exact COMMIT boundary or its uncommitted snapshot. */
+static int s_capacity_admission_observe;
+static unsigned s_capacity_admission_observations;
+static void capacity_admission_observe(const char *path, const char *scenario,
+    const char *phase, const EdrEvidenceCacheStatus *sample, int read_live) {
+  if (!s_capacity_admission_observe) return;
+  EdrEvidenceCacheStatus current;
+  if (!sample) { edr_local_evidence_cache_get_status(&current); sample = &current; }
+  int64_t live = read_live ? sqlite_scalar_integer(path,
+      "SELECT (page_count-freelist_count)*page_size "
+      "FROM pragma_page_count,pragma_freelist_count,pragma_page_size;") : -1;
+  assert(!read_live || live >= 0);
+  assert(++s_capacity_admission_observations <= 64u);
+  printf("capacity_admission_observation scenario=%s phase=%s limit_bytes=%llu "
+      "db_bytes=%llu wal_bytes=%llu shm_bytes=%llu physical_available=%u "
+      "live_observed=%d live_bytes=%lld live_scope=%s "
+      "atomic_size_live_snapshot=0 exact_commit=0 admitted=%llu rejected=%llu "
+      "candidate_writes=%llu transaction_failures=%llu capacity_cause=%u sqlite_rc=%u\n",
+      scenario, phase, (unsigned long long)sample->max_db_mb * UINT64_C(1048576),
+      (unsigned long long)sample->db_bytes, (unsigned long long)sample->wal_bytes,
+      (unsigned long long)sample->shm_bytes, (unsigned)sample->physical_accounting_available,
+      read_live, (long long)live, read_live ? "committed_readonly_snapshot" : "unobserved",
+      (unsigned long long)sample->candidate_admitted,
+      (unsigned long long)sample->candidate_rejected,
+      (unsigned long long)sample->p0_candidates_written,
+      (unsigned long long)sample->candidate_transaction_failures,
+      (unsigned)sample->capacity_last_cause, (unsigned)sample->capacity_last_sqlite_rc);
+  assert(fflush(stdout) == 0);
+}
+
 static int sqlite_table_has_column(const char *path, const char *table, const char *column) {
   sqlite3 *db = NULL;
   sqlite3_stmt *stmt = NULL;
@@ -933,10 +972,12 @@ static void test_candidate_commit_failure_leaves_no_dedupe_or_context_state(void
   candidate.process_start_key = 0x73101u;
   candidate.process_creation_filetime_100ns = 133700000000000001ULL;
 
+  capacity_admission_observe(db,"commit_failure","pre_record",NULL,1);
   edr_local_evidence_cache_test_fail_next_commits(1u);
   edr_local_evidence_cache_record_behavior(&candidate);
   EdrEvidenceCacheStatus failed;
   edr_local_evidence_cache_get_status(&failed);
+  capacity_admission_observe(db,"commit_failure","failed_public_record_end",&failed,1);
   assert(failed.candidate_requests == 1u);
   assert(failed.candidate_reused == 0u);
   assert(failed.candidate_admission_attempts == 1u);
@@ -967,6 +1008,7 @@ static void test_candidate_commit_failure_leaves_no_dedupe_or_context_state(void
   edr_local_evidence_cache_record_behavior(&candidate);
   EdrEvidenceCacheStatus committed;
   edr_local_evidence_cache_get_status(&committed);
+  capacity_admission_observe(db,"commit_failure","retry_public_record_end",&committed,1);
   assert(committed.candidate_requests == 2u);
   assert(committed.candidate_reused == 0u);
   assert(committed.candidate_admission_attempts == 2u);
@@ -1420,6 +1462,127 @@ static void test_post_context_exact_replay_charges_only_durable_changes(void) {
   (void)remove(db);
   (void)remove("local_evidence_cache_post_context_replay.sqlite-wal");
   (void)remove("local_evidence_cache_post_context_replay.sqlite-shm");
+}
+
+static void test_context_fanout_owner_set_is_atomic(void) {
+  const char *db = "local_evidence_cache_owner_set.sqlite";
+  for (unsigned fault = 0; fault < 5u; ++fault) {
+    EdrBehaviorRecord candidate, context;
+    EdrEvidenceCacheStatus before, after;
+    char ids[2][160];
+    struct timespec ts; assert(timespec_get(&ts, TIME_UTC) == TIME_UTC);
+    int64_t now = (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+    (void)remove(db); (void)remove("local_evidence_cache_owner_set.sqlite-wal");
+    (void)remove("local_evidence_cache_owner_set.sqlite-shm");
+    assert(edr_local_evidence_cache_open(db, 16u, 24u) == 0);
+    init_record(&candidate, EDR_EVENT_NET_CONNECT);
+    candidate.pid = 74501u; candidate.ppid = 74500u;
+    candidate.process_start_key = 74501u;
+    candidate.process_creation_filetime_100ns = UINT64_C(133700000000074501);
+    candidate.parent_process_start_key = 74500u;
+    candidate.parent_process_creation_filetime_100ns = UINT64_C(133700000000074500);
+    candidate.parent_pid_state = EDR_PARENT_PID_KNOWN;
+    strcpy(candidate.parent_resolution_source, "live_parent_generation");
+    strcpy(candidate.parent_name, "owner-parent.exe");
+    strcpy(candidate.endpoint_id, "ep-owner-set"); strcpy(candidate.tenant_id, "owner-tenant");
+    strcpy(candidate.process_name, "owner-child.exe");
+    candidate.net_dport = 445u;
+    for (unsigned i = 0; i < 2u; ++i) {
+      candidate.event_time_ns = now + (int64_t)i;
+      snprintf(candidate.event_id, sizeof(candidate.event_id), "owner-candidate-%u", i);
+      snprintf(candidate.net_dst, sizeof(candidate.net_dst), "192.0.2.%u", i + 1u);
+      edr_behavior_bind_parent_context(&candidate);
+      edr_local_evidence_cache_record_behavior(&candidate);
+      sqlite_candidate_id_for_source_event(db, candidate.event_id, ids[i], sizeof(ids[i]));
+    }
+    edr_local_evidence_cache_get_status(&before);
+    /* Both the child and parent roles match each candidate. The public
+     * producer must de-duplicate those IDs before validating the owner set. */
+    assert(before.context_windows_used == 4u);
+    sqlite3 *raw = NULL; assert(sqlite3_open(db, &raw) == SQLITE_OK);
+    /* Corrupt only this disposable fixture after the RAM windows were
+     * published, to exercise the transaction's independent owner check. The
+     * normal floor/identity guards otherwise reject these mutations first. */
+    if (fault > 0u && fault < 4u)
+      assert(sqlite3_exec(raw, "DROP TRIGGER alert_context_floor_v1_update;", NULL, NULL, NULL) == SQLITE_OK);
+    if (fault == 4u)
+      assert(sqlite3_exec(raw, "DROP TRIGGER context_window_floor_v1_eligible;"
+          "DROP TRIGGER alert_context_floor_v1_eligible;", NULL, NULL, NULL) == SQLITE_OK);
+    char *sql = NULL;
+    if (fault == 1u) sql = sqlite3_mprintf("UPDATE p0_candidates SET endpoint_id='other-endpoint' WHERE candidate_id=%Q", ids[1]);
+    else if (fault == 2u) sql = sqlite3_mprintf("UPDATE p0_candidates SET tenant_id='other-tenant' WHERE candidate_id=%Q", ids[1]);
+    else if (fault == 3u) sql = sqlite3_mprintf("UPDATE p0_candidates SET candidate_id='missing-owner-fixture' WHERE candidate_id=%Q", ids[1]);
+    else if (fault == 4u) sql = sqlite3_mprintf("INSERT INTO context_retirement_progress(candidate_id,phase,reason) VALUES(%Q,2,1);"
+        "UPDATE p0_candidates SET local_retention_state='retirement_eligible' WHERE candidate_id=%Q", ids[1], ids[1]);
+    if (sql) { assert(sqlite3_exec(raw, sql, NULL, NULL, NULL) == SQLITE_OK); sqlite3_free(sql); }
+    uint64_t facts = sqlite_table_count(db, "context_facts");
+    uint64_t refs = sqlite_table_count(db, "context_reference_projection");
+    context = candidate; context.type = EDR_EVENT_PROCESS_CREATE;
+    context.event_time_ns = now + 1000; context.net_dst[0] = '\0'; context.net_dport = 0;
+    strcpy(context.event_id, "owner-context"); strcpy(context.cmdline, "owner-child.exe --ordinary");
+    edr_behavior_bind_parent_context(&context);
+    assert(!edr_local_evidence_cache_is_candidate(&context));
+    edr_local_evidence_cache_record_behavior(&context);
+    edr_local_evidence_cache_get_status(&after);
+    assert(sqlite_table_count(db, "context_facts") == facts + (fault ? 0u : 1u));
+    assert(sqlite_table_count(db, "context_reference_projection") == refs + (fault ? 0u : 2u));
+    for (unsigned i = 0; i < 2u; ++i)
+      assert(sqlite_post_artifact_count(db, ids[i], "owner-context") == (fault ? 0u : 1u));
+    if (fault) {
+      assert(after.context_failure_reasons[EDR_EVIDENCE_FAILURE_INVALID] ==
+          before.context_failure_reasons[EDR_EVIDENCE_FAILURE_INVALID] + 1u);
+      assert(after.context_refs_written == before.context_refs_written);
+    }
+    assert(sqlite3_close(raw) == SQLITE_OK); edr_local_evidence_cache_close();
+    (void)remove(db); (void)remove("local_evidence_cache_owner_set.sqlite-wal");
+    (void)remove("local_evidence_cache_owner_set.sqlite-shm");
+  }
+  puts("context_owner_set roles_deduplicated=1 missing_owner=1 endpoint_scope=1 tenant_scope=1 retired_owner=1 atomic=1");
+}
+
+/* Explicit diagnostic mode only; ordinary contracts keep their original I/O. */
+static int s_retention_cost_diagnostic;
+static void retention_cost_mark(const char *stage, unsigned step);
+
+static void test_context_fanout_owner_set_maximum(void) {
+  const char *db = "local_evidence_cache_owner_maximum.sqlite";
+  EdrBehaviorRecord r; struct timespec ts;
+  (void)remove(db); (void)remove("local_evidence_cache_owner_maximum.sqlite-wal");
+  (void)remove("local_evidence_cache_owner_maximum.sqlite-shm");
+  assert(timespec_get(&ts, TIME_UTC) == TIME_UTC);
+  int64_t now = (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+  assert(edr_local_evidence_cache_open(db, 64u, 24u) == 0);
+  retention_cost_mark("fanout_opened",0);
+  init_record(&r, EDR_EVENT_NET_CONNECT); r.pid=74601u; r.ppid=0;
+  r.parent_pid_state=EDR_PARENT_PID_EXPLICIT_ZERO;
+  r.process_start_key=74601u; r.process_creation_filetime_100ns=UINT64_C(133700000000074601);
+  strcpy(r.endpoint_id,"ep-owner-maximum"); strcpy(r.tenant_id,"owner-tenant");
+  strcpy(r.process_name,"owner-maximum.exe"); strcpy(r.net_dst,"192.0.2.1"); r.net_dport=445u;
+  for(unsigned i=0;i<256u;++i) {
+    r.event_time_ns=now+(int64_t)i;
+    snprintf(r.event_id,sizeof(r.event_id),"maximum-owner-%u",i);
+    edr_local_evidence_cache_record_behavior(&r);
+    if ((i+1u)%64u==0u) retention_cost_mark("fanout_seeded",i+1u);
+  }
+  EdrEvidenceCacheStatus before,after; edr_local_evidence_cache_get_status(&before);
+  assert(before.candidate_admitted==256u && before.context_windows_used==256u);
+  uint64_t refs=sqlite_table_count(db,"context_reference_projection"),facts=sqlite_table_count(db,"context_facts");
+  r.type=EDR_EVENT_PROCESS_CREATE; r.net_dst[0]='\0'; r.net_dport=0; r.event_time_ns=now+1000;
+  strcpy(r.event_id,"maximum-owner-context"); strcpy(r.cmdline,"owner-maximum.exe --ordinary");
+  assert(!edr_local_evidence_cache_is_candidate(&r));
+  retention_cost_mark("fanout_ready",256u);
+  edr_local_evidence_cache_record_behavior(&r);
+  retention_cost_mark("fanout_written",256u);
+  edr_local_evidence_cache_get_status(&after);
+  assert(after.context_refs_written==before.context_refs_written+256u);
+  assert(sqlite_table_count(db,"context_reference_projection")==refs+256u);
+  assert(sqlite_table_count(db,"context_facts")==facts+1u);
+  retention_cost_mark("fanout_verified",256u);
+  edr_local_evidence_cache_close();
+  retention_cost_mark("fanout_closed",256u);
+  (void)remove(db); (void)remove("local_evidence_cache_owner_maximum.sqlite-wal");
+  (void)remove("local_evidence_cache_owner_maximum.sqlite-shm");
+  puts("context_owner_set maximum_owners=256 complete_fanout=1");
 }
 
 static void test_critical_context_high_fanout_is_atomically_bounded(void) {
@@ -2498,14 +2661,25 @@ static void test_capacity_success_does_not_throttle_next_reclaim(void) {
         "PRAGMA wal_checkpoint(TRUNCATE);",round,round);
     assert(fixture); assert(sqlite3_exec(raw,fixture,NULL,NULL,NULL)==SQLITE_OK); sqlite3_free(fixture);
     char prefix[64]; snprintf(prefix,sizeof(prefix),"missing-%u-%%",round);
+    retention_cost_mark("capacity_seeded",round);
     classify_pressure_fixture_groups(raw,prefix);
+    retention_cost_mark("capacity_classified",round);
+#ifdef EDR_RETENTION_SYNC_ATTRIBUTION
+    retention_sync_phase_begin(round);
+#endif
     int64_t before_refs=sqlite_scalar_integer(db,"SELECT COUNT(*) FROM candidate_context_refs WHERE fact_id='orphan-fixture';");
     candidate.event_time_ns++;
     snprintf(candidate.event_id, sizeof(candidate.event_id), "rapid-reclaim-%u", round);
     snprintf(candidate.net_dst, sizeof(candidate.net_dst), "10.74.33.%u", round + 1u);
     edr_local_evidence_cache_get_status(&before);
+#ifdef EDR_RETENTION_SYNC_ATTRIBUTION
+    rs_entry_begin(RS_ENTRY_INITIAL);
+#endif
     edr_local_evidence_cache_record_behavior(&candidate);
     edr_local_evidence_cache_get_status(&after);
+#ifdef EDR_RETENTION_SYNC_ATTRIBUTION
+    rs_entry_end();
+#endif
     /* An admission may yield after its work budget. Existing bounded failure
      * backoff and later maintenance must still converge, without fake ACKs.
      * Allow one turn per fixture group plus the bounded reclamation drain;
@@ -2517,15 +2691,28 @@ static void test_capacity_success_does_not_throttle_next_reclaim(void) {
     for (unsigned retry=0; after.candidate_admitted==before.candidate_admitted &&
          retry<retry_limit && stalled<32u; ++retry) {
       s_test_monotonic_ns+=60000000000ULL;
+#ifdef EDR_RETENTION_SYNC_ATTRIBUTION
+      rs_entry_begin(RS_ENTRY_POLL);
+#endif
       edr_local_evidence_cache_poll_maintenance();
+#ifdef EDR_RETENTION_SYNC_ATTRIBUTION
+      rs_entry_end(); rs_entry_begin(RS_ENTRY_RETRY);
+#endif
       edr_local_evidence_cache_record_behavior(&candidate);
       edr_local_evidence_cache_get_status(&after);
+#ifdef EDR_RETENTION_SYNC_ATTRIBUTION
+      rs_entry_end();
+#endif
       uint64_t bytes=after.db_bytes+after.wal_bytes;
       if(after.retention_groups_retired>retired_seen || bytes<best_bytes) stalled=0;
       else ++stalled;
       if(bytes<best_bytes) best_bytes=bytes;
       retired_seen=after.retention_groups_retired;
     }
+#ifdef EDR_RETENTION_SYNC_ATTRIBUTION
+    retention_sync_phase_end(&before,&after);
+#endif
+    retention_cost_mark("capacity_reclaimed",round);
     if (after.candidate_admitted != before.candidate_admitted + 1u) {
       fprintf(stderr,"capacity convergence failed: round=%u retired=%llu held=%llu "
           "maintenance=%llu db=%llu wal=%llu retention_failures=%llu cause=%s\n",round,
@@ -2643,7 +2830,7 @@ static void test_existing_candidate_update_honors_capacity(void) {
   sqlite3 *raw = NULL, *reader = NULL;
   sqlite3_stmt *pin = NULL, *st = NULL;
   EdrBehaviorRecord candidate, context;
-  EdrEvidenceCacheStatus initial, before, after;
+  EdrEvidenceCacheStatus initial, before, after, crossing_pre;
   struct timespec ts;
   assert(make_test_sqlite_path(db, sizeof(db)) == 0);
   assert(edr_local_evidence_cache_open(db, 1u, 24u) == 0);
@@ -2690,11 +2877,21 @@ static void test_existing_candidate_update_honors_capacity(void) {
   assert(sqlite3_step(pin) == SQLITE_ROW);
   assert(strcmp((const char *)sqlite3_column_text(pin, 0), candidate_id) == 0);
   before = initial;
+  if (s_capacity_admission_observe) crossing_pre = before;
+  capacity_admission_observe(db,"pinned_reader","replay_series_pre",&before,1);
   for (unsigned replay = 0; replay < 200u &&
        before.db_bytes + before.wal_bytes <= 1024u * 1024u; ++replay) {
+    if (s_capacity_admission_observe) crossing_pre = before;
     edr_local_evidence_cache_record_behavior(&candidate);
     edr_local_evidence_cache_get_status(&before);
   }
+  if (s_capacity_admission_observe) {
+    assert(crossing_pre.db_bytes + crossing_pre.wal_bytes <= 1024u * 1024u);
+    /* Retain the actual preceding status sample without introducing a query
+     * into every replay. Its corresponding live-page value was not sampled. */
+    capacity_admission_observe(db,"pinned_reader","pre_crossing_public_record",&crossing_pre,0);
+  }
+  capacity_admission_observe(db,"pinned_reader","crossed_public_record_end",&before,1);
   assert(before.db_bytes + before.wal_bytes > 1024u * 1024u);
   assert(before.p0_candidates_written > initial.p0_candidates_written);
   assert(before.candidate_rejected == initial.candidate_rejected);
@@ -2707,6 +2904,8 @@ static void test_existing_candidate_update_honors_capacity(void) {
   for (unsigned refusal = 0; refusal < 2u; ++refusal) {
     edr_local_evidence_cache_record_behavior(&candidate);
     edr_local_evidence_cache_get_status(&after);
+    capacity_admission_observe(db,"pinned_reader",refusal ?
+        "second_refused_public_record_end" : "next_refused_public_record_end",&after,1);
     assert(after.candidate_rejected == before.candidate_rejected + 1u);
     assert(after.db_budget_dropped == before.db_budget_dropped + 1u);
     assert(after.candidate_failure_reasons[EDR_EVIDENCE_FAILURE_CAPACITY] ==
@@ -2729,6 +2928,7 @@ static void test_existing_candidate_update_honors_capacity(void) {
   strcpy(blocked_context.event_id, "blocked-context-different-source");
   edr_local_evidence_cache_record_behavior(&blocked_context);
   edr_local_evidence_cache_get_status(&after);
+  capacity_admission_observe(db,"pinned_reader","context_refused_public_record_end",&after,1);
   assert(after.context_capacity_causes[EDR_EVIDENCE_CAPACITY_WAL_BUSY] == 1u);
   assert(after.capacity_last_sqlite_rc == SQLITE_BUSY && after.capacity_last_owner == 2u);
   assert_capacity_diagnostics(&after);
@@ -2749,6 +2949,7 @@ static void test_existing_candidate_update_honors_capacity(void) {
   snprintf(candidate.cmdline, sizeof(candidate.cmdline), "powershell.exe -File recovered.ps1");
   edr_local_evidence_cache_record_behavior(&candidate);
   edr_local_evidence_cache_get_status(&after);
+  capacity_admission_observe(db,"pinned_reader","reader_released_public_record_end",&after,1);
   assert(after.records_written == before.records_written + 1u);
   assert(after.p0_candidates_written == before.p0_candidates_written + 1u);
   assert(after.candidate_rejected == before.candidate_rejected);
@@ -2770,6 +2971,7 @@ static void test_existing_candidate_update_honors_capacity(void) {
     if (!reopen) {
       assert(edr_local_evidence_cache_open(db, 1u, 24u) == 0);
       edr_local_evidence_cache_get_status(&after);
+      capacity_admission_observe(db,"pinned_reader","same_cap_reopened",&after,1);
       assert(after.capacity_last_owner == 0u);
       assert(after.candidate_capacity_causes[EDR_EVIDENCE_CAPACITY_WAL_BUSY] == 0u);
       assert(after.context_capacity_causes[EDR_EVIDENCE_CAPACITY_WAL_BUSY] == 0u);
@@ -7539,6 +7741,11 @@ static void test_authorized_query_scope_and_absence(void) {
   assert(sqlite3_open(path,&db)==SQLITE_OK);
   retention_group_fixture(db,"query-right",1,now-1,now-1,now-1);
   retention_group_fixture(db,"query-other",1,now-1,now-1,now-1);
+  /* This query now consumes retained context too. The generic retirement
+   * fixture's opaque placeholder is not a valid production context bundle. */
+  compact_exec(db,"UPDATE artifacts SET manifest_json=json_object('schema','p0_context_bundle.v1',"
+      "'candidate_id',candidate_id,'endpoint_id',endpoint_id,'context',json('[]')) "
+      "WHERE candidate_id IN ('query-right','query-other');");
   compact_exec(db,"UPDATE p0_candidates SET tenant_id='other-tenant',process_name='must-not-export' WHERE candidate_id='query-other';"
       "UPDATE p0_candidates SET cmdline='private-unnecessary-command',process_name='visible' WHERE candidate_id='query-right';");
   assert(edr_local_evidence_cache_query_authorized_json("query-task",&meta,out,sizeof(out))==0);
@@ -7618,6 +7825,7 @@ static void test_physical_floor_rejects_evidence_copy(void) {
   assert(make_test_sqlite_path(path,sizeof(path))==0);
   assert(edr_local_evidence_cache_open(path,8,1)==0);
   edr_local_evidence_cache_get_status(&before);
+  capacity_admission_observe(path,"physical_floor","pre_record",&before,1);
   test_setenv("EDR_STORAGE_MIN_FREE_MB","1073741824");
   assert(edr_local_evidence_cache_record_command_result("blocked-copy","rtq_query","done",1,0,"detail","")==EDR_EVIDENCE_COMMAND_RESULT_CAPACITY);
   edr_local_evidence_cache_get_status(&after);
@@ -7637,6 +7845,7 @@ static void test_physical_floor_rejects_evidence_copy(void) {
   edr_local_evidence_cache_record_behavior(&candidate);
   edr_local_evidence_cache_get_status(&after);
   assert(after.candidate_capacity_causes[EDR_EVIDENCE_CAPACITY_PHYSICAL_GUARD]==1u);
+  capacity_admission_observe(path,"physical_floor","refused_public_record_end",&after,1);
   assert(after.capacity_last_sqlite_rc==0u);
   assert_capacity_diagnostics(&after);
   test_unsetenv("EDR_STORAGE_MIN_FREE_MB");
@@ -7667,7 +7876,11 @@ static void test_maintenance_query_copy_slices(void) {
 
 /* Test-only VFS accounting measures SQLite's issued reads/writes, including
  * WAL and checkpoint copies. It is not a hardware disk-controller counter. */
-typedef struct { sqlite3_file base; sqlite3_file *real; int main_database; } RetentionBenchFile;
+typedef struct { sqlite3_file base; sqlite3_file *real; int main_database;
+#ifdef EDR_RETENTION_SYNC_ATTRIBUTION
+  unsigned file_kind;
+#endif
+} RetentionBenchFile;
 static sqlite3_vfs *retention_bench_vfs_parent;
 static uint64_t retention_bench_reads, retention_bench_writes, retention_bench_syncs;
 static int retention_raise_floor_on_write;
@@ -7731,6 +7944,25 @@ static void retention_delegate_record(unsigned index, uint64_t started) {
   if (elapsed>value->maximum) value->maximum=elapsed;
 }
 
+#ifdef EDR_RETENTION_SYNC_ATTRIBUTION
+static void retention_sync_phase_begin(unsigned round) {
+  if (s_retention_cost_diagnostic)
+    rs_round_begin(round,retention_bench_syncs,retention_delegate_timing[2].ticks,retention_bench_writes);
+}
+static void retention_sync_phase_end(const EdrEvidenceCacheStatus *before,
+                                     const EdrEvidenceCacheStatus *after) {
+  if (!s_retention_cost_diagnostic) return;
+  if (after->maintenance_runs<before->maintenance_runs ||
+      after->retention_groups_retired<before->retention_groups_retired ||
+      after->retention_groups_held<before->retention_groups_held)
+    retention_sync_probe.errors|=RS_ERROR_RECONCILE;
+  rs_round_end(retention_bench_syncs,retention_delegate_timing[2].ticks,retention_bench_writes,
+      after->maintenance_runs-before->maintenance_runs,
+      after->retention_groups_retired-before->retention_groups_retired,
+      after->retention_groups_held-before->retention_groups_held);
+}
+#endif
+
 
 static void capacity_reclaim_slow_boundary(int enabled) {
   retention_checkpoint_delay_ms=enabled ? capacity_checkpoint_delay_ms : 0u;
@@ -7784,10 +8016,22 @@ static int bench_write(sqlite3_file *f,const void *b,int n,sqlite3_int64 o) {
   uint64_t delegate_started=retention_delegate_enabled ? retention_delegate_tick() : 0u;
   int result=BENCH_FILE(f)->pMethods->xWrite(BENCH_FILE(f),b,n,o);
   if (retention_delegate_enabled) retention_delegate_record(1u,delegate_started);
+#ifdef EDR_RETENTION_SYNC_ATTRIBUTION
+  rs_write(((RetentionBenchFile *)f)->file_kind,(uint64_t)(unsigned)n,result);
+#endif
   return result;
 }
-static int bench_truncate(sqlite3_file *f,sqlite3_int64 n) { return BENCH_FILE(f)->pMethods->xTruncate(BENCH_FILE(f),n); }
+static int bench_truncate(sqlite3_file *f,sqlite3_int64 n) {
+  int result=BENCH_FILE(f)->pMethods->xTruncate(BENCH_FILE(f),n);
+#ifdef EDR_RETENTION_SYNC_ATTRIBUTION
+  rr_truncate(((RetentionBenchFile *)f)->file_kind,n,result);
+#endif
+  return result;
+}
 static int bench_sync(sqlite3_file *f,int flags) {
+#ifdef EDR_RETENTION_SYNC_ATTRIBUTION
+  uint64_t previous_ticks=retention_delegate_timing[2].ticks;
+#endif
   ++retention_bench_syncs;
   /* Preserve the real filesystem result, but make checkpoint I/O slower than
    * one maintenance slice. This must not starve actual group retirement. */
@@ -7803,6 +8047,9 @@ static int bench_sync(sqlite3_file *f,int flags) {
   uint64_t delegate_started=retention_delegate_enabled ? retention_delegate_tick() : 0u;
   int result=BENCH_FILE(f)->pMethods->xSync(BENCH_FILE(f),flags);
   if (retention_delegate_enabled) retention_delegate_record(2u,delegate_started);
+#ifdef EDR_RETENTION_SYNC_ATTRIBUTION
+  rs_sync(((RetentionBenchFile *)f)->file_kind,retention_delegate_timing[2].ticks-previous_ticks,result);
+#endif
   return result;
 }
 static int bench_size(sqlite3_file *f,sqlite3_int64 *n) { return BENCH_FILE(f)->pMethods->xFileSize(BENCH_FILE(f),n); }
@@ -7828,12 +8075,78 @@ static const sqlite3_io_methods retention_bench_methods = {3,bench_close,bench_r
 static int retention_bench_open(sqlite3_vfs *v,const char *name,sqlite3_file *file,int flags,int *out) {
   (void)v; RetentionBenchFile *f=(RetentionBenchFile *)file;
   f->main_database=(flags & SQLITE_OPEN_MAIN_DB)!=0;
+#ifdef EDR_RETENTION_SYNC_ATTRIBUTION
+  f->file_kind=(flags & SQLITE_OPEN_MAIN_DB) ? RS_FILE_MAIN :
+      (flags & SQLITE_OPEN_WAL) ? RS_FILE_WAL :
+      (flags & (SQLITE_OPEN_MAIN_JOURNAL|SQLITE_OPEN_MASTER_JOURNAL)) ? RS_FILE_JOURNAL :
+      (flags & (SQLITE_OPEN_TEMP_DB|SQLITE_OPEN_TRANSIENT_DB|SQLITE_OPEN_TEMP_JOURNAL|SQLITE_OPEN_SUBJOURNAL)) ?
+      RS_FILE_TEMP : RS_FILE_UNKNOWN;
+#endif
   f->real=(sqlite3_file *)(f+1); memset(f->real,0,(size_t)retention_bench_vfs_parent->szOsFile);
   int rc=retention_bench_vfs_parent->xOpen(retention_bench_vfs_parent,name,f->real,flags,out);
   if (f->real->pMethods) f->base.pMethods=&retention_bench_methods;
   return rc;
 }
 #undef BENCH_FILE
+
+/* The existing VFS delegates remain authoritative. Timers wrap real calls,
+ * never inject delays or replace results. Counters are cumulative per run. */
+static void retention_cost_mark(const char *stage, unsigned step) {
+  if (!s_retention_cost_diagnostic) return;
+  double user=0.0,system=0.0;
+  uint64_t process_reads=0,process_writes=0;
+  int process_io=0;
+#if defined(_WIN32)
+  FILETIME created,exited,kernel,user_time; IO_COUNTERS io;
+  assert(GetProcessTimes(GetCurrentProcess(),&created,&exited,&kernel,&user_time));
+  assert(GetProcessIoCounters(GetCurrentProcess(),&io));
+  user=((uint64_t)user_time.dwHighDateTime<<32 | user_time.dwLowDateTime)/1e7;
+  system=((uint64_t)kernel.dwHighDateTime<<32 | kernel.dwLowDateTime)/1e7;
+  process_reads=io.ReadTransferCount;process_writes=io.WriteTransferCount;process_io=1;
+#else
+  struct rusage usage;assert(getrusage(RUSAGE_SELF,&usage)==0);
+  user=usage.ru_utime.tv_sec+usage.ru_utime.tv_usec/1e6;
+  system=usage.ru_stime.tv_sec+usage.ru_stime.tv_usec/1e6;
+#endif
+  printf("retention_cost stage=%s step=%u monotonic_ns=%llu user_s=%.6f system_s=%.6f "
+      "vfs_read_bytes=%llu vfs_write_bytes=%llu vfs_syncs=%llu process_io_available=%d "
+      "process_read_bytes=%llu process_write_bytes=%llu",
+      stage,step,(unsigned long long)soak_monotonic_ns(),user,system,
+      (unsigned long long)retention_bench_reads,(unsigned long long)retention_bench_writes,
+      (unsigned long long)retention_bench_syncs,process_io,
+      (unsigned long long)process_reads,(unsigned long long)process_writes);
+  assert(retention_delegate_hz);
+  for (unsigned i=0;i<3u;++i) {
+    const RetentionDelegateTiming *t=&retention_delegate_timing[i];
+    printf(" delegate_%u_calls=%llu delegate_%u_us=%.3f delegate_%u_max_us=%.3f",i,
+        (unsigned long long)t->calls,i,1e6*(double)t->ticks/(double)retention_delegate_hz,
+        i,1e6*(double)t->maximum/(double)retention_delegate_hz);
+  }
+  puts("");assert(fflush(stdout)==0);
+}
+
+static void test_retention_cost_diagnostic(void) {
+  retention_bench_vfs_parent=sqlite3_vfs_find(NULL);assert(retention_bench_vfs_parent);
+  sqlite3_vfs vfs=*retention_bench_vfs_parent;vfs.zName="retention-cost-diagnostic";vfs.pNext=NULL;
+  vfs.szOsFile+=(int)sizeof(RetentionBenchFile);vfs.xOpen=retention_bench_open;
+  assert(sqlite3_vfs_register(&vfs,1)==SQLITE_OK);
+  retention_delegate_reset(1);s_retention_cost_diagnostic=1;
+#ifdef EDR_RETENTION_SYNC_ATTRIBUTION
+  rs_reset();
+#endif
+  retention_cost_mark("begin",0);
+  test_context_fanout_owner_set_maximum();
+  retention_cost_mark("capacity_begin",0);
+  test_capacity_success_does_not_throttle_next_reclaim();
+  retention_cost_mark("complete",0);
+#ifdef EDR_RETENTION_SYNC_ATTRIBUTION
+  assert(rs_report(retention_delegate_hz)==0);
+  retention_sync_probe.enabled=0;
+#endif
+  s_retention_cost_diagnostic=0;retention_delegate_reset(0);
+  assert(sqlite3_vfs_register(retention_bench_vfs_parent,1)==SQLITE_OK);
+  assert(sqlite3_vfs_unregister(&vfs)==SQLITE_OK);
+}
 
 static void test_capacity_reclaim_with_slow_io(unsigned checkpoint_ms, unsigned read_ms) {
   retention_bench_vfs_parent=sqlite3_vfs_find(NULL); assert(retention_bench_vfs_parent);
@@ -11718,10 +12031,14 @@ static void test_candidate_live_size_query_failure_is_storage(void) {
     edr_behavior_bind_parent_context(candidate);
     EdrEvidenceCacheStatus before, failed, recovered;
     edr_local_evidence_cache_get_status(&before);
+    capacity_admission_observe(path,alert_entry ? "live_query_alert" : "live_query_behavior",
+        "pre_record",&before,1);
     edr_local_evidence_cache_test_fail_next_live_size_queries(1u);
     if (alert_entry) assert(edr_local_evidence_cache_record_alert_context(candidate, NULL) < 0);
     else edr_local_evidence_cache_record_behavior(candidate);
     edr_local_evidence_cache_get_status(&failed);
+    capacity_admission_observe(path,alert_entry ? "live_query_alert" : "live_query_behavior",
+        "failed_public_record_end",&failed,1);
     assert(failed.candidate_requests == before.candidate_requests + 1u);
     assert(failed.candidate_admission_attempts == before.candidate_admission_attempts + 1u);
     assert(failed.candidate_admitted == before.candidate_admitted);
@@ -11747,6 +12064,8 @@ static void test_candidate_live_size_query_failure_is_storage(void) {
     if (alert_entry) assert(edr_local_evidence_cache_record_alert_context(candidate, NULL) == 0);
     else edr_local_evidence_cache_record_behavior(candidate);
     edr_local_evidence_cache_get_status(&recovered);
+    capacity_admission_observe(path,alert_entry ? "live_query_alert" : "live_query_behavior",
+        "retry_public_record_end",&recovered,1);
     assert(recovered.candidate_admitted == before.candidate_admitted + 1u);
     assert(recovered.candidate_rejected == failed.candidate_rejected);
     assert(recovered.candidate_transaction_failures == failed.candidate_transaction_failures);
@@ -12438,9 +12757,13 @@ static void test_pressure_continuation_postwrite_refusal(int fail_rollback) {
   EdrEvidenceCacheStatus before, refused, resumed;
   edr_local_evidence_cache_get_status(&before);
   assert(before.db_bytes == 1048576u && before.wal_bytes == 0u);
+  capacity_admission_observe(path,fail_rollback ? "rollback_unconfirmed" : "postwrite_limit",
+      "pre_record",&before,1);
   if (fail_rollback) edr_local_evidence_cache_test_fail_next_capacity_rollbacks(1u);
   assert(edr_local_evidence_cache_record_alert_context(incoming,&facts) < 0);
   edr_local_evidence_cache_get_status(&refused);
+  capacity_admission_observe(path,fail_rollback ? "rollback_unconfirmed" : "postwrite_limit",
+      "refused_public_record_end",&refused,1);
   assert(refused.candidate_transaction_failures == before.candidate_transaction_failures+1u);
   unsigned reason = fail_rollback ? EDR_EVIDENCE_FAILURE_STORAGE : EDR_EVIDENCE_FAILURE_CAPACITY;
   assert(refused.candidate_failure_reasons[reason] == before.candidate_failure_reasons[reason]+1u);
@@ -12455,10 +12778,14 @@ static void test_pressure_continuation_postwrite_refusal(int fail_rollback) {
     assert(strstr(refused.last_error,"rollback did not finish"));
     for (unsigned turn = 0; turn < 100u; ++turn) edr_local_evidence_cache_poll_maintenance();
     edr_local_evidence_cache_get_status(&resumed);
+    capacity_admission_observe(path,"rollback_unconfirmed","maintenance_held",&resumed,1);
     assert(resumed.maintenance_runs == refused.maintenance_runs);
     parent_fixture_owner_hash(db,protected->pid,after_hash); assert(!strcmp(protected_hash,after_hash));
     edr_local_evidence_cache_close();
     assert(edr_local_evidence_cache_open_with_policy(path,16u,1u,1u) == 0);
+    /* Preserve this older fixture's recovery budget and expose the change;
+     * it does not establish same-capacity reopen after unconfirmed rollback. */
+    capacity_admission_observe(path,"rollback_unconfirmed","reopened_fixture_cap_16mib",NULL,1);
     assert(compact_scalar(db,"SELECT COUNT(*) FROM p0_candidates WHERE pid=99104") == 0);
     parent_fixture_owner_hash(db,protected->pid,after_hash); assert(!strcmp(protected_hash,after_hash));
     printf("pressure_continuation_rollback_failure storage=1 capacity=0 scheduled=0 original_owner_preserved=1\n");
@@ -12467,6 +12794,7 @@ static void test_pressure_continuation_postwrite_refusal(int fail_rollback) {
   s_test_monotonic_ns += UINT64_C(1000000000);
   edr_local_evidence_cache_test_set_retention_monotonic_ms(3604000);
   edr_local_evidence_cache_poll_maintenance(); edr_local_evidence_cache_get_status(&resumed);
+  capacity_admission_observe(path,"postwrite_limit","same_cap_maintenance_resumed",&resumed,1);
   fprintf(stderr,"pressure_continuation_postwrite pre_runs=%llu refused_runs=%llu next_runs=%llu retired=%llu->%llu txfail=%llu->%llu\n",
       (unsigned long long)before.maintenance_runs,(unsigned long long)refused.maintenance_runs,
       (unsigned long long)resumed.maintenance_runs,(unsigned long long)refused.retention_groups_retired,
@@ -14619,6 +14947,8 @@ static void test_accounting_generation_reopen(void) {
   puts("accounting_generation reopen=1 failed_open=1 same_open_stable=1 saturated_unknown_not_reused=1");
 }
 
+#include "retirement_delete_atomicity_cases.h"
+
 static void test_phase2_commit_fairness_and_backoff(void) {
   const int64_t now=INT64_C(1700000000000000000),old=now-INT64_C(360000000000000);
   char path[512],before_hash[65],after_hash[65];sqlite3 *db=NULL;
@@ -14681,6 +15011,17 @@ static void test_phase2_commit_fairness_and_backoff(void) {
 /* An already retired owner must not lose its continuation merely because the
  * next rotating TTL stage consumes a slice. The oversized optional copy is
  * intentionally held by the existing byte budget, without delaying SQLite. */
+/* Explicit diagnostic entry only: flushed boundaries survive a supervisor
+ * timeout. Keep this out of both the normal suite and cost comparisons. */
+static int s_phase2_diagnostic;
+static void phase2_diagnostic_stage(const char *stage) {
+  if (!s_phase2_diagnostic) return;
+  printf("phase2_stage stage=%s monotonic_ns=%llu vfs_read_bytes=%llu vfs_write_bytes=%llu\n",
+      stage, (unsigned long long)soak_monotonic_ns(),
+      (unsigned long long)retention_bench_reads, (unsigned long long)retention_bench_writes);
+  fflush(stdout);
+}
+
 static void test_phase2_continues_across_ttl(int benchmark) {
   const int64_t now=INT64_C(1700000000000000000), old=now-INT64_C(360000000000000);
   char path[512], before_hash[65], after_hash[65]; sqlite3 *db=NULL;
@@ -14690,6 +15031,7 @@ static void test_phase2_continues_across_ttl(int benchmark) {
   vfs.zName="phase2-scheduler-comparison";vfs.pNext=NULL;
   vfs.szOsFile+=(int)sizeof(RetentionBenchFile);vfs.xOpen=retention_bench_open;
   assert(sqlite3_vfs_register(&vfs,1)==SQLITE_OK);
+  phase2_diagnostic_stage("prepare_begin");
   assert(make_test_sqlite_path(path,sizeof(path))==0);
   edr_local_evidence_cache_test_set_now_unix_ns(now);
   s_test_monotonic_ns=UINT64_C(1000000000);
@@ -14706,6 +15048,7 @@ static void test_phase2_continues_across_ttl(int benchmark) {
       "INSERT INTO process_cache(endpoint_id,pid,name,last_seen_ns) VALUES('oversize-ttl',1,printf('%05000000d',1),1);");
   retention_ref_fixture(db,"phase2-keeper","phase2-f00001",old);
   assert(edr_context_store_open(&store,db)==0);
+  phase2_diagnostic_stage("proof_begin");
   unsigned proof_turns=0;
   while(!compact_scalar(db,"SELECT COUNT(*) FROM context_retirement_progress WHERE phase=2")) {
     compact_exec(db,"BEGIN IMMEDIATE;");
@@ -14719,6 +15062,7 @@ static void test_phase2_continues_across_ttl(int benchmark) {
   assert(before.db_bytes+before.wal_bytes<512u*1024u*1024u);
   unsigned turns=0, active_turns=0; uint64_t poll_wall=0,poll_cpu=0,poll_reads=0,poll_writes=0;
   s_test_monotonic_ns+=UINT64_C(60000000000);
+  phase2_diagnostic_stage("maintenance_begin");
   while(compact_scalar(db,"SELECT COUNT(*) FROM context_retirement_progress WHERE phase=2") && turns<(benchmark ? 2000u : 80u)) {
     uint64_t started=soak_monotonic_ns();clock_t cpu=clock();
     uint64_t reads=retention_bench_reads,writes=retention_bench_writes;
@@ -14734,6 +15078,7 @@ static void test_phase2_continues_across_ttl(int benchmark) {
     if(!benchmark) assert(after.maintenance_runs==before.maintenance_runs+1u);
     before=after; s_test_monotonic_ns+=benchmark ? UINT64_C(1000000000) : UINT64_C(1000000);
   }
+  phase2_diagnostic_stage("verification_begin");
   assert(compact_scalar(db,"SELECT COUNT(*) FROM context_retirement_progress WHERE phase=2")==0);
   assert(compact_scalar(db,"SELECT COUNT(*) FROM process_cache WHERE endpoint_id='oversize-ttl'")==1);
   compact_startup_rowset_hash(db,"SELECT * FROM materialized_artifacts WHERE candidate_id='phase2-keeper' ORDER BY artifact_id",after_hash);
@@ -14741,10 +15086,12 @@ static void test_phase2_continues_across_ttl(int benchmark) {
   printf("phase2_ttl refs=%lld turns=%u active_turns=%u owner_interval_ms=%u poll_wall_us=%llu poll_cpu_us=%llu poll_read_bytes=%llu poll_write_bytes=%llu keeper=%s\n",(long long)initial,turns,active_turns,benchmark ? 1000u : 1u,
       (unsigned long long)(poll_wall/1000u),(unsigned long long)(poll_cpu*1000000u/CLOCKS_PER_SEC),
       (unsigned long long)poll_reads,(unsigned long long)poll_writes,after_hash);
+  phase2_diagnostic_stage("close_begin");
   assert(sqlite3_close(db)==SQLITE_OK);edr_local_evidence_cache_close();cleanup_test_sqlite_path(path);
   edr_local_evidence_cache_test_set_now_unix_ns(0);s_test_monotonic_ns=UINT64_C(1000000000);
   assert(sqlite3_vfs_register(retention_bench_vfs_parent,1)==SQLITE_OK);
   assert(sqlite3_vfs_unregister(&vfs)==SQLITE_OK);
+  phase2_diagnostic_stage("complete");
 }
 #endif
 
@@ -15232,12 +15579,24 @@ static void test_window_entry_order_and_recovery(int enforce) {
 }
 #endif
 
+#include "retained_context_recall_cases.h"
 #include "window_recovery_budget_cases.h"
 
 int main(int argc, char **argv) {
 #if defined(EDR_HAVE_SQLITE)
   if(argc==2 && (!strcmp(argv[1],"--window-recovery-budget") || !strcmp(argv[1],"--window-recovery-budget-probe"))) {
     test_window_recovery_budget(!strcmp(argv[1],"--window-recovery-budget")); return 0;
+  }
+#endif
+#if defined(EDR_HAVE_SQLITE)
+  if(argc==2 && (!strcmp(argv[1],"--retained-context-recall") || !strcmp(argv[1],"--retained-context-probe"))) {
+    int enforce=!strcmp(argv[1],"--retained-context-recall");
+    test_retained_context_recall(enforce);
+    if(enforce) {
+      test_retained_context_unknown_actor(); test_retained_context_adjacent_ns();
+      test_retained_context_scientific_time();
+    }
+    return 0;
   }
 #endif
 #if defined(EDR_HAVE_SQLITE)
@@ -15263,14 +15622,28 @@ int main(int argc, char **argv) {
   if (argc==2 && (!strcmp(argv[1],"--window-lifecycle-probe") || !strcmp(argv[1],"--window-lifecycle-contract"))) { test_window_entry_order_and_recovery(!strcmp(argv[1],"--window-lifecycle-contract")); if (!strcmp(argv[1],"--window-lifecycle-contract")) test_window_recovery_failures_and_frozen_policy(); return 0; }
 #endif
 #if defined(EDR_HAVE_SQLITE)
+  if (argc==2 && !strcmp(argv[1],"--retirement-delete-atomicity")) {
+    test_retirement_delete_failure_boundaries(); return 0;
+  }
   if (argc==2 && !strcmp(argv[1],"--phase2-continuation")) {
     test_phase2_continues_across_ttl(0);test_phase2_commit_fairness_and_backoff();test_accounting_generation_reopen();return 0;
+  }
+  if (argc==2 && !strcmp(argv[1],"--retention-cost-diagnostic")) {
+    test_retention_cost_diagnostic();return 0;
+  }
+#ifdef EDR_RETENTION_SYNC_ATTRIBUTION
+  if (argc==2 && !strcmp(argv[1],"--sync-probe-contract")) return rs_contract()==0 ? 0 : 1;
+#endif
+  if (argc==2 && !strcmp(argv[1],"--phase2-diagnostic")) {
+    s_phase2_diagnostic=1;test_phase2_continues_across_ttl(0);return 0;
   }
   if (argc==2 && !strcmp(argv[1],"--phase2-scheduling-benchmark")) {
     test_phase2_continues_across_ttl(1); return 0;
   }
   if (argc == 2 && !strcmp(argv[1], "--context-writer-reuse")) {
     test_context_writer_transaction_reuse();
+    test_context_fanout_owner_set_is_atomic();
+    test_context_fanout_owner_set_maximum();
     test_post_context_exact_replay_charges_only_durable_changes();
     test_critical_context_high_fanout_is_atomically_bounded();
     test_candidate_commit_failure_leaves_no_dedupe_or_context_state();
@@ -15315,6 +15688,22 @@ int main(int argc, char **argv) {
   s_test_executable = argv[0];
 #endif
 #if defined(EDR_HAVE_SQLITE)
+  if (argc == 2 && strcmp(argv[1], "--capacity-admission-contract") == 0) {
+    s_capacity_admission_observe = 1;
+    test_existing_candidate_update_honors_capacity();
+    test_candidate_live_size_query_failure_is_storage();
+    test_pressure_continuation_postwrite_refusal(0);
+    test_pressure_continuation_postwrite_refusal(1);
+    test_candidate_commit_failure_leaves_no_dedupe_or_context_state();
+    test_physical_floor_rejects_evidence_copy();
+    printf("capacity_admission_contract cases=7 observations=%u observation_limit=64 "
+        "prewrite_db_wal_admission=1 candidate_precommit_live_limit=1 "
+        "strict_post_db_wal_limit=0 exact_commit_observed=0 peak_bound_proven=0 "
+        "rollback_unconfirmed_reopen_limit_mib=16 same_cap_rollback_reopen_proven=0\n",
+        s_capacity_admission_observations);
+    assert(fflush(stdout) == 0);
+    return 0;
+  }
   if (argc == 2 && strcmp(argv[1], "--startup-logical-budget-public512") == 0) {
     test_startup_logical_budget_legacy(1,0,512u); return 0;
   }
@@ -15477,6 +15866,7 @@ int main(int argc, char **argv) {
   RUN_CACHE_CASE("context", test_window_recovery_budget(1));
   RUN_CACHE_CASE("retention", test_phase2_continues_across_ttl(0));
   RUN_CACHE_CASE("retention", test_phase2_commit_fairness_and_backoff());
+  RUN_CACHE_CASE("retention", test_retirement_delete_failure_boundaries());
   for (int scenario = 0; scenario < 9; ++scenario) {
     RUN_CACHE_CASE("context", test_candidate_alert_source_ownership(scenario));
   }
@@ -15512,6 +15902,10 @@ int main(int argc, char **argv) {
   RUN_CACHE_CASE("context", test_metrics_commit_failure_close_and_retention_boundary());
   RUN_CACHE_CASE("retention", test_selected_window_and_command_fact_dependencies());
   RUN_CACHE_CASE("retention", test_authorized_query_scope_and_absence());
+  RUN_CACHE_CASE("retention", test_retained_context_recall(1));
+  RUN_CACHE_CASE("retention", test_retained_context_unknown_actor());
+  RUN_CACHE_CASE("retention", test_retained_context_adjacent_ns());
+  RUN_CACHE_CASE("retention", test_retained_context_scientific_time());
   RUN_CACHE_CASE("retention", test_physical_floor_rejects_evidence_copy());
   RUN_CACHE_CASE("retention", test_maintenance_query_copy_slices());
   RUN_CACHE_CASE("retention", test_physical_floor_holds_maintenance_and_startup());
@@ -15582,6 +15976,8 @@ int main(int argc, char **argv) {
   RUN_CACHE_CASE("context", test_invalid_legacy_post_context_rolls_back_normalization());
   RUN_CACHE_CASE("retention", test_context_write_budget_cannot_starve_later_candidate());
   RUN_CACHE_CASE("retention", test_post_context_exact_replay_charges_only_durable_changes());
+  RUN_CACHE_CASE("retention", test_context_fanout_owner_set_is_atomic());
+  RUN_CACHE_CASE("retention", test_context_fanout_owner_set_maximum());
   RUN_CACHE_CASE("retention", test_critical_context_high_fanout_is_atomically_bounded());
   RUN_CACHE_CASE("migration", test_incremental_cache_migration_recovers_from_blockers());
   RUN_CACHE_CASE("context", test_startup_cache_context_filter_preserves_risk_and_boundaries());

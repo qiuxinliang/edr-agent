@@ -1,6 +1,6 @@
 # Native contracts and storage comparisons before a candidate release. Contract
 # dependencies are built; private compiled tools preserve their actual gate outcome.
-# Failed-gate tools are restricted to the two fixed isolated reclaim contracts.
+# Failed-gate tools are restricted to fixed isolated reclaim/phase-2 diagnostics.
 # No product packaging, release or endpoint access. A manual opt-in diagnosis
 # may create one disposable ARM64 SCM service from an unshipped diagnostic build.
 name: Evidence retention native comparison
@@ -19,6 +19,11 @@ on:
         default: false
       diagnose_pipeline_backlog:
         description: 'Run bounded ARM64 library backlog profiles; no Service, release or endpoint'
+        type: boolean
+        required: false
+        default: false
+      diagnose_retention_cost:
+        description: 'Validate the latency clock and attribute two fixed ARM64 retention cases; no gate override'
         type: boolean
         required: false
         default: false
@@ -178,6 +183,14 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Windows release gate dependency regression failed' }
           python -B tests/test_pcre2_cmake_gate.py PCRE2CMakeGateTests.test_static_matcher_header_wins_over_shared_dependency_prefix -v
           if ($LASTEXITCODE -ne 0) { throw 'Windows PCRE2 header isolation regression failed' }
+      - name: Verify native cost clock without process-metric contamination
+        if: ${{ inputs.diagnose_retention_cost == true }}
+        timeout-minutes: 8
+        shell: pwsh
+        run: |
+          $prefix = Join-Path $env:GITHUB_WORKSPACE 'vcpkg_installed/${{ matrix.triplet }}'
+          python -B tests/run_evidence_cost_clock_contract.py --output "$env:RUNNER_TEMP/cost-clock-contract" --dependency-prefix "$prefix" --native-machine '${{ matrix.arch }}'
+          if ($LASTEXITCODE -ne 0) { throw 'Native cost clock regression failed; original and corrected observations retained' }
       - name: Build and execute actual native release and telemetry contracts
         id: contracts
         shell: pwsh
@@ -202,6 +215,12 @@ jobs:
           $opensslTools = Join-Path $prefix 'tools/openssl'
           & .\tests\run_telemetry_windows_native.ps1 -BuildDir contract-build -Configuration Release -OpenSslBin $opensslTools -IncludeReleaseGate
           if ($LASTEXITCODE -ne 0) { throw 'Actual native release and telemetry contracts failed before comparison' }
+      - name: Attribute bounded ARM64 retention preparation and operation cost
+        if: ${{ always() && github.event_name == 'workflow_dispatch' && inputs.diagnose_retention_cost && matrix.arch == 'arm64' }}
+        shell: pwsh
+        run: |
+          python -B tests/run_retention_cost_diagnostic.py --build-dir contract-build --output "$env:RUNNER_TEMP/retention-cost-diagnosis"
+          if ($LASTEXITCODE -ne 0) { throw 'Retention cost diagnosis unavailable or incomplete; original gate outcome retained' }
       # Temporary diagnosis for the observed C: xSync timeout. Keep a failed
       # normal gate failed; this A/B measurement cannot grant release status.
       - name: Diagnose AMD64 pressure temporary-volume boundary
@@ -637,5 +656,9 @@ jobs:
             ${{ runner.temp }}/retention-sliced-contract/*.log
             ${{ runner.temp }}/queue-critical-load/*.log
             ${{ runner.temp }}/queue-critical-load/*.json
+            ${{ runner.temp }}/retention-cost-diagnosis/*.json
+            ${{ runner.temp }}/retention-cost-diagnosis/*.log
+            ${{ runner.temp }}/cost-clock-contract/**/*.json
+            ${{ runner.temp }}/cost-clock-contract/**/*.log
             ${{ runner.temp }}/pressure-temp-diagnosis/*.json
             ${{ runner.temp }}/pressure-temp-diagnosis/*.log

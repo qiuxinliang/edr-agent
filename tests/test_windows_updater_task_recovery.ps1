@@ -7,7 +7,7 @@ Set-StrictMode -Version Latest
 $tokens=$null;$errors=$null
 $ast=[Management.Automation.Language.Parser]::ParseFile($UpdaterPath,[ref]$tokens,[ref]$errors)
 if($errors.Count){throw 'updater_parse_failed'}
-foreach($name in @('Get-AgentTaskFolder','Save-AgentTaskDefinition','Test-AgentTaskSecurityDescriptor','Restore-AgentTaskDefinition','Write-AtomicJson','Get-Sha256','Confirm-FullInstallerQuiesced')){
+foreach($name in @('Get-AgentTaskFolder','Save-AgentTaskDefinition','Test-AgentTaskSecurityDescriptor','Restore-AgentTaskDefinition','Write-AtomicJson','Get-Sha256','Confirm-FullInstallerQuiesced','Assert-RollbackRuntimeIdentity','Assert-InstalledRuntimeIdentity','Test-SupportedNativeRuntimeComponent')){
   $defs=@($ast.FindAll({param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name},$true))
   if($defs.Count -ne 1){throw "missing_recovery_owner_$name"}
   Invoke-Expression $defs[0].Extent.Text
@@ -36,7 +36,7 @@ $fullInstallerTaskBackupPath=Join-Path $root 'task.json'
 $journalPath=Join-Path $root 'transaction.json'
 $fullInstallerConfigBackupPath=Join-Path $root 'absent-config'
 $fullInstallerBackupPath=Join-Path $root 'fixture-backup';$installFull=$root
-$currentPath=Join-Path $root 'restored.bin';[IO.File]::WriteAllText($currentPath,'public old runtime')
+$currentPath=Join-Path $root 'FDSensor.exe';[IO.File]::WriteAllText($currentPath,'public old runtime')
 $marker=Join-Path $root 'started.txt'
 $resolvedDeploymentMode='scheduled_task';$ServiceName='unused-fixture'
 $StartupTimeoutSeconds=10;$HealthObserveMs=1000;$failureMessage='fixture_install_task_timeout'
@@ -54,6 +54,15 @@ try{
   $originalXml=[string]$original.Xml;$originalSddl=[string]$original.GetSecurityDescriptor(7)
   $hash=Save-AgentTaskDefinition -TaskName $ScheduledTaskName -TaskPath '\' -Path $fullInstallerTaskBackupPath
   $journal=@{full_installer_task_backup_sha256=$hash;installer_job_name=('Global\FDSecurity.Installer.'+$tag);installer_quiesced=$false}
+  $manifestPath=Join-Path $root 'native-package-integrity.json'
+  $files=foreach($name in @('FDSecurityInstallerWorker.exe','uninstall.exe')){
+    $path=Join-Path $root $name
+    [IO.File]::WriteAllText($path,'old component')
+    @{name=$name;sha256=(Get-Sha256 $path)}
+  }
+  [IO.File]::WriteAllText($manifestPath,(@{schema='edr.windows.native-package-integrity.v1';files=$files}|ConvertTo-Json -Depth 3))
+  $journal.previous_sha256=Get-Sha256 $currentPath
+  $journal.previous_runtime_identity_sha256=Get-Sha256 $manifestPath
   $fullInstallerLegacyWaitCompleted=$false
   # Job termination is the external boundary of this Task/ACL fixture. Execute
   # the real quiescence function with an explicit owner result; the dedicated
@@ -104,6 +113,24 @@ try{
   Check (-not $script:mirrored -and $script:stopCalls -eq 0 -and $script:startCalls -eq 0 -and -not $journal.installer_quiesced) 'writer_failure_prevents_runtime_and_task_start'
   Check (@(Get-ScheduledTask | Where-Object {$_.TaskName -ceq $ScheduledTaskName}).Count -eq 0) 'writer_failure_prevents_task_registration'
   $script:barrierReject=$false
+  $workerPath=Join-Path $root 'FDSecurityInstallerWorker.exe'
+  foreach($item in @($currentPath,$manifestPath,$workerPath)){
+    $bytes=[IO.File]::ReadAllBytes($item);$modified=[IO.File]::GetLastWriteTimeUtc($item)
+    $changed=$bytes.Clone();$changed[0]=$changed[0] -bxor 1
+    [IO.File]::WriteAllBytes($item,$changed);[IO.File]::SetLastWriteTimeUtc($item,$modified)
+    $report=@{status='failed';error=$failureMessage}
+    & $newBody
+    Check ($report.rollback -ceq 'failed' -and $report.error.StartsWith($failureMessage) -and $script:startCalls -eq 0) 'same_metadata_corruption_blocks_start_and_retains_cause'
+    Check (@(Get-ScheduledTask -TaskName $ScheduledTaskName -ErrorAction SilentlyContinue).Count -eq 0) 'identity_rejected_before_registration'
+    [IO.File]::WriteAllBytes($item,$bytes)
+  }
+  $pin=$journal.previous_runtime_identity_sha256
+  $journal.Remove('previous_runtime_identity_sha256')
+  $journal.expected_runtime_identity_sha256=$pin
+  $report=@{status='failed';error=$failureMessage}
+  & $newBody
+  Check ($report.error -like '*requires the pre-update*' -and $script:startCalls -eq 0) 'legacy_missing_pin_cannot_substitute_target'
+  $journal.previous_runtime_identity_sha256=$pin
   $report=@{status='failed';error=$failureMessage};$script:mirrored=$false
   & $newBody
   if($report.rollback -ne 'succeeded'){
@@ -169,10 +196,11 @@ try{
   # after old runtime bytes have already been restored before a crash.
   $copy=@($ast.FindAll({param($n) $n -is [Management.Automation.Language.ForEachStatementAst] -and $n.Variable.VariablePath.UserPath -ceq 'field' -and $n.Extent.Text.Contains('full_installer_task_backup_sha256')},$true))
   Check ($copy.Count -eq 1) 'journal_restore_owner'
-  $prior=[pscustomobject]@{full_installer_task_backup_sha256=$hash;stage='rollback_full_installer_started';updated_at='2026-01-01T00:00:00Z'}
-  $priorProperties=@('full_installer_task_backup_sha256');$journal=@{}
+  $prior=[pscustomobject]@{full_installer_task_backup_sha256=$hash;previous_sha256=$journal.previous_sha256;previous_runtime_identity_sha256=$pin;stage='rollback_full_installer_started';updated_at='2026-01-01T00:00:00Z'}
+  $priorProperties=@($prior.PSObject.Properties.Name);$journal=@{}
   . ([scriptblock]::Create($copy[0].Extent.Text))
   Check ($journal.full_installer_task_backup_sha256 -ceq $hash) 'journal_restores_snapshot_digest'
+  Assert-RollbackRuntimeIdentity -Directory $root -Journal $journal
   $route=@($ast.FindAll({param($n) $n -is [Management.Automation.Language.IfStatementAst] -and $n.Clauses[0].Item1.Extent.Text.Contains('$currentMatchesCandidate') -and $n.Clauses[0].Item1.Extent.Text.Contains('rollback_*')},$true))
   Check ($route.Count -eq 1) 'full_rollback_resume_owner'
   $UpgradeClass='installer_required';$currentMatchesCandidate=$false;$fullInstallerStarted=$false

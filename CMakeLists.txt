@@ -878,6 +878,12 @@ endif()
 edr_apply_common_warnings(edr_agent)
 
 if(WIN32)
+  find_package(Python3 REQUIRED COMPONENTS Interpreter)
+  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+    scripts/installer_job/InstallerJob.cs scripts/installer_job/embed.py)
+  execute_process(COMMAND "${Python3_EXECUTABLE}" -I -B
+    "${CMAKE_CURRENT_SOURCE_DIR}/scripts/installer_job/embed.py"
+    COMMAND_ERROR_IS_FATAL ANY)
   configure_file(${CMAKE_CURRENT_SOURCE_DIR}/scripts/edr_agent_inplace_update.ps1
     ${CMAKE_CURRENT_BINARY_DIR}/edr_agent_inplace_update.ps1 COPYONLY)
   target_compile_definitions(edr_agent PRIVATE EDR_OS_WINDOWS=1)

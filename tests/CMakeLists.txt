@@ -19,6 +19,13 @@ find_package(Python3 REQUIRED COMPONENTS Interpreter)
 add_test(NAME evidence_storage_inventory
   COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/test_evidence_storage_inventory.py)
 set_tests_properties(evidence_storage_inventory PROPERTIES TIMEOUT 30)
+if(APPLE OR WIN32)
+  # The frozen-copy tool requires macOS descriptor paths or Windows pinned
+  # handles. Other SQLite VFS implementations fail closed until validated.
+  add_test(NAME evidence_legacy_archive
+    COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/test_evidence_legacy_archive.py)
+  set_tests_properties(evidence_legacy_archive PROPERTIES TIMEOUT 30)
+endif()
 add_test(NAME evidence_ownership_contract
   COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/test_evidence_ownership_contract.py)
 set_tests_properties(evidence_ownership_contract PROPERTIES TIMEOUT 30)
@@ -1666,6 +1673,20 @@ target_link_libraries(test_local_evidence_cache_candidate PRIVATE edr_egress_pol
 edr_apply_test_warnings(test_local_evidence_cache_candidate)
 add_test(NAME local_evidence_cache_candidate COMMAND test_local_evidence_cache_candidate --suite context WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 if(SQLite3_FOUND)
+  # Only this explicitly built diagnostic wraps SQLite calls. The production
+  # owner and normal contract binary retain their original sources and flags.
+  get_target_property(retention_sync_sources test_local_evidence_cache_candidate SOURCES)
+  list(REMOVE_ITEM retention_sync_sources ${CMAKE_SOURCE_DIR}/src/storage/local_evidence_cache.c)
+  add_executable(test_retention_sync_attribution EXCLUDE_FROM_ALL
+    ${retention_sync_sources} ${CMAKE_CURRENT_SOURCE_DIR}/retention_sync_storage.c)
+  target_include_directories(test_retention_sync_attribution PRIVATE
+    $<TARGET_PROPERTY:test_local_evidence_cache_candidate,INCLUDE_DIRECTORIES>)
+  target_compile_definitions(test_retention_sync_attribution PRIVATE
+    $<TARGET_PROPERTY:test_local_evidence_cache_candidate,COMPILE_DEFINITIONS>
+    EDR_RETENTION_SYNC_ATTRIBUTION=1)
+  target_link_libraries(test_retention_sync_attribution PRIVATE
+    $<TARGET_PROPERTY:test_local_evidence_cache_candidate,LINK_LIBRARIES>)
+  edr_apply_test_warnings(test_retention_sync_attribution)
   # An explicitly requested diagnostic, not a passing CTest. Exit 1 reports
   # the known identical-source replay gap after physical candidate retirement.
   get_target_property(retired_replay_sources test_local_evidence_cache_candidate SOURCES)

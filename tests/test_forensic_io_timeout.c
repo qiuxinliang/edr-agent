@@ -8,8 +8,10 @@
 #ifdef _WIN32
 #include <windows.h>
 #include <direct.h>
+#include <process.h>
 #else
 #include <unistd.h>
+#include <sys/wait.h>
 #endif
 static uint64_t now_ms(void) {
 #ifdef _WIN32
@@ -21,7 +23,8 @@ static uint64_t now_ms(void) {
 static int cancel_now(void *p) {(void)p;return 1;}
 int main(int argc,char **argv) {
   if(argc==3 && !strcmp(argv[1],EDR_FORENSIC_WORKER_ARG))return edr_forensic_io_worker_main(argv[2]);
-  assert(argc==1);char root[700];
+  int unconfirmed=argc==2 && !strcmp(argv[1],"--unconfirmed-stop");
+  assert(argc==1 || unconfirmed);char root[700];
 #ifdef _WIN32
   char temp[600];assert(GetTempPathA(sizeof(temp),temp));assert(GetTempFileNameA(temp,"efi",0,root));assert(DeleteFileA(root));assert(!_mkdir(root));
 #else
@@ -29,6 +32,17 @@ int main(int argc,char **argv) {
 #endif
   EdrForensicIoRequest q={0};EdrForensicIoResult result={0};q.version=EDR_FORENSIC_IO_VERSION;q.operation=1;q.timeout_ms=2000;
   strcpy(q.manifest,"synthetic evidence; hard deadline contract\n");
+  if(unconfirmed) {
+    snprintf(q.workspace,sizeof(q.workspace),"%s/first",root);
+    snprintf(q.staging,sizeof(q.staging),"%s/first.staging",root);
+    q.operation=1u|(7u<<8);
+    assert(edr_forensic_io_run(&q,&result,NULL,NULL)==EDR_RESPONSE_WRITER_UNCONFIRMED);
+    snprintf(q.workspace,sizeof(q.workspace),"%s/second",root);
+    snprintf(q.staging,sizeof(q.staging),"%s/second.staging",root);
+    q.operation=1;uint64_t started=now_ms();
+    assert(edr_forensic_io_run(&q,&result,NULL,NULL)==EDR_RESPONSE_WRITER_UNCONFIRMED && now_ms()-started<100);
+    puts("PASS: unconfirmed writer retains launcher admission until process restart");return 0;
+  }
   for(unsigned phase=0;phase<=5;phase++) {
     snprintf(q.workspace,sizeof(q.workspace),"%s/phase-%u",root,phase);
     snprintf(q.staging,sizeof(q.staging),"%s/phase-%u.staging",root,phase);
@@ -52,6 +66,13 @@ int main(int argc,char **argv) {
   }
   q.operation=1;assert(edr_forensic_io_run(&q,&result,cancel_now,NULL)==EDR_DC_ERR_CANCELLED);
   q.timeout_ms=0;assert(edr_forensic_io_run(&q,&result,NULL,NULL)==EDR_DC_ERR_TIMEOUT);
+#ifdef _WIN32
+  assert(_spawnl(_P_WAIT,argv[0],argv[0],"--unconfirmed-stop",NULL)==0);
+#else
+  pid_t child=fork();assert(child>=0);
+  if(!child){execl(argv[0],argv[0],"--unconfirmed-stop",(char *)NULL);_exit(127);}
+  int status=0;assert(waitpid(child,&status,0)==child && WIFEXITED(status) && WEXITSTATUS(status)==0);
+#endif
   /* The launcher, before a process exists, is also a blocking-I/O boundary.
    * Leave its pipe blocked until this test process exits: further submissions
    * must refuse immediately, never accumulate abandoned launcher threads. */

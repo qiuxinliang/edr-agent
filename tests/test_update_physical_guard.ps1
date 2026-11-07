@@ -23,6 +23,11 @@ try { Assert-UpdateFreeSpace -Path $env:TEMP -GrowthBytes 1 } catch { if($_.Exce
 if(-not $overflow){throw 'overflow accepted'}
 [UInt64]$available=0; [UInt64]$total=0; [UInt64]$free=0
 if(-not [FDSecurityUpdateDiskSpace]::GetDiskFreeSpaceExW($env:TEMP,[ref]$available,[ref]$total,[ref]$free)){throw 'native test volume probe failed'}
+if($available -eq 0 -or $available -gt $total){throw 'invalid available space for caller'}
+$missing=Join-Path $env:TEMP ([Guid]::NewGuid().ToString('N'))
+[UInt64]$ignoredAvailable=0;[UInt64]$ignoredTotal=0;[UInt64]$ignoredFree=0
+if([FDSecurityUpdateDiskSpace]::GetDiskFreeSpaceExW($missing,[ref]$ignoredAvailable,[ref]$ignoredTotal,[ref]$ignoredFree)){throw 'missing native path accepted'}
+if([Runtime.InteropServices.Marshal]::GetLastWin32Error() -notin @(2,3)){throw 'missing native path lost the Windows error'}
 [UInt64]$MinFreeBytes=$available+1GB
 $full=$false
 try { Assert-UpdateFreeSpace -Path $env:TEMP -GrowthBytes 1 } catch { if($_.Exception.Message -notlike 'insufficient disk space:*'){throw}; $full=$true }

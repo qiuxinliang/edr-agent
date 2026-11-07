@@ -121,8 +121,6 @@ function Test-CollectorBuildStaging([string] $Root) {
             $start = $text.IndexOf('$outDir = $null')
             $end = $text.IndexOf('$workerExe = Join-Path $outDir', $start)
             if ($start -lt 0 -or $end -lt 0) { throw "missing packaging prefix: $workflowName" }
-            # The manual workflow supports AMD64 only; the formal workflow covers both.
-            if ($architecture -eq 'arm64' -and $workflowName -eq 'edr-agent-client-build.yml') { continue }
             Push-Location $caseRoot
             try {
               Invoke-Expression $text.Substring($start, $end - $start)
@@ -141,10 +139,56 @@ function Test-CollectorBuildStaging([string] $Root) {
   }
 }
 
+function Test-NativeRuntimeIdentityGeneration([string] $Root) {
+  # Execute the real workflow producer with synthetic bytes, including the
+  # root DLL omitted by the d64d55d3 build-only artifact. No PE is launched.
+  $outDir = Join-Path $Root 'build'
+  New-Item -ItemType Directory -Path (Join-Path $outDir 'collector'), (Join-Path $outDir 'nested') -Force | Out-Null
+  $workerExe = Join-Path $outDir 'FDSecurityInstallerWorker.exe'
+  $uninstallerExe = Join-Path $outDir 'uninstall.exe'
+  $builtinCollectorPackagePath = Join-Path $outDir 'collector/forensic_collector_builtin.exe'
+  $expectedNames = @('FDSecurityInstallerWorker.exe', 'uninstall.exe',
+    'collector/forensic_collector_builtin.exe', 'msvcp140.dll', 'VCRUNTIME140.dll')
+  foreach ($name in @('VCRUNTIME140.dll', 'msvcp140.dll', 'nested/ignored.dll', 'ignored.txt') + $expectedNames[0..2]) {
+    [IO.File]::WriteAllText((Join-Path $outDir $name), "fixture:$name")
+  }
+  foreach ($workflowName in @('edr-agent-client-release.yml', 'edr-agent-client-build.yml')) {
+    $text = Get-Content -LiteralPath (Join-Path $RepoRoot ".github/workflows/$workflowName") -Raw
+    $start = $text.IndexOf('$nativeIntegrityPath = Join-Path $outDir')
+    $end = $text.IndexOf('$null = $items.Add($nativeIntegrityPath)', $start)
+    if ($start -lt 0 -or $end -lt 0) { throw "missing native integrity producer: $workflowName" }
+    $producer = $text.Substring($start, $end - $start)
+    Invoke-Expression $producer
+    $manifest = Get-Content -LiteralPath $nativeIntegrityPath -Raw | ConvertFrom-Json
+    if ($manifest.schema -cne 'edr.windows.native-package-integrity.v1' -or $manifest.files.Count -ne 5) {
+      throw "native identity must bind three components and both root DLLs: $workflowName"
+    }
+    for ($i = 0; $i -lt $expectedNames.Count; $i++) {
+      $entry = $manifest.files[$i]
+      $expectedHash = (Get-FileHash -LiteralPath (Join-Path $outDir $expectedNames[$i]) -Algorithm SHA256).Hash.ToLowerInvariant()
+      if ($entry.name -cne $expectedNames[$i] -or $entry.sha256 -cne $expectedHash) {
+        throw "native identity name, ordering or hash changed: $workflowName/$($expectedNames[$i])"
+      }
+    }
+    if ($workflowName -eq 'edr-agent-client-build.yml') {
+      $dllStart = $producer.IndexOf('Get-ChildItem -LiteralPath $outDir -Filter "*.dll"')
+      $dllEnd = $producer.IndexOf('[object[]]$nativeIntegrityFileArray', $dllStart)
+      if ($dllStart -lt 0 -or $dllEnd -lt 0) { throw 'missing build-only DLL producer' }
+      Invoke-Expression $producer.Remove($dllStart, $dllEnd - $dllStart)
+      $oldManifest = Get-Content -LiteralPath $nativeIntegrityPath -Raw | ConvertFrom-Json
+      if ($oldManifest.files.Count -ne 3 -or @($oldManifest.files | Where-Object { $_.name -ieq 'msvcp140.dll' }).Count -ne 0) {
+        throw 'd64d55d3 missing-DLL counterexample was not reproduced'
+      }
+    }
+  }
+  Write-Host 'PASS: actual workflow native identity binds sorted root DLL bytes; old missing-DLL producer reproduced'
+}
+
 $fixtureRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("edr-release-pe-closure-" + [guid]::NewGuid().ToString('N'))
 $previousUpgradeClass = [Environment]::GetEnvironmentVariable('EDR_UPGRADE_CLASS', 'Process')
 try {
   Test-CollectorBuildStaging (Join-Path $fixtureRoot 'staging')
+  Test-NativeRuntimeIdentityGeneration (Join-Path $fixtureRoot 'native-identity')
   $outDir = Join-Path $fixtureRoot 'build'
   $collectorDir = Join-Path $outDir 'collector'
   $tryCompileDir = Join-Path $outDir 'tests/try_compile'

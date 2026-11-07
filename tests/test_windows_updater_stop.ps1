@@ -141,6 +141,13 @@ $rollbackBody=[scriptblock]::Create($body.Substring(1,$body.Length-2))
 function Test-Path { [CmdletBinding()]param([string]$LiteralPath,[string]$PathType);return $false }
 function Set-UpdateStage([string]$Stage,[string]$Status){$script:lastStage=$Stage}
 function Invoke-FullInstallerRuntimeMirror([string]$Source,[string]$Destination,[string]$Stage){$script:mirrors++}
+# The task recovery fixture exercises real file digests. This SCM fixture
+# injects the identity outcome alongside its existing file/mirror substitutes.
+function Assert-RollbackRuntimeIdentity {param($Directory,$Journal)
+  if($script:flowCase -eq 'backup_identity_failure'){throw 'fixture_backup_hash_mismatch'}
+}
+$script:flowCase=''
+$journal=@{}
 function Start-AgentRuntime {param($Mode,$TaskName,$TaskPath,$WindowsServiceName,$ExecutablePath,$TimeoutSeconds);$script:starts++}
 function Wait-AgentHealthObservation {param($Mode,$TaskName,$TaskPath,$WindowsServiceName,$ExecutablePath,$ObserveForMs);$script:healthChecks++}
 function Get-Sha256([string]$Path){return 'public-restored-hash'}
@@ -256,7 +263,7 @@ foreach($name in @('Assert-UpdateStartDeadline','Get-UnixTimeMilliseconds')) {
 $DeadlineUnixMs=[UInt64]2;$updateDeadlineProvided=$false;$recoveringUpdate=$false
 $installerResults=New-Object 'System.Collections.Generic.List[object]'
 foreach($mode in @('scheduled_task','service')){
-  foreach($flowCase in @('success','backup_failure','task_backup_failure','deadline_expired','stop_failure','inventory_failure','interrupted')){
+  foreach($flowCase in @('success','backup_failure','backup_identity_failure','task_backup_failure','deadline_expired','stop_failure','inventory_failure','interrupted')){
     if($mode -eq 'service' -and $flowCase -eq 'task_backup_failure'){continue}
     $script:flowCase=$flowCase;$resolvedDeploymentMode=$mode
     $updateDeadlineProvided=$flowCase -eq 'deadline_expired'
@@ -280,6 +287,7 @@ foreach($mode in @('scheduled_task','service')){
     switch($flowCase){
       'success'{Check ($null -eq $failure -and $report.status -ceq 'succeeded' -and $script:installStops -eq 1 -and $script:installerCalls -eq 1 -and $script:healthChecks -eq 1 -and $script:restores -eq 0) ("quiesce_then_inventory_then_health: mode={0}; first_failure={1}" -f $mode,$failure)}
       'backup_failure'{Check ($failure -ceq 'fixture_backup_failed' -and $script:installStops -eq 0 -and $script:installerCalls -eq 0 -and $script:restores -eq 0) 'backup_failure_keeps_owner_running'}
+      'backup_identity_failure'{Check ($failure -ceq 'fixture_backup_hash_mismatch' -and $script:backupReady -and $script:installStops -eq 0 -and $script:installerCalls -eq 0 -and -not $journal['stop_intent']) 'unverified_backup_keeps_owner_running'}
       'task_backup_failure'{Check ($failure -ceq 'fixture_task_backup_failed' -and $script:installStops -eq 0 -and $script:installerCalls -eq 0 -and $script:restores -eq 0) 'task_snapshot_failure_keeps_owner_running'}
       'deadline_expired'{Check ($failure -ceq 'UPDATE_DEADLINE_EXPIRED|runtime_stop_not_started' -and -not $fullInstallerStarted -and $script:installStops -eq 0 -and $script:installerCalls -eq 0 -and $script:restores -eq 0) 'expired_admission_keeps_owner_running'}
       'stop_failure'{Check ($failure -ceq 'fixture_stop_failed' -and $script:installerCalls -eq 0 -and $script:restores -eq 0 -and $script:starts -eq 0 -and $report.rollback -ceq 'failed') 'stop_failure_never_installs_or_restores'}

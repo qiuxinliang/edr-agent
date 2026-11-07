@@ -50,6 +50,13 @@ int main(int argc, char **argv) {
   assert(sqlite3_open(path,&db)==SQLITE_OK);
   retention_group_fixture(db,"recall-one",1,now-1,now-1,now-1);
   compact_exec(db,"UPDATE p0_candidates SET source_completeness='COMPLETE';");
+  /* Retirement fixtures contain an opaque preservation marker. The real
+   * retained-context reader must reject it, even when its candidate is complete. */
+  assert(edr_local_evidence_cache_query_authorized_json(auth->command_id,&meta,output,sizeof(output))<0);
+  assert(strstr(output,"pre-context identity invalid"));
+  compact_exec(db,"UPDATE artifacts SET manifest_json=json_object('schema','p0_context_bundle.v1',"
+      "'candidate_id',candidate_id,'endpoint_id',endpoint_id,'context',json('[]')) "
+      "WHERE candidate_id='recall-one' AND artifact_type='p0_context_bundle';");
   assert(edr_local_evidence_cache_query_authorized_json(auth->command_id,&meta,output,sizeof(output))==0);
   check_recall(output,"unknown",1); /* A complete row cannot prove continuous collection. */
   compact_exec(db,"UPDATE p0_candidates SET source_completeness='TRUNCATED',source_truncated_fields='source.cmdline';");

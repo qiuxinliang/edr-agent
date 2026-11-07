@@ -137,13 +137,81 @@ class WindowsReleaseGateTests(unittest.TestCase):
         names = [re.search(pattern, source).group(1) for pattern in (
             r'\$zip = "([^"]+)"', r'\$src = "([^"]+)"',
             r'name: (edr-agent-windows-[^\r\n]+)')]
-        for branch in ("codex/evidence-cache-io-lifecycle", "main"):
-            resolved = [name.replace("${{ github.ref_name }}", branch)
-                        .replace("${{ github.sha }}", "a" * 40) for name in names]
-            self.assertEqual(resolved[0], resolved[1], "archive producer and consumer must agree")
-            for name in resolved:
-                self.assertNotRegex(name, r'[\\/:*?"<>|\r\n]', "Windows path and artifact names must be single safe components")
-                self.assertNotIn("${{", name, "fixture must resolve every identity input")
+        for architecture in ("amd64", "arm64"):
+            for branch in ("codex/evidence-cache-io-lifecycle", "main"):
+                resolved = [name.replace("${{ github.ref_name }}", branch)
+                            .replace("${{ github.sha }}", "a" * 40)
+                            .replace("$env:EDR_RELEASE_ARCH", architecture) for name in names]
+                self.assertEqual(resolved[0], resolved[1], "archive producer and consumer must agree")
+                self.assertIn(f"windows-{architecture}-exe.zip", resolved[0])
+                for name in resolved:
+                    self.assertNotRegex(name, r'[\\/:*?"<>|\r\n]', "Windows path and artifact names must be single safe components")
+                    self.assertNotIn("${{", name, "fixture must resolve every identity input")
+
+    def test_client_build_version_input_runs_existing_owner_before_packaging(self):
+        shell = shutil.which("pwsh") or shutil.which("powershell.exe")
+        if not shell:
+            self.skipTest("Native PowerShell is required for the workflow version owner")
+        workflow = (ROOT / ".github/workflows/edr-agent-client-build.yml").read_text(encoding="utf-8")
+        step = workflow.split("- name: Resolve agent version\n", 1)[1].split("\n      - ", 1)[0]
+        body = step.split("        run: |\n", 1)[1]
+        body = "\n".join(line[10:] for line in body.splitlines()) + "\n"
+        self.assertNotIn("${{", body)
+        cases = [("", "codex/evidence-cache-io-lifecycle", "3.2.642", False),
+                 ("", "win_3.2.723", "3.2.723", False),
+                 ("3.2.726", "codex/evidence-cache-io-lifecycle", "3.2.726", True),
+                 ("0.0.0", "main", "0.0.0", True),
+                 ("65534.65534.65534", "main", "65534.65534.65534", True)]
+        invalid = (" ", "3.2", "3.2.3.0", "03.2.726", "3.02.726", "3.2.0726",
+                   "3.2.726-beta", "3.2.726+build", "3.2.65535", "65535.2.726",
+                   "3.65535.726", "3.2.999999999999999999999", "3.2.726\n",
+                   "３.2.726", "3.2.726'; throw 'injected", "$(throw 'injected')")
+        cases += [(value, "main", None, False) for value in invalid]
+        cases = [case + ("normal",) for case in cases]
+        cases += [("3.2.726", "main", None, False, "missing_cmake"),
+                  ("3.2.726", "main", None, False, "successful_noop_owner")]
+        deadline = time.monotonic() + 60
+        with tempfile.TemporaryDirectory(prefix="edr-build-version-") as temporary:
+            work = Path(temporary)
+            (work / "scripts").mkdir()
+            shutil.copy2(ROOT / "scripts/update-version.ps1", work / "scripts/update-version.ps1")
+            probe = work / "probe.ps1"
+            probe.write_text(body, encoding="utf-8")
+            original = "project(edr_agent VERSION 3.2.642 LANGUAGES C)\n"
+            for value, ref, expected, mutated, fixture in cases:
+                with self.subTest(value=value, ref=ref, fixture=fixture):
+                    cmake = work / "CMakeLists.txt"
+                    cmake.write_text(original, encoding="utf-8")
+                    shutil.copy2(ROOT / "scripts/update-version.ps1", work / "scripts/update-version.ps1")
+                    if fixture == "missing_cmake":
+                        cmake.unlink()
+                    if fixture == "successful_noop_owner":
+                        (work / "scripts/update-version.ps1").write_text("Write-Host 'test successful no-op'\n", encoding="utf-8")
+                    for name in ("VERSION", "github-env.txt"):
+                        (work / name).unlink(missing_ok=True)
+                    env = os.environ.copy()
+                    env.update(EDR_BUILD_AGENT_VERSION=value, GITHUB_REF_NAME=ref,
+                               GITHUB_WORKSPACE=str(work), GITHUB_ENV=str(work / "github-env.txt"))
+                    remaining = deadline - time.monotonic()
+                    self.assertGreater(remaining, 0, "version owner cases exceeded the 60 second budget")
+                    result = subprocess.run([shell, "-NoProfile", "-NonInteractive", "-File", str(probe)],
+                                            cwd=work, env=env, capture_output=True, text=True, timeout=min(15, remaining))
+                    if expected is None:
+                        self.assertNotEqual(result.returncode, 0, value)
+                        if fixture == "missing_cmake":
+                            self.assertFalse(cmake.exists())
+                        else:
+                            self.assertEqual(cmake.read_text(), original)
+                        self.assertFalse((work / "VERSION").exists())
+                        self.assertFalse((work / "github-env.txt").exists())
+                    else:
+                        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                        self.assertEqual((work / "VERSION").read_text(), expected)
+                        env_bytes = (work / "github-env.txt").read_bytes()
+                        env_text = env_bytes.decode("utf-16" if env_bytes.startswith(b"\xff\xfe") else "utf-8-sig")
+                        self.assertIn("EDR_AGENT_VERSION=" + expected, env_text)
+                        self.assertEqual((work / "CMakeLists.txt").read_text(),
+                                         original.replace("3.2.642", expected) if mutated else original)
 
     def test_client_build_supplies_setup_ui_signature_expectation(self):
         source = (ROOT / ".github/workflows/edr-agent-client-build.yml").read_text(encoding="utf-8")
@@ -1571,7 +1639,7 @@ int main(void) {
             probe_step = re.search(r'- name: Verify release gate build dependencies\n(.*?)(?=\n      - name:)',
                                    source, re.DOTALL)
             self.assertIsNotNone(probe_step)
-            prefix_var = "VCPKG_INSTALLED_ROOT" if "release" in workflow else "VCPKG_INSTALLED_X64"
+            prefix_var = "VCPKG_INSTALLED_ROOT"
             self.assertIn('CMAKE_PREFIX_PATH: ${{ env.' + prefix_var + ' }}', probe_step[1])
             if workflow == "edr-agent-client-release.yml":
                 self.assertIn("& .\\tests\\run_telemetry_windows_native.ps1 @telemetryArgs", source)
