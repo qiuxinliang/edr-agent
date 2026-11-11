@@ -4349,69 +4349,121 @@ static int manifest_array_add_unique_source(cJSON *array, const char *value,
  * id before replacing its latest enrichment view. This reuses the existing
  * artifact row and transaction rather than creating another persistence
  * path or charging extra cache writes. */
-static int manifest_add_source_event_aliases(cJSON *root, const char *candidate_id,
-                                             const char *current_event_id) {
-  cJSON *aliases = NULL;
-  sqlite3_stmt *st = NULL;
-  uint32_t count = 0u;
-  int ok = 1;
-  aliases = cJSON_CreateArray();
-  if (!root || !aliases || !candidate_id || !candidate_id[0]) {
-    if (!aliases) s_persistence_failure = EDR_EVIDENCE_FAILURE_RESOURCE;
-    cJSON_Delete(aliases);
+static int manifest_add_source_event_aliases(cJSON *root, const cJSON *previous, const char *current_event_id) {
+  cJSON *aliases = cJSON_CreateArray();
+  if (!aliases) {
+    s_persistence_failure = EDR_EVIDENCE_FAILURE_RESOURCE;
     return 0;
   }
-  if (s_db && sqlite3_prepare_v2(
-                  s_db,
-                  "SELECT manifest_json FROM artifacts WHERE candidate_id=? "
-                  "AND artifact_type='p0_context_bundle' LIMIT 1;",
-                  -1, &st, NULL) == SQLITE_OK) {
-    sqlite3_bind_text(st, 1, candidate_id, -1, SQLITE_TRANSIENT);
-    if (sqlite3_step(st) == SQLITE_ROW) {
-      const char *raw = (const char *)sqlite3_column_text(st, 0);
-      cJSON *previous = cJSON_Parse(raw ? raw : "");
-      if (!previous) {
-        ok = 0;
-      } else {
-        cJSON *previous_aliases =
-            cJSON_GetObjectItemCaseSensitive(previous, "source_event_ids");
-        if (cJSON_IsArray(previous_aliases)) {
-          cJSON *item;
-          cJSON_ArrayForEach(item, previous_aliases) {
-            if (!cJSON_IsString(item) || !item->valuestring ||
-                !manifest_array_add_unique_source(aliases, item->valuestring,
-                                                  &count)) {
-              ok = 0;
-              break;
-            }
-          }
-        } else {
-          cJSON *previous_source =
-              cJSON_GetObjectItemCaseSensitive(previous, "source_event_id");
-          if (cJSON_IsString(previous_source) && previous_source->valuestring) {
-            ok = manifest_array_add_unique_source(
-                aliases, previous_source->valuestring, &count);
-          }
-        }
-        cJSON_Delete(previous);
-      }
+  uint32_t count = 0;
+  const cJSON *old = cJSON_GetObjectItemCaseSensitive(previous, "source_event_ids");
+  if (cJSON_IsArray(old)) {
+    const cJSON *item;
+    cJSON_ArrayForEach(item, old) {
+      if (!cJSON_IsString(item) || !item->valuestring ||
+          !manifest_array_add_unique_source(aliases, item->valuestring, &count))
+        goto failed;
     }
-    sqlite3_finalize(st);
-  } else if (s_db) {
-    s_persistence_failure = sqlite3_errcode(s_db) == SQLITE_NOMEM ?
-        EDR_EVIDENCE_FAILURE_RESOURCE : EDR_EVIDENCE_FAILURE_STORAGE;
-    cJSON_Delete(aliases);
-    return 0;
+  } else {
+    const cJSON *item = cJSON_GetObjectItemCaseSensitive(previous, "source_event_id");
+    if (cJSON_IsString(item) && !manifest_array_add_unique_source(aliases, item->valuestring, &count)) goto failed;
   }
-  if (ok) {
-    ok = manifest_array_add_unique_source(aliases, current_event_id, &count);
-  }
-  if (!ok || !cJSON_AddItemToObject(root, "source_event_ids", aliases)) {
-    cJSON_Delete(aliases);
-    return 0;
-  }
-  return 1;
+  if (manifest_array_add_unique_source(aliases, current_event_id, &count) &&
+      cJSON_AddItemToObject(root, "source_event_ids", aliases))
+    return 1;
+failed:
+  cJSON_Delete(aliases);
+  return 0;
 }
+
+static const char *const frozen_context_fields[] = {"context",
+                                                    "pre_window_s",
+                                                    "post_window_s",
+                                                    "pre_context_count",
+                                                    "post_until_ns",
+                                                    "serialized_context_count",
+                                                    "omitted_context_count",
+                                                    "context_truncated"};
+
+static int authorized_context_timestamp(sqlite3_stmt *st, int column, int64_t *out);
+
+/* Read aliases and the previously frozen window in one statement in the
+ * candidate's transaction. Extract the array before cJSON can round its
+ * integer tokens. Older partial bundles still overlay each field they have. */
+static int prior_context_bundle(const char *candidate, const char *endpoint, cJSON **previous, int *complete) {
+  sqlite3_stmt *st = NULL;
+  *previous = NULL;
+  *complete = 0;
+  if (!s_db) return 1;
+  int ok = 0;
+  EdrEvidenceFailureReason failure = EDR_EVIDENCE_FAILURE_STORAGE;
+  if (sqlite3_prepare_v2(s_db,
+                         "SELECT manifest_json, json_extract(manifest_json,'$.context'), "
+                         "json_extract(manifest_json,'$.post_until_ns','$.post_until_ns') FROM artifacts "
+                         "WHERE candidate_id=?1 AND artifact_type='p0_context_bundle' LIMIT 1;",
+                         -1, &st, NULL) != SQLITE_OK ||
+      sqlite3_bind_text(st, 1, candidate, -1, SQLITE_STATIC) != SQLITE_OK)
+    goto done;
+  int step = sqlite3_step(st);
+  if (step == SQLITE_DONE) {
+    ok = 1;
+    goto done;
+  }
+  if (step != SQLITE_ROW) goto done;
+  const char *raw = (const char *)sqlite3_column_text(st, 0);
+  if (!raw || !(*previous = cJSON_Parse(raw))) {
+    failure = EDR_EVIDENCE_FAILURE_INVALID;
+    goto done;
+  }
+  failure = EDR_EVIDENCE_FAILURE_RESOURCE;
+  cJSON *prior = *previous;
+  const cJSON *array = cJSON_GetObjectItemCaseSensitive(prior, "context");
+  int slots = cJSON_GetArraySize(array);
+  int array_ok = cJSON_IsArray(array) && slots <= 32;
+  if (array_ok) {
+    const char *exact = (const char *)sqlite3_column_text(st, 1);
+    cJSON *replacement = exact ? cJSON_CreateRaw(exact) : NULL;
+    if (!replacement || !cJSON_ReplaceItemInObjectCaseSensitive(prior, "context", replacement)) {
+      cJSON_Delete(replacement);
+      goto done;
+    }
+  }
+  int64_t until = 0;
+  if (authorized_context_timestamp(st, 2, &until)) {
+    char digits[32];
+    sqlite_u64_decimal((uint64_t)until, digits);
+    cJSON *replacement = cJSON_CreateRaw(digits);
+    if (!replacement || !cJSON_ReplaceItemInObjectCaseSensitive(prior, "post_until_ns", replacement)) {
+      cJSON_Delete(replacement);
+      goto done;
+    }
+  }
+  const cJSON *schema = cJSON_GetObjectItemCaseSensitive(prior, "schema");
+  const cJSON *owner = cJSON_GetObjectItemCaseSensitive(prior, "candidate_id");
+  const cJSON *ep = cJSON_GetObjectItemCaseSensitive(prior, "endpoint_id");
+  const cJSON *pre = cJSON_GetObjectItemCaseSensitive(prior, "pre_window_s");
+  const cJSON *post = cJSON_GetObjectItemCaseSensitive(prior, "post_window_s");
+  const cJSON *count = cJSON_GetObjectItemCaseSensitive(prior, "pre_context_count");
+  const cJSON *serialized = cJSON_GetObjectItemCaseSensitive(prior, "serialized_context_count");
+  const cJSON *omitted = cJSON_GetObjectItemCaseSensitive(prior, "omitted_context_count");
+  const cJSON *truncated = cJSON_GetObjectItemCaseSensitive(prior, "context_truncated");
+  *complete = array_ok && until > 0 && cJSON_IsString(schema) &&
+              !strcmp(schema->valuestring, "p0_context_bundle.v1") && cJSON_IsString(owner) &&
+              !strcmp(owner->valuestring, candidate) && cJSON_IsString(ep) && !strcmp(ep->valuestring, endpoint) &&
+              cJSON_IsNumber(pre) && pre->valuedouble == pre->valueint && pre->valueint >= 30 &&
+              pre->valueint <= 120 && cJSON_IsNumber(post) && post->valuedouble == post->valueint &&
+              post->valueint >= 30 && post->valueint <= 120 && cJSON_IsNumber(count) &&
+              count->valuedouble == count->valueint && count->valueint >= slots && cJSON_IsNumber(serialized) &&
+              serialized->valuedouble == slots && cJSON_IsNumber(omitted) &&
+              omitted->valuedouble == count->valuedouble - slots && cJSON_IsBool(truncated) &&
+              cJSON_IsTrue(truncated) == (omitted->valuedouble > 0);
+  ok = 1;
+done:
+  if (!ok) s_persistence_failure = sqlite3_errcode(s_db) == SQLITE_NOMEM ? EDR_EVIDENCE_FAILURE_RESOURCE : failure;
+  sqlite3_finalize(st);
+  return ok;
+}
+
 #endif
 
 static int build_context_manifest_json(const EdrBehaviorRecord *r, const char *candidate_id,
@@ -4439,10 +4491,19 @@ static int build_context_manifest_json(const EdrBehaviorRecord *r, const char *c
     manifest_rejected("context manifest allocation failed");
     return -1;
   }
-  context = root ? cJSON_AddArrayToObject(root, "context") : NULL;
+  int frozen_complete = 0;
+#if defined(EDR_HAVE_SQLITE)
+  cJSON *previous = NULL;
+  if (!prior_context_bundle(candidate_id, r->endpoint_id, &previous, &frozen_complete)) {
+    cJSON_Delete(previous); cJSON_Delete(root);
+    manifest_rejected("previous context manifest unreadable");
+    return -1;
+  }
+#endif
+  context = cJSON_AddArrayToObject(root, "context");
   ok = root && context &&
 #if defined(EDR_HAVE_SQLITE)
-       manifest_add_source_event_aliases(root, candidate_id, r->event_id) &&
+       manifest_add_source_event_aliases(root, previous, r->event_id) &&
 #endif
        manifest_add_text(root, "schema", "p0_context_bundle.v1") &&
        manifest_add_text(root, "candidate_id", candidate_id) &&
@@ -4478,7 +4539,7 @@ static int build_context_manifest_json(const EdrBehaviorRecord *r, const char *c
   uint32_t pos = s_context_ring_pos;
   uint32_t added = 0u;
   ContextRingRelation relation = {0};
-  for (uint32_t i = 0u; ok && i < EDR_EVIDENCE_CONTEXT_RING_SLOTS && added < 32u; ++i) {
+  for (uint32_t i = 0u; ok && !frozen_complete && i < EDR_EVIDENCE_CONTEXT_RING_SLOTS && added < 32u; ++i) {
     const RingSlot *s = &s_context_ring[(pos + EDR_EVIDENCE_CONTEXT_RING_SLOTS - 1u - i) %
                                         EDR_EVIDENCE_CONTEXT_RING_SLOTS];
     cJSON *item;
@@ -4525,30 +4586,16 @@ static int build_context_manifest_json(const EdrBehaviorRecord *r, const char *c
          cJSON_AddBoolToObject(root, "context_truncated", omitted != 0u);
   }
 #if defined(EDR_HAVE_SQLITE)
-  if (ok && s_db) {
-    sqlite3_stmt *previous = NULL;
-    if (sqlite3_prepare_v2(s_db, "SELECT manifest_json FROM artifacts WHERE candidate_id=? "
-        "AND artifact_type='p0_context_bundle' LIMIT 1;", -1, &previous, NULL) != SQLITE_OK) ok = 0;
-    else {
-      bind_text(previous, 1, candidate_id);
-      int step = sqlite3_step(previous);
-      if (step == SQLITE_ROW) {
-        const char *raw = (const char *)sqlite3_column_text(previous, 0);
-        cJSON *prior = cJSON_Parse(raw ? raw : "");
-        const char *fields[] = {"context", "pre_window_s", "post_window_s", "pre_context_count",
-          "post_until_ns", "serialized_context_count", "omitted_context_count", "context_truncated"};
-        if (!prior) ok = 0;
-        for (unsigned i = 0; ok && i < sizeof(fields)/sizeof(fields[0]); ++i) {
-          cJSON *value = cJSON_GetObjectItemCaseSensitive(prior, fields[i]);
-          if (!value) continue; /* Older manifests may omit diagnostic fields. */
-          cJSON *copy = cJSON_Duplicate(value, 1);
-          if (!copy || !cJSON_ReplaceItemInObjectCaseSensitive(root, fields[i], copy)) { cJSON_Delete(copy); ok = 0; }
-        }
-        cJSON_Delete(prior);
-      } else if (step != SQLITE_DONE) ok = 0;
+  if (ok && previous) {
+    for (unsigned i = 0; ok && i < sizeof(frozen_context_fields)/sizeof(frozen_context_fields[0]); ++i) {
+      const char *key = frozen_context_fields[i];
+      cJSON *existing = cJSON_DetachItemFromObjectCaseSensitive(previous,key);
+      if (existing && !cJSON_ReplaceItemInObjectCaseSensitive(root,key,existing)) {
+        cJSON_Delete(existing); ok = 0;
+      }
     }
-    sqlite3_finalize(previous);
   }
+  cJSON_Delete(previous);
 #endif
   if (!ok) {
     manifest_rejected("context manifest allocation or UTF-8 validation failed");

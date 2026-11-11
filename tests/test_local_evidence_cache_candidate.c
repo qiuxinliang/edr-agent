@@ -15597,7 +15597,7 @@ int main(int argc, char **argv) {
     int enforce=!strcmp(argv[1],"--retained-context-recall");
     test_retained_context_recall(enforce);
     if(enforce) {
-      test_retained_context_unknown_actor(); test_retained_context_adjacent_ns();
+      test_retained_context_unknown_actor(); test_retained_context_adjacent_ns(0); test_retained_context_adjacent_ns(1);
       test_retained_context_scientific_time();
     }
     return 0;
@@ -15908,7 +15908,8 @@ int main(int argc, char **argv) {
   RUN_CACHE_CASE("retention", test_authorized_query_scope_and_absence());
   RUN_CACHE_CASE("retention", test_retained_context_recall(1));
   RUN_CACHE_CASE("retention", test_retained_context_unknown_actor());
-  RUN_CACHE_CASE("retention", test_retained_context_adjacent_ns());
+  RUN_CACHE_CASE("retention", test_retained_context_adjacent_ns(0));
+  RUN_CACHE_CASE("retention", test_retained_context_adjacent_ns(1));
   RUN_CACHE_CASE("retention", test_retained_context_scientific_time());
   RUN_CACHE_CASE("retention", test_physical_floor_rejects_evidence_copy());
   RUN_CACHE_CASE("retention", test_maintenance_query_copy_slices());

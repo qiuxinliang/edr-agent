@@ -169,7 +169,7 @@ static void test_retained_context_unknown_actor(void) {
   }
   edr_local_evidence_cache_test_set_now_unix_ns(0);
 }
-static void test_retained_context_adjacent_ns(void) {
+static void test_retained_context_adjacent_ns(int enrich) {
   const int64_t base=INT64_C(1793100000000000000),now=base+INT64_C(2000000000);
   for(unsigned layout=0;layout<2u;++layout) {
     char path[640],queue_path[640],out[16384];EdrBehaviorRecord owner,pre;
@@ -187,12 +187,22 @@ static void test_retained_context_adjacent_ns(void) {
      * snapshots retain their exact times, but do not store file_key. */
     pre.file_key=2u;++pre.event_time_ns;snprintf(pre.event_id,sizeof(pre.event_id),"adjacent-pre-two");edr_local_evidence_cache_record_behavior(&pre);
     edr_local_evidence_cache_record_behavior(&owner);
+    if (enrich) {
+      strcpy(owner.cmdline,"synthetic enriched command with the same source");
+      edr_local_evidence_cache_record_behavior(&owner);
+    }
     edr_local_evidence_cache_close();edr_pt_cache_shutdown();
     edr_local_evidence_cache_test_set_now_unix_ns(now);assert(edr_local_evidence_cache_open(path,16,24)==0);
     EdrSoarCommandMeta meta;retained_recall_contract(&meta,&owner,now,"{\"event_type\":\"file_write\"}",50);
     EdrCommandResultAuthorization *a=&meta.result_authorization;
     int result=edr_local_evidence_cache_query_authorized_json(a->command_id,&meta,out,sizeof(out));
     if(result)fprintf(stderr,"adjacent ns query failure: %s\n",out);assert(result==0);
+    if (enrich) {
+      printf("retained_enriched_pre layout=%u observations=%d exact_second=%d\n",
+          layout, retained_recall_rows(out,"context_pre"),
+          strstr(out,"\"event_time_ns\":1793099999000000001") != NULL);
+      fflush(stdout);
+    }
     assert(retained_recall_rows(out,"context_pre")==2 && retained_recall_rows(out,NULL)==2);
     /* Inspect exact decimal tokens: cJSON double parsing would itself round
      * these independently retained events to the same numeric value. */
