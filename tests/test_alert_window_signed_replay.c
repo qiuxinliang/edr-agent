@@ -26,10 +26,7 @@
 static const char type[] = "alert_window_query_v1";
 static char payload[640];
 
-static int64_t make_request(void) {
-  struct timespec now;
-  assert(timespec_get(&now, TIME_UTC) == TIME_UTC);
-  int64_t anchor = (int64_t)now.tv_sec * INT64_C(1000000000) + now.tv_nsec;
+static void make_request(int64_t anchor) {
   int n = snprintf(
       payload, sizeof(payload),
       "{\"tenant_id\":\"t\",\"endpoint_id\":\"ep\",\"alert_id\":\"a\",\"source_event_id\":\"e\",\"pid\":42,"
@@ -38,7 +35,18 @@ static int64_t make_request(void) {
       "\"until_ns\":\"%lld\",\"limit\":50,\"max_bytes\":8192}",
       (long long)anchor, (long long)(anchor - INT64_C(120000000000)), (long long)(anchor + INT64_C(120000000000)));
   assert(n > 0 && (size_t)n < sizeof(payload));
-  return anchor;
+}
+
+/* Match cachedInvestigationTaskID's JSON array and 24-byte SHA-256 prefix.
+ * Keep the synthetic UUID stable while deriving its time and task from this run. */
+static void make_investigation_ids(int64_t issued_ms, char request_id[80], char task_id[53]) {
+  char seed[256], digest[65];
+  int n = snprintf(request_id, 80, "lcq1.%lld.69c92518-3a30-4201-a51a-081303e114bd", (long long)issued_ms);
+  assert(n > 0 && n < 80);
+  n = snprintf(seed, sizeof(seed), "[\"edr.local-cache-investigation.v1\",\"t\",\"a\",\"synthetic-analyst\",\"%s\"]",
+               request_id);
+  assert(n > 0 && (size_t)n < sizeof(seed) && edr_sha256_hex((const uint8_t *)seed, (size_t)n, digest) == 0);
+  assert(snprintf(task_id, 53, "lcq-%.48s", digest) == 52);
 }
 
 /* Materialize the owner, its actual edge and a recycled PID through the same
@@ -137,7 +145,8 @@ static void sign_command(EVP_PKEY *key, const char *id, EdrSoarCommandMeta *m) {
   snprintf(m->soar_correlation_id, sizeof(m->soar_correlation_id), "%s", id);
 }
 
-int main(void) {
+int main(int argc, char **argv) {
+  assert(argc == 1 || argc == 2);
   const char *id = "lcq-synthetic-window-signed";
   EdrConfig cfg = {0};
   strcpy(cfg.agent.tenant_id, "t");
@@ -148,9 +157,12 @@ int main(void) {
   assert(test_env("EDR_SOAR_REPORT_ALWAYS", "1") == 0);
   edr_egress_set_command_result_validator(edr_command_state_result_authorized);
   assert(edr_local_evidence_cache_open_with_policy("synthetic-cache.db", 16, 1, 4) == 0);
-  int64_t anchor = make_request();
+  struct timespec now;
+  assert(timespec_get(&now, TIME_UTC) == TIME_UTC);
+  int64_t anchor = (int64_t)now.tv_sec * INT64_C(1000000000) + now.tv_nsec;
+  make_request(anchor);
   EdrSoarCommandMeta meta = {0};
-  meta.issued_at_unix_ms = (int64_t)time(NULL) * 1000;
+  meta.issued_at_unix_ms = anchor / INT64_C(1000000);
   meta.deadline_ms = 60000;
   EVP_PKEY *key = test_signer();
   sign_command(key, id, &meta);
@@ -178,10 +190,11 @@ int main(void) {
   cJSON_Delete(receipt);
   char fact_id[65];
   record_connection(anchor, fact_id);
-  /* Existing server task-ID derivation for tenant t, alert a, actor
-   * synthetic-analyst, and this fixed synthetic request_id. */
-  const char *request_id = "lcq1.1794361630687.69c92518-3a30-4201-a51a-081303e114bd";
-  id = "lcq-baaa5e22dc2029994236126cee6b78907e66e1507fb9edc0";
+  char request_id[80], task_id[53];
+  make_investigation_ids(meta.issued_at_unix_ms, request_id, task_id);
+  long long key_time_ms = 0;
+  assert(sscanf(request_id, "lcq1.%lld.", &key_time_ms) == 1 && key_time_ms == meta.issued_at_unix_ms);
+  id = task_id;
   sign_command(key, id, &meta);
   assert(edr_command_receive_envelope(id, type, (const uint8_t *)payload, strlen(payload), &meta) == 1);
   assert(edr_command_replay_persisted_inbox_once() == 1);
@@ -201,8 +214,23 @@ int main(void) {
                                       r->soar_correlation_id, "", "");
   assert(http && edr_egress_request_validate_for_scope("POST", "ingest/report-command-result", "application/json",
                                                        http, strlen(http), "t", "ep", why, sizeof(why)) == 0);
-  printf("{\"request_id\":\"%s\",\"actor\":\"synthetic-analyst\",\"request\":%s,\"http\":%s}\n", request_id, payload,
-         http);
+  printf("{\"request_id\":\"%s\",\"actor\":\"synthetic-analyst\",\"issued_at_unix_ms\":%lld,\"deadline_ms\":%u,"
+         "\"request\":%s,\"http\":%s}\n", request_id, (long long)meta.issued_at_unix_ms, meta.deadline_ms, payload, http);
+  if (argc == 2) {
+    /* Opt-in cross-language fixture. Export only the ephemeral public key. */
+    uint8_t public_key[32];
+    size_t key_size = sizeof(public_key);
+    assert(EVP_PKEY_get_raw_public_key(key, public_key, &key_size) == 1 && key_size == sizeof(public_key));
+    FILE *fixture = fopen(argv[1], "wbx");
+    assert(fixture && fprintf(fixture, "{\"public_key_hex\":\"") > 0);
+    for (size_t i = 0; i < key_size; ++i) assert(fprintf(fixture, "%02x", (unsigned)public_key[i]) == 2);
+    assert(fprintf(fixture, "\",\"request_id\":\"%s\",\"actor\":\"synthetic-analyst\",\"envelope\":{"
+        "\"command_id\":\"%s\",\"command_type\":\"%s\",\"issued_at_unix_ms\":%lld,\"deadline_ms\":%u,"
+        "\"idempotency_key\":\"%s\",\"soar_correlation_id\":\"%s\",\"payload\":%s},\"http\":%s}\n",
+        request_id, id, type, (long long)meta.issued_at_unix_ms, meta.deadline_ms,
+        meta.idempotency_key, meta.soar_correlation_id, payload, http) > 0);
+    assert(fclose(fixture) == 0);
+  }
 
   id = "lcq-synthetic-rebound";
   sign_command(key, id, &meta);
