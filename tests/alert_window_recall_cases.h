@@ -21,7 +21,7 @@ static void window_deliver(EdrBehaviorRecord *r, const char *id, int64_t base, i
   edr_local_evidence_cache_record_behavior(r);
 }
 
-static void window_registry_input(EdrBehaviorRecord *r, const char *id, int64_t base, int64_t offset,
+static void init_window_registry(EdrBehaviorRecord *r, const char *id, int64_t base, int64_t offset,
                                   const char *key, const char *value, int wrong) {
   init_floor_parent(r, base - INT64_C(90000000000));
   r->event_time_ns = base + offset;
@@ -34,6 +34,11 @@ static void window_registry_input(EdrBehaviorRecord *r, const char *id, int64_t 
   strcpy(r->reg_op, "set_value");
   strcpy(r->reg_value_data, "private-registry-data");
   if (wrong) ++r->process_creation_filetime_100ns;
+}
+
+static void window_registry_input(EdrBehaviorRecord *r, const char *id, int64_t base, int64_t offset,
+                                  const char *key, const char *value, int wrong) {
+  init_window_registry(r, id, base, offset, key, value, wrong);
   assert(!edr_local_evidence_cache_is_candidate(r));
   edr_local_evidence_cache_record_behavior(r);
 }
@@ -196,3 +201,71 @@ static void test_alert_window_recall(void) {
   }
 }
 #endif
+
+/* One real candidate and its independently sourced post-window records.
+ * Reopen before querying so persisted source-quality markers are exercised. */
+static void test_registry_source_fidelity(void) {
+  static const char *markers[] = {
+      "source.reg_key_path", "source.reg_value_name", "source.reg_op", "source.list_overflow",
+      "reg_key_path", "reg_value_name", "reg_op", "source.source_completeness",
+      NULL, "source.reg_value_data", "source.reg_key_path_extra", "source.other"};
+  const int64_t base = INT64_C(1750061200000000101), sec = INT64_C(1000000000);
+  EdrBehaviorRecord *r = calloc(1, sizeof(*r));
+  assert(r);
+  for (int compact = 0; compact < 2; ++compact) {
+    char path[640];
+    assert(make_test_sqlite_path(path, sizeof(path)) == 0);
+    test_setenv("EDR_EVIDENCE_CONTEXT_WINDOW_S", "45");
+    s_test_monotonic_ns = UINT64_C(100000000000);
+    edr_local_evidence_cache_test_set_retention_monotonic_ms(1000000);
+    edr_local_evidence_cache_test_set_now_unix_ns(base);
+    assert((compact ? edr_local_evidence_cache_open(path, 16, 24) : test_open_legacy_context(path, 16, 24)) == 0);
+    window_deliver(r, "registry-fidelity", base, 0, 0, 0);
+    for (size_t i = 0; i < sizeof(markers) / sizeof(markers[0]); ++i) {
+      char id[32];
+      snprintf(id, sizeof(id), "fidelity-%u", (unsigned)i);
+      init_window_registry(r, id, base, (int64_t)(i + 1) * sec, "HKCU/Software/Fidelity", id, 0);
+      if (markers[i]) edr_behavior_mark_source_truncated(r, markers[i]);
+      else strcpy(r->source_completeness, "TRUNCATED");
+      if (i == 11) strcpy(r->source_completeness, "NOT_EVALUABLE");
+      edr_local_evidence_cache_record_behavior(r);
+    }
+    edr_local_evidence_cache_close();
+    assert(edr_local_evidence_cache_open(path,16,24) == 0);
+    EdrAlertWindowQuery q = {0};
+    q.tenant_id = r->tenant_id;
+    q.endpoint_id = r->endpoint_id;
+    q.alert_id = "alert-registry";
+    q.source_event_id = "registry-fidelity";
+    q.pid = r->pid;
+    q.process_start_key = r->process_start_key;
+    q.process_creation_filetime_100ns = r->process_creation_filetime_100ns;
+    q.source_time_ns = q.from_ns = base;
+    q.until_ns = base + 20 * sec;
+    q.expires_unix_ms = q.until_ns / 1000000 + 30000;
+    q.kind = "registry";
+    q.limit = 50;
+    q.max_bytes = 8192;
+    cJSON *answer = window_answer(&q);
+    const cJSON *row;
+    unsigned correct = 0, incomplete = 0, gaps = 0;
+    cJSON_ArrayForEach(row, cJSON_GetObjectItemCaseSensitive(answer, "rows")) {
+      const char *value = cJSON_GetObjectItemCaseSensitive(row, "registry_value")->valuestring;
+      if (!strcmp(value, "fidelity-9")) correct |= 1;
+      else if (!strcmp(value, "fidelity-10")) correct |= 2;
+      else ++incomplete;
+    }
+    cJSON_ArrayForEach(row, cJSON_GetObjectItemCaseSensitive(answer, "gap_reasons"))
+      if (!strcmp(row->valuestring, "registry_fields_missing")) ++gaps;
+    fprintf(stderr, "registry_source_fidelity layout=%d incomplete_projected=%u controls=%u gaps=%u\n",
+            compact, incomplete, correct, gaps);
+    assert(incomplete == 0 && correct == 3 && gaps == 1);
+    cJSON_Delete(answer);
+    edr_local_evidence_cache_close();
+    cleanup_test_sqlite_path(path);
+  }
+  edr_local_evidence_cache_test_set_now_unix_ns(0);
+  edr_local_evidence_cache_test_set_retention_monotonic_ms(-1);
+  s_test_monotonic_ns = 0;
+  free(r);
+}

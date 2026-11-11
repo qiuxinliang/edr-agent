@@ -10960,6 +10960,22 @@ static int window_scope_json(const EdrAlertWindowQuery *q, cJSON *root) {
          manifest_add_u64(scope, "limit", q->limit) && manifest_add_u64(scope, "max_bytes", q->max_bytes);
 }
 
+/* Both current decoder names and legacy unqualified omissions can be present in
+ * a frozen manifest. Never turn a clipped key or a missing value name into
+ * an exact registry finding (the empty string is itself a valid value name). */
+static int window_registry_incomplete(const char *quality, const char *omissions) {
+  static const char *const missing[] = {
+      "source.reg_key_path", "source.reg_value_name", "source.reg_op",
+      "source.list_overflow", "source.source_completeness",
+      "reg_key_path", "reg_value_name", "reg_op"};
+  if ((!strcmp(quality, "TRUNCATED") && !*omissions) ||
+      (!strcmp(quality, "NOT_EVALUABLE") && *omissions))
+    return 1;
+  for (size_t i = 0; *omissions && i < sizeof(missing) / sizeof(missing[0]); ++i)
+    if (source_field_list_has(omissions, missing[i])) return 1;
+  return 0;
+}
+
 /* A related child/parent in the same retained window is not the signed subject. */
 static int window_project_event(AlertWindowRead *r, const cJSON *event, int64_t ts, const char *fact_id,
                                 unsigned slot) {
@@ -10986,11 +11002,12 @@ static int window_project_event(AlertWindowRead *r, const cJSON *event, int64_t 
         !parent_context_number(event, "remote_port", &port) || !port || port > 65535)
       return EDR_PARENT_CONTEXT_ERROR_INTEGRITY;
   } else {
+    const char *quality = authorized_context_text(event, "source_completeness");
+    if (!quality) return EDR_PARENT_CONTEXT_ERROR_INTEGRITY;
     if (!key || !*key || !value || !op ||
         (strcmp(op, "set_value") && strcmp(op, "create_key") && strcmp(op, "delete_key") &&
          strcmp(op, "delete_value")) ||
-        source_field_list_has(trunc, "reg_key_path") || source_field_list_has(trunc, "reg_value_name") ||
-        source_field_list_has(trunc, "reg_op")) {
+        window_registry_incomplete(quality, trunc)) {
       r->registry_missing = 1;
       return 0;
     }
