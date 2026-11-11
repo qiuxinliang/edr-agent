@@ -3,6 +3,7 @@
 
 #include "cJSON.h"
 #include "edr/local_evidence_cache.h"
+#include "edr/alert_window_page.h"
 #include "edr/rtq_contract.h"
 #include <errno.h>
 #include <stdlib.h>
@@ -71,11 +72,11 @@ static inline int window_identifier(const char *s, size_t max) {
   return n <= max && strspn(s, "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.:-") == n;
 }
 
-/* All pointers borrow the parsed purpose. Requiring all 13 keys and their
- * exact count rejects any extras, including common command control fields. */
+/* All pointers borrow the parsed purpose. Both supported shapes are closed. */
 static inline int window_scope(const cJSON *request, EdrAlertWindowQuery *q) {
   uint64_t from, anchor, until;
-  if (!cJSON_IsObject(request) || cJSON_GetArraySize(request) != 13) return 0;
+  const cJSON *page = cJSON_GetObjectItemCaseSensitive(request, "pre_page");
+  if (!cJSON_IsObject(request) || cJSON_GetArraySize(request) != (page ? 14 : 13)) return 0;
   q->tenant_id = window_string(request, "tenant_id");
   q->endpoint_id = window_string(request, "endpoint_id");
   q->alert_id = window_string(request, "alert_id");
@@ -97,11 +98,23 @@ static inline int window_scope(const cJSON *request, EdrAlertWindowQuery *q) {
   q->from_ns = (int64_t)from;
   q->source_time_ns = (int64_t)anchor;
   q->until_ns = (int64_t)until;
-  return 1;
+  q->pre_start_slot = 0;
+  q->pre_snapshot_sha256 = q->previous_task_id = q->previous_result_sha256 = NULL;
+  if (page) {
+    if (!cJSON_IsObject(page) || cJSON_GetArraySize(page) != 4 ||
+        !window_uint(page, "start_slot", 0, 31, &q->pre_start_slot) ||
+        !(q->pre_snapshot_sha256 = window_string(page, "snapshot_sha256")) ||
+        !(q->previous_task_id = window_string(page, "previous_task_id")) ||
+        !(q->previous_result_sha256 = window_string(page, "previous_result_sha256"))) return 0;
+  }
+  return edr_window_page_valid(q);
 }
 /* Both objects must have passed window_scope, including canonical decimal parsing. */
 static inline int window_same_scope(const EdrAlertWindowQuery *a, const EdrAlertWindowQuery *b) {
-  return !strcmp(a->tenant_id, b->tenant_id) && !strcmp(a->endpoint_id, b->endpoint_id) &&
+  return (a->pre_snapshot_sha256 ? b->pre_snapshot_sha256 && a->pre_start_slot == b->pre_start_slot &&
+             !strcmp(a->pre_snapshot_sha256, b->pre_snapshot_sha256) && !strcmp(a->previous_task_id, b->previous_task_id) &&
+             !strcmp(a->previous_result_sha256, b->previous_result_sha256) : !b->pre_snapshot_sha256) &&
+         !strcmp(a->tenant_id, b->tenant_id) && !strcmp(a->endpoint_id, b->endpoint_id) &&
          !strcmp(a->alert_id, b->alert_id) && !strcmp(a->source_event_id, b->source_event_id) &&
          !strcmp(a->kind, b->kind) && a->pid == b->pid && a->limit == b->limit && a->max_bytes == b->max_bytes &&
          a->from_ns == b->from_ns && a->until_ns == b->until_ns && a->source_time_ns == b->source_time_ns &&

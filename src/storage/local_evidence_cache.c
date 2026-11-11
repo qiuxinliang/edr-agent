@@ -1,6 +1,7 @@
 #include "edr/egress_request_policy.h"
 #include "edr/validation_trace.h"
 #include "edr/local_evidence_cache.h"
+#include "edr/alert_window_page.h"
 #include "edr/command.h"
 #include "edr/storage_physical_guard.h"
 #include "edr/evidence_recall_manifest.h"
@@ -10927,6 +10928,7 @@ typedef struct {
   const EdrAlertWindowQuery *query;
   EvidenceQueryDeadline deadline;
   char owner[160], start[32], birth[32];
+  char snapshot[65];
   int64_t first_ns, last_ns;
   cJSON *rows;
   unsigned examined;
@@ -10946,7 +10948,7 @@ static int window_matches(const cJSON *object, const char *key, const char *valu
 
 static int window_scope_json(const EdrAlertWindowQuery *q, cJSON *root) {
   cJSON *scope = cJSON_AddObjectToObject(root, "scope");
-  return scope && manifest_add_text(scope, "tenant_id", q->tenant_id) &&
+  int ok = scope && manifest_add_text(scope, "tenant_id", q->tenant_id) &&
          manifest_add_text(scope, "endpoint_id", q->endpoint_id) &&
          manifest_add_text(scope, "alert_id", q->alert_id) &&
          manifest_add_text(scope, "source_event_id", q->source_event_id) &&
@@ -10958,6 +10960,12 @@ static int window_scope_json(const EdrAlertWindowQuery *q, cJSON *root) {
          manifest_add_u64_text(scope, "from_ns", (uint64_t)q->from_ns) &&
          manifest_add_u64_text(scope, "until_ns", (uint64_t)q->until_ns) &&
          manifest_add_u64(scope, "limit", q->limit) && manifest_add_u64(scope, "max_bytes", q->max_bytes);
+  if (!ok || !q->pre_snapshot_sha256) return ok;
+  cJSON *page = cJSON_AddObjectToObject(scope, "pre_page");
+  return page && manifest_add_u64(page, "start_slot", q->pre_start_slot) &&
+         manifest_add_text(page, "snapshot_sha256", q->pre_snapshot_sha256) &&
+         manifest_add_text(page, "previous_task_id", q->previous_task_id) &&
+         manifest_add_text(page, "previous_result_sha256", q->previous_result_sha256);
 }
 
 /* Both current decoder names and legacy unqualified omissions can be present in
@@ -11016,6 +11024,7 @@ static int window_project_event(AlertWindowRead *r, const cJSON *event, int64_t 
         !manifest_utf8_valid(value))
       return EDR_PARENT_CONTEXT_ERROR_INTEGRITY;
   }
+  if (q->pre_snapshot_sha256 && slot < q->pre_start_slot) return 0;
   if ((unsigned)cJSON_GetArraySize(r->rows) >= q->limit) {
     r->output_truncated = 1;
     return 0;
@@ -11036,16 +11045,32 @@ static int window_project_event(AlertWindowRead *r, const cJSON *event, int64_t 
   return 0;
 }
 
+static void window_snapshot_begin(EdrSha256Ctx *hash, const AlertWindowRead *r) {
+  const EdrAlertWindowQuery *q = r->query;
+  edr_sha256_init(hash);
+  const char *strings[] = {EDR_WINDOW_PRE_PAGE_SCHEMA, q->tenant_id, q->endpoint_id, q->alert_id,
+                           q->source_event_id, q->kind, r->owner};
+  const uint64_t numbers[] = {q->pid, q->process_start_key, q->process_creation_filetime_100ns,
+                              q->source_time_ns, q->from_ns, q->until_ns, q->limit, q->max_bytes,
+                              r->first_ns, r->last_ns, (uint64_t)r->pre_truncated};
+  for (size_t i = 0; i < sizeof(strings)/sizeof(strings[0]); ++i) candidate_digest_text(hash, strings[i]);
+  for (size_t i = 0; i < sizeof(numbers)/sizeof(numbers[0]); ++i) candidate_digest_u64(hash, numbers[i]);
+}
+
 static int window_read_pre(AlertWindowRead *r, const char *raw, const cJSON *bundle) {
   const cJSON *events = cJSON_GetObjectItemCaseSensitive(bundle, "context");
   int count = cJSON_GetArraySize(events);
   if (!cJSON_IsArray(events) || count > 32) return EDR_PARENT_CONTEXT_ERROR_INTEGRITY;
   sqlite3_stmt *st = NULL;
   int rc = EDR_PARENT_CONTEXT_ERROR_STORAGE;
-  if (sqlite3_prepare_v2(s_db,
-                         "SELECT json_extract(value,'$.event_time_ns','$.event_time_ns') "
-                         "FROM json_each(?1,'$.context') ORDER BY key;",
-                         -1, &st, NULL) != SQLITE_OK ||
+  EdrSha256Ctx hash;
+  const int paged = r->query->pre_snapshot_sha256 != NULL;
+  const char *sql = paged ? "SELECT json_extract(value,'$.event_time_ns','$.event_time_ns'),value "
+                            "FROM json_each(?1,'$.context') ORDER BY key;"
+                          : "SELECT json_extract(value,'$.event_time_ns','$.event_time_ns') "
+                            "FROM json_each(?1,'$.context') ORDER BY key;";
+  if (paged) window_snapshot_begin(&hash, r);
+  if (sqlite3_prepare_v2(s_db, sql, -1, &st, NULL) != SQLITE_OK ||
       sqlite3_bind_text(st, 1, raw, -1, SQLITE_STATIC) != SQLITE_OK)
     goto done;
   unsigned slot = 0;
@@ -11058,12 +11083,29 @@ static int window_read_pre(AlertWindowRead *r, const char *raw, const cJSON *bun
       rc = EDR_PARENT_CONTEXT_ERROR_INTEGRITY;
       goto done;
     }
+    if (paged) {
+      const char *frozen = window_column(st, 1, EDR_EVIDENCE_MANIFEST_MAX_BYTES);
+      if (!frozen) { rc = EDR_PARENT_CONTEXT_ERROR_INTEGRITY; goto done; }
+      candidate_digest_text(&hash, frozen);
+    }
     rc = window_project_event(r, item, ts, NULL, slot++);
     if (rc) goto done;
     ++r->examined;
     item = item->next;
   }
   rc = step != SQLITE_DONE ? EDR_PARENT_CONTEXT_ERROR_STORAGE : item ? EDR_PARENT_CONTEXT_ERROR_INTEGRITY : 0;
+  if (!rc && paged) {
+    uint8_t digest[EDR_SHA256_DIGEST_LEN];
+    const char digits[] = "0123456789abcdef";
+    edr_sha256_final(&hash, digest);
+    for (size_t i = 0; i < sizeof(digest); ++i) {
+      r->snapshot[2*i] = digits[digest[i] >> 4];
+      r->snapshot[2*i+1] = digits[digest[i] & 15];
+    }
+    r->snapshot[64] = 0;
+    if (r->query->pre_start_slot && strcmp(r->snapshot, r->query->pre_snapshot_sha256))
+      rc = EDR_PARENT_CONTEXT_ERROR_INTEGRITY;
+  }
 done:
   sqlite3_finalize(st);
   return rc;
@@ -11246,8 +11288,10 @@ static int window_gap(cJSON *list, const char *value) {
 
 static int window_encode(AlertWindowRead *r, cJSON *root, char *out, size_t cap) {
   int found = r->owner[0] != 0;
+  int paged = r->query->pre_snapshot_sha256 != NULL;
   cJSON *gaps = cJSON_AddArrayToObject(root, "gap_reasons");
-  if (!gaps || !manifest_add_text(root, "schema", "edr.alert-window.v1") || !window_scope_json(r->query, root) ||
+  if (!gaps || !manifest_add_text(root, "schema", paged ? EDR_WINDOW_PRE_PAGE_SCHEMA : "edr.alert-window.v1") ||
+      !window_scope_json(r->query, root) || (found && paged && !manifest_add_text(root, "snapshot_sha256", r->snapshot)) ||
       !manifest_add_text(root, "coverage", found ? "retained_window" : "owner_unavailable") ||
       (found && (!manifest_add_u64_text(root, "window_from_ns", (uint64_t)r->first_ns) ||
                  !manifest_add_u64_text(root, "window_until_ns", (uint64_t)r->last_ns))) ||
@@ -11284,6 +11328,10 @@ static int window_encode(AlertWindowRead *r, cJSON *root, char *out, size_t cap)
   }
   int rc = EDR_PARENT_CONTEXT_ERROR_BUDGET;
   size_t final_bytes = strlen(json);
+  if (paged && cJSON_IsTrue(truncated) && !r->rows->child) {
+    cJSON_free(json);
+    return EDR_PARENT_CONTEXT_ERROR_BUDGET;
+  }
   if (final_bytes <= r->query->max_bytes && final_bytes < cap) {
     memcpy(out, json, final_bytes + 1);
     rc = 0;
@@ -11296,7 +11344,7 @@ static int window_encode(AlertWindowRead *r, cJSON *root, char *out, size_t cap)
 int edr_local_evidence_cache_query_alert_window_json(const EdrAlertWindowQuery *q, char *out, size_t cap) {
   if (!out || !cap) return EDR_PARENT_CONTEXT_ERROR_INVALID;
   *out = 0;
-  if (!q || !parent_context_scope_text(q->tenant_id, sizeof(((EdrBehaviorRecord *)0)->tenant_id)) ||
+  if (!q || !edr_window_page_valid(q) || !parent_context_scope_text(q->tenant_id, sizeof(((EdrBehaviorRecord *)0)->tenant_id)) ||
       !parent_context_scope_text(q->endpoint_id, sizeof(((EdrBehaviorRecord *)0)->endpoint_id)) ||
       !parent_context_scope_text(q->source_event_id, sizeof(((EdrBehaviorRecord *)0)->event_id)) ||
       !parent_context_scope_text(q->alert_id, 128) || !q->kind ||
@@ -11324,7 +11372,7 @@ int edr_local_evidence_cache_query_alert_window_json(const EdrAlertWindowQuery *
   transaction = 1;
   rc = window_read_owner(&read);
   if (!rc && read.owner[0]) rc = window_check_projection(&read);
-  if (!rc && read.owner[0]) rc = window_read_post(&read);
+  if (!rc && read.owner[0] && !q->pre_snapshot_sha256) rc = window_read_post(&read);
   if (!rc) rc = window_encode(&read, root, out, cap);
   if (!rc && exec_sql("COMMIT;") == 0)
     transaction = 0;

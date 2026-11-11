@@ -15582,11 +15582,13 @@ static void test_window_entry_order_and_recovery(int enforce) {
 #include "retained_context_recall_cases.h"
 #include "window_recovery_budget_cases.h"
 #include "alert_window_recall_cases.h"
+#include "alert_window_pre_page_cases.h"
 
 int main(int argc, char **argv) {
 #if defined(EDR_HAVE_SQLITE)
   if (argc == 2 && !strcmp(argv[1], "--alert-window-recall")) {
     test_alert_window_recall();
+    test_alert_window_pre_page();
     test_registry_source_fidelity(); return 0;
   }
   if (argc == 2 && !strcmp(argv[1], "--registry-source-fidelity")) {

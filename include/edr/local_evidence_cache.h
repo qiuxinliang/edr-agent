@@ -408,6 +408,9 @@ typedef struct {
   uint32_t pid, limit, max_bytes;
   uint64_t process_start_key, process_creation_filetime_100ns;
   int64_t source_time_ns, from_ns, until_ns, expires_unix_ms;
+  uint32_t pre_start_slot;
+  /* NULL selects the original mixed window. An empty digest starts a frozen registry page. */
+  const char *pre_snapshot_sha256, *previous_task_id, *previous_result_sha256;
 } EdrAlertWindowQuery;
 int edr_local_evidence_cache_query_alert_window_json(
     const EdrAlertWindowQuery *query, char *out, size_t cap);

@@ -16,6 +16,46 @@ static void assert_window_project(const EdrCommandResultAuthorization *a, cJSON 
   cJSON_free(raw);
 }
 
+static void assert_registry_page_projection(EdrCommandResultAuthorization a, const cJSON *mixed, int64_t issued) {
+  const char digest[] = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+  cJSON *r = cJSON_Duplicate(mixed, 1);
+  CHECK(r);
+  cJSON *q = cJSON_GetObjectItemCaseSensitive(r, "scope");
+  cJSON *page = cJSON_AddObjectToObject(q, "pre_page");
+  CHECK(page && cJSON_AddNumberToObject(page, "start_slot", 4));
+  CHECK(cJSON_AddStringToObject(page, "snapshot_sha256", digest));
+  CHECK(cJSON_AddStringToObject(page, "previous_task_id", "lcq-0123456789abcdef0123456789abcdef0123456789abcdef"));
+  CHECK(cJSON_AddStringToObject(page, "previous_result_sha256", digest));
+  char *request = cJSON_PrintUnformatted(q);
+  CHECK(request && edr_command_result_bind_contract(&a, (const uint8_t *)request, strlen(request), issued) == 0);
+  cJSON_free(request);
+  assert_window_project(&a, r, 0);
+  CHECK(cJSON_SetValuestring(cJSON_GetObjectItemCaseSensitive(r, "schema"), "edr.alert-window.pre-page.v1"));
+  CHECK(cJSON_AddStringToObject(r, "snapshot_sha256", digest));
+  assert_window_project(&a, r, 0); /* post is outside this page */
+  cJSON *rows = cJSON_GetObjectItemCaseSensitive(r, "rows");
+  cJSON *row = cJSON_GetArrayItem(rows, 0);
+  cJSON_DeleteItemFromObject(row, "fact_id");
+  CHECK(cJSON_SetValuestring(cJSON_GetObjectItemCaseSensitive(row, "phase"), "pre"));
+  CHECK(cJSON_SetValuestring(cJSON_GetObjectItemCaseSensitive(row, "event_time_ns"), "1700000000000000000"));
+  cJSON *slot = cJSON_AddNumberToObject(row, "slot", 4);
+  CHECK(slot && cJSON_ReplaceItemInObjectCaseSensitive(r, "output_truncated", cJSON_CreateTrue()));
+  assert_window_project(&a, r, 1);
+  cJSON_SetNumberValue(slot, 3); assert_window_project(&a, r, 0);
+  cJSON_SetNumberValue(slot, 31); assert_window_project(&a, r, 0);
+  cJSON_SetNumberValue(slot, 4);
+  CHECK(cJSON_SetValuestring(cJSON_GetObjectItemCaseSensitive(q, "alert_id"), "other"));
+  assert_window_project(&a, r, 0);
+  CHECK(cJSON_SetValuestring(cJSON_GetObjectItemCaseSensitive(q, "alert_id"), "a"));
+  CHECK(cJSON_SetValuestring(cJSON_GetObjectItemCaseSensitive(r, "snapshot_sha256"),
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
+  assert_window_project(&a, r, 0);
+  CHECK(cJSON_SetValuestring(cJSON_GetObjectItemCaseSensitive(r, "snapshot_sha256"), digest));
+  cJSON_DeleteItemFromArray(rows, 0);
+  assert_window_project(&a, r, 0);
+  cJSON_Delete(r);
+}
+
 static int alert_window_command_results(void) {
   const char *type = "alert_window_query_v2", *id = "synthetic-window";
   char path[256];
@@ -102,6 +142,7 @@ static int alert_window_command_results(void) {
   CHECK(cJSON_AddStringToObject(row, "registry_value", ""));
   CHECK(cJSON_AddStringToObject(row, "registry_op", "set_value"));
   assert_window_project(a, r, 1);
+  assert_registry_page_projection(*a, r, m.issued_at_unix_ms);
   CHECK(cJSON_AddStringToObject(row, "value_data", "secret"));
   assert_window_project(a, r, 0);
   cJSON_DeleteItemFromObject(row, "value_data");

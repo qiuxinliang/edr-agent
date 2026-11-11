@@ -25,8 +25,9 @@ static int window_result_row(const cJSON *row, const EdrAlertWindowQuery *q, uin
     return 0;
   const char *phase = result_text(row, "phase");
   if (!strcmp(phase, "pre")) {
-    if (stamp > (uint64_t)q->source_time_ns || !window_uint(row, "slot", 0, 31, &slot)) return 0;
+    if (stamp > (uint64_t)q->source_time_ns || !window_uint(row, "slot", q->pre_start_slot, 31, &slot)) return 0;
   } else if (!strcmp(phase, "post")) {
+    if (q->pre_snapshot_sha256) return 0;
     id = window_string(row, "fact_id");
     if (stamp < (uint64_t)q->source_time_ns || !id || strlen(id) != 64 || strspn(id, "0123456789abcdef") != 64)
       return 0;
@@ -35,7 +36,7 @@ static int window_result_row(const cJSON *row, const EdrAlertWindowQuery *q, uin
   for (const cJSON *prior = rows->child; prior != row; prior = prior->next) {
     uint32_t previous;
     if (id ? !strcmp(id, result_text(prior, "fact_id"))
-           : (window_uint(prior, "slot", 0, 31, &previous) && previous == slot))
+           : (window_uint(prior, "slot", 0, 31, &previous) && (q->pre_snapshot_sha256 ? previous >= slot : previous == slot)))
       return 0;
   }
   if (!strcmp(q->kind, "network"))
@@ -52,8 +53,8 @@ static cJSON *result_alert_window(const cJSON *root, const cJSON *contract,
   const cJSON *gaps = cJSON_GetObjectItemCaseSensitive(root, "gap_reasons");
   const cJSON *scan = cJSON_GetObjectItemCaseSensitive(root, "scan_limited");
   const cJSON *truncated = cJSON_GetObjectItemCaseSensitive(root, "output_truncated");
-  if (!cJSON_IsObject(root) || strcmp(result_text(root, "schema"), "edr.alert-window.v1") ||
-      !window_scope(cJSON_GetObjectItemCaseSensitive(contract, "request"), &scope) ||
+  if (!cJSON_IsObject(root) || !window_scope(cJSON_GetObjectItemCaseSensitive(contract, "request"), &scope) ||
+      strcmp(result_text(root, "schema"), scope.pre_snapshot_sha256 ? EDR_WINDOW_PRE_PAGE_SCHEMA : "edr.alert-window.v1") ||
       strcmp(scope.endpoint_id, auth->endpoint_id) || strcmp(scope.tenant_id, auth->tenant_id) ||
       !result_integer(contract, "max_bytes", scope.max_bytes, scope.max_bytes, NULL) ||
       !result_integer(contract, "max_rows", scope.limit, scope.limit, NULL) ||
@@ -82,7 +83,14 @@ static cJSON *result_alert_window(const cJSON *root, const cJSON *contract,
       return NULL;
   } else {
     uint64_t from, until;
-    if (cJSON_GetArraySize(root) != 10 || !unknown || strcmp(result_text(root, "coverage"), "retained_window") ||
+    if (scope.pre_snapshot_sha256) {
+      const char *digest = window_string(root, "snapshot_sha256");
+      uint32_t last = 0;
+      if (!edr_window_hex(digest, 64) || (scope.pre_start_slot && strcmp(digest, scope.pre_snapshot_sha256)) ||
+          cJSON_IsTrue(scan) || (cJSON_IsTrue(truncated) && (!rows->child ||
+             !window_uint(rows->child->prev, "slot", scope.pre_start_slot, 30, &last)))) return NULL;
+    }
+    if (cJSON_GetArraySize(root) != (scope.pre_snapshot_sha256 ? 11 : 10) || !unknown || strcmp(result_text(root, "coverage"), "retained_window") ||
         !window_decimal(root, "window_from_ns", INT64_MAX, &from) ||
         !window_decimal(root, "window_until_ns", INT64_MAX, &until) || from < (uint64_t)scope.from_ns ||
         from > (uint64_t)scope.source_time_ns || (uint64_t)scope.source_time_ns - from < UINT64_C(30000000000) ||
