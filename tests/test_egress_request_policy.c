@@ -329,6 +329,7 @@ static void test_parent_context_capability_health_projection(void) {
     snprintf(body, sizeof(body), "{\"endpoint_id\":\"ep\",\"agent_version\":\"3.2.692\","
         "\"policy_version\":\"p\",\"engine_health\":{\"capability_manifest\":{\"commands\":{"
         "\"alert_window_query_v1\":{\"code_supported\":true,\"build_supported\":true,\"policy_enabled\":true,\"runtime_status\":\"healthy\"},"
+        "\"alert_window_query_v2\":{\"code_supported\":true,\"build_supported\":true,\"policy_enabled\":true,\"runtime_status\":\"healthy\",\"cmdline\":\"synthetic-private\"},"
         "\"parent_context_query_v1\":{\"code_supported\":true,\"build_supported\":%s,"
         "\"policy_enabled\":%s,\"runtime_status\":\"%s\",\"rules_count\":7,\"source_event_id\":\"synthetic-private-source\","
         "\"parent\":{\"cmdline\":\"synthetic-private-command\",\"path\":\"synthetic-private-path\"}}}}}}",
@@ -341,6 +342,8 @@ static void test_parent_context_capability_health_projection(void) {
         cJSON_GetObjectItemCaseSensitive(decoded, "engine_health"), "capability_manifest"), "commands");
     cJSON *entry = cJSON_GetObjectItemCaseSensitive(commands, "parent_context_query_v1");
     assert(!cJSON_HasObjectItem(commands, "alert_window_query_v1"));
+    const cJSON *window = cJSON_GetObjectItemCaseSensitive(commands, "alert_window_query_v2");
+    assert(cJSON_IsObject(window) && cJSON_GetArraySize(window) == 4 && !cJSON_HasObjectItem(window,"cmdline"));
     assert(cJSON_IsObject(entry) && cJSON_GetArraySize(entry) == 4);
     assert(cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(entry, "code_supported")));
     assert(cJSON_IsBool(cJSON_GetObjectItemCaseSensitive(entry, "build_supported")) &&

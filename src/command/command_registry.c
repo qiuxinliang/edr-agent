@@ -1,4 +1,5 @@
 #include "edr/command_registry.h"
+#include "edr/command_result_json.h"
 
 #include <string.h>
 
@@ -78,7 +79,7 @@ static const EdrCommandAlias k_commands[] = {
             EDR_COMMAND_PAYLOAD_OBJECT),
     COMMAND("rtq_execute", EDR_COMMAND_KIND_RTQ_EXECUTE, "rtq_execute", 0, EDR_COMMAND_PAYLOAD_OBJECT),
     COMMAND("RTQ_EXECUTE", EDR_COMMAND_KIND_RTQ_EXECUTE, "rtq_execute", 0, EDR_COMMAND_PAYLOAD_OBJECT),
-    COMMAND("alert_window_query_v1", EDR_COMMAND_KIND_ALERT_WINDOW_QUERY, "alert_window_query_v1", 0, EDR_COMMAND_PAYLOAD_OBJECT),
+    COMMAND(EDR_ALERT_WINDOW_COMMAND, EDR_COMMAND_KIND_ALERT_WINDOW_QUERY, EDR_ALERT_WINDOW_COMMAND, 0, EDR_COMMAND_PAYLOAD_OBJECT),
     COMMAND("rtq_query", EDR_COMMAND_KIND_RTQ_QUERY, "rtq_query", 0, EDR_COMMAND_PAYLOAD_OBJECT),
     COMMAND("RTQ_QUERY", EDR_COMMAND_KIND_RTQ_QUERY, "rtq_query", 0, EDR_COMMAND_PAYLOAD_OBJECT),
     COMMAND("rtr_process_tree", EDR_COMMAND_KIND_PROCESS_TREE, "rtr_process_tree", 0,

@@ -25,6 +25,8 @@
 #include "edr/shellcode_detector.h"
 #include "edr/shellcode_known.h"
 #include "edr/time_util.h"
+#include "edr/command_result_json.h"
+#include "edr/command_util.h"
 
 #include "edr/attack_surface_report.h"
 #include "edr/collector.h"
@@ -1756,6 +1758,11 @@ static int edr_agent_capability_manifest_json(const EdrAgent *agent,
   const char *signing_runtime = !signing_build ? "unavailable"
                                 : !signing_policy ? "disabled"
                                 : signing_key_configured ? "healthy" : "degraded";
+  int window_build = sqlite_build && signing_build;
+  int window_policy = agent && edr_command_rtq_readonly_enabled() && signing_policy;
+  const char *window_runtime = !window_build ? "unavailable" : !window_policy ? "disabled" :
+      signing_key_configured && evidence_status && evidence_status->db_open &&
+      http_rt && http_rt->alert_window_transport_ready ? "healthy" : "unavailable";
   char agent_update_script[4096];
   EdrAgentUpdateRuntimeInfo agent_update_info;
   (void)edr_agent_update_get_runtime_info(&agent_update_info, agent_update_script, sizeof(agent_update_script));
@@ -1876,6 +1883,7 @@ static int edr_agent_capability_manifest_json(const EdrAgent *agent,
       "%s"
       "\"result_delivery_renewal\":{\"code_supported\":true,\"build_supported\":%s,\"policy_enabled\":true,\"runtime_status\":\"%s\"},"
       "\"rtq_execute\":{\"code_supported\":true,\"build_supported\":true,\"policy_enabled\":%s,\"runtime_status\":\"healthy\"},"
+      "\"" EDR_ALERT_WINDOW_COMMAND "\":{\"code_supported\":true,\"build_supported\":%s,\"policy_enabled\":%s,\"runtime_status\":\"%s\"},"
       "\"parent_context_query_v1\":{\"code_supported\":true,\"build_supported\":%s,\"policy_enabled\":%s,\"runtime_status\":\"%s\"},"
       "\"rtq_registry\":{\"code_supported\":true,\"build_supported\":%s,\"policy_enabled\":%s,\"runtime_status\":\"%s\"},"
       "\"rtq_eventlog\":{\"code_supported\":true,\"build_supported\":%s,\"policy_enabled\":%s,\"runtime_status\":\"%s\"},"
@@ -1938,6 +1946,7 @@ static int edr_agent_capability_manifest_json(const EdrAgent *agent,
       response_command_capability,
       signing_build ? "true" : "false", !signing_build ? "unavailable" : signing_key_configured ? "healthy" : "degraded",
       rtq_policy ? "true" : "false",
+      window_build ? "true" : "false", window_policy ? "true" : "false", window_runtime,
       sqlite_build ? "true" : "false", rtq_policy ? "true" : "false", parent_context_runtime,
       windows_native ? "true" : "false", rtq_policy ? "true" : "false", windows_native ? "healthy" : "unavailable",
       windows_native ? "true" : "false", rtq_policy ? "true" : "false", windows_native ? "healthy" : "unavailable",

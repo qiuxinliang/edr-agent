@@ -3735,10 +3735,6 @@ static void do_alert_window_query(const char *id, const uint8_t *payload, size_t
   char detail[ALERT_WINDOW_MAX_BYTES + 1u];
   const char *failure = "alert window result authorization invalid";
   struct timespec wall;
-  if (!ALERT_WINDOW_RECEIVER_VERIFIED) {
-    failure = "alert window receiver unavailable";
-    goto rejected;
-  }
   if (!edr_command_rtq_readonly_enabled()) {
     failure = "readonly RTQ disabled";
     goto rejected;
@@ -3780,16 +3776,20 @@ static void do_alert_window_query(const char *id, const uint8_t *payload, size_t
   cJSON_Delete(request);
   cJSON_Delete(contract);
   if (rc) {
-    const char *cause = rc == EDR_PARENT_CONTEXT_ERROR_EXPIRED     ? "alert window request expired"
-                        : rc == EDR_PARENT_CONTEXT_ERROR_BUDGET    ? "alert window budget exceeded"
-                        : rc == EDR_PARENT_CONTEXT_ERROR_INTEGRITY ? "alert window integrity conflict"
-                        : rc == EDR_PARENT_CONTEXT_ERROR_BUSY      ? "alert window cache busy"
-                        : rc == EDR_PARENT_CONTEXT_ERROR_INVALID   ? "alert window request invalid"
-                        : rc == EDR_PARENT_CONTEXT_ERROR_STORAGE   ? "alert window storage unavailable"
-                                                                   : "alert window query unavailable";
+    const char *cause;
+    int code;
+    switch (rc) {
+      case EDR_PARENT_CONTEXT_ERROR_INVALID:   code = 2; cause = "alert window request invalid"; break;
+      case EDR_PARENT_CONTEXT_ERROR_EXPIRED:   code = 4; cause = "alert window request expired"; break;
+      case EDR_PARENT_CONTEXT_ERROR_BUDGET:    code = 5; cause = "alert window budget exceeded"; break;
+      case EDR_PARENT_CONTEXT_ERROR_INTEGRITY: code = 6; cause = "alert window integrity conflict"; break;
+      case EDR_PARENT_CONTEXT_ERROR_BUSY:      code = 7; cause = "alert window cache busy"; break;
+      case EDR_PARENT_CONTEXT_ERROR_STORAGE:   code = 8; cause = "alert window storage unavailable"; break;
+      default:                                 code = 3; cause = "alert window query unavailable"; break;
+    }
     ++s_exec_fail;
     audit_both(id, cause);
-    soar_emit(id, meta, EdrCmdExecFailed, 3, cause);
+    soar_emit(id, meta, EdrCmdExecFailed, code, cause);
     return;
   }
   ++s_handled;
@@ -3802,7 +3802,7 @@ rejected:
   cJSON_Delete(contract);
   ++s_rejected;
   audit_both(id, failure);
-  soar_emit(id, meta, EdrCmdExecRejected, 2, failure);
+  soar_emit(id, meta, EdrCmdExecFailed, 2, failure);
 }
 
 static void do_rtr_process_tree(const char *cmd_id, const uint8_t *pl, size_t len,
@@ -5462,6 +5462,7 @@ static void flush_command_result_outbox(void) {
     snprintf(sm.playbook_run_id, sizeof(sm.playbook_run_id), "%s", pending[i].playbook_run_id);
     snprintf(sm.playbook_step_id, sizeof(sm.playbook_step_id), "%s", pending[i].playbook_step_id);
     sm.result_authorization = pending[i].result_authorization;
+    sm.result_finished_unix_ms = pending[i].result_finished_unix_ms;
     if (!command_should_report(pending[i].command_id, pending[i].command_type, &sm,
                                pending[i].execution_status, pending[i].exit_code)) {
       continue;

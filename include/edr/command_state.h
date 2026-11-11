@@ -47,6 +47,7 @@ typedef struct EdrCommandStateRecord {
   int64_t report_next_retry_unix_ms;
   char report_last_error[128];
   int64_t updated_unix_ms;
+  int64_t result_finished_unix_ms;
   char agent_boot_id[64];
   int process_id;
   char soar_correlation_id[128];

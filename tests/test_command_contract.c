@@ -33,9 +33,9 @@ static void test_alert_window_contract(void) {
       "\"kind\":\"registry\",\"from_ns\":\"1699999880000000001\",\"until_ns\":\"1700000120000000001\","
       "\"limit\":50,\"max_bytes\":8192}";
   char reason[192];
-  require_true(validate("alert_window_query_v1",payload,reason,sizeof(reason)), "signed alert window scope accepted");
+  require_true(validate("alert_window_query_v2",payload,reason,sizeof(reason)), "signed alert window scope accepted");
   test_setenv("EDR_COMMAND_ALLOW_UNSIGNED","1");
-  require_true(edr_command_contract_signature_required("test","alert_window_query_v1"), "window reads always require a signature");
+  require_true(edr_command_contract_signature_required("test","alert_window_query_v2"), "window reads always require a signature");
   test_setenv("EDR_COMMAND_ALLOW_UNSIGNED","0");
   const char *changes[][2] = {
     {"18446744073709551615","18446744073709551616"}, {"133700000000000001","0133700000000000001"},
@@ -47,7 +47,7 @@ static void test_alert_window_contract(void) {
   for (size_t i=0;i<COUNT_OF(changes);i++) {
     char modified[1024]; const char *at=strstr(payload,changes[i][0]);
     snprintf(modified,sizeof(modified),"%.*s%s%s",(int)(at-payload),payload,changes[i][1],at+strlen(changes[i][0]));
-    require_true(!validate("alert_window_query_v1",modified,reason,sizeof(reason)), "invalid window scope denied");
+    require_true(!validate("alert_window_query_v2",modified,reason,sizeof(reason)), "invalid window scope denied");
   }
 }
 

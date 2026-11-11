@@ -102,7 +102,7 @@ target_link_libraries(test_command_inbox PRIVATE Threads::Threads edr_egress_pol
 edr_apply_test_warnings(test_command_inbox)
 add_test(NAME command_inbox_persistence COMMAND test_command_inbox WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 if(WIN32)
-  target_link_libraries(test_command_inbox PRIVATE advapi32)
+  target_link_libraries(test_command_inbox PRIVATE advapi32 ws2_32)
 endif()
 
 # Embed the production I/O boundary for bounded CRT failure injection.
@@ -236,7 +236,7 @@ add_executable(test_command_process ${CMAKE_CURRENT_SOURCE_DIR}/test_command_pro
 target_include_directories(test_command_process PRIVATE ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/third_party/cjson)
 target_link_libraries(test_command_process PRIVATE Threads::Threads edr_egress_policy)
 if(WIN32)
-  target_link_libraries(test_command_process PRIVATE advapi32)
+  target_link_libraries(test_command_process PRIVATE advapi32 ws2_32)
 endif()
 edr_apply_test_warnings(test_command_process)
 add_test(NAME command_process_identity_and_receipts COMMAND test_command_process)
@@ -513,6 +513,7 @@ add_executable(test_command_result_json ${CMAKE_CURRENT_SOURCE_DIR}/test_command
 target_include_directories(test_command_result_json PRIVATE
   ${CMAKE_SOURCE_DIR}/include
   ${CMAKE_SOURCE_DIR}/third_party/cjson)
+target_link_libraries(test_command_result_json PRIVATE edr_egress_policy)
 edr_apply_test_warnings(test_command_result_json)
 add_test(NAME command_result_json_contract COMMAND test_command_result_json
   WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
@@ -2162,21 +2163,11 @@ add_executable(test_command_result_egress test_command_result_egress.c
   ${CMAKE_SOURCE_DIR}/src/transport/command_result_json.c)
 target_link_libraries(test_command_result_egress PRIVATE edr_egress_policy Threads::Threads)
 if(WIN32)
-  target_link_libraries(test_command_result_egress PRIVATE advapi32)
+  target_link_libraries(test_command_result_egress PRIVATE advapi32 ws2_32)
 endif()
 edr_apply_test_warnings(test_command_result_egress)
 add_test(NAME command_result_egress COMMAND test_command_result_egress)
-add_test(NAME alert_window_installed_sender_closed COMMAND test_command_result_egress --alert-window)
-get_target_property(_result_egress_sources test_command_result_egress SOURCES)
-add_executable(test_alert_window_isolated_receiver ${_result_egress_sources})
-target_compile_definitions(test_alert_window_isolated_receiver PRIVATE
-  EDR_ALERT_WINDOW_ISOLATED_RECEIVER=1 EDR_LOCAL_EVIDENCE_CACHE_TESTING=1)
-target_link_libraries(test_alert_window_isolated_receiver PRIVATE edr_egress_policy Threads::Threads)
-if(WIN32)
-  target_link_libraries(test_alert_window_isolated_receiver PRIVATE advapi32 ws2_32)
-endif()
-edr_apply_test_warnings(test_alert_window_isolated_receiver)
-add_test(NAME alert_window_isolated_result_egress COMMAND test_alert_window_isolated_receiver --alert-window)
+add_test(NAME alert_window_private_result_egress COMMAND test_command_result_egress --alert-window)
 
 add_executable(test_command_result_compaction test_command_result_compaction.c
   ${CMAKE_SOURCE_DIR}/src/command/command_state.c
@@ -2185,7 +2176,7 @@ add_executable(test_command_result_compaction test_command_result_compaction.c
   ${CMAKE_SOURCE_DIR}/src/transport/command_result_json.c)
 target_link_libraries(test_command_result_compaction PRIVATE edr_egress_policy Threads::Threads)
 if(WIN32)
-  target_link_libraries(test_command_result_compaction PRIVATE advapi32)
+  target_link_libraries(test_command_result_compaction PRIVATE advapi32 ws2_32)
 endif()
 edr_apply_test_warnings(test_command_result_compaction)
 add_test(NAME command_result_compaction COMMAND test_command_result_compaction)
@@ -2255,22 +2246,18 @@ if(SQLite3_FOUND AND OpenSSL_FOUND)
   target_link_libraries(test_egress_tls_client PRIVATE edr_runtime_test_common)
   target_compile_definitions(test_egress_tls_client PRIVATE EDR_TEST_EXTENDED_EGRESS=1)
   edr_apply_test_warnings(test_egress_tls_client)
-  # Resolve unchanged runtime owners from the existing test objects. Only the
-  # isolated runner's command execution and egress owners enable this receiver.
-  add_library(alert_window_test_runtime STATIC $<TARGET_OBJECTS:edr_runtime_test_common>)
   add_executable(test_alert_window_signed_replay test_alert_window_signed_replay.c
-    ${_runtime_test_agent_source} ${_runtime_test_pmfe_source}
-    ${CMAKE_SOURCE_DIR}/src/command/command_state.c ${CMAKE_SOURCE_DIR}/src/command/command_stub.c)
-  target_include_directories(test_alert_window_signed_replay PRIVATE $<TARGET_PROPERTY:edr_agent,INCLUDE_DIRECTORIES>)
-  target_compile_definitions(test_alert_window_signed_replay PRIVATE $<TARGET_PROPERTY:edr_agent,COMPILE_DEFINITIONS>
-    EDR_ALERT_WINDOW_ISOLATED_RECEIVER=1 EDR_LOCAL_EVIDENCE_CACHE_TESTING=1)
-  target_link_libraries(test_alert_window_signed_replay PRIVATE alert_window_test_runtime
-    $<TARGET_PROPERTY:edr_agent,LINK_LIBRARIES>)
+    ${_runtime_test_agent_source} ${_runtime_test_pmfe_source})
+  target_link_libraries(test_alert_window_signed_replay PRIVATE edr_runtime_test_common)
   edr_apply_test_warnings(test_alert_window_signed_replay)
   add_test(NAME alert_window_signed_replay COMMAND ${Python3_EXECUTABLE} -c
     "import subprocess,sys,tempfile; d=tempfile.TemporaryDirectory(); subprocess.run([sys.argv[1]],cwd=d.name,check=True)"
     $<TARGET_FILE:test_alert_window_signed_replay>)
   set_tests_properties(alert_window_signed_replay PROPERTIES TIMEOUT 30)
+  add_test(NAME alert_window_private_transport COMMAND ${Python3_EXECUTABLE} -B
+    ${CMAKE_SOURCE_DIR}/tests/test_alert_window_transport.py $<TARGET_FILE:test_alert_window_signed_replay>)
+  set_tests_properties(alert_window_private_transport PROPERTIES TIMEOUT 45)
+
   add_executable(test_forensic_baseline_staging test_forensic_baseline_staging.c
     ${_runtime_test_agent_source} ${_runtime_test_pmfe_source})
   target_link_libraries(test_forensic_baseline_staging PRIVATE edr_runtime_test_common)
@@ -2354,9 +2341,9 @@ endfunction()
 edr_minimization_test(egress_batch_policy test_egress_batch_policy)
 edr_minimization_test(egress_request_policy test_egress_request_policy)
 edr_minimization_test(command_result_egress test_command_result_egress)
-edr_minimization_test(alert_window_installed_sender_closed test_command_result_egress)
-edr_minimization_test(alert_window_isolated_result_egress test_alert_window_isolated_receiver)
+edr_minimization_test(alert_window_private_result_egress test_command_result_egress)
 edr_minimization_test(alert_window_signed_replay test_alert_window_signed_replay)
+edr_minimization_test(alert_window_private_transport test_alert_window_signed_replay)
 edr_minimization_test(command_result_compaction test_command_result_compaction)
 edr_minimization_test(authorized_local_query_contract test_egress_tls_client)
 edr_minimization_test(queue_recovery_real_codec test_queue_recovery)
@@ -2536,7 +2523,7 @@ if(SQLite3_FOUND)
   endif()
 endif()
 if(WIN32)
-  target_link_libraries(storage_space_preflight_client PRIVATE advapi32)
+  target_link_libraries(storage_space_preflight_client PRIVATE advapi32 ws2_32)
   target_compile_definitions(storage_space_preflight_client PRIVATE EDR_COMMAND_STATE_INVENTORY_TEST=1)
 endif()
 edr_apply_test_warnings(storage_space_preflight_client)

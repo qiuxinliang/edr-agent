@@ -104,7 +104,7 @@ int edr_command_result_bind_contract(EdrCommandResultAuthorization *a,const uint
    * it never receives query or raw-output authority. */
   snprintf(a->content_contract,sizeof(a->content_contract),"{\"schema\":\"edr.command.result-purpose.v1\",\"kind\":\"status\",\"max_bytes\":1024}");
   if (!strcmp(a->command_type,ALERT_WINDOW_COMMAND) &&
-      (!ALERT_WINDOW_RECEIVER_VERIFIED || !payload || !len || len>4096u || !window_wire_valid(payload,len))) return -1;
+      (!payload || !len || len>4096u || !window_wire_valid(payload,len))) return -1;
   cJSON *request=payload && len ? edr_egress_parse_purpose_object(payload,len) : cJSON_CreateObject();
   if(!cJSON_IsObject(request)){cJSON_Delete(request);return -1;}
   const char *kind=!strcmp(a->command_type,"rtq_execute")?"rtq":
@@ -639,9 +639,7 @@ static cJSON *result_shell(const cJSON *root,const cJSON *contract,const EdrComm
   if(!ok){cJSON_Delete(out);return NULL;}return out;
 }
 #include "command_result_typed.inc"
-#if ALERT_WINDOW_RECEIVER_VERIFIED
 #include "command_result_alert_window.inc"
-#endif
 
 int edr_command_result_project_detail(const EdrCommandResultAuthorization *a,const char *type,
     int status,int exit_code,const char *detail,char *out,size_t cap) {
@@ -671,12 +669,10 @@ int edr_command_result_project_detail(const EdrCommandResultAuthorization *a,con
   else if(!strcmp(type,"rtr_shell") && !strcmp(kind,"shell_output") && body && cJSON_HasObjectItem(body,"output"))projected=result_shell(body,contract,a,0);
   else if(status==1 && !strcmp(type,"rtq_execute") && !strcmp(kind,"rtq"))projected=result_query(body,contract,a,0);
   else if(status==1 && !strcmp(type,ALERT_WINDOW_COMMAND)) {
-#if ALERT_WINDOW_RECEIVER_VERIFIED
     const char *wire=inner ? wrapper_raw->valuestring : detail;
     if (!exit_code && !strcmp(type,a->command_type) && !strcmp(kind,type) &&
         strlen(wire)<=(size_t)max_bytes && window_wire_valid((const uint8_t *)wire,strlen(wire)))
       projected=result_alert_window(body,contract,a);
-#endif
   }
   else if(status==1 && !strcmp(type,"rtq_query") && !strcmp(kind,"cached_rtq"))projected=result_query(body,contract,a,1);
   else if(status==1 && !strcmp(type,"rtr_process_tree") && !strcmp(kind,"parent_context"))projected=result_parent_context(body,contract,a);

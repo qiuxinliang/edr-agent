@@ -1,6 +1,7 @@
 #include "edr/command_result_json.h"
 
 #include "cJSON.h"
+#include "edr/sha256.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -75,12 +76,26 @@ static void verify_http_ack_contract(void) {
                "missing response is rejected");
 }
 
+static void verify_window_ack(void) {
+  const char *detail = "{\"result\":\"合成\"}";
+  char hash[65], ack[512];
+  require_true(edr_sha256_hex((const uint8_t *)detail,strlen(detail),hash)==0,"digest");
+  snprintf(ack,sizeof(ack),"{\"data\":{\"accepted\":true,\"complete\":true,\"command_id\":\"a\","
+           "\"endpoint_id\":\"ep\",\"result_sha256\":\"%s\"}}",hash);
+  require_true(edr_alert_window_result_acked(ack,"a","ep",detail),"exact protected result ACK");
+  require_true(!edr_alert_window_result_acked(ack,"b","ep",detail),"cross-task ACK rejected");
+  require_true(!edr_alert_window_result_acked(ack,"a","other",detail),"cross-endpoint ACK rejected");
+  require_true(!edr_alert_window_result_acked(ack,"a","ep","{}"),"other result bytes rejected");
+  require_true(!edr_alert_window_result_acked("{\"accepted\":true}","a","ep",detail),"legacy ACK rejected");
+}
+
 int main(void) {
   verify_type("rtq_execute");
   verify_type("rtr_shell");
   verify_type("velo_query");
   verify_type("targeted_forensic");
   verify_http_ack_contract();
+  verify_window_ack();
   printf("ok\n");
   return 0;
 }

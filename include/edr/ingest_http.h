@@ -54,6 +54,7 @@ typedef struct {
   int http_fallback_available;
   int insecure_http;
   int mtls_configured;
+  int alert_window_transport_ready;
   int websocket_ready;
   int http2_enabled;
   int http2_required;

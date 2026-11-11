@@ -1,5 +1,6 @@
 #include <stdatomic.h>
 #include "edr/egress_request_policy.h"
+#include "edr/command_result_json.h"
 #include "edr/egress_batch_policy.h"
 #include "edr/p0_source_only_contract.h"
 #include "cJSON.h"
@@ -530,7 +531,7 @@ static int capability_field(const char *path, HealthType *type) {
     "rtq_registry", "rtq_eventlog", "yara_scan", "memory_dump", "targeted_forensic", "targeted_forensic_file",
     "targeted_forensic_process", "targeted_forensic_registry", "targeted_forensic_memory", "agent_update_v1",
     "endpoint_lifecycle_v1", "endpoint_uninstall_attestation_v1", "velociraptor_query", "result_delivery_renewal",
-    "parent_context_query_v1"};
+    "parent_context_query_v1", EDR_ALERT_WINDOW_COMMAND};
   const char *p = NULL;
   const char *prefix = "engine_health.capability_manifest.features.";
   const char *const *names = features;
@@ -550,7 +551,7 @@ static int capability_field(const char *path, HealthType *type) {
     for (size_t i = 0; i < sizeof(upgrade_fields) / sizeof(upgrade_fields[0]); ++i)
       if (!strcmp(dot, upgrade_fields[i].path)) { *type = upgrade_fields[i].type; return 1; }
   }
-  if (names == commands && !strcmp(name, "parent_context_query_v1") &&
+  if (names == commands && (!strcmp(name, "parent_context_query_v1") || !strcmp(name, EDR_ALERT_WINDOW_COMMAND)) &&
       strcmp(dot, "code_supported") && strcmp(dot, "build_supported") &&
       strcmp(dot, "policy_enabled") && strcmp(dot, "runtime_status")) return 0;
   if (strcmp(dot, "code_supported") == 0 || strcmp(dot, "build_supported") == 0 ||
@@ -1207,7 +1208,8 @@ int edr_egress_request_validate_for_scope(const char *method, const char *suffix
    * inventory, artifacts or diagnostic events. Task results require their durable owner. */
   if (!strcmp(method, "GET")) return !body && !len && control_get_valid(path) ? 0 : deny(reason, cap, "egress_control_field_or_route_denied");
   if (strcmp(method, "POST")) return deny(reason, cap, "egress_method_denied");
-  int command_result = !strcmp(path, "ingest/report-command-result");
+  int window_result = !strcmp(path, EDR_ALERT_WINDOW_RESULT_SUFFIX);
+  int command_result = window_result || !strcmp(path, "ingest/report-command-result");
   int batch = strcmp(path, "ingest/report-events") == 0;
   int heartbeat = strcmp(path, "ingest/heartbeat") == 0;
   int health = strcmp(path, "ingest/engine-health") == 0;
@@ -1216,7 +1218,7 @@ int edr_egress_request_validate_for_scope(const char *method, const char *suffix
       !strcmp(path, "ingest/config-status") || !strcmp(path, "agent/lifecycle/uninstall-attest");
   if (!batch && !heartbeat && !health && !delta && !control && !command_result) return deny(reason, cap, "egress_purpose_not_allowed");
   if (!body || !len || len > (batch ? EDR_EGRESS_BATCH_WIRE_MAX_BYTES :
-      heartbeat ? 1024u : control ? 8192u : command_result ? EDR_EGRESS_COMMAND_RESULT_MAX_BYTES : EDR_EGRESS_HEALTH_MAX_BYTES)) return deny(reason, cap, "egress_body_limit");
+      heartbeat ? 1024u : control ? 8192u : window_result ? 65536u : command_result ? EDR_EGRESS_COMMAND_RESULT_MAX_BYTES : EDR_EGRESS_HEALTH_MAX_BYTES)) return deny(reason, cap, "egress_body_limit");
   if (batch && content_type && strcmp(content_type, "application/x-protobuf") == 0)
     return validate_proto_batch(body, len,tenant,endpoint, reason, cap);
   if (!content_type || strcmp(content_type, "application/json")) return deny(reason, cap, "egress_content_type_denied");
@@ -1233,7 +1235,14 @@ int edr_egress_request_validate_for_scope(const char *method, const char *suffix
   int rc = 0;
   if (command_result) {
     EdrEgressCommandResultValidator owner = atomic_load_explicit(&command_result_validator, memory_order_acquire);
-    if (!command_result_schema_valid(root)) rc = deny(reason, cap, "command_result_schema_invalid");
+    const cJSON *result = cJSON_GetObjectItemCaseSensitive(root, "result");
+    const char *type = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(result, "command_type"));
+    const char *detail = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(result, "detail_utf8"));
+    if (!type || window_result != (!strcmp(type, EDR_ALERT_WINDOW_COMMAND)) ||
+        !strcmp(type,"alert_window_query_v1") ||
+        (window_result && (!detail || strlen(detail) > EDR_ALERT_WINDOW_RESULT_LIMIT)))
+      rc = deny(reason, cap, "command_result_destination_mismatch");
+    else if (!command_result_schema_valid(root)) rc = deny(reason, cap, "command_result_schema_invalid");
     else {
       int owned = owner && tenant && endpoint ? owner(tenant, endpoint, body, len) : 0;
       if (owned == EDR_EGRESS_AUTHORIZATION_EXPIRED || owned == EDR_EGRESS_LOCAL_STATE_FAILURE) {

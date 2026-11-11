@@ -1,6 +1,7 @@
-/* An isolated command receiver, actual durable executor/SQLite reader and HTTP
- * policy gate. No transport, collector or service thread starts in this test. */
+/* Owner-bound synthetic workload for native command execution and signed
+ * receipt delivery. Transport modes accept only an isolated loopback receiver. */
 #include "edr/command.h"
+#include "edr/ingest_http.h"
 #include "edr/command_state.h"
 #include "edr/command_result_json.h"
 #include "edr/config.h"
@@ -23,7 +24,7 @@
 #define test_env(k, v) setenv(k, v, 1)
 #endif
 
-static const char type[] = "alert_window_query_v1";
+static const char type[] = "alert_window_query_v2";
 static char payload[640];
 
 static void make_request(int64_t anchor) {
@@ -102,11 +103,7 @@ static void record_connection(int64_t anchor, char fact_id[65]) {
   sqlite3_close(db);
 }
 
-static EVP_PKEY *test_signer(void) {
-  EVP_PKEY_CTX *generator = EVP_PKEY_CTX_new_id(EVP_PKEY_ED25519, NULL);
-  EVP_PKEY *key = NULL;
-  assert(generator && EVP_PKEY_keygen_init(generator) == 1 && EVP_PKEY_keygen(generator, &key) == 1);
-  EVP_PKEY_CTX_free(generator);
+static void install_test_public_key(EVP_PKEY *key) {
   BIO *pub = BIO_new(BIO_s_mem());
   char pem[256];
   assert(pub && PEM_write_bio_PUBKEY(pub, key) == 1);
@@ -115,6 +112,14 @@ static EVP_PKEY *test_signer(void) {
   pem[n] = 0;
   assert(test_env("EDR_COMMAND_SIGNING_PUBLIC_KEY", pem) == 0);
   BIO_free(pub);
+}
+
+static EVP_PKEY *test_signer(void) {
+  EVP_PKEY_CTX *generator = EVP_PKEY_CTX_new_id(EVP_PKEY_ED25519, NULL);
+  EVP_PKEY *key = NULL;
+  assert(generator && EVP_PKEY_keygen_init(generator) == 1 && EVP_PKEY_keygen(generator, &key) == 1);
+  EVP_PKEY_CTX_free(generator);
+  install_test_public_key(key);
   return key;
 }
 
@@ -145,8 +150,125 @@ static void sign_command(EVP_PKEY *key, const char *id, EdrSoarCommandMeta *m) {
   snprintf(m->soar_correlation_id, sizeof(m->soar_correlation_id), "%s", id);
 }
 
+/* The loopback receiver disappears once (old server), then returns a swapped
+ * ACK. Recovery reopens the durable terminal before the exact ACK arrives. */
+static void private_transport(const char *base, EdrCommandStateRecord *r, EdrSoarCommandMeta *meta) {
+  edr_ingest_http_configure(base,"t","test","synthetic-token","ep","test","ca.pem","client.pem",
+                            "client.key","pem",NULL,NULL,"direct",NULL,NULL);
+  EdrRequestSigningConfig signing = {1, "synthetic-key", "c3ludGhldGlj"};
+  edr_ingest_http_configure_request_signing(&signing);
+  meta->result_finished_unix_ms = r->result_finished_unix_ms;
+  const int64_t first_finish = r->result_finished_unix_ms;
+  for (int i = 0; i < 3; ++i) {
+    int rc = edr_ingest_http_post_command_result_typed(r->command_id,type,meta,1,0,r->detail);
+    if (i == 2) {
+      assert(rc == EDR_INGEST_COMMAND_RESULT_OK && edr_command_state_mark_reported(r) == 0);
+    } else {
+      assert(rc == EDR_INGEST_COMMAND_RESULT_RETRYABLE_FAILURE);
+      assert(edr_command_state_mark_report_retry(r,"synthetic receiver unavailable",first_finish) == 0);
+      char id[sizeof(r->command_id)];
+      strcpy(id,r->command_id);
+      assert(edr_command_state_begin(id,type,meta,NULL,r) == EDR_COMMAND_STATE_BEGIN_DUP_FINAL);
+      assert(r->report_pending && r->result_finished_unix_ms == first_finish);
+    }
+  }
+}
+
+static cJSON *fixture_object(const char *path, char *wire, size_t capacity) {
+  FILE *f = fopen(path, "rb");
+  assert(f);
+  size_t length = fread(wire, 1, capacity, f);
+  assert(!ferror(f) && feof(f) && length > 0 && length < capacity);
+  assert(fclose(f) == 0);
+  wire[length] = 0;
+  cJSON *o = edr_egress_parse_purpose_object(wire, length);
+  assert(o);
+  return o;
+}
+
+static const char *fixture_string(const cJSON *object, const char *key) {
+  const char *s = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(object,key));
+  assert(s && *s);
+  return s;
+}
+
+static void ordered_go_receipt(const char *envelope_path, const char *transport_path) {
+  char wire[16384], options[4096], raw_payload[4097];
+  cJSON *job = fixture_object(envelope_path,wire,sizeof(wire));
+  cJSON *transport = fixture_object(transport_path,options,sizeof(options));
+  cJSON *request = fixture_object("payload.json",raw_payload,sizeof(raw_payload));
+  const cJSON *env = cJSON_GetObjectItemCaseSensitive(job,"envelope");
+  assert(cJSON_Compare(request,cJSON_GetObjectItemCaseSensitive(env,"payload"),1));
+  const char *pub = fixture_string(job,"public_key_hex");
+  unsigned char raw[32];
+  assert(strlen(pub)==64 && strspn(pub,"0123456789abcdef")==64);
+  for (size_t i = 0; i < sizeof(raw); i++) {
+    unsigned pair;
+    assert(sscanf(pub + i*2,"%2x",&pair) == 1);
+    raw[i] = (unsigned char)pair;
+  }
+  EVP_PKEY *key = EVP_PKEY_new_raw_public_key(EVP_PKEY_ED25519,NULL,raw,sizeof(raw));
+  assert(key);
+  install_test_public_key(key);
+  EVP_PKEY_free(key);
+
+  const char *url = fixture_string(transport,"base_url");
+  unsigned port;
+  int consumed = 0;
+  assert(sscanf(url,"https://127.0.0.1:%u/api/v1%n",&port,&consumed)==1 &&
+         consumed > 0 && (size_t)consumed==strlen(url) && port>0 && port<=65535);
+  const char *id = fixture_string(env,"command_id"), *correlation = fixture_string(env,"soar_correlation_id");
+  const char *idem = fixture_string(env,"idempotency_key");
+  assert(!strcmp(fixture_string(env,"command_type"),type) && !strcmp(id,correlation));
+  EdrConfig cfg = {0};
+  strcpy(cfg.agent.tenant_id,"t");
+  strcpy(cfg.agent.endpoint_id,"ep");
+  cfg.command.allow_rtq_readonly=1;
+  edr_command_bind_config(&cfg);
+  assert(test_env("EDR_COMMAND_STATE_DIR","command-state")==0);
+  edr_ingest_http_configure(url,"t","agent:ep",fixture_string(transport,"bearer"),"ep","test",
+      fixture_string(transport,"ca_file"),fixture_string(transport,"cert_file"),fixture_string(transport,"key_file"),
+      "pem",NULL,NULL,"direct",NULL,NULL);
+  edr_ingest_http_configure_control_transport_options(0,0,1);
+  EdrRequestSigningConfig signing={0};
+  signing.enabled=1;
+  const char *kid=fixture_string(transport,"key_id"), *secret=fixture_string(transport,"secret");
+  assert(strlen(kid)<sizeof(signing.key_id) && strlen(secret)<sizeof(signing.secret));
+  strcpy(signing.key_id,kid);
+  strcpy(signing.secret,secret);
+  edr_ingest_http_configure_request_signing(&signing);
+  assert(edr_local_evidence_cache_open_with_policy("synthetic-cache.db",16,1,4)==0);
+  char fact_id[65];
+  record_connection(strtoll(fixture_string(request,"source_time_ns"),NULL,10),fact_id);
+  EdrSoarCommandMeta m={0};
+  assert(strlen(correlation)<sizeof(m.soar_correlation_id) && strlen(idem)<sizeof(m.idempotency_key));
+  strcpy(m.soar_correlation_id,correlation);
+  strcpy(m.idempotency_key,idem);
+  m.issued_at_unix_ms=(int64_t)cJSON_GetNumberValue(cJSON_GetObjectItemCaseSensitive(env,"issued_at_unix_ms"));
+  m.deadline_ms=(uint32_t)cJSON_GetNumberValue(cJSON_GetObjectItemCaseSensitive(env,"deadline_ms"));
+  assert(m.deadline_ms==60000);
+  assert(edr_command_receive_envelope(id,type,(const uint8_t *)raw_payload,strlen(raw_payload),&m)==1);
+  assert(edr_command_replay_persisted_inbox_once()==1);
+  EdrCommandStateRecord *r=calloc(1,sizeof(*r));
+  assert(r && edr_command_state_begin(id,type,&m,NULL,r)==EDR_COMMAND_STATE_BEGIN_DUP_FINAL);
+  assert(r->execution_status==1 && !r->exit_code && r->report_pending && !r->report_policy_held);
+  assert(strstr(r->detail,fact_id) && !strstr(r->detail,"51744"));
+  m.result_finished_unix_ms=r->result_finished_unix_ms;
+  assert(edr_ingest_http_post_command_result_typed(id,type,&m,1,0,r->detail)==0);
+  assert(edr_command_state_mark_reported(r)==0);
+  free(r);
+  edr_local_evidence_cache_close();
+  cJSON_Delete(request);
+  cJSON_Delete(transport);
+  cJSON_Delete(job);
+}
+
 int main(int argc, char **argv) {
-  assert(argc == 1 || argc == 2);
+  if (argc == 4 && !strcmp(argv[1],"--ordered-go")) {
+    ordered_go_receipt(argv[2],argv[3]);
+    return 0;
+  }
+  assert(argc == 1 || argc == 2 || (argc == 3 && !strcmp(argv[1],"--private-transport")));
   const char *id = "lcq-synthetic-window-signed";
   EdrConfig cfg = {0};
   strcpy(cfg.agent.tenant_id, "t");
@@ -178,10 +300,10 @@ int main(int argc, char **argv) {
   assert(receipt &&
          !strcmp(cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(receipt, "coverage")), "owner_unavailable"));
   assert(cJSON_GetArraySize(cJSON_GetObjectItemCaseSensitive(receipt, "rows")) == 0);
-  char *http = edr_command_result_http_json("ep", "test", id, type, 1, 0, r->detail, meta.issued_at_unix_ms,
+  char *http = edr_command_result_http_json("ep", "test", id, type, 1, 0, r->detail, r->result_finished_unix_ms,
                                             r->soar_correlation_id, "", "");
   char why[128];
-  assert(http && edr_egress_request_validate_for_scope("POST", "ingest/report-command-result", "application/json",
+  assert(http && edr_egress_request_validate_for_scope("POST", EDR_ALERT_WINDOW_RESULT_SUFFIX, "application/json",
                                                        http, strlen(http), "t", "ep", why, sizeof(why)) == 0);
   assert(edr_command_receive_envelope(id, type, (const uint8_t *)payload, strlen(payload), &meta) == 0);
   assert(edr_command_state_count_inbox() == 0);
@@ -210,9 +332,9 @@ int main(int argc, char **argv) {
   assert(cJSON_GetNumberValue(cJSON_GetObjectItemCaseSensitive(row, "remote_port")) == 51742);
   assert(!strcmp(cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(row, "remote_ip")), "192.0.2.74"));
   assert(!strcmp(r->soar_correlation_id, id));
-  http = edr_command_result_http_json("ep", "test", id, type, 1, 0, r->detail, meta.issued_at_unix_ms,
+  http = edr_command_result_http_json("ep", "test", id, type, 1, 0, r->detail, r->result_finished_unix_ms,
                                       r->soar_correlation_id, "", "");
-  assert(http && edr_egress_request_validate_for_scope("POST", "ingest/report-command-result", "application/json",
+  assert(http && edr_egress_request_validate_for_scope("POST", EDR_ALERT_WINDOW_RESULT_SUFFIX, "application/json",
                                                        http, strlen(http), "t", "ep", why, sizeof(why)) == 0);
   printf("{\"request_id\":\"%s\",\"actor\":\"synthetic-analyst\",\"issued_at_unix_ms\":%lld,\"deadline_ms\":%u,"
          "\"request\":%s,\"http\":%s}\n", request_id, (long long)meta.issued_at_unix_ms, meta.deadline_ms, payload, http);
@@ -231,6 +353,8 @@ int main(int argc, char **argv) {
         meta.idempotency_key, meta.soar_correlation_id, payload, http) > 0);
     assert(fclose(fixture) == 0);
   }
+
+  if (argc == 3) private_transport(argv[2],r,&meta);
 
   id = "lcq-synthetic-rebound";
   sign_command(key, id, &meta);

@@ -1,10 +1,8 @@
-#if defined(EDR_ALERT_WINDOW_ISOLATED_RECEIVER) && defined(EDR_LOCAL_EVIDENCE_CACHE_TESTING)
 #if defined(_WIN32)
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #else
 #include <arpa/inet.h>
-#endif
 #endif
 #include "edr/command_cancel.h"
 #include "edr/command_state.h"
@@ -1214,7 +1212,15 @@ static void fill_record_from_line(const char *line, EdrCommandStateRecord *out) 
   out->retry_count = parse_json_int_field_line(line, "retry_count", 0);
   out->final_record = parse_json_int_field_line(line, "final", 0);
   out->report_pending = parse_json_int_field_line(line, "report_pending", 0);
-  out->report_policy_held = parse_json_int_field_line(line,"report_policy_held",0);
+  /* A v2 receipt remains pending and reserved while a supported old Agent
+   * owns the machine. Old senders honor their generic hold; only the private
+   * sender understands the independently persisted window hold. */
+  if (!strcmp(out->command_type, ALERT_WINDOW_COMMAND)) {
+    out->result_finished_unix_ms = parse_json_int64_field_line(line, "result_finished_unix_ms", 0);
+    out->report_policy_held = parse_json_int_field_line(line, "window_report_held", 1);
+  } else {
+    out->report_policy_held = parse_json_int_field_line(line, "report_policy_held", 0);
+  }
   parse_json_string_field_line(line,"report_policy_version",out->report_policy_version,sizeof(out->report_policy_version));
   out->report_attempts = (uint32_t)parse_json_int_field_line(line, "report_attempts", 0);
   out->process_id = parse_json_int_field_line(line, "process_id", 0);
@@ -2665,6 +2671,7 @@ int edr_command_state_renew_delivery(const char *renewal_id,const uint8_t *paylo
       !cJSON_IsNumber(expires) || expires->valuedouble<=now || expires->valuedouble>now+86400000LL ||
       expires->valuedouble>(double)authority->expires_unix_ms || (double)(int64_t)expires->valuedouble!=expires->valuedouble)goto done;
   int upgrade=!strcmp(kind->valuestring,"upgrade_payload");
+  if (!strcmp(type->valuestring, ALERT_WINDOW_COMMAND)) goto done;
   if(upgrade && strcmp(type->valuestring,"agent_update"))goto done;
   FILE *lock=state_lock_acquire();if(!lock){rc=EDR_EGRESS_LOCAL_STATE_FAILURE;goto done;}
   cJSON *target=NULL;char path[1200],sha[65];
@@ -3090,6 +3097,24 @@ static int command_state_finish(const char *command_id, const char *command_type
       edr_command_state_free_inbox_record(&inbox);
     }
   }
+  int64_t finished = state_now_ms();
+  char finished_field[96] = "";
+  int window = command_type && !strcmp(command_type, ALERT_WINDOW_COMMAND);
+  if (window) {
+    struct timespec utc;
+    finished = timespec_get(&utc, TIME_UTC) == TIME_UTC ? (int64_t)utc.tv_sec * 1000 + utc.tv_nsec / 1000000 : 0;
+
+    if (!meta || meta->deadline_ms == 0 || meta->deadline_ms > 60000 || meta->issued_at_unix_ms <= 0 ||
+        finished < meta->issued_at_unix_ms || finished - meta->issued_at_unix_ms >= meta->deadline_ms) {
+      content_held = 1;
+    }
+    snprintf(finished_field, sizeof(finished_field), "\"result_finished_unix_ms\":%lld,\"window_report_held\":%d,",
+             (long long)finished, content_held);
+    if (content_held) {
+      detail = "";
+      strcpy(det, "\"\"");
+    }
+  }
   char auth[EDR_COMMAND_STATE_AUTH_CAP];
   if (authorization_json(&final_authority, auth, sizeof(auth)) != 0) {state_lock_release(lock);return -1;}
   snprintf(line, sizeof(line),
@@ -3098,19 +3123,21 @@ static int command_state_finish(const char *command_id, const char *command_type
            "\"exit_code\":%d,\"retry_count\":%d,\"report_pending\":%d,"
            "\"report_attempts\":%u,\"report_last_failure_unix_ms\":%lld,"
            "\"report_next_retry_unix_ms\":0,\"report_last_error\":\"%s\",\"report_policy_held\":%d,\"report_policy_version\":\"%s\","
-           "\"updated_unix_ms\":%lld,"
+           "%s\"updated_unix_ms\":%lld,"
            "\"soar_correlation_id\":%s,\"playbook_run_id\":%s,\"playbook_step_id\":%s,"
            "\"agent_boot_id\":%s,\"process_id\":%d,\"artifacts\":%s,\"detail\":%s,\"result_authorization\":%s}",
            cid, ctype, idem, st, execution_status, exit_code, retry, report_pending ? 1 : 0,
-           0u, 0LL, content_held ? "result_content_contract_denied" : "", content_held,
-           content_held ? EDR_EGRESS_POLICY_VERSION : "",
-           (long long)state_now_ms(), scid, run, step, boot, pid, art, det, auth);
+           0u, 0LL, content_held ? "result_content_contract_denied" : "", window || content_held,
+           (window || content_held) ? EDR_EGRESS_POLICY_VERSION : "",
+           finished_field, (long long)finished, scid, run, step, boot, pid, art, det, auth);
   int prior=(once || final_authority.content_contract[0]) ? matching_terminal_locked(command_id,command_type,meta,response_status,
       execution_status,exit_code,detail,artifacts) : 0;
   int written=prior==0 ? append_state_line(line) : prior;
   state_lock_release(lock);
   if(written!=0)return written==1 && !once ? 0 : written;
-  int copy_outcome = edr_local_evidence_cache_record_command_result(
+  /* Its sole durable delivery owner already holds the projected result. A
+   * second generic file-query copy would outlive the alert's access boundary. */
+  int copy_outcome = window ? EDR_EVIDENCE_COMMAND_RESULT_UNAVAILABLE : edr_local_evidence_cache_record_command_result(
       command_id, command_type, response_status ? response_status : "failed",
       execution_status, exit_code, local_detail, artifacts);
   /* The terminal delivery/idempotency owner is already durable. Local detail
@@ -3274,8 +3301,10 @@ int edr_command_state_collect_pending(EdrCommandStateRecord *out, size_t cap) {
       }
       fill_record_from_line(line,rec);first=end;
       if(!rec->report_pending)continue;
-      pending_exists=1;
+      /* Only time-dependent retries need another read of an unchanged file.
+       * Releasing a policy hold changes the durable owner or the executable. */
       if(rec->report_policy_held && !strcmp(rec->report_policy_version,EDR_EGRESS_POLICY_VERSION))continue;
+      pending_exists=1;
       if(rec->report_next_retry_unix_ms<=0 || rec->report_next_retry_unix_ms<=now_ms)out[n++]=*rec;
     }
   }
@@ -3335,6 +3364,11 @@ int edr_command_state_result_authorized(const char *tenant, const char *endpoint
   const cJSON *exit_code = cJSON_GetObjectItemCaseSensitive(result, "exit_code");
   valid = valid && cJSON_IsNumber(status) && status->valuedouble == latest->execution_status &&
       cJSON_IsNumber(exit_code) && exit_code->valuedouble == latest->exit_code;
+  if (valid && !strcmp(latest->command_type, ALERT_WINDOW_COMMAND)) {
+    const cJSON *finished = cJSON_GetObjectItemCaseSensitive(result, "finished_unix_ms");
+    valid = latest->result_finished_unix_ms > 0 && !latest->report_policy_held &&
+            cJSON_IsNumber(finished) && finished->valuedouble == (double)latest->result_finished_unix_ms;
+  }
   if (valid && !strcmp(latest->command_type, "shell_stream")) {
     /* Streams inherit the admitted session, never authority from an ID prefix alone. */
     cJSON *stream = cJSON_Parse(latest->detail);
@@ -3399,6 +3433,11 @@ static int mark_report_waiting(const EdrCommandStateRecord *record,
   uint32_t attempts = held ? record->report_attempts : record->report_attempts < UINT32_MAX
                           ? record->report_attempts + 1u
                           : UINT32_MAX;
+  char finished_field[96] = "";
+  int window = !strcmp(record->command_type, ALERT_WINDOW_COMMAND);
+  if (window)
+    snprintf(finished_field, sizeof(finished_field), "\"result_finished_unix_ms\":%lld,\"window_report_held\":%d,",
+             (long long)record->result_finished_unix_ms, held);
   char auth[EDR_COMMAND_STATE_AUTH_CAP];
   if (authorization_json(&record->result_authorization, auth, sizeof(auth)) != 0) return -1;
   snprintf(line, sizeof(line),
@@ -3408,12 +3447,12 @@ static int mark_report_waiting(const EdrCommandStateRecord *record,
            "\"report_policy_held\":%d,\"report_policy_version\":\"%s\","
            "\"report_attempts\":%u,\"report_last_failure_unix_ms\":%lld,"
            "\"report_next_retry_unix_ms\":%lld,\"report_last_error\":%s,"
-           "\"updated_unix_ms\":%lld,\"soar_correlation_id\":%s,"
+           "%s\"updated_unix_ms\":%lld,\"soar_correlation_id\":%s,"
            "\"playbook_run_id\":%s,\"playbook_step_id\":%s,\"agent_boot_id\":%s,"
            "\"process_id\":%d,\"artifacts\":%s,\"detail\":%s,\"result_authorization\":%s}",
            cid, ctype, idem, st, record->execution_status, record->exit_code,
-           record->retry_count, held, held ? EDR_EGRESS_POLICY_VERSION : "", attempts, (long long)now_ms,
-           (long long)next_retry_unix_ms, report_error, (long long)now_ms,
+           record->retry_count, window || held, (window || held) ? EDR_EGRESS_POLICY_VERSION : "", attempts, (long long)now_ms,
+           (long long)next_retry_unix_ms, report_error, finished_field, (long long)now_ms,
            scid, run, step, boot, pid, art, det, auth);
   /* An in-flight send may report expiry after a signed renewal or ACK.
    * Serialize its retry transition with the current durable owner so stale

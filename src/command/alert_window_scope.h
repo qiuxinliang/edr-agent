@@ -8,18 +8,10 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define ALERT_WINDOW_COMMAND "alert_window_query_v1"
-#define ALERT_WINDOW_MAX_BYTES 8192u
+#include "edr/command_result_json.h"
+#define ALERT_WINDOW_COMMAND EDR_ALERT_WINDOW_COMMAND
+#define ALERT_WINDOW_MAX_BYTES EDR_ALERT_WINDOW_RESULT_LIMIT
 #define ALERT_WINDOW_RADIUS_NS UINT64_C(120000000000)
-
-/* Installed servers predating the dedicated receipt consumer may expose a
- * generic result preview. Only the isolated regression target has a verified
- * sink. There is deliberately no runtime switch or release capability grant. */
-#if defined(EDR_ALERT_WINDOW_ISOLATED_RECEIVER) && defined(EDR_LOCAL_EVIDENCE_CACHE_TESTING)
-#define ALERT_WINDOW_RECEIVER_VERIFIED 1
-#else
-#define ALERT_WINDOW_RECEIVER_VERIFIED 0
-#endif
 
 /* All numeric JSON tokens in either window schema are unsigned integers.
  * Reject fractional/exponent spellings before cJSON rounds to a double. */

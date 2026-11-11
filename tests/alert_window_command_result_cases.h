@@ -1,5 +1,3 @@
-/* Two builds exercise the same real durable result and HTTP egress owners.
- * Only the isolated test target may export a synthetic window receipt. */
 static const char window_request[] =
     "{\"tenant_id\":\"tenant\",\"endpoint_id\":\"ep\",\"alert_id\":\"a\",\"source_event_id\":\"evt\",\"pid\":42,"
     "\"process_start_key\":\"18446744073709551615\",\"process_creation_filetime_100ns\":\"133700000000000001\","
@@ -14,12 +12,12 @@ static const char window_row[] =
 static void assert_window_project(const EdrCommandResultAuthorization *a, cJSON *r, int pass) {
   char *raw = cJSON_PrintUnformatted(r), out[8197];
   CHECK(raw);
-  CHECK((edr_command_result_project_detail(a, "alert_window_query_v1", 1, 0, raw, out, sizeof(out)) == 0) == pass);
+  CHECK((edr_command_result_project_detail(a, "alert_window_query_v2", 1, 0, raw, out, sizeof(out)) == 0) == pass);
   cJSON_free(raw);
 }
 
 static int alert_window_command_results(void) {
-  const char *type = "alert_window_query_v1", *id = "synthetic-window";
+  const char *type = "alert_window_query_v2", *id = "synthetic-window";
   char path[256];
   snprintf(path, sizeof(path), "./alert-window-egress-%ld", (long)pid());
   env("EDR_COMMAND_STATE_DIR", path);
@@ -31,6 +29,8 @@ static int alert_window_command_results(void) {
   strcpy(a->tenant_id, "tenant");
   strcpy(a->endpoint_id, "ep");
   m.issued_at_unix_ms = (int64_t)time(NULL) * 1000;
+  m.deadline_ms = 60000;
+  strcpy(m.soar_correlation_id,id);
   a->expires_unix_ms = m.issued_at_unix_ms + 60000;
   char detail[4096];
   snprintf(detail, sizeof(detail),
@@ -43,19 +43,6 @@ static int alert_window_command_results(void) {
                                                m.issued_at_unix_ms);
   cJSON *r = cJSON_Parse(detail);
   CHECK(r);
-#if !defined(EDR_ALERT_WINDOW_ISOLATED_RECEIVER)
-  CHECK(bound != 0);
-  /* Even a previously persisted test grant cannot cross an installed sender. */
-  snprintf(a->content_contract, sizeof(a->content_contract),
-           "{\"schema\":\"edr.command.result-purpose.v1\","
-           "\"kind\":\"alert_window_query_v1\",\"max_rows\":50,\"max_bytes\":8192,\"request\":%s}",
-           window_request);
-  assert_window_project(a, r, 0);
-  CHECK(edr_command_state_finish(id, type, &m, "ok", 1, 0, detail, "", 1) == 0);
-  char *b = persisted_body(id, type);
-  CHECK(!allowed("tenant", "ep", b));
-  free(b);
-#else
   CHECK(bound == 0);
   EdrCommandResultAuthorization wrong = *a;
   strcpy(wrong.tenant_id, "other");
@@ -73,7 +60,12 @@ static int alert_window_command_results(void) {
   assert_window_project(a, r, 1);
   CHECK(edr_command_state_finish(id, type, &m, "ok", 1, 0, detail, "", 1) == 0);
   char *b = persisted_body(id, type);
-  CHECK(allowed("tenant", "ep", b) && !allowed("other", "ep", b));
+  char why[128];
+  CHECK(!allowed("tenant","ep",b));
+  CHECK(edr_egress_request_validate_for_scope("POST",EDR_ALERT_WINDOW_RESULT_SUFFIX,"application/json",
+        b,strlen(b),"tenant","ep",why,sizeof(why))==0);
+  CHECK(edr_egress_request_validate_for_scope("POST",EDR_ALERT_WINDOW_RESULT_SUFFIX,"application/json",
+        b,strlen(b),"other","ep",why,sizeof(why))!=0);
   free(b);
   cJSON *rows = cJSON_GetObjectItemCaseSensitive(r, "rows"), *row = cJSON_GetArrayItem(rows, 0);
   CHECK(cJSON_AddItemToArray(rows, cJSON_Duplicate(row, 1)));
@@ -124,7 +116,6 @@ static int alert_window_command_results(void) {
   assert_window_project(a, r, 1);
   CHECK(cJSON_AddStringToObject(r, "raw_detail", "secret"));
   assert_window_project(a, r, 0);
-#endif
   cJSON_Delete(r);
   puts("alert window result authorization and final egress passed");
   return 0;

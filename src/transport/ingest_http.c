@@ -564,7 +564,8 @@ static int url_uses_control_http2_policy(const char *url) {
   }
   return strstr(url, "/ingest/control/") != NULL ||
          strstr(url, "/ingest/poll-commands") != NULL ||
-         strstr(url, "/ingest/report-command-result") != NULL;
+         strstr(url, "/ingest/report-command-result") != NULL ||
+         strstr(url, "/" EDR_ALERT_WINDOW_RESULT_SUFFIX) != NULL;
 }
 
 static int http2_enabled_for_url(const char *url) {
@@ -1434,6 +1435,14 @@ void edr_ingest_http_configure(const char *rest_base, const char *tenant_id, con
   runtime_state_unlock();
 }
 
+/* Called with the runtime lock. These are configuration facts, not a
+ * round-trip or authority to read a window. The receiver authenticates each POST. */
+static int alert_window_transport_configured(void) {
+  return !strncmp(s_rest, "https://", 8) && s_endpoint[0] && s_bearer[0] &&
+         s_request_signing.enabled && s_request_signing.secret[0] && s_request_signing.key_id[0] &&
+         (!strcmp(s_mtls_status, "schannel_store_ready") || !strcmp(s_mtls_status, "pem_ready"));
+}
+
 int edr_ingest_http_configured(void) {
   runtime_state_lock();
   int configured = s_rest[0] != 0 && s_endpoint[0] != 0;
@@ -1547,6 +1556,7 @@ void edr_ingest_http_get_runtime(EdrIngestHttpRuntime *out) {
   out->configured = edr_ingest_http_configured();
   out->http_fallback_available = out->configured;
   out->insecure_http = s_insecure_http;
+  out->alert_window_transport_ready = alert_window_transport_configured();
   out->mtls_configured = (schannel_store_mtls_configured() ||
                           (s_client_cert_file[0] && s_client_key_file[0])) ? 1 : 0;
   out->websocket_ready = stream_lease_valid ? 1 : 0;
@@ -3997,6 +4007,21 @@ static struct curl_slist *curl_append_signature_headers(struct curl_slist *heade
   return headers;
 }
 
+/* libcurl does not enforce application request signatures. Require all
+ * generated fields before sending this protected body on either HTTP version. */
+static int window_curl_headers_ready(const char *url, const struct curl_slist *headers) {
+  if (!strstr(url, "/" EDR_ALERT_WINDOW_RESULT_SUFFIX)) return 1;
+  static const char *const keys[] = {"Authorization: Bearer ", "X-EDR-Signature-Version: ", "X-EDR-Key-ID: ",
+     "X-EDR-Timestamp-Ms: ", "X-EDR-Nonce: ", "X-EDR-Content-SHA256: ", "X-EDR-Signature: "};
+  for (size_t i = 0; i < sizeof(keys)/sizeof(keys[0]); i++) {
+    const struct curl_slist *header = headers;
+    size_t n = strlen(keys[i]);
+    while (header && (strncmp(header->data, keys[i], n) || !header->data[n])) header = header->next;
+    if (!header) return 0;
+  }
+  return 1;
+}
+
 static struct curl_slist *curl_common_headers(const char *content_type) {
   char h[1024];
   struct curl_slist *headers = NULL;
@@ -4229,6 +4254,11 @@ static int curl_h2_request(const char *method, const char *url, const char *cont
   rb.cap = resp_body_cap;
   headers = curl_common_headers(content_type);
   headers = curl_append_signature_headers(headers, method, url, body, body_len);
+  if (!window_curl_headers_ready(url,headers)) {
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+    return record_egress_decision(EDR_EGRESS_REQUEST_DENIED, "alert_window_request_signature_required");
+  }
   curl_apply_common_options(curl, url, headers, timeout_s > 0 ? timeout_s : http_socket_timeout_s());
   curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, errbuf);
   curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_write_buffer_cb);
@@ -4312,6 +4342,11 @@ static int curl_h1_request(const char *method, const char *url, const char *cont
   rb.cap = resp_body_cap;
   headers = curl_common_headers(content_type);
   headers = curl_append_signature_headers(headers, method, url, body, body_len);
+  if (!window_curl_headers_ready(url,headers)) {
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+    return record_egress_decision(EDR_EGRESS_REQUEST_DENIED, "alert_window_request_signature_required");
+  }
   http_version = (long)CURL_HTTP_VERSION_1_1;
   curl_apply_common_options_ex(curl, url, headers,
                                timeout_s > 0 ? timeout_s : http_socket_timeout_s(),
@@ -4544,9 +4579,16 @@ static int native_request_ex(const char *method, const char *url, const char *co
     runtime_failure("invalid ingest url");
     return -1;
   }
+  if (!strcmp(path, "/api/v1/" EDR_ALERT_WINDOW_RESULT_SUFFIX) || !strcmp(path, "/" EDR_ALERT_WINDOW_RESULT_SUFFIX)) {
+    runtime_state_lock();
+    int ready = https && !strcmp(path, "/api/v1/" EDR_ALERT_WINDOW_RESULT_SUFFIX) && alert_window_transport_configured();
+    runtime_state_unlock();
+    if (!ready) return record_egress_decision(EDR_EGRESS_REQUEST_DENIED, "alert_window_secure_transport_required");
+  }
   if (https && http2_enabled_for_url(url)) {
 #ifdef EDR_HAVE_CURL_HTTP2
     int h2rc = curl_h2_request(method, url, content_type, body, body_len, resp_body, resp_body_cap, timeout_s);
+    if (h2rc == EDR_EGRESS_REQUEST_DENIED) return h2rc;
     if (h2rc == 0) {
       return 0;
     }
@@ -4705,6 +4747,10 @@ static int request_to_suffix_ex(const char *method, const char *suffix, const ch
   }
   char last_error[sizeof(s_last_error)];
   runtime_string_copy(last_error, sizeof(last_error), s_last_error);
+  if (!strcmp(suffix, EDR_ALERT_WINDOW_RESULT_SUFFIX)) {
+    /* A proxy may echo request bytes. Never copy its body to diagnostics. */
+    if (out_body && out_cap) out_body[0] = 0;
+  }
   fprintf(stderr, "[ingest-http] request failed method=%s suffix=%s rc=%d err=%s resp=%.240s\n",
           method ? method : "-", suffix ? suffix : "-", rc, last_error[0] ? last_error : "-",
           out_body && out_body[0] ? out_body : "-");
@@ -5834,7 +5880,7 @@ static long command_result_http_status_from_error(const char *error) {
   return status ? strtol(status + strlen("status="), NULL, 10) : 0;
 }
 
-static void command_result_note_delivery_failure(const char *response) {
+static void command_result_note_delivery_failure(const char *response, int window) {
   char transport_error[sizeof(s_last_error)];
   runtime_string_copy(transport_error, sizeof(transport_error), s_last_error);
   long status = command_result_http_status_from_error(transport_error);
@@ -5855,7 +5901,8 @@ static void command_result_note_delivery_failure(const char *response) {
   runtime_state_lock();
   s_last_command_result_retryable =
       strncmp(transport_error, "egress_denied:", 14u) != 0 &&
-      !(status >= 400 && status < 500 && status != 408 && status != 429);
+      !(status >= 400 && status < 500 && status != 408 && status != 429 &&
+        !(window && (status == 404 || status == 405)));
   if (status > 0 || code[0] || message[0]) {
     snprintf(s_last_command_result_error, sizeof(s_last_command_result_error),
              "HTTP %ld %s%s%s", status,
@@ -5888,6 +5935,7 @@ int edr_ingest_http_post_command_result_typed(const char *command_id, const char
   char response[512];
   int rc;
   int application_ack_missing = 0;
+  int window = command_type && !strcmp(command_type, EDR_ALERT_WINDOW_COMMAND);
   if (!edr_ingest_http_configured() || !command_id || !command_id[0]) {
     return -1;
   }
@@ -5896,18 +5944,31 @@ int edr_ingest_http_post_command_result_typed(const char *command_id, const char
    * path remains disabled until it has an equivalent result_ack protocol. */
   body = edr_command_result_http_json(
       s_endpoint, s_agent_ver, command_id, command_type, execution_status,
-      exit_code, detail_utf8, unix_ms_now(),
+      exit_code, detail_utf8, window && meta ? meta->result_finished_unix_ms : unix_ms_now(),
       meta ? meta->soar_correlation_id : "",
       meta ? meta->playbook_run_id : "",
       meta ? meta->playbook_step_id : "");
   if (!body) {
     return -1;
   }
+  /* The transport bounds copies and appends NUL. A full buffer or an
+   * embedded NUL must never turn a prefix into an authoritative ACK. */
+  if (window) memset(response, 0xa5, sizeof(response));
   response[0] = '\0';
-  rc = request_to_suffix("POST", "ingest/report-command-result", "application/json",
+  rc = request_to_suffix("POST", window ? EDR_ALERT_WINDOW_RESULT_SUFFIX : "ingest/report-command-result", "application/json",
                          body, strlen(body), response, sizeof(response));
   if (rc == 0) {
-    if (!edr_command_result_http_response_acked(response)) {
+    int ack;
+    if (window) {
+      size_t end = strlen(response);
+      int complete = end < sizeof(response) - 1;
+      for (size_t i = end + 1; complete && i < sizeof(response); ++i)
+        complete = (unsigned char)response[i] == 0xa5;
+      ack = complete && edr_alert_window_result_acked(response, command_id, s_endpoint, detail_utf8);
+    } else {
+      ack = edr_command_result_http_response_acked(response);
+    }
+    if (!ack) {
       rc = -1;
       application_ack_missing = 1;
       runtime_state_lock();
@@ -5937,7 +5998,7 @@ int edr_ingest_http_post_command_result_typed(const char *command_id, const char
   if (rc == EDR_EGRESS_AUTHORIZATION_EXPIRED || rc == EDR_EGRESS_LOCAL_STATE_FAILURE) return rc;
   if (rc != 0) {
     if (!application_ack_missing) {
-      command_result_note_delivery_failure(response);
+      command_result_note_delivery_failure(window ? NULL : response, window);
     }
     runtime_state_lock();
     int retryable = s_last_command_result_retryable;

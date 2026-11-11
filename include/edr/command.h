@@ -65,6 +65,8 @@ typedef struct EdrSoarCommandMeta {
   uint32_t deadline_ms;
   /* 命令发起来源(取证 velo 仅允许 "operator" 人工下发;空/其它=自动化,被 gate 拒绝)。 */
   char initiated_by[32];
+  /* Local only. Set by the durable terminal-result sender. */
+  int64_t result_finished_unix_ms;
   EdrCommandResultAuthorization result_authorization;
 } EdrSoarCommandMeta;
 

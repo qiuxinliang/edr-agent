@@ -1,6 +1,9 @@
 #include "edr/command_result_json.h"
 
 #include "cJSON.h"
+#include "edr/egress_request_policy.h"
+#include "edr/sha256.h"
+#include <string.h>
 
 static const char *non_null(const char *value) { return value ? value : ""; }
 
@@ -93,6 +96,24 @@ int edr_command_result_http_response_acked(const char *json) {
 
 int edr_command_result_http_chunk_response_acked(const char *json) {
   return command_result_http_ack_state(json) != COMMAND_RESULT_ACK_INVALID;
+}
+
+int edr_alert_window_result_acked(const char *json, const char *command_id,
+                                  const char *endpoint_id, const char *detail) {
+  if (!json || !command_id || !*command_id || !endpoint_id || !*endpoint_id ||
+      !detail || strlen(detail) > EDR_ALERT_WINDOW_RESULT_LIMIT) return 0;
+  cJSON *root = edr_egress_parse_purpose_object(json, strlen(json));
+  const cJSON *data = cJSON_GetObjectItemCaseSensitive(root, "data");
+  const char *id = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(data, "command_id"));
+  const char *endpoint = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(data, "endpoint_id"));
+  const char *hash = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(data, "result_sha256"));
+  char expected[65];
+  int ok = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(data,"accepted")) &&
+           cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(data,"complete")) &&
+           id && !strcmp(id,command_id) && endpoint && !strcmp(endpoint,endpoint_id) &&
+           hash && !edr_sha256_hex((const uint8_t *)detail,strlen(detail),expected) && !strcmp(hash,expected);
+  cJSON_Delete(root);
+  return ok;
 }
 
 void edr_command_result_json_free(char *json) { cJSON_free(json); }

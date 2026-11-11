@@ -7,6 +7,13 @@
 extern "C" {
 #endif
 
+/* Only this version has a private receiver. Older command types cannot opt in. */
+#define EDR_ALERT_WINDOW_COMMAND "alert_window_query_v2"
+#define EDR_ALERT_WINDOW_RESULT_SUFFIX "ingest/alert-window-result"
+#define EDR_ALERT_WINDOW_RESULT_LIMIT 8192u
+int edr_alert_window_result_acked(const char *json, const char *command_id,
+                                  const char *endpoint_id, const char *detail);
+
 /** Builds the HTTP command-result contract consumed by PostReportCommandResult. */
 char *edr_command_result_http_json(const char *endpoint_id,
                                    const char *agent_version,

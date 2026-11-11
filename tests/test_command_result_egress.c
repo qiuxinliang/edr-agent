@@ -60,7 +60,9 @@ static int renew(const char *request,const EdrSoarCommandMeta *meta) {
 static char *persisted_body(const char *id,const char *type) {
   EdrCommandStateRecord *r=calloc(1,sizeof(*r));CHECK(r);
   CHECK(edr_command_state_begin(id,type,NULL,NULL,r)==EDR_COMMAND_STATE_BEGIN_DUP_FINAL);
-  char *b=wire(id,type,r->detail,r->soar_correlation_id);free(r);return b;
+  char *b=edr_command_result_http_json("ep","test",id,type,r->execution_status,r->exit_code,r->detail,
+      r->result_finished_unix_ms ? r->result_finished_unix_ms : (int64_t)time(NULL)*1000,r->soar_correlation_id,"","");
+  free(r); CHECK(b); return b;
 }
 static void typed_owner_case(const char *id,const char *type,const char *request,const char *detail,int allowed_result) {
   EdrSoarCommandMeta m=task(id,type);
