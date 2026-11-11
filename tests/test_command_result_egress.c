@@ -922,7 +922,10 @@ static void upgrade_denial_projection_tests(void) {
   CHECK(edr_command_result_project_detail(&m.result_authorization,"agent_update",2,19,unknown,out,sizeof(out))==0 && !strstr(out,"PRIVATE-PAYLOAD") && strstr(out,"command_rejected"));
 }
 
+#include "alert_window_command_result_cases.h"
+
 int main(int argc, char **argv) {
+  if(argc==2 && !strcmp(argv[1],"--alert-window"))return alert_window_command_results();
   if(argc==4 && !strcmp(argv[1],"--project-recall"))return export_recall_projection(argv[2],argv[3]);
   CHECK(argc==1);
   upgrade_denial_projection_tests();

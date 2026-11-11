@@ -3,8 +3,37 @@
 
 #include <ctype.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+
+// cJSON strings use NUL termination. Reject encoded NUL before decoding so a
+// signed predicate cannot be shortened by string consumers after validation.
+static inline int rtq_payload_text_valid(const uint8_t *payload, size_t length) {
+  for (size_t i = 0; i < length; i++) {
+    unsigned char first = payload[i];
+    if (!first) return 0;
+    if (first < 0x80u) continue;
+    size_t extra = first >= 0xc2u && first <= 0xdfu ? 1u :
+                   first >= 0xe0u && first <= 0xefu ? 2u :
+                   first >= 0xf0u && first <= 0xf4u ? 3u : 0u;
+    if (!extra || i + extra >= length) return 0;
+    unsigned char second = payload[i + 1u];
+    if ((first == 0xe0u && second < 0xa0u) || (first == 0xedu && second >= 0xa0u) ||
+        (first == 0xf0u && second < 0x90u) || (first == 0xf4u && second >= 0x90u)) return 0;
+    for (size_t j = 1u; j <= extra; j++) {
+      if ((payload[i + j] & 0xc0u) != 0x80u) return 0;
+    }
+    i += extra;
+  }
+  for (size_t i = 0; i + 1u < length; i++) {
+    if (payload[i] != '\\') continue;
+    if (i + 5u < length && payload[i + 1u] == 'u' &&
+        !memcmp(payload + i + 2u, "0000", 4u)) return 0;
+    i++; // Skip escaped backslashes, including literal "\\\\u0000" text.
+  }
+  return 1;
+}
 
 #define EDR_RTQ_PROCESS_BATCH_SCHEMA "edr.rtq.process-batch.v1"
 

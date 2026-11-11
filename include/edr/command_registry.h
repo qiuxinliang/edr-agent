@@ -55,6 +55,7 @@ typedef enum EdrCommandKind {
   EDR_COMMAND_KIND_AGENT_OFFBOARD,
   EDR_COMMAND_KIND_AGENT_UNINSTALL,
   EDR_COMMAND_KIND_ATTACK_SURFACE,
+  EDR_COMMAND_KIND_ALERT_WINDOW_QUERY,
 } EdrCommandKind;
 
 typedef enum EdrCommandPayloadSchema {

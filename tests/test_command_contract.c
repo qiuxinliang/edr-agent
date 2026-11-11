@@ -26,6 +26,31 @@ static int validate(const char *type, const char *payload, char *reason, size_t 
                                        reason, reason_cap);
 }
 
+static void test_alert_window_contract(void) {
+  const char *payload = "{\"tenant_id\":\"tenant\",\"endpoint_id\":\"ep\",\"alert_id\":\"alert\","
+      "\"source_event_id\":\"evt\",\"pid\":42,\"process_start_key\":\"18446744073709551615\","
+      "\"process_creation_filetime_100ns\":\"133700000000000001\",\"source_time_ns\":\"1700000000000000001\","
+      "\"kind\":\"registry\",\"from_ns\":\"1699999880000000001\",\"until_ns\":\"1700000120000000001\","
+      "\"limit\":50,\"max_bytes\":8192}";
+  char reason[192];
+  require_true(validate("alert_window_query_v1",payload,reason,sizeof(reason)), "signed alert window scope accepted");
+  test_setenv("EDR_COMMAND_ALLOW_UNSIGNED","1");
+  require_true(edr_command_contract_signature_required("test","alert_window_query_v1"), "window reads always require a signature");
+  test_setenv("EDR_COMMAND_ALLOW_UNSIGNED","0");
+  const char *changes[][2] = {
+    {"18446744073709551615","18446744073709551616"}, {"133700000000000001","0133700000000000001"},
+    {"1699999880000000001","1700000000000000002"}, {"1700000120000000001","1700000120000000002"},
+    {"8192}","8193}"}, {"50,","51,"}, {"registry","process"}, {"evt","evt\\u0000other"},
+    {"8192}","8192,\"fields\":[\"cmdline\"]}"}, {"8192}","8192,\"max_bytes\":8}"},
+    {"42,","0,"}, {"42,","42.0000000000000000001,"}, {"42,","42e0,"}
+  };
+  for (size_t i=0;i<COUNT_OF(changes);i++) {
+    char modified[1024]; const char *at=strstr(payload,changes[i][0]);
+    snprintf(modified,sizeof(modified),"%.*s%s%s",(int)(at-payload),payload,changes[i][1],at+strlen(changes[i][0]));
+    require_true(!validate("alert_window_query_v1",modified,reason,sizeof(reason)), "invalid window scope denied");
+  }
+}
+
 static void test_cached_query_identity(void) {
   char reason[256], payload[512];
   require_true(validate("rtq_query", "{\"endpoint_id\":\"ep-1\",\"pid\":42,"
@@ -103,6 +128,7 @@ static void test_parent_context_contract(void) {
 }
 
 int main(void) {
+  test_alert_window_contract();
   test_parent_context_contract();
   char reason[256];
   const EdrCommandDescriptor *descriptor = edr_command_registry_lookup("RTR_GET_FILE");

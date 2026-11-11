@@ -2166,6 +2166,18 @@ if(WIN32)
 endif()
 edr_apply_test_warnings(test_command_result_egress)
 add_test(NAME command_result_egress COMMAND test_command_result_egress)
+add_test(NAME alert_window_installed_sender_closed COMMAND test_command_result_egress --alert-window)
+get_target_property(_result_egress_sources test_command_result_egress SOURCES)
+add_executable(test_alert_window_isolated_receiver ${_result_egress_sources})
+target_compile_definitions(test_alert_window_isolated_receiver PRIVATE
+  EDR_ALERT_WINDOW_ISOLATED_RECEIVER=1 EDR_LOCAL_EVIDENCE_CACHE_TESTING=1)
+target_link_libraries(test_alert_window_isolated_receiver PRIVATE edr_egress_policy Threads::Threads)
+if(WIN32)
+  target_link_libraries(test_alert_window_isolated_receiver PRIVATE advapi32 ws2_32)
+endif()
+edr_apply_test_warnings(test_alert_window_isolated_receiver)
+add_test(NAME alert_window_isolated_result_egress COMMAND test_alert_window_isolated_receiver --alert-window)
+
 add_executable(test_command_result_compaction test_command_result_compaction.c
   ${CMAKE_SOURCE_DIR}/src/command/command_state.c
   ${CMAKE_SOURCE_DIR}/src/command/command_cancel.c
@@ -2243,6 +2255,22 @@ if(SQLite3_FOUND AND OpenSSL_FOUND)
   target_link_libraries(test_egress_tls_client PRIVATE edr_runtime_test_common)
   target_compile_definitions(test_egress_tls_client PRIVATE EDR_TEST_EXTENDED_EGRESS=1)
   edr_apply_test_warnings(test_egress_tls_client)
+  # Resolve unchanged runtime owners from the existing test objects. Only the
+  # isolated runner's command execution and egress owners enable this receiver.
+  add_library(alert_window_test_runtime STATIC $<TARGET_OBJECTS:edr_runtime_test_common>)
+  add_executable(test_alert_window_signed_replay test_alert_window_signed_replay.c
+    ${_runtime_test_agent_source} ${_runtime_test_pmfe_source}
+    ${CMAKE_SOURCE_DIR}/src/command/command_state.c ${CMAKE_SOURCE_DIR}/src/command/command_stub.c)
+  target_include_directories(test_alert_window_signed_replay PRIVATE $<TARGET_PROPERTY:edr_agent,INCLUDE_DIRECTORIES>)
+  target_compile_definitions(test_alert_window_signed_replay PRIVATE $<TARGET_PROPERTY:edr_agent,COMPILE_DEFINITIONS>
+    EDR_ALERT_WINDOW_ISOLATED_RECEIVER=1 EDR_LOCAL_EVIDENCE_CACHE_TESTING=1)
+  target_link_libraries(test_alert_window_signed_replay PRIVATE alert_window_test_runtime
+    $<TARGET_PROPERTY:edr_agent,LINK_LIBRARIES>)
+  edr_apply_test_warnings(test_alert_window_signed_replay)
+  add_test(NAME alert_window_signed_replay COMMAND ${Python3_EXECUTABLE} -c
+    "import subprocess,sys,tempfile; d=tempfile.TemporaryDirectory(); subprocess.run([sys.argv[1]],cwd=d.name,check=True)"
+    $<TARGET_FILE:test_alert_window_signed_replay>)
+  set_tests_properties(alert_window_signed_replay PROPERTIES TIMEOUT 30)
   add_executable(test_forensic_baseline_staging test_forensic_baseline_staging.c
     ${_runtime_test_agent_source} ${_runtime_test_pmfe_source})
   target_link_libraries(test_forensic_baseline_staging PRIVATE edr_runtime_test_common)
@@ -2326,6 +2354,9 @@ endfunction()
 edr_minimization_test(egress_batch_policy test_egress_batch_policy)
 edr_minimization_test(egress_request_policy test_egress_request_policy)
 edr_minimization_test(command_result_egress test_command_result_egress)
+edr_minimization_test(alert_window_installed_sender_closed test_command_result_egress)
+edr_minimization_test(alert_window_isolated_result_egress test_alert_window_isolated_receiver)
+edr_minimization_test(alert_window_signed_replay test_alert_window_signed_replay)
 edr_minimization_test(command_result_compaction test_command_result_compaction)
 edr_minimization_test(authorized_local_query_contract test_egress_tls_client)
 edr_minimization_test(queue_recovery_real_codec test_queue_recovery)

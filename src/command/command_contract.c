@@ -1,4 +1,5 @@
 #include "edr/rtq_contract.h"
+#include "alert_window_scope.h"
 #include "edr/command_contract.h"
 
 #include "edr/command_registry.h"
@@ -570,34 +571,6 @@ static int validate_rtq_semantics(const cJSON *root, char *reason, size_t reason
   return 1;
 }
 
-// cJSON strings use NUL termination. Reject encoded NUL before decoding so a
-// signed predicate cannot be shortened by string consumers after validation.
-static int rtq_payload_text_valid(const uint8_t *payload, size_t length) {
-  for (size_t i = 0; i < length; i++) {
-    unsigned char first = payload[i];
-    if (!first) return 0;
-    if (first < 0x80u) continue;
-    size_t extra = first >= 0xc2u && first <= 0xdfu ? 1u :
-                   first >= 0xe0u && first <= 0xefu ? 2u :
-                   first >= 0xf0u && first <= 0xf4u ? 3u : 0u;
-    if (!extra || i + extra >= length) return 0;
-    unsigned char second = payload[i + 1u];
-    if ((first == 0xe0u && second < 0xa0u) || (first == 0xedu && second >= 0xa0u) ||
-        (first == 0xf0u && second < 0x90u) || (first == 0xf4u && second >= 0x90u)) return 0;
-    for (size_t j = 1u; j <= extra; j++) {
-      if ((payload[i + j] & 0xc0u) != 0x80u) return 0;
-    }
-    i += extra;
-  }
-  for (size_t i = 0; i + 1u < length; i++) {
-    if (payload[i] != '\\') continue;
-    if (i + 5u < length && payload[i + 1u] == 'u' &&
-        !memcmp(payload + i + 2u, "0000", 4u)) return 0;
-    i++; // Skip escaped backslashes, including literal "\\\\u0000" text.
-  }
-  return 1;
-}
-
 static int parent_context_decimal(const cJSON *root, const char *key, uint64_t max,
                                   uint64_t *out) {
   const cJSON *item = cJSON_GetObjectItemCaseSensitive(root, key);
@@ -880,7 +853,8 @@ static int validate_semantics(EdrCommandKind kind, const cJSON *root,
 
 int edr_command_contract_signature_required(const char *command_id, const char *command_type) {
   (void)command_id;
-  if (!strcmp(command_type ? command_type : "", "result_delivery_renewal") ||
+  if (!strcmp(command_type ? command_type : "", ALERT_WINDOW_COMMAND) ||
+      !strcmp(command_type ? command_type : "", "result_delivery_renewal") ||
       edr_command_registry_is_shell(command_type)) {
     return 1;
   }
@@ -922,6 +896,9 @@ int edr_command_contract_validate(const char *command_type, const uint8_t *paylo
   if (payload_len > 0u && !payload) {
     return contract_fail(reason, reason_cap, "command payload pointer is null");
   }
+  if (descriptor->kind == EDR_COMMAND_KIND_ALERT_WINDOW_QUERY &&
+      (payload_len > 4096u || !window_wire_valid(payload,payload_len)))
+    return contract_fail(reason,reason_cap,"invalid alert window request size or encoding");
   if ((descriptor->kind == EDR_COMMAND_KIND_RTQ_EXECUTE || descriptor->kind == EDR_COMMAND_KIND_RTQ_QUERY ||
        descriptor->kind == EDR_COMMAND_KIND_PROCESS_TREE) && payload_len > 0u &&
       !rtq_payload_text_valid(payload, payload_len)) {
@@ -950,6 +927,13 @@ int edr_command_contract_validate(const char *command_type, const uint8_t *paylo
     return contract_fail(reason, reason_cap, "command payload must be a complete JSON object");
   }
   free(json);
+
+  if (descriptor->kind == EDR_COMMAND_KIND_ALERT_WINDOW_QUERY) {
+    EdrAlertWindowQuery query = {0};
+    int valid = window_scope(root,&query);
+    cJSON_Delete(root);
+    return valid || contract_fail(reason,reason_cap,"invalid alert window scope or budget");
+  }
 
   const CommandFieldRule *rules = NULL;
   size_t rule_count = 0u;

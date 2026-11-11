@@ -1,6 +1,7 @@
 /* The durable command owner owns both request-derived purposes and projection.
  * This file is compiled only as part of command_state.c. */
 #include "edr/shell_session.h"
+#include "alert_window_scope.h"
 #include "edr/rtq_contract.h"
 #include "edr/evidence_recall_manifest.h"
 static const char *result_text(const cJSON *o, const char *key) {
@@ -102,9 +103,12 @@ int edr_command_result_bind_contract(EdrCommandResultAuthorization *a,const uint
   /* A malformed/over-budget request can still receive a finite rejection;
    * it never receives query or raw-output authority. */
   snprintf(a->content_contract,sizeof(a->content_contract),"{\"schema\":\"edr.command.result-purpose.v1\",\"kind\":\"status\",\"max_bytes\":1024}");
+  if (!strcmp(a->command_type,ALERT_WINDOW_COMMAND) &&
+      (!ALERT_WINDOW_RECEIVER_VERIFIED || !payload || !len || len>4096u || !window_wire_valid(payload,len))) return -1;
   cJSON *request=payload && len ? edr_egress_parse_purpose_object(payload,len) : cJSON_CreateObject();
   if(!cJSON_IsObject(request)){cJSON_Delete(request);return -1;}
   const char *kind=!strcmp(a->command_type,"rtq_execute")?"rtq":
+      !strcmp(a->command_type,ALERT_WINDOW_COMMAND)?ALERT_WINDOW_COMMAND:
       !strcmp(a->command_type,"rtq_query")?"cached_rtq":
       !strcmp(a->command_type,"rtr_process_tree") && !strcmp(result_text(request,"view"),"parent_context")?"parent_context":
       !strcmp(a->command_type,"shell_open")?"shell_stream":
@@ -116,6 +120,14 @@ int edr_command_result_bind_contract(EdrCommandResultAuthorization *a,const uint
   }
   cJSON *contract=cJSON_CreateObject();int ok=contract!=NULL;
   unsigned rows=500,window=600;uint32_t event_type=0;int has_type=0;
+  if (!strcmp(kind, ALERT_WINDOW_COMMAND)) {
+    EdrAlertWindowQuery scope = {0};
+    if (!window_scope(request,&scope) ||
+        strcmp(scope.tenant_id,a->tenant_id) || strcmp(scope.endpoint_id,a->endpoint_id)) {
+      cJSON_Delete(request); cJSON_Delete(contract); return -1;
+    }
+    rows=scope.limit;
+  }
   if(!strcmp(kind,"cached_rtq")) {
     static const char *aliases[][2]={{"process_name","process_name_contains"},{"process_cmdline","cmdline_contains"},{"file_path","file_path_contains"},{"file_sha256","sha256"},{"event_type","type"}};
     for(size_t i=0;i<sizeof(aliases)/sizeof(aliases[0]);i++) {
@@ -138,7 +150,7 @@ int edr_command_result_bind_contract(EdrCommandResultAuthorization *a,const uint
   if(ok)ok=cJSON_AddStringToObject(contract,"schema","edr.command.result-purpose.v1") &&
       cJSON_AddStringToObject(contract,"kind",kind) &&
       cJSON_AddNumberToObject(contract,"max_bytes",!strcmp(kind,"status")?1024:
-          !strcmp(kind,"parent_context")?cJSON_GetNumberValue(cJSON_GetObjectItemCaseSensitive(request,"max_bytes")):16383) &&
+          (!strcmp(kind,"parent_context") || !strcmp(kind,ALERT_WINDOW_COMMAND))?cJSON_GetNumberValue(cJSON_GetObjectItemCaseSensitive(request,"max_bytes")):16383) &&
       cJSON_AddNumberToObject(contract,"max_rows",rows) &&
       cJSON_AddNumberToObject(contract,"max_chunks",63) &&
       cJSON_AddNumberToObject(contract,"window_s",window) &&
@@ -627,6 +639,9 @@ static cJSON *result_shell(const cJSON *root,const cJSON *contract,const EdrComm
   if(!ok){cJSON_Delete(out);return NULL;}return out;
 }
 #include "command_result_typed.inc"
+#if ALERT_WINDOW_RECEIVER_VERIFIED
+#include "command_result_alert_window.inc"
+#endif
 
 int edr_command_result_project_detail(const EdrCommandResultAuthorization *a,const char *type,
     int status,int exit_code,const char *detail,char *out,size_t cap) {
@@ -655,6 +670,14 @@ int edr_command_result_project_detail(const EdrCommandResultAuthorization *a,con
   else if(!strcmp(type,"shell_stream") && !strcmp(kind,"shell_stream"))projected=result_shell(body,contract,a,1);
   else if(!strcmp(type,"rtr_shell") && !strcmp(kind,"shell_output") && body && cJSON_HasObjectItem(body,"output"))projected=result_shell(body,contract,a,0);
   else if(status==1 && !strcmp(type,"rtq_execute") && !strcmp(kind,"rtq"))projected=result_query(body,contract,a,0);
+  else if(status==1 && !strcmp(type,ALERT_WINDOW_COMMAND)) {
+#if ALERT_WINDOW_RECEIVER_VERIFIED
+    const char *wire=inner ? wrapper_raw->valuestring : detail;
+    if (!exit_code && !strcmp(type,a->command_type) && !strcmp(kind,type) &&
+        strlen(wire)<=(size_t)max_bytes && window_wire_valid((const uint8_t *)wire,strlen(wire)))
+      projected=result_alert_window(body,contract,a);
+#endif
+  }
   else if(status==1 && !strcmp(type,"rtq_query") && !strcmp(kind,"cached_rtq"))projected=result_query(body,contract,a,1);
   else if(status==1 && !strcmp(type,"rtr_process_tree") && !strcmp(kind,"parent_context"))projected=result_parent_context(body,contract,a);
   else if(!strcmp(type,a->command_type) && !strcmp(kind,"typed")) {

@@ -1,0 +1,131 @@
+/* Two builds exercise the same real durable result and HTTP egress owners.
+ * Only the isolated test target may export a synthetic window receipt. */
+static const char window_request[] =
+    "{\"tenant_id\":\"tenant\",\"endpoint_id\":\"ep\",\"alert_id\":\"a\",\"source_event_id\":\"evt\",\"pid\":42,"
+    "\"process_start_key\":\"18446744073709551615\",\"process_creation_filetime_100ns\":\"133700000000000001\","
+    "\"source_time_ns\":\"1700000000000000001\",\"kind\":\"network\",\"from_ns\":\"1699999880000000001\","
+    "\"until_ns\":\"1700000120000000001\",\"limit\":50,\"max_bytes\":8192}";
+static const char window_row[] =
+    "{\"phase\":\"post\",\"event_time_ns\":\"1700000000000000002\",\"pid\":42,"
+    "\"process_start_key\":\"18446744073709551615\",\"process_creation_filetime_100ns\":\"133700000000000001\","
+    "\"fact_id\":\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\","
+    "\"remote_ip\":\"2001:db8::5\",\"remote_port\":443}";
+
+static void assert_window_project(const EdrCommandResultAuthorization *a, cJSON *r, int pass) {
+  char *raw = cJSON_PrintUnformatted(r), out[8197];
+  CHECK(raw);
+  CHECK((edr_command_result_project_detail(a, "alert_window_query_v1", 1, 0, raw, out, sizeof(out)) == 0) == pass);
+  cJSON_free(raw);
+}
+
+static int alert_window_command_results(void) {
+  const char *type = "alert_window_query_v1", *id = "synthetic-window";
+  char path[256];
+  snprintf(path, sizeof(path), "./alert-window-egress-%ld", (long)pid());
+  env("EDR_COMMAND_STATE_DIR", path);
+  edr_egress_set_command_result_validator(edr_command_state_result_authorized);
+  EdrSoarCommandMeta m = {0};
+  EdrCommandResultAuthorization *a = &m.result_authorization;
+  strcpy(a->command_type, type);
+  strcpy(a->command_id, id);
+  strcpy(a->tenant_id, "tenant");
+  strcpy(a->endpoint_id, "ep");
+  m.issued_at_unix_ms = (int64_t)time(NULL) * 1000;
+  a->expires_unix_ms = m.issued_at_unix_ms + 60000;
+  char detail[4096];
+  snprintf(detail, sizeof(detail),
+           "{\"schema\":\"edr.alert-window.v1\",\"scope\":%s,\"rows\":[%s],"
+           "\"coverage\":\"retained_window\",\"gap_reason\":\"unknown\",\"gap_reasons\":[\"unknown\"],"
+           "\"scan_limited\":false,\"output_truncated\":false,\"window_from_ns\":\"1699999970000000001\","
+           "\"window_until_ns\":\"1700000000000000003\"}",
+           window_request, window_row);
+  int bound = edr_command_result_bind_contract(a, (const uint8_t *)window_request, strlen(window_request),
+                                               m.issued_at_unix_ms);
+  cJSON *r = cJSON_Parse(detail);
+  CHECK(r);
+#if !defined(EDR_ALERT_WINDOW_ISOLATED_RECEIVER)
+  CHECK(bound != 0);
+  /* Even a previously persisted test grant cannot cross an installed sender. */
+  snprintf(a->content_contract, sizeof(a->content_contract),
+           "{\"schema\":\"edr.command.result-purpose.v1\","
+           "\"kind\":\"alert_window_query_v1\",\"max_rows\":50,\"max_bytes\":8192,\"request\":%s}",
+           window_request);
+  assert_window_project(a, r, 0);
+  CHECK(edr_command_state_finish(id, type, &m, "ok", 1, 0, detail, "", 1) == 0);
+  char *b = persisted_body(id, type);
+  CHECK(!allowed("tenant", "ep", b));
+  free(b);
+#else
+  CHECK(bound == 0);
+  EdrCommandResultAuthorization wrong = *a;
+  strcpy(wrong.tenant_id, "other");
+  CHECK(edr_command_result_bind_contract(&wrong, (const uint8_t *)window_request, strlen(window_request),
+                                         m.issued_at_unix_ms) != 0);
+  assert_window_project(a, r, 1);
+  cJSON *from = cJSON_GetObjectItemCaseSensitive(r, "window_from_ns");
+  CHECK(cJSON_SetValuestring(from, "1699999970000000000"));
+  assert_window_project(a, r, 0);
+  CHECK(cJSON_SetValuestring(from, "1699999980000000001"));
+  assert_window_project(a, r, 0);
+  CHECK(cJSON_SetValuestring(from, "1699999879000000001"));
+  assert_window_project(a, r, 0);
+  CHECK(cJSON_SetValuestring(from, "1699999970000000001"));
+  assert_window_project(a, r, 1);
+  CHECK(edr_command_state_finish(id, type, &m, "ok", 1, 0, detail, "", 1) == 0);
+  char *b = persisted_body(id, type);
+  CHECK(allowed("tenant", "ep", b) && !allowed("other", "ep", b));
+  free(b);
+  cJSON *rows = cJSON_GetObjectItemCaseSensitive(r, "rows"), *row = cJSON_GetArrayItem(rows, 0);
+  CHECK(cJSON_AddItemToArray(rows, cJSON_Duplicate(row, 1)));
+  assert_window_project(a, r, 0);
+  cJSON_DeleteItemFromArray(rows, 1);
+  CHECK(cJSON_AddStringToObject(row, "cmdline", "synthetic-private"));
+  assert_window_project(a, r, 0);
+  cJSON_DeleteItemFromObject(row, "cmdline");
+  const char *bad_ip[] = {"host.example", "127.0.0.1:21", "fe80::1%12", "300.1.2.3", "::1 secret", ""};
+  for (unsigned i = 0; i < sizeof(bad_ip) / sizeof(bad_ip[0]); i++) {
+    CHECK(cJSON_SetValuestring(cJSON_GetObjectItemCaseSensitive(row, "remote_ip"), bad_ip[i]));
+    assert_window_project(a, r, 0);
+  }
+  CHECK(cJSON_SetValuestring(cJSON_GetObjectItemCaseSensitive(row, "remote_ip"), "192.0.2.9"));
+  assert_window_project(a, r, 1);
+  CHECK(cJSON_SetValuestring(cJSON_GetObjectItemCaseSensitive(row, "event_time_ns"), "1700000000000000000"));
+  assert_window_project(a, r, 0);
+  CHECK(cJSON_SetValuestring(cJSON_GetObjectItemCaseSensitive(row, "event_time_ns"), "1700000000000000004"));
+  assert_window_project(a, r, 0);
+  CHECK(cJSON_SetValuestring(cJSON_GetObjectItemCaseSensitive(row, "event_time_ns"), "1700000000000000002"));
+  cJSON *scope = cJSON_GetObjectItemCaseSensitive(r, "scope");
+  CHECK(cJSON_SetValuestring(cJSON_GetObjectItemCaseSensitive(scope, "source_event_id"), "other"));
+  assert_window_project(a, r, 0);
+  CHECK(cJSON_SetValuestring(cJSON_GetObjectItemCaseSensitive(scope, "source_event_id"), "evt"));
+  CHECK(cJSON_SetValuestring(cJSON_GetObjectItemCaseSensitive(scope, "kind"), "registry"));
+  char *reg = cJSON_PrintUnformatted(scope);
+  CHECK(reg);
+  CHECK(edr_command_result_bind_contract(a, (const uint8_t *)reg, strlen(reg), m.issued_at_unix_ms) == 0);
+  cJSON_free(reg);
+  assert_window_project(a, r, 0);
+  cJSON_DeleteItemFromObject(row, "remote_ip");
+  cJSON_DeleteItemFromObject(row, "remote_port");
+  CHECK(cJSON_AddStringToObject(row, "registry_key", "HKCU\\Example"));
+  CHECK(cJSON_AddStringToObject(row, "registry_value", ""));
+  CHECK(cJSON_AddStringToObject(row, "registry_op", "set_value"));
+  assert_window_project(a, r, 1);
+  CHECK(cJSON_AddStringToObject(row, "value_data", "secret"));
+  assert_window_project(a, r, 0);
+  cJSON_DeleteItemFromObject(row, "value_data");
+  cJSON_DeleteItemFromArray(rows, 0);
+  cJSON_DeleteItemFromObject(r, "window_from_ns");
+  cJSON_DeleteItemFromObject(r, "window_until_ns");
+  CHECK(cJSON_SetValuestring(cJSON_GetObjectItemCaseSensitive(r, "coverage"), "owner_unavailable"));
+  assert_window_project(a, r, 0);
+  CHECK(cJSON_SetValuestring(cJSON_GetObjectItemCaseSensitive(r, "gap_reason"), "owner_unavailable"));
+  CHECK(cJSON_SetValuestring(cJSON_GetArrayItem(cJSON_GetObjectItemCaseSensitive(r, "gap_reasons"), 0),
+                             "owner_unavailable"));
+  assert_window_project(a, r, 1);
+  CHECK(cJSON_AddStringToObject(r, "raw_detail", "secret"));
+  assert_window_project(a, r, 0);
+#endif
+  cJSON_Delete(r);
+  puts("alert window result authorization and final egress passed");
+  return 0;
+}

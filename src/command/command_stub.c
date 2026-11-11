@@ -17,6 +17,7 @@
 #include "edr/storage_reservation.h"
 #include "edr/command_cancel.h"
 #include "edr/command_contract.h"
+#include "alert_window_scope.h"
 #include "edr/command_executor.h"
 #include "edr/command_registry.h"
 #include "edr/command_state.h"
@@ -3727,6 +3728,83 @@ static void do_rtq_query(const char *cmd_id, const uint8_t *pl, size_t len, cons
   soar_emit(cmd_id, sm, EdrCmdExecOk, 0, detail);
 }
 
+static void do_alert_window_query(const char *id, const uint8_t *payload, size_t len,
+                                  const EdrSoarCommandMeta *meta) {
+  EdrAlertWindowQuery q = {0}, signed_scope = {0};
+  cJSON *contract = NULL, *request = NULL;
+  char detail[ALERT_WINDOW_MAX_BYTES + 1u];
+  const char *failure = "alert window result authorization invalid";
+  struct timespec wall;
+  if (!ALERT_WINDOW_RECEIVER_VERIFIED) {
+    failure = "alert window receiver unavailable";
+    goto rejected;
+  }
+  if (!edr_command_rtq_readonly_enabled()) {
+    failure = "readonly RTQ disabled";
+    goto rejected;
+  }
+  if (!meta || !id || !payload || !len || len > 4096 || !window_wire_valid(payload, len) || !meta->deadline_ms ||
+      meta->deadline_ms > 60000 || meta->issued_at_unix_ms <= 0 ||
+      meta->issued_at_unix_ms > INT64_MAX - meta->deadline_ms || timespec_get(&wall, TIME_UTC) != TIME_UTC)
+    goto rejected;
+  const EdrCommandResultAuthorization *auth = &meta->result_authorization;
+  const EdrConfig *cfg = edr_command_get_config();
+  if (!memchr(auth->command_id, 0, sizeof(auth->command_id)) || strcmp(auth->command_id, id) ||
+      !memchr(auth->command_type, 0, sizeof(auth->command_type)) ||
+      strcmp(auth->command_type, ALERT_WINDOW_COMMAND) || !memchr(auth->tenant_id, 0, sizeof(auth->tenant_id)) ||
+      !memchr(auth->endpoint_id, 0, sizeof(auth->endpoint_id)) ||
+      !memchr(auth->content_contract, 0, sizeof(auth->content_contract)) || !cfg ||
+      strcmp(cfg->agent.tenant_id, auth->tenant_id) || strcmp(cfg->agent.endpoint_id, auth->endpoint_id))
+    goto rejected;
+  contract = edr_egress_parse_purpose_object(auth->content_contract, strlen(auth->content_contract));
+  request = edr_egress_parse_purpose_object(payload, len);
+  const char *schema = window_string(contract, "schema"), *kind = window_string(contract, "kind");
+  uint32_t bytes, rows;
+  if (!schema || strcmp(schema, "edr.command.result-purpose.v1") || !kind || strcmp(kind, ALERT_WINDOW_COMMAND) ||
+      cJSON_GetNumberValue(cJSON_GetObjectItemCaseSensitive(contract, "issued_unix_ms")) !=
+          (double)meta->issued_at_unix_ms ||
+      !window_scope(cJSON_GetObjectItemCaseSensitive(contract, "request"), &q) ||
+      !window_scope(request, &signed_scope) || !window_same_scope(&q, &signed_scope) ||
+      strcmp(auth->tenant_id, q.tenant_id) || strcmp(auth->endpoint_id, q.endpoint_id) ||
+      !window_uint(contract, "max_bytes", q.max_bytes, q.max_bytes, &bytes) ||
+      !window_uint(contract, "max_rows", q.limit, q.limit, &rows))
+    goto rejected;
+  q.expires_unix_ms = meta->issued_at_unix_ms + meta->deadline_ms;
+  if (auth->expires_unix_ms < q.expires_unix_ms) q.expires_unix_ms = auth->expires_unix_ms;
+  int64_t now = (int64_t)wall.tv_sec * 1000 + wall.tv_nsec / 1000000;
+  if (now < meta->issued_at_unix_ms || now >= q.expires_unix_ms) {
+    failure = "alert window authorization expired";
+    goto rejected;
+  }
+  int rc = edr_local_evidence_cache_query_alert_window_json(&q, detail, (size_t)q.max_bytes + 1u);
+  cJSON_Delete(request);
+  cJSON_Delete(contract);
+  if (rc) {
+    const char *cause = rc == EDR_PARENT_CONTEXT_ERROR_EXPIRED     ? "alert window request expired"
+                        : rc == EDR_PARENT_CONTEXT_ERROR_BUDGET    ? "alert window budget exceeded"
+                        : rc == EDR_PARENT_CONTEXT_ERROR_INTEGRITY ? "alert window integrity conflict"
+                        : rc == EDR_PARENT_CONTEXT_ERROR_BUSY      ? "alert window cache busy"
+                        : rc == EDR_PARENT_CONTEXT_ERROR_INVALID   ? "alert window request invalid"
+                        : rc == EDR_PARENT_CONTEXT_ERROR_STORAGE   ? "alert window storage unavailable"
+                                                                   : "alert window query unavailable";
+    ++s_exec_fail;
+    audit_both(id, cause);
+    soar_emit(id, meta, EdrCmdExecFailed, 3, cause);
+    return;
+  }
+  ++s_handled;
+  ++s_exec_ok;
+  audit_both(id, "alert window query complete");
+  soar_emit(id, meta, EdrCmdExecOk, 0, detail);
+  return;
+rejected:
+  cJSON_Delete(request);
+  cJSON_Delete(contract);
+  ++s_rejected;
+  audit_both(id, failure);
+  soar_emit(id, meta, EdrCmdExecRejected, 2, failure);
+}
+
 static void do_rtr_process_tree(const char *cmd_id, const uint8_t *pl, size_t len,
                                 const EdrSoarCommandMeta *sm) {
   (void)pl; (void)len; /* The signed frozen request owns both query and fields. */
@@ -5057,6 +5135,10 @@ static int command_lane_filter(const char *command_type, void *user) {
 static int command_signature_policy_for(const char *cmd_id, const char *cmd_type,
                                         const EdrSoarCommandMeta *sm, int internal_trusted,
                                         CommandSignaturePolicy *out, char *reason, size_t reason_cap) {
+  if (internal_trusted && !strcmp(cmd_type,ALERT_WINDOW_COMMAND)) {
+    snprintf(reason,reason_cap,"alert window requires an external signed request");
+    return 0;
+  }
   int required = internal_trusted ? 0 : edr_command_contract_signature_required(cmd_id, cmd_type);
   if (out) out->required = required;
   if (required && (!sm || sm->issued_at_unix_ms <= 0 || sm->deadline_ms == 0u)) {
@@ -6317,6 +6399,9 @@ void edr_command_execute_received_envelope(const char *command_id, const char *c
       return;
     case EDR_COMMAND_KIND_RTQ_EXECUTE:
       edr_response_rtq_execute(id, payload, payload_len, sm);
+      return;
+    case EDR_COMMAND_KIND_ALERT_WINDOW_QUERY:
+      do_alert_window_query(id,payload,payload_len,sm);
       return;
     case EDR_COMMAND_KIND_RTQ_QUERY:
       do_rtq_query(id, payload, payload_len, sm);

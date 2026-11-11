@@ -1,3 +1,11 @@
+#if defined(EDR_ALERT_WINDOW_ISOLATED_RECEIVER) && defined(EDR_LOCAL_EVIDENCE_CACHE_TESTING)
+#if defined(_WIN32)
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
+#include <arpa/inet.h>
+#endif
+#endif
 #include "edr/command_cancel.h"
 #include "edr/command_state.h"
 #include "edr/local_evidence_cache.h"
