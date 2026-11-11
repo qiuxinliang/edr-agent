@@ -51,6 +51,33 @@ static int verify_entities_and_bounds(void) {
          strlen(short_out) == sizeof(short_out) - 1u;
 }
 
+static int verify_registry_operation(void) {
+  static const struct {
+    const char *xml;
+    const char *expected;
+  } cases[] = {
+    {"<Data Name='OperationType'>%%1904</Data>", "set_value"},
+    {"<Data Name=\"OperationType\">%%1905</Data>", "set_value"},
+    {"<Data Name='OperationType' >%%1906</Data>", "delete_value"},
+    {"<Data Name='ObjectValueName'>%%1905</Data>", NULL},
+    {"<Data Name='OperationType'/>", NULL},
+    {"<Data Name='OperationType'>%%1999</Data>", NULL},
+    {"<Data Name='OperationType'>%%19050</Data>", NULL},
+    {"<Data Name='OperationType'>%%1906", NULL},
+    {"<Data Name='OperationType'>%%1905</Data><Data Name='OperationType'>%%1906</Data>", NULL},
+    {"<Data Name=\"OperationType\">%%1905</Data><Data Name='OperationType'>%%1906</Data>", NULL},
+    {"<Data Name=\"OperationType\">%%1906</Data><Data Name=\"OperationType\">%%1906</Data>", NULL},
+  };
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+    const char *actual = edr_security_4657_operation(cases[i].xml);
+    if (cases[i].expected ? !actual || strcmp(actual, cases[i].expected) : actual != NULL) {
+      fprintf(stderr, "unexpected 4657 operation for case %zu\n", i);
+      return 0;
+    }
+  }
+  return 1;
+}
+
 int main(void) {
   char name[512], xml[1024], input[513];
   memset(input, 'v', 511);
@@ -84,5 +111,5 @@ int main(void) {
                                              "ObjectName", name, sizeof(name)) ||
       edr_security_4657_identity_incomplete("<Data Name='ObjectName'>&amp;#65;</Data>",
                                             "ObjectName", name, sizeof(name))) return 1;
-  return verify_long_command_line() && verify_entities_and_bounds() ? 0 : 1;
+  return verify_long_command_line() && verify_entities_and_bounds() && verify_registry_operation() ? 0 : 1;
 }

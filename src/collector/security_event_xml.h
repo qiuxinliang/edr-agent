@@ -18,7 +18,7 @@ typedef enum {
  * TRUNCATED as source provenance instead of treating the prefix as complete. */
 static EdrSecurityXmlTextStatus edr_security_xml_read_data(
     const char *xml, const char *name, char *out, size_t cap,
-    size_t *source_length, int *unresolved_entity) {
+    size_t *source_length, int *unresolved_entity, int require_unique) {
   char needle_single[160];
   char needle_double[160];
   const char *p;
@@ -36,9 +36,14 @@ static EdrSecurityXmlTextStatus edr_security_xml_read_data(
   (void)snprintf(needle_double, sizeof(needle_double), "<Data Name=\"%s\"", name);
   p = strstr(xml, needle_single);
   prefix = strlen(needle_single);
+  if (p && require_unique &&
+      (strstr(p + prefix, needle_single) || strstr(xml, needle_double)))
+    return EDR_SECURITY_XML_TEXT_INVALID;
   if (!p) {
     p = strstr(xml, needle_double);
     prefix = strlen(needle_double);
+    if (p && require_unique && strstr(p + prefix, needle_double))
+      return EDR_SECURITY_XML_TEXT_INVALID;
   }
   if (!p) return EDR_SECURITY_XML_TEXT_MISSING;
   p += prefix;
@@ -78,7 +83,20 @@ static EdrSecurityXmlTextStatus edr_security_xml_read_data(
 
 static inline EdrSecurityXmlTextStatus edr_security_xml_get_data_utf8(
     const char *xml, const char *name, char *out, size_t cap, size_t *source_length) {
-  return edr_security_xml_read_data(xml, name, out, cap, source_length, NULL);
+  return edr_security_xml_read_data(xml, name, out, cap, source_length, NULL, 0);
+}
+
+/* EventLog renders publisher resource IDs in EventData, independently of
+ * the display language. An incomplete or ambiguous ID cannot select an
+ * event family: registry_set rules distinguish writes from deletions. */
+static inline const char *edr_security_4657_operation(const char *xml) {
+  char token[sizeof("%%1906")];
+  if (edr_security_xml_read_data(xml, "OperationType", token, sizeof(token),
+                                 NULL, NULL, 1) != EDR_SECURITY_XML_TEXT_COMPLETE)
+    return NULL;
+  if (!strcmp(token, "%%1904") || !strcmp(token, "%%1905")) return "set_value";
+  if (!strcmp(token, "%%1906")) return "delete_value";
+  return NULL;
 }
 
 /* Registry keys and value names are identities. ETW1's line sanitizer
@@ -86,7 +104,7 @@ static inline EdrSecurityXmlTextStatus edr_security_xml_get_data_utf8(
 static inline int edr_security_4657_identity_incomplete(
     const char *xml, const char *name, char *out, size_t cap) {
   int unresolved_entity;
-  EdrSecurityXmlTextStatus status = edr_security_xml_read_data(xml, name, out, cap, NULL, &unresolved_entity);
+  EdrSecurityXmlTextStatus status = edr_security_xml_read_data(xml, name, out, cap, NULL, &unresolved_entity, 0);
   if (status == EDR_SECURITY_XML_TEXT_TRUNCATED && cap > 1u) {
     /* EvtRender supplied valid UTF-8. Keep every complete scalar in the
      * prefix so a split final character cannot invalidate the entire fact. */

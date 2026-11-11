@@ -995,6 +995,17 @@ static void test_security_4657_source_identity(void) {
   assert(edr_behavior_source_field_truncated(&record, "source.reg_key_path"));
   assert(edr_behavior_source_field_truncated(&record, "source.reg_value_name"));
   assert(!strcmp(record.source_completeness, "TRUNCATED") && !strcmp(record.reg_op, "set_value"));
+
+  fill_slot(&slot, EDR_EVENT_REG_DELETE_KEY,
+            "ETW1\nprov=security_4657\npid=5101\nregkey=HKCU/test\nregname=preview\n"
+            "regop=delete_value\nregistry_source=security_4657\n");
+  slot.timestamp_ns = UINT64_C(1735689602000000200);
+  slot.registry_value_name_incomplete = 1;
+  edr_behavior_from_slot(&slot, &record);
+  assert(record.event_time_ns == INT64_C(1735689602000000200) &&
+         record.type == EDR_EVENT_REG_DELETE_KEY && !strcmp(record.reg_op, "delete_value"));
+  assert(!strcmp(record.reg_source, "security_4657") && !strcmp(record.reg_value_name, "preview") &&
+         edr_behavior_source_field_truncated(&record, "source.reg_value_name"));
 }
 
 static void test_registry_persistence_alias_bridge(void) {

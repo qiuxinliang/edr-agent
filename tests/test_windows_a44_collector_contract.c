@@ -170,8 +170,8 @@ int main(void) {
   ok &= require_contains(tdh, "void edr_tdh_win_get_property_stats_ext(",
                          "ETW observability extended TDH statistics must be implemented");
   /* Source-contract only: macOS cannot compile the Windows EventLog callback. */
-  ok &= require_contains(collector, "static void edr_security_emit_registry_4657(const char *xml)",
-                         "4657 must retain a dedicated callback");
+  ok &= require_contains(collector, "edr_security_emit_registry_4657(xml, security_event_time_ns);",
+                         "4657 must receive the recorded event time obtained from its EventLog handle");
   ok &= require_contains(collector, "(void)edr_xml_get_data_utf8(xml, \"SubjectUserName\", user, sizeof(user));",
                          "4657 must preserve Subject actor identity");
   ok &= require_contains(collector, "TargetUserName\", user, sizeof(user));",

@@ -2503,7 +2503,8 @@ void edr_behavior_from_slot(const EdrEventSlot *slot, EdrBehaviorRecord *r) {
     if (ef.regstatus[0]) {
       snprintf(r->reg_detail_status, sizeof(r->reg_detail_status), "%s", ef.regstatus);
     }
-    if (r->type == EDR_EVENT_REG_SET_VALUE && !strcmp(ef.regsource, "security_4657")) {
+    if ((r->type == EDR_EVENT_REG_SET_VALUE || r->type == EDR_EVENT_REG_DELETE_KEY) &&
+        !strcmp(ef.regsource, "security_4657")) {
       if (slot->registry_key_incomplete) edr_behavior_mark_source_truncated(r, "source.reg_key_path");
       if (slot->registry_value_name_incomplete) edr_behavior_mark_source_truncated(r, "source.reg_value_name");
     }

@@ -1738,7 +1738,7 @@ static void edr_registry_normalize_security_path(char *out, size_t out_cap,
   }
 }
 
-static void edr_security_emit_registry_4657(const char *xml) {
+static void edr_security_emit_registry_4657(const char *xml, uint64_t event_time_ns) {
   char pid[64];
   char img[1024];
   char key_raw[2048];
@@ -1757,6 +1757,15 @@ static void edr_security_emit_registry_4657(const char *xml) {
   int n;
   int has_process_id;
   s_health.security_4657_received++;
+  if (!event_time_ns) {
+    edr_collector_note_drop(EDR_COLLECTOR_DROP_SECURITY_RENDER);
+    return;
+  }
+  const char *operation = edr_security_4657_operation(xml);
+  if (!operation) {
+    edr_collector_note_drop(EDR_COLLECTOR_DROP_SECURITY_UNSUPPORTED);
+    return;
+  }
   memset(&slot, 0, sizeof(slot));
   (void)edr_xml_get_data_utf8(xml, "ProcessId", pid, sizeof(pid));
   (void)edr_xml_get_data_utf8(xml, "ProcessName", img, sizeof(img));
@@ -1780,16 +1789,21 @@ static void edr_security_emit_registry_4657(const char *xml) {
   edr_etw1_sanitize_value(safe_old, sizeof(safe_old), old_value);
   edr_etw1_sanitize_value(safe_new, sizeof(safe_new), new_value);
 
-  slot.timestamp_ns = edr_unix_ns();
-  slot.type = EDR_EVENT_REG_SET_VALUE;
-  n = snprintf((char *)slot.data, sizeof(slot.data),
-               "ETW1\nprov=security_4657\npid=%s\neid=4657\nimg=%s\nuser=%s\n"
+  slot.timestamp_ns = event_time_ns;
+  slot.type = !strcmp(operation, "delete_value") ? EDR_EVENT_REG_DELETE_KEY : EDR_EVENT_REG_SET_VALUE;
+  /* The provider already identifies 4657. Removing its duplicate ID pays
+   * for the longer delete operation. Reserve the unused bytes so the same
+   * variable fields still fit, and oversize inputs are still rejected. */
+  const size_t capacity = sizeof(slot.data) - (sizeof("eid=4657\n") - 1u) +
+      (slot.type == EDR_EVENT_REG_DELETE_KEY ? sizeof("delete_value") - sizeof("set_value") : 0u);
+  n = snprintf((char *)slot.data, capacity,
+               "ETW1\nprov=security_4657\npid=%s\nimg=%s\nuser=%s\n"
                "user_domain=%s\nregkey=%s\nregname=%s\nregold=%s\nregdata=%s\n"
-               "regop=set_value\nregistry_source=security_4657\n"
+               "regop=%s\nregistry_source=security_4657\n"
                "registry_attribution=%s\nregistry_detail_status=captured\n",
                pid[0] ? pid : "0", safe_img, user, domain, safe_key, safe_name,
-               safe_old, safe_new, has_process_id ? "process_id" : "unavailable");
-  if (n <= 0 || (size_t)n >= sizeof(slot.data)) {
+               safe_old, safe_new, operation, has_process_id ? "process_id" : "unavailable");
+  if (n <= 0 || (size_t)n >= capacity) {
     s_health.registry_payload_missing++;
     return;
   }
@@ -1850,7 +1864,7 @@ static DWORD WINAPI edr_security_eventlog_callback(EVT_SUBSCRIBE_NOTIFY_ACTION a
   {
     unsigned event_id = edr_xml_event_id(xml);
     if (event_id == 4657u) {
-      edr_security_emit_registry_4657(xml);
+      edr_security_emit_registry_4657(xml, security_event_time_ns);
       free(xml);
       return ERROR_SUCCESS;
     }
