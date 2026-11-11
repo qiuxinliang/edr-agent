@@ -978,6 +978,25 @@ static void test_integer_ip_fields_are_normalized(void) {
   assert(strcmp(r.net_dst, "203.0.113.44") == 0);
 }
 
+static void test_security_4657_source_identity(void) {
+  EdrEventSlot slot;
+  EdrBehaviorRecord record;
+  fill_slot(&slot, EDR_EVENT_REG_SET_VALUE,
+            "ETW1\nprov=security_4657\npid=5101\nregkey=HKCU/test\nregname=\n"
+            "regdata=unchanged\nregop=set_value\nregistry_source=security_4657\n");
+  edr_behavior_from_slot(&slot, &record);
+  assert(!record.reg_value_name[0] && !record.source_truncated_fields[0]);
+  slot.registry_value_name_incomplete = 1;
+  edr_behavior_from_slot(&slot, &record);
+  assert(!strcmp(record.source_truncated_fields, "source.reg_value_name"));
+  assert(!strcmp(record.reg_key_path, "HKCU/test") && !strcmp(record.reg_value_data, "unchanged"));
+  slot.registry_key_incomplete = 1;
+  edr_behavior_from_slot(&slot, &record);
+  assert(edr_behavior_source_field_truncated(&record, "source.reg_key_path"));
+  assert(edr_behavior_source_field_truncated(&record, "source.reg_value_name"));
+  assert(!strcmp(record.source_completeness, "TRUNCATED") && !strcmp(record.reg_op, "set_value"));
+}
+
 static void test_registry_persistence_alias_bridge(void) {
   EdrEventSlot slot;
   EdrBehaviorRecord r;
@@ -1506,6 +1525,7 @@ int main(void) {
   test_sensor_alias_bridge();
   test_integer_ip_fields_are_normalized();
   test_registry_persistence_alias_bridge();
+  test_security_4657_source_identity();
   test_pmfe_followup_bridge_preserves_link_without_false_mitre();
   test_pmfe_structured_signals_reach_detection_context();
   test_kernel_file_read_generation_bridge();

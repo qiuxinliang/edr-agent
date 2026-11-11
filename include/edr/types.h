@@ -106,6 +106,10 @@ typedef struct {
   uint8_t attack_surface_hint;
   uint8_t process_token_snapshot_truncated;
   bool consumed;
+  /* Collector-owned loss at the Security 4657 XML-to-ETW1 boundary.
+   * Keep the original bounded payload and its other facts intact. */
+  uint8_t registry_key_incomplete;
+  uint8_t registry_value_name_incomplete;
 } EdrEventSlot;
 
 #endif

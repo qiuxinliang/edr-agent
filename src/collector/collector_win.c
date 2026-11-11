@@ -1757,10 +1757,13 @@ static void edr_security_emit_registry_4657(const char *xml) {
   int n;
   int has_process_id;
   s_health.security_4657_received++;
+  memset(&slot, 0, sizeof(slot));
   (void)edr_xml_get_data_utf8(xml, "ProcessId", pid, sizeof(pid));
   (void)edr_xml_get_data_utf8(xml, "ProcessName", img, sizeof(img));
-  (void)edr_xml_get_data_utf8(xml, "ObjectName", key_raw, sizeof(key_raw));
-  (void)edr_xml_get_data_utf8(xml, "ObjectValueName", value_name, sizeof(value_name));
+  slot.registry_key_incomplete = edr_security_4657_identity_incomplete(
+      xml, "ObjectName", key_raw, sizeof(key_raw));
+  slot.registry_value_name_incomplete = edr_security_4657_identity_incomplete(
+      xml, "ObjectValueName", value_name, sizeof(value_name));
   (void)edr_xml_get_data_utf8(xml, "OldValue", old_value, sizeof(old_value));
   (void)edr_xml_get_data_utf8(xml, "NewValue", new_value, sizeof(new_value));
   (void)edr_xml_get_data_utf8(xml, "SubjectUserName", user, sizeof(user));
@@ -1777,7 +1780,6 @@ static void edr_security_emit_registry_4657(const char *xml) {
   edr_etw1_sanitize_value(safe_old, sizeof(safe_old), old_value);
   edr_etw1_sanitize_value(safe_new, sizeof(safe_new), new_value);
 
-  memset(&slot, 0, sizeof(slot));
   slot.timestamp_ns = edr_unix_ns();
   slot.type = EDR_EVENT_REG_SET_VALUE;
   n = snprintf((char *)slot.data, sizeof(slot.data),

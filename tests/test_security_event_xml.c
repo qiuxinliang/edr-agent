@@ -52,5 +52,37 @@ static int verify_entities_and_bounds(void) {
 }
 
 int main(void) {
+  char name[512], xml[1024], input[513];
+  memset(input, 'v', 511);
+  input[511] = '\0';
+  snprintf(xml, sizeof(xml), "<Data Name='ObjectValueName'>%s</Data>", input);
+  if (edr_security_4657_identity_incomplete(xml, "ObjectValueName", name, sizeof(name)) ||
+      strcmp(name, input)) return 1;
+  input[511] = 'x';
+  input[512] = '\0';
+  snprintf(xml, sizeof(xml), "<Data Name='ObjectValueName'>%s</Data>", input);
+  if (!edr_security_4657_identity_incomplete(xml, "ObjectValueName", name, sizeof(name)) ||
+      strlen(name) != 511) return 1;
+  const char *multibyte = "<Data Name='ObjectValueName'>A\xe8\xb0\x83Z</Data>";
+  if (!edr_security_4657_identity_incomplete(multibyte, "ObjectValueName", name, 4) ||
+      strcmp(name, "A") ||
+      !edr_security_4657_identity_incomplete(multibyte, "ObjectValueName", name, 5) ||
+      strcmp(name, "A\xe8\xb0\x83")) return 1;
+  static const char *const empty[] = {
+      "<Data Name='ObjectValueName'></Data>", "<Data Name='ObjectValueName'/>",
+      "<Data Name=\"ObjectValueName\" />"};
+  for (size_t i = 0u; i < sizeof(empty)/sizeof(empty[0]); ++i) {
+    if (edr_security_4657_identity_incomplete(empty[i], "ObjectValueName", name, sizeof(name)) ||
+        name[0]) return 1;
+  }
+  if (!edr_security_4657_identity_incomplete("<Event/>", "ObjectValueName", name, sizeof(name)) ||
+      !edr_security_4657_identity_incomplete("<Data Name='ObjectName'>A\nB</Data>",
+                                             "ObjectName", name, sizeof(name))) return 1;
+  /* A literal ampersand may introduce text that resembles a reference.
+   * Only an entity actually left undecoded makes this identity uncertain. */
+  if (!edr_security_4657_identity_incomplete("<Data Name='ObjectName'>&#65;</Data>",
+                                             "ObjectName", name, sizeof(name)) ||
+      edr_security_4657_identity_incomplete("<Data Name='ObjectName'>&amp;#65;</Data>",
+                                            "ObjectName", name, sizeof(name))) return 1;
   return verify_long_command_line() && verify_entities_and_bounds() ? 0 : 1;
 }
