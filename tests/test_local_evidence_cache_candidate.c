@@ -15581,9 +15581,13 @@ static void test_window_entry_order_and_recovery(int enforce) {
 
 #include "retained_context_recall_cases.h"
 #include "window_recovery_budget_cases.h"
+#include "alert_window_recall_cases.h"
 
 int main(int argc, char **argv) {
 #if defined(EDR_HAVE_SQLITE)
+  if (argc == 2 && !strcmp(argv[1], "--alert-window-recall")) {
+    test_alert_window_recall(); return 0;
+  }
   if(argc==2 && (!strcmp(argv[1],"--window-recovery-budget") || !strcmp(argv[1],"--window-recovery-budget-probe"))) {
     test_window_recovery_budget(!strcmp(argv[1],"--window-recovery-budget")); return 0;
   }

@@ -401,6 +401,17 @@ typedef struct {
 int edr_local_evidence_cache_query_parent_context_json(
     const EdrParentContextQuery *query, char *out, size_t cap);
 
+/* The command layer supplies the authenticated, frozen alert scope. This
+ * on-demand reader never searches the endpoint ring, queue or another owner. */
+typedef struct {
+  const char *tenant_id, *endpoint_id, *alert_id, *source_event_id, *kind;
+  uint32_t pid, limit, max_bytes;
+  uint64_t process_start_key, process_creation_filetime_100ns;
+  int64_t source_time_ns, from_ns, until_ns, expires_unix_ms;
+} EdrAlertWindowQuery;
+int edr_local_evidence_cache_query_alert_window_json(
+    const EdrAlertWindowQuery *query, char *out, size_t cap);
+
 /** 是否属于可落库/可上传的告警候选。普通 ETW 只进入 hot ring 与滑动指标。 */
 int edr_local_evidence_cache_is_candidate(const EdrBehaviorRecord *r);
 
