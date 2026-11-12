@@ -117,7 +117,7 @@ target_include_directories(test_command_upload_outbox PRIVATE
   ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/third_party/cjson)
 target_link_libraries(test_command_upload_outbox PRIVATE Threads::Threads edr_egress_policy)
 if(WIN32)
-  target_link_libraries(test_command_upload_outbox PRIVATE advapi32)
+  target_link_libraries(test_command_upload_outbox PRIVATE advapi32 ws2_32)
 endif()
 edr_apply_test_warnings(test_command_upload_outbox)
 add_test(NAME command_upload_outbox_recovery COMMAND test_command_upload_outbox

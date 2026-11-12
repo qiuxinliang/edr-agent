@@ -27,6 +27,7 @@ static int measured_hash_worker(const EdrForensicIoRequest *request,EdrForensicI
 int edr_egress_is_policy_hold(int rc) {return rc==-3||rc==-4||rc==-7;}
 int edr_egress_upload_preflight(const char *id,const char *upload,const char *path,const char *sha,uint64_t *size) {(void)id;(void)upload;(void)path;(void)sha;if(size)*size=24;return policy_result;}
 #ifdef _WIN32
+#include <winsock2.h>
 #include <windows.h>
 #include <direct.h>
 #include <process.h>
