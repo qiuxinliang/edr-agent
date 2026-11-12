@@ -8908,86 +8908,143 @@ static int sqlite_window_recovery_checkpoint(void) {
   return rc == SQLITE_OK ? 0 : sqlite_maintenance_error("window recovery checkpoint", rc);
 }
 
+enum { WINDOW_RECOVERY_TERMINAL_FULL = 1, WINDOW_RECOVERY_STOP_AT_LIVE = 2 };
+
+/* A double FULL may be deferred only for an independently verified terminal
+ * owner, after the existing retry and a confirmed rollback. */
+static int sqlite_recover_one_window(const char *id, const char *endpoint,
+    const char *tenant, const char *spec, int bounded, int terminal_only,
+    const char *prior_error) {
+  ContextWindowPlan plan = {0}; const char *state = "active", *gap = "service_restart_gap";
+  int decoded = bounded && window_spec_decode(spec, id, endpoint, tenant, &plan) == 0;
+  if (!decoded) {
+    state = "interrupted"; gap = "invalid_window_metadata";
+  } else {
+    for (unsigned i = 0; i < plan.count; ++i) {
+      if (edr_monotonic_ns() < plan.slots[i].created_mono_ns) { state = "interrupted"; gap = "monotonic_clock_reset"; break; }
+      if (context_window_nominally_ended(&plan.slots[i], now_unix_ns(), edr_monotonic_ns())) { state = "expired"; gap = "restart_after_window"; break; }
+      if (!window_live_generation_matches(&plan.slots[i])) { state = "interrupted"; gap = "live_generation_unverified"; break; }
+    }
+  }
+  const int terminal = decoded && strcmp(state, "active") != 0;
+  if (terminal_only && !terminal) return WINDOW_RECOVERY_STOP_AT_LIVE;
+  int retry_rc = SQLITE_OK;
+  if (!sqlite_database_write_allow(16384u) || exec_sql("BEGIN IMMEDIATE;") != 0) {
+    set_error("window recovery metadata capacity unavailable; owner preserved"); return -1;
+  }
+  int metadata_rc = window_metadata_set(id, state, NULL, gap);
+  if (metadata_rc != 0) {
+    sqlite_rollback_silent();
+    /* A full compatible store can have no page for a longer state/gap.
+     * Only a verified, now-terminal execution plan may be consumed. The
+     * frozen time bounds/floor and every evidence payload/ref remain intact.
+     * A live plan that cannot persist its restart gap is explicitly refused,
+     * just as bounded slot replacement interrupts a window; never publish
+     * it as recovered. Invalid plans remain available for diagnosis.
+     * This is one retry on startup FULL, not normal ingestion work. */
+    if ((metadata_rc & 0xff) != SQLITE_FULL || !decoded) return -1;
+    if (!sqlite3_get_autocommit(s_db)) {
+      set_error("window recovery SQLITE_FULL rollback unconfirmed; owner preserved");
+      return -1;
+    }
+    if (!strcmp(state, "active")) {
+      state = "interrupted";
+      gap = "window_capacity_replaced";
+    }
+    if (!sqlite_database_write_allow(16384u) || exec_sql("BEGIN IMMEDIATE;") != 0 ||
+        (retry_rc = window_metadata_set(id, state, "", gap)) != 0) goto recovery_failed;
+  }
+  if ((!strcmp(state, "active") && plan_context_window_slots(&plan) != 0) ||
+      exec_sql("COMMIT;") != 0) goto recovery_failed;
+  if (metadata_rc != 0) set_error(prior_error);
+  if (!strcmp(state, "active")) publish_context_window_plan(&plan);
+  return 0;
+recovery_failed:
+  {
+    char retry_error[sizeof(s_status.last_error)];
+    copy_s(retry_error, sizeof(retry_error), s_status.last_error);
+    sqlite_rollback_silent();
+    if ((metadata_rc & 0xff) == SQLITE_FULL) {
+      char error[160];
+      snprintf(error, sizeof(error), "window recovery first sqlite=%d FULL; retry: %.80s",
+          metadata_rc, retry_error);
+      set_error(error);
+    }
+    if (terminal && (retry_rc & 0xff) == SQLITE_FULL && sqlite3_get_autocommit(s_db))
+      return WINDOW_RECOVERY_TERMINAL_FULL;
+    return -1;
+  }
+}
+
 static int sqlite_recover_context_windows(void) {
   /* The active partial index is bounded by the existing 256-slot allocation.
    * Load one row per short transaction; never hold a reader during live I/O. */
   char cursor[160] = "";
-  int changed = 0;
+  char resume[sizeof(cursor)] = "", first_error[sizeof(s_status.last_error)] = "";
+  char prior_error[sizeof(s_status.last_error)];
+  copy_s(prior_error, sizeof(prior_error), s_status.last_error);
+  int changed = 0, advanced = 0, retrying = 0;
   for (unsigned n = 0; n < EDR_EVIDENCE_CONTEXT_WINDOWS; ++n) {
     sqlite3_stmt *st = NULL; char id[160], endpoint[48], tenant[64], spec[1025];
     if (sqlite3_prepare_v2(s_db, "SELECT candidate_id,endpoint_id,tenant_id,context_window_spec "
         "FROM p0_candidates WHERE context_window_state='active' AND candidate_id>? "
-        "AND local_retention_state='retained' ORDER BY candidate_id LIMIT 1;", -1, &st, NULL) != SQLITE_OK) return -1;
+        "AND local_retention_state='retained' ORDER BY candidate_id LIMIT 1;", -1, &st, NULL) != SQLITE_OK) {
+      set_error(first_error[0] ? first_error : sqlite3_errmsg(s_db));
+      return -1;
+    }
     bind_text(st, 1, cursor); int step = sqlite3_step(st);
     if (step == SQLITE_DONE) {
       sqlite3_finalize(st);
+      if (first_error[0] && !retrying) {
+        if (!advanced) { set_error(first_error); return -1; }
+        copy_s(cursor, sizeof(cursor), resume);
+        retrying = 1;
+        continue;
+      }
       /* Do not let recovery-only WAL allocation falsely turn an otherwise
        * full, compatible store into a new capacity retirement request. */
       return changed ? sqlite_window_recovery_checkpoint() : 0;
     }
-    if (step != SQLITE_ROW) { sqlite3_finalize(st); return -1; }
+    if (step != SQLITE_ROW) {
+      set_error(first_error[0] ? first_error : sqlite3_errmsg(s_db));
+      sqlite3_finalize(st);
+      return -1;
+    }
     copy_s(id, sizeof(id), (const char *)sqlite3_column_text(st, 0));
     copy_s(endpoint, sizeof(endpoint), (const char *)sqlite3_column_text(st, 1));
     copy_s(tenant, sizeof(tenant), (const char *)sqlite3_column_text(st, 2));
     const char *raw = (const char *)sqlite3_column_text(st, 3);
     int bounded = raw && strlen(raw) <= 1024u;
     copy_s(spec, sizeof(spec), bounded ? raw : ""); sqlite3_finalize(st);
-    copy_s(cursor, sizeof(cursor), id);
-    ContextWindowPlan plan = {0}; const char *state = "active", *gap = "service_restart_gap";
-    int decoded = bounded && window_spec_decode(spec, id, endpoint, tenant, &plan) == 0;
-    if (!decoded) {
-      state = "interrupted"; gap = "invalid_window_metadata";
+    int terminal_only = first_error[0] && !retrying;
+    int rc = sqlite_recover_one_window(id, endpoint, tenant, spec, bounded, terminal_only, prior_error);
+    if (rc == WINDOW_RECOVERY_TERMINAL_FULL && !retrying) {
+      /* Keep the predecessor, so the blocked owner is included on retry.
+       * Only terminal peers may advance here. Committed peers leave the
+       * active index; live plans are never published twice or out of order. */
+      if (!first_error[0]) {
+        copy_s(resume, sizeof(resume), cursor);
+        copy_s(first_error, sizeof(first_error), s_status.last_error);
+      }
+      set_error(prior_error);
+    } else if (rc == 0) {
+      changed = 1;
+      if (terminal_only) advanced = 1;
     } else {
-      for (unsigned i = 0; i < plan.count; ++i) {
-        if (edr_monotonic_ns() < plan.slots[i].created_mono_ns) { state = "interrupted"; gap = "monotonic_clock_reset"; break; }
-        if (context_window_nominally_ended(&plan.slots[i], now_unix_ns(), edr_monotonic_ns())) { state = "expired"; gap = "restart_after_window"; break; }
-        if (!window_live_generation_matches(&plan.slots[i])) { state = "interrupted"; gap = "live_generation_unverified"; break; }
-      }
-    }
-    if (!sqlite_database_write_allow(16384u) || exec_sql("BEGIN IMMEDIATE;") != 0) {
-      set_error("window recovery metadata capacity unavailable; owner preserved"); return -1;
-    }
-    int metadata_rc = window_metadata_set(id, state, NULL, gap);
-    if (metadata_rc != 0) {
-      sqlite_rollback_silent();
-      /* A full compatible store can have no page for a longer state/gap.
-       * Only a verified, now-terminal execution plan may be consumed. The
-       * frozen time bounds/floor and every evidence payload/ref remain intact.
-       * A live plan that cannot persist its restart gap is explicitly refused,
-       * just as bounded slot replacement interrupts a window; never publish
-       * it as recovered. Invalid plans remain available for diagnosis.
-       * This is one retry on startup FULL, not normal ingestion work. */
-      if ((metadata_rc & 0xff) != SQLITE_FULL || !decoded) return -1;
-      if (!sqlite3_get_autocommit(s_db)) {
-        set_error("window recovery SQLITE_FULL rollback unconfirmed; owner preserved");
-        return -1;
-      }
-      if (!strcmp(state, "active")) {
-        state = "interrupted";
-        gap = "window_capacity_replaced";
-      }
-      if (!sqlite_database_write_allow(16384u) || exec_sql("BEGIN IMMEDIATE;") != 0 ||
-          window_metadata_set(id, state, "", gap) != 0) goto recovery_failed;
-    }
-    if ((!strcmp(state, "active") && plan_context_window_slots(&plan) != 0) ||
-        exec_sql("COMMIT;") != 0) goto recovery_failed;
-    changed = 1;
-    if (!strcmp(state, "active")) publish_context_window_plan(&plan);
-    continue;
-recovery_failed:
-    {
-      char retry_error[sizeof(s_status.last_error)];
-      copy_s(retry_error, sizeof(retry_error), s_status.last_error);
-      sqlite_rollback_silent();
-      if ((metadata_rc & 0xff) == SQLITE_FULL) {
-        char error[160];
-        snprintf(error, sizeof(error), "window recovery first sqlite=%d FULL; retry: %.80s",
-            metadata_rc, retry_error);
+      if (rc == WINDOW_RECOVERY_STOP_AT_LIVE || rc == WINDOW_RECOVERY_TERMINAL_FULL) {
+        set_error(first_error);
+      } else if (first_error[0]) {
+        char error[sizeof(s_status.last_error)];
+        snprintf(error, sizeof(error), "window recovery first sqlite=%d FULL; later: %.80s",
+                 SQLITE_FULL, s_status.last_error);
         set_error(error);
       }
       return -1;
     }
+    copy_s(cursor, sizeof(cursor), id);
   }
+  /* Every inspection and the single revisit spend the original slot budget. */
+  if (first_error[0] && !retrying) { set_error(first_error); return -1; }
   sqlite3_stmt *remaining = NULL;
   int ok = sqlite3_prepare_v2(s_db, "SELECT 1 FROM p0_candidates WHERE context_window_state='active' "
       "AND candidate_id>? LIMIT 1;", -1, &remaining, NULL) == SQLITE_OK;

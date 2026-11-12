@@ -83,6 +83,78 @@ static void window_budget_query(const char *state, const char *gap, int64_t now)
   assert(strstr(out,"window_observation_gap")); cJSON_Delete(root);
 }
 
+/* Exceed the connection's real pager limit during the blocked owner's
+ * UPDATE. SQLite rolls the trigger's allocation back with the statement. */
+static void test_window_recovery_terminal_peers(int64_t base) {
+  enum { PEER_FITS, NO_PEER, INVALID_PEER, LIVE_PEER, PEER_REFUSED, STILL_FULL, BUDGET_SPENT };
+  static const struct { int mode, peers, interrupted; } cases[] = {
+    {PEER_FITS,1,2}, {NO_PEER,0,0}, {INVALID_PEER,1,0}, {LIVE_PEER,1,0},
+    {PEER_REFUSED,1,0}, {STILL_FULL,1,1}, {BUDGET_SPENT,255,255}
+  };
+  for (size_t n=0; n<sizeof(cases)/sizeof(cases[0]); ++n) {
+    const int mode=cases[n].mode, peers=cases[n].peers;
+    char path[640], floors[65], after[65];
+    assert(make_test_sqlite_path(path,sizeof(path))==0);
+    edr_local_evidence_cache_test_set_now_unix_ns(base);
+    edr_local_evidence_cache_test_set_retention_monotonic_ms(1000);
+    s_test_monotonic_ns=UINT64_C(1000000000);
+    assert(edr_local_evidence_cache_open(path,8,1)==0);
+    EdrBehaviorRecord candidate;
+    for (int i=0; i<=peers; ++i) {
+      init_window_replacement_candidate(&candidate,(unsigned)i,base);
+      edr_local_evidence_cache_record_behavior(&candidate);
+    }
+    edr_local_evidence_cache_close();
+    sqlite3 *db=NULL;
+    assert(sqlite3_open(path,&db)==SQLITE_OK);
+    assert(compact_scalar(db,"SELECT count(*) FROM p0_candidates WHERE context_window_state='active' "
+                             "AND context_window_protect_until_active_ms>0")==peers+1);
+    compact_exec(db,"CREATE TABLE blocked_owner AS SELECT min(candidate_id) AS id FROM p0_candidates;");
+    if (mode==INVALID_PEER)
+      compact_exec(db,"UPDATE p0_candidates SET context_window_spec='{}' WHERE candidate_id NOT IN (SELECT id FROM blocked_owner);");
+    if (mode==LIVE_PEER)
+      compact_exec(db,"UPDATE p0_candidates SET context_window_spec=json_set(context_window_spec,'$.created_mono_ns','1') "
+                      "WHERE candidate_id NOT IN (SELECT id FROM blocked_owner);");
+    if (mode==PEER_REFUSED)
+      compact_exec(db,"CREATE TRIGGER peer_refused BEFORE UPDATE OF context_window_state ON p0_candidates "
+                      "WHEN OLD.candidate_id NOT IN (SELECT id FROM blocked_owner) BEGIN SELECT RAISE(ABORT,'terminal peer refused'); END;");
+    compact_exec(db,"CREATE TABLE peer_padding(payload BLOB); CREATE TRIGGER blocked_window BEFORE UPDATE OF context_window_state ON p0_candidates "
+      "WHEN OLD.candidate_id IN (SELECT id FROM blocked_owner) AND (NOT EXISTS(SELECT 1 FROM p0_candidates WHERE candidate_id NOT IN (SELECT id FROM blocked_owner)) "
+      "OR EXISTS(SELECT 1 FROM p0_candidates WHERE candidate_id NOT IN (SELECT id FROM blocked_owner) AND context_window_state='active')) "
+      "BEGIN INSERT INTO peer_padding VALUES(zeroblob(9*1024*1024)); END;");
+    if (mode==STILL_FULL)
+      compact_exec(db,"CREATE TRIGGER still_blocked BEFORE UPDATE OF context_window_state ON p0_candidates "
+        "WHEN OLD.candidate_id IN (SELECT id FROM blocked_owner) BEGIN INSERT INTO peer_padding VALUES(zeroblob(9*1024*1024)); END;");
+    const char *protected_rows="SELECT candidate_id,context_window_protect_until_active_ms,alert_context_protect_until_active_ms,"
+        "event_time_ns,context_post_until_ns FROM p0_candidates ORDER BY candidate_id";
+    compact_startup_rowset_hash(db,protected_rows,floors);
+    s_test_monotonic_ns=UINT64_C(500000000);
+    edr_local_evidence_cache_test_set_window_recovery_identity(1);
+    int rc=edr_local_evidence_cache_open(path,8,1);
+    EdrEvidenceCacheStatus status; edr_local_evidence_cache_get_status(&status);
+    assert((rc==0)==(mode==PEER_FITS));
+    assert(status.context_windows_used==0 && compact_scalar(db,"SELECT count(*) FROM peer_padding")==0);
+    assert(compact_scalar(db,"SELECT count(*) FROM p0_candidates")==peers+1);
+    const int terminated=cases[n].interrupted;
+    assert(compact_scalar(db,"SELECT count(*) FROM p0_candidates WHERE context_window_state='interrupted' "
+                             "AND context_window_gap_reason='monotonic_clock_reset'")==terminated);
+    assert(compact_scalar(db,"SELECT count(*) FROM p0_candidates WHERE context_window_state='active'")==peers+1-terminated);
+    if (!rc) assert(!strstr(status.last_error,"FULL") && !strstr(status.last_error,"disk is full"));
+    else if(mode==PEER_REFUSED) assert(strstr(status.last_error,"FULL") && strstr(status.last_error,"terminal peer refused"));
+    else assert(strstr(status.last_error,"FULL"));
+    compact_startup_rowset_hash(db,protected_rows,after); assert(!strcmp(floors,after));
+    edr_local_evidence_cache_close();
+    if (mode==PEER_FITS || mode==BUDGET_SPENT) {
+      assert(edr_local_evidence_cache_open(path,8,1)==0);
+      assert(compact_scalar(db,"SELECT count(*) FROM p0_candidates WHERE context_window_state='active'")==0);
+      assert(compact_scalar(db,"SELECT count(*) FROM peer_padding")==0);
+      compact_startup_rowset_hash(db,protected_rows,after); assert(!strcmp(floors,after));
+      edr_local_evidence_cache_close();
+    }
+    assert(sqlite3_close(db)==SQLITE_OK); cleanup_test_sqlite_path(path);
+  }
+}
+
 static void test_window_recovery_budget(int enforce) {
   const int64_t base=INT64_C(1793100000000000000);
   char queue_path[640];assert(make_test_sqlite_path(queue_path,sizeof(queue_path))==0);
@@ -202,6 +274,7 @@ static void test_window_recovery_budget(int enforce) {
     }
     edr_local_evidence_cache_close();assert(sqlite3_close(db)==SQLITE_OK);cleanup_test_sqlite_path(path);
   }
+  if (enforce) test_window_recovery_terminal_peers(base);
   test_unsetenv("EDR_EVIDENCE_CONTEXT_WINDOW_S");
   edr_local_evidence_cache_test_set_window_recovery_identity(-1);
   edr_local_evidence_cache_test_set_retention_monotonic_ms(-1);
