@@ -63,7 +63,7 @@ RUNTIME_EXPECTED = {
     "behavior_record_alert_proto_contract",
     "behavior_record_alert_emit_contract", "p0_direct_emit_suppression", "p0_deferred_snapshot",
     "process_tree_cache", "local_evidence_cache_candidate", "local_evidence_cache_migration",
-    "local_evidence_cache_retention", "local_evidence_cache_context_layout", "local_evidence_cache_pressure_continuation", "command_fact_transport",
+    "owner_manifest_frame", "local_evidence_cache_retention", "local_evidence_cache_context_layout", "local_evidence_cache_pressure_continuation", "command_fact_transport",
     "python_installer_config_contract",
     "detection_decision_combo", "detection_regression_scenarios",
     "detection_profile_and_trigger_modes", "detection_sensor_bridge",
@@ -355,6 +355,17 @@ class WindowsReleaseGateTests(unittest.TestCase):
                 self.assertIn("0% tests passed, 1 tests failed out of 1", result.stdout)
                 self.assertNotIn("***Not Run", result.stdout)
 
+    def test_owner_manifest_frame_failure_blocks_reader_release(self):
+        name = "owner_manifest_frame"
+        with tempfile.TemporaryDirectory() as directory:
+            source, build, _ = self.fixture(directory, failing_test=name)
+            self.run_command("cmake", "-S", str(source), "-B", str(build), "-G", "Ninja")
+            result = self.run_command("ctest", "--test-dir", str(build), "-L", LABEL,
+                                      "-R", "^" + name + "$", "--no-tests=error",
+                                      "--output-on-failure", success=False)
+            self.assertIn("0% tests passed, 1 tests failed out of 1", result.stdout)
+            self.assertNotIn("***Not Run", result.stdout)
+
     def test_update_invocation_uses_actual_contract_target_and_checkout_driver(self):
         production = (ROOT / "tests/CMakeLists.txt").read_text(encoding="utf-8")
         start = production.index("  # Run the actual C-generated caller")
@@ -476,7 +487,7 @@ class WindowsReleaseGateTests(unittest.TestCase):
                  # Each executable must still be a distinct build dependency.
                  # Its identical body need only be compiled once per fixture.
                  "add_library(gate_fixture_success OBJECT main.c)",
-                 "set(OpenSSL_FOUND TRUE)", "set(SQLite3_FOUND TRUE)", "set(EDR_PCRE2_AVAILABLE TRUE)",
+                 "set(OpenSSL_FOUND TRUE)", "set(SQLite3_FOUND TRUE)", "set(EDR_WITH_ZSTD TRUE)", "set(EDR_PCRE2_AVAILABLE TRUE)",
                  # This fixture tests scheduling with tiny executables; real
                  # canonical bytes are verified by the native product tests.
                  f"set(EDR_P0_TEST_CONFIG_AVAILABLE {'TRUE' if p0_inputs_available else 'FALSE'})"]
