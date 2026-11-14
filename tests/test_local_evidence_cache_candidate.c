@@ -15583,8 +15583,14 @@ static void test_window_entry_order_and_recovery(int enforce) {
 #include "window_recovery_budget_cases.h"
 #include "alert_window_recall_cases.h"
 #include "alert_window_pre_page_cases.h"
+#include "owner_manifest_frame_cases.h"
 
 int main(int argc, char **argv) {
+#if defined(EDR_HAVE_SQLITE) && defined(EDR_HAVE_ZSTD)
+  if (argc == 2 && !strcmp(argv[1], "--owner-manifest-frame")) {
+    test_owner_manifest_frame(); return 0;
+  }
+#endif
 #if defined(EDR_HAVE_SQLITE)
   if (argc == 2 && !strcmp(argv[1], "--alert-window-recall")) {
     test_alert_window_recall();

@@ -42,6 +42,9 @@
 
 #if defined(EDR_HAVE_SQLITE)
 #include <sqlite3.h>
+#ifdef EDR_HAVE_ZSTD
+#include <zstd.h>
+#endif
 #include "edr/v1/event.pb.h"
 #include <pb_decode.h>
 #include "evidence_context_store.h"
@@ -4388,19 +4391,125 @@ static const char *const frozen_context_fields[] = {"context",
 
 static int authorized_context_timestamp(sqlite3_stmt *st, int column, int64_t *out);
 
+#ifdef EDR_HAVE_ZSTD
+/* The writer has at most 32 event objects, each with fewer than 64 fields.
+ * The one variable-shaped subtree is copied from detection_context. A JSON
+ * member needs at least five bytes including its separator. Bound work before
+ * the strict parser compares every pair of keys in each object. String bytes
+ * do not count as structure. The strict parser still validates all grammar. */
+static int owner_frame_structure_bounded(const char *raw, size_t len) {
+  enum { signature_bytes = sizeof(((EdrBehaviorRecord *)0)->detection_context),
+         signature_keys = 1 + signature_bytes / 5,
+         fixed_objects = 32 + 8, fields = 64,
+         max_pairs = signature_keys * (signature_keys - 1) / 2 +
+                     fixed_objects * fields * (fields - 1) / 2,
+         max_separators = signature_bytes + fixed_objects * (2 * fields + 2),
+         /* Generated field names are shorter than 64 bytes. All keys in the
+          * copied signature, including terminators, fit in its source record. */
+         max_key_work = signature_keys * signature_bytes +
+                        fixed_objects * fields * (fields - 1) / 2 * 64 };
+  uint32_t key_bytes[CJSON_NESTING_LIMIT];
+  uint16_t keys[CJSON_NESTING_LIMIT];
+  size_t depth = 0, string_start = 0, last_key_bytes = 0;
+  unsigned pairs = 0, key_work = 0, separators = 0;
+  int quoted = 0;
+  for (size_t i = 0; i < len; ++i) {
+    char c = raw[i];
+    if (quoted) {
+      if (c == '\\') ++i;
+      else if (c == '"') { quoted = 0; last_key_bytes = i - string_start; }
+    } else if (c == '"') {
+      quoted = 1;
+      string_start = i;
+    } else if (c == '{' || c == '[') {
+      if (depth == CJSON_NESTING_LIMIT) return 0;
+      key_bytes[depth] = 0;
+      keys[depth++] = 0;
+    } else if (c == '}' || c == ']') {
+      if (!depth) return 0;
+      --depth;
+    } else if (c == ':' || c == ',') {
+      if (!depth || ++separators > max_separators) return 0;
+      if (c == ':') {
+        pairs += keys[depth - 1]++;
+        /* strcmp with each preceding key reads at most that key and its NUL.
+         * Raw JSON token bytes conservatively include escape spelling. */
+        key_work += key_bytes[depth - 1];
+        if (pairs > max_pairs || key_work > max_key_work) return 0;
+        key_bytes[depth - 1] += (uint32_t)last_key_bytes;
+        last_key_bytes = 0;
+      }
+    }
+  }
+  return !quoted && !depth;
+}
+#endif
+
+/* The caller owns scratch until it has finished using raw. TEXT stays borrowed
+ * from SQLite. BLOB is accepted only for complete, checksummed owner frames. */
+static int read_owner_manifest(sqlite3_stmt *st, int column, const char **raw,
+                               int *length, char **scratch) {
+  int type = sqlite3_column_type(st, column);
+  *raw = NULL;
+  *scratch = NULL;
+  *length = sqlite3_column_bytes(st, column);
+  if (*length <= 0 || (unsigned)*length > EDR_EVIDENCE_MANIFEST_MAX_BYTES)
+    return SQLITE_MISMATCH;
+  if (type == SQLITE_TEXT) {
+    *raw = (const char *)sqlite3_column_text(st, column);
+    return *raw ? SQLITE_OK : SQLITE_NOMEM;
+  }
+#ifdef EDR_HAVE_ZSTD
+  if (type == SQLITE_BLOB && *length >= 10) {
+    const unsigned char *frame = sqlite3_column_blob(st, column);
+    if (!frame) return SQLITE_NOMEM;
+    size_t size = (size_t)*length;
+    /* Standard magic, checksum present, no dictionary/reserved header bits,
+     * exactly one frame. The writer only keeps a frame smaller than its TEXT. */
+    if (memcmp(frame, "\x28\xb5\x2f\xfd", 4) || (frame[4] & 0x1fu) != 0x04u ||
+        ZSTD_findFrameCompressedSize(frame, size) != size) return SQLITE_MISMATCH;
+    unsigned long long plain = ZSTD_getFrameContentSize(frame, size);
+    if (plain <= size || plain > EDR_EVIDENCE_MANIFEST_MAX_BYTES) return SQLITE_MISMATCH;
+    char *decoded = sqlite3_malloc64(plain + 1u);
+    if (!decoded) return SQLITE_NOMEM;
+    size_t result = ZSTD_decompress(decoded, (size_t)plain, frame, size);
+    if (result != plain || !manifest_utf8_bytes_valid(decoded, (size_t)plain) ||
+        !owner_frame_structure_bounded(decoded, (size_t)plain)) {
+      sqlite3_free(decoded);
+      return ZSTD_getErrorCode(result) == ZSTD_error_memory_allocation ? SQLITE_NOMEM : SQLITE_MISMATCH;
+    }
+    decoded[plain] = 0;
+    *raw = *scratch = decoded;
+    *length = (int)plain;
+    return SQLITE_OK;
+  }
+#endif
+  return SQLITE_MISMATCH;
+}
+
+/* Keep malformed containers and overlong numbers out of double-path JSON
+ * extraction. Two paths preserve the original integer token for the parser. */
+#define FRAME_TIME_JSON(value, path) \
+  "CASE WHEN json_type(" value ",'" path "') IN ('integer','real') " \
+  "THEN CASE WHEN length(CAST((" value " -> '" path "') AS BLOB))<=63 " \
+  "THEN json_extract(" value ",'" path "','" path "') END END"
+
 /* Read aliases and the previously frozen window in one statement in the
  * candidate's transaction. Extract the array before cJSON can round its
  * integer tokens. Older partial bundles still overlay each field they have. */
 static int prior_context_bundle(const char *candidate, const char *endpoint, cJSON **previous, int *complete) {
-  sqlite3_stmt *st = NULL;
+  sqlite3_stmt *st = NULL, *decoded_fields = NULL;
+  char *scratch = NULL;
   *previous = NULL;
   *complete = 0;
   if (!s_db) return 1;
   int ok = 0;
   EdrEvidenceFailureReason failure = EDR_EVIDENCE_FAILURE_STORAGE;
   if (sqlite3_prepare_v2(s_db,
-                         "SELECT manifest_json, json_extract(manifest_json,'$.context'), "
-                         "json_extract(manifest_json,'$.post_until_ns','$.post_until_ns') FROM artifacts "
+                         "SELECT manifest_json, CASE WHEN typeof(manifest_json)='text' "
+                         "THEN json_extract(manifest_json,'$.context') END, "
+                         "CASE WHEN typeof(manifest_json)='text' THEN "
+                         "json_extract(manifest_json,'$.post_until_ns','$.post_until_ns') END FROM artifacts "
                          "WHERE candidate_id=?1 AND artifact_type='p0_context_bundle' LIMIT 1;",
                          -1, &st, NULL) != SQLITE_OK ||
       sqlite3_bind_text(st, 1, candidate, -1, SQLITE_STATIC) != SQLITE_OK)
@@ -4411,10 +4520,23 @@ static int prior_context_bundle(const char *candidate, const char *endpoint, cJS
     goto done;
   }
   if (step != SQLITE_ROW) goto done;
-  const char *raw = (const char *)sqlite3_column_text(st, 0);
-  if (!raw || !(*previous = cJSON_Parse(raw))) {
+  const char *raw;
+  int bytes;
+  int read_rc = read_owner_manifest(st, 0, &raw, &bytes, &scratch);
+  if (read_rc != SQLITE_OK) {
+    failure = read_rc == SQLITE_NOMEM ? EDR_EVIDENCE_FAILURE_RESOURCE : EDR_EVIDENCE_FAILURE_INVALID;
+    goto done;
+  }
+  if (!(*previous = scratch ? edr_egress_parse_purpose_object(raw, (size_t)bytes) : cJSON_Parse(raw))) {
     failure = EDR_EVIDENCE_FAILURE_INVALID;
     goto done;
+  }
+  if (scratch) {
+    const char *fields = "SELECT json_extract(?1,'$.context'),"
+                         FRAME_TIME_JSON("?1", "$.post_until_ns");
+    if (sqlite3_prepare_v2(s_db, fields, -1, &decoded_fields, NULL) != SQLITE_OK ||
+        sqlite3_bind_text(decoded_fields, 1, raw, bytes, SQLITE_STATIC) != SQLITE_OK ||
+        sqlite3_step(decoded_fields) != SQLITE_ROW) goto done;
   }
   failure = EDR_EVIDENCE_FAILURE_RESOURCE;
   cJSON *prior = *previous;
@@ -4422,7 +4544,8 @@ static int prior_context_bundle(const char *candidate, const char *endpoint, cJS
   int slots = cJSON_GetArraySize(array);
   int array_ok = cJSON_IsArray(array) && slots <= 32;
   if (array_ok) {
-    const char *exact = (const char *)sqlite3_column_text(st, 1);
+    const char *exact = (const char *)sqlite3_column_text(decoded_fields ? decoded_fields : st,
+                                                        decoded_fields ? 0 : 1);
     cJSON *replacement = exact ? cJSON_CreateRaw(exact) : NULL;
     if (!replacement || !cJSON_ReplaceItemInObjectCaseSensitive(prior, "context", replacement)) {
       cJSON_Delete(replacement);
@@ -4430,7 +4553,7 @@ static int prior_context_bundle(const char *candidate, const char *endpoint, cJS
     }
   }
   int64_t until = 0;
-  if (authorized_context_timestamp(st, 2, &until)) {
+  if (authorized_context_timestamp(decoded_fields ? decoded_fields : st, decoded_fields ? 1 : 2, &until)) {
     char digits[32];
     sqlite_u64_decimal((uint64_t)until, digits);
     cJSON *replacement = cJSON_CreateRaw(digits);
@@ -4458,9 +4581,17 @@ static int prior_context_bundle(const char *candidate, const char *endpoint, cJS
               serialized->valuedouble == slots && cJSON_IsNumber(omitted) &&
               omitted->valuedouble == count->valuedouble - slots && cJSON_IsBool(truncated) &&
               cJSON_IsTrue(truncated) == (omitted->valuedouble > 0);
+  /* Legacy TEXT can be partially populated. A frame is produced only from a
+   * complete owner; never copy another owner's frozen fields on replay. */
+  if (scratch && !*complete) {
+    failure = EDR_EVIDENCE_FAILURE_INVALID;
+    goto done;
+  }
   ok = 1;
 done:
   if (!ok) s_persistence_failure = sqlite3_errcode(s_db) == SQLITE_NOMEM ? EDR_EVIDENCE_FAILURE_RESOURCE : failure;
+  sqlite3_finalize(decoded_fields);
+  sqlite3_free(scratch);
   sqlite3_finalize(st);
   return ok;
 }
@@ -10561,6 +10692,7 @@ invalid:
 
 static int authorized_retained_context(EvidenceQueueQuery *q,
     const EdrCommandResultAuthorization *authorization, unsigned *scanned) {
+  char *owner_scratch = NULL;
   sqlite3_stmt *st = NULL;
   unsigned char (*seen)[32] = NULL;
   unsigned examined = 0, scan_limit = q->filter->limit*20u+100u;
@@ -10628,8 +10760,11 @@ static int authorized_retained_context(EvidenceQueueQuery *q,
     ++*scanned;
     if (authorized_query_interrupted(q->deadline)) { q->error = "evidence query deadline reached"; rc = -1; break; }
     const char *candidate = (const char *)sqlite3_column_text(st, 0);
-    const char *raw = (const char *)sqlite3_column_text(st, 1);
-    int bytes = sqlite3_column_bytes(st, 1);
+    const char *raw;
+    int bytes;
+    sqlite3_free(owner_scratch);
+    int read_rc = read_owner_manifest(st, 1, &raw, &bytes, &owner_scratch);
+    if (read_rc == SQLITE_NOMEM) goto storage;
     cJSON *bundle = NULL;
     if (!candidate || !raw || bytes <= 0 || bytes > (int)EDR_EVIDENCE_MANIFEST_MAX_BYTES ||
         memchr(raw, 0, (size_t)bytes) ||
@@ -10646,9 +10781,10 @@ static int authorized_retained_context(EvidenceQueueQuery *q,
     }
     rc = 1;
     sqlite3_stmt *items = NULL;
-    if (sqlite3_prepare_v2(s_db,
-        "SELECT value,json_extract(value,'$.event_time_ns','$.event_time_ns') FROM json_each(?1,'$.context');",
-        -1, &items, NULL) != SQLITE_OK ||
+    const char *items_sql = owner_scratch
+        ? "SELECT value," FRAME_TIME_JSON("value", "$.event_time_ns") " FROM json_each(?1,'$.context');"
+        : "SELECT value,json_extract(value,'$.event_time_ns','$.event_time_ns') FROM json_each(?1,'$.context');";
+    if (sqlite3_prepare_v2(s_db, items_sql, -1, &items, NULL) != SQLITE_OK ||
         sqlite3_bind_text(items,1,raw,-1,SQLITE_TRANSIENT) != SQLITE_OK) {
       sqlite3_finalize(items); cJSON_Delete(bundle); goto storage;
     }
@@ -10696,6 +10832,7 @@ storage:
   q->error = authorized_query_interrupted(q->deadline) ? "evidence query deadline reached" :
       "evidence query retained context storage failure";
 done:
+  sqlite3_free(owner_scratch);
   free(seen);
   sqlite3_finalize(st);
   return q->error ? -1 : rc;
@@ -11114,7 +11251,7 @@ static void window_snapshot_begin(EdrSha256Ctx *hash, const AlertWindowRead *r) 
   for (size_t i = 0; i < sizeof(numbers)/sizeof(numbers[0]); ++i) candidate_digest_u64(hash, numbers[i]);
 }
 
-static int window_read_pre(AlertWindowRead *r, const char *raw, const cJSON *bundle) {
+static int window_read_pre(AlertWindowRead *r, const char *raw, const cJSON *bundle, int framed) {
   const cJSON *events = cJSON_GetObjectItemCaseSensitive(bundle, "context");
   int count = cJSON_GetArraySize(events);
   if (!cJSON_IsArray(events) || count > 32) return EDR_PARENT_CONTEXT_ERROR_INTEGRITY;
@@ -11126,6 +11263,10 @@ static int window_read_pre(AlertWindowRead *r, const char *raw, const cJSON *bun
                             "FROM json_each(?1,'$.context') ORDER BY key;"
                           : "SELECT json_extract(value,'$.event_time_ns','$.event_time_ns') "
                             "FROM json_each(?1,'$.context') ORDER BY key;";
+  if (framed) {
+    sql = paged ? "SELECT " FRAME_TIME_JSON("value", "$.event_time_ns") ",value FROM json_each(?1,'$.context') ORDER BY key;"
+                : "SELECT " FRAME_TIME_JSON("value", "$.event_time_ns") " FROM json_each(?1,'$.context') ORDER BY key;";
+  }
   if (paged) window_snapshot_begin(&hash, r);
   if (sqlite3_prepare_v2(s_db, sql, -1, &st, NULL) != SQLITE_OK ||
       sqlite3_bind_text(st, 1, raw, -1, SQLITE_STATIC) != SQLITE_OK)
@@ -11190,6 +11331,7 @@ static int window_read_owner(AlertWindowRead *r) {
   sqlite3_stmt *st = NULL;
   int rc = EDR_PARENT_CONTEXT_ERROR_STORAGE;
   cJSON *bundle = NULL;
+  char *scratch = NULL;
   if (sqlite3_prepare_v2(s_db, sql, -1, &st, NULL) != SQLITE_OK ||
       sqlite3_bind_text(st, 1, canonical, -1, SQLITE_STATIC) != SQLITE_OK ||
       sqlite3_bind_text(st, 2, q->tenant_id, -1, SQLITE_STATIC) != SQLITE_OK ||
@@ -11206,13 +11348,20 @@ static int window_read_owner(AlertWindowRead *r) {
   }
   if (step != SQLITE_ROW) goto done;
   rc = EDR_PARENT_CONTEXT_ERROR_INTEGRITY;
-  const char *raw = window_column(st, 3, EDR_EVIDENCE_MANIFEST_MAX_BYTES);
+  const char *raw;
+  int bytes;
+  int read_rc = read_owner_manifest(st, 3, &raw, &bytes, &scratch);
+  if (read_rc != SQLITE_OK) {
+    if (read_rc == SQLITE_NOMEM) rc = EDR_PARENT_CONTEXT_ERROR_STORAGE;
+    goto done;
+  }
   const char *ep = window_column(st, 4, 128), *tenant = window_column(st, 5, 64);
   const char *status = window_column(st, 6, 64), *artifact = window_column(st, 7, 255);
   if (!raw || !ep || strcmp(ep, q->endpoint_id) || !tenant || strcmp(tenant, q->tenant_id) || !status ||
       strcmp(status, "local_manifest") || !artifact || strncmp(artifact, canonical, strlen(canonical)) ||
       strcmp(artifact + strlen(canonical), ":p0_context_bundle:candidate") ||
-      !(bundle = edr_egress_parse_purpose_object(raw, strlen(raw))) ||
+      memchr(raw, 0, (size_t)bytes) ||
+      !(bundle = edr_egress_parse_purpose_object(raw, (size_t)bytes)) ||
       !window_matches(bundle, "schema", "p0_context_bundle.v1") ||
       !window_matches(bundle, "candidate_id", canonical) || !window_matches(bundle, "endpoint_id", q->endpoint_id))
     goto done;
@@ -11238,13 +11387,14 @@ static int window_read_owner(AlertWindowRead *r) {
   copy_s(r->owner, sizeof(r->owner), canonical);
   r->interrupted = !strcmp(state, "interrupted") || *gap;
   r->pre_truncated = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(bundle, "context_truncated"));
-  rc = window_read_pre(r, raw, bundle);
+  rc = window_read_pre(r, raw, bundle, scratch != NULL);
   if (!rc) {
     step = sqlite3_step(st);
     if (step != SQLITE_DONE)
       rc = step == SQLITE_ROW ? EDR_PARENT_CONTEXT_ERROR_INTEGRITY : EDR_PARENT_CONTEXT_ERROR_STORAGE;
   }
 done:
+  sqlite3_free(scratch);
   cJSON_Delete(bundle);
   sqlite3_finalize(st);
   return rc;
