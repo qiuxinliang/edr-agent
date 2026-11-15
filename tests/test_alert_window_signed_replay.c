@@ -1,6 +1,8 @@
 /* Owner-bound synthetic workload for native command execution and signed
  * receipt delivery. Transport modes accept only an isolated loopback receiver. */
 #include "edr/command.h"
+#include "edr/command_cancel.h"
+#include "edr/command_executor.h"
 #include "edr/ingest_http.h"
 #include "edr/command_state.h"
 #include "edr/command_result_json.h"
@@ -8,6 +10,7 @@
 #include "edr/egress_request_policy.h"
 #include "edr/local_evidence_cache.h"
 #include "edr/sha256.h"
+#include "edr/time_util.h"
 #include "cJSON.h"
 #include <sqlite3.h>
 #include <openssl/evp.h>
@@ -19,6 +22,7 @@
 #include <time.h>
 
 #ifdef _WIN32
+#include <windows.h>
 #define test_env(k, v) _putenv_s(k, v)
 #else
 #define test_env(k, v) setenv(k, v, 1)
@@ -26,6 +30,38 @@
 
 static const char type[] = "alert_window_query_v2";
 static char payload[640];
+static uint64_t replay_deadline_ns;
+
+static void start_replay_executor(void) {
+  replay_deadline_ns = edr_monotonic_ns() + UINT64_C(20000000000);
+  assert(edr_command_executor_start() == 0);
+}
+
+/* Hold the normal active-command identity across admission and policy changes.
+ * Both manual and background replay must leave that durable inbox untouched. */
+static void replay_held_command(const char *id, const EdrSoarCommandMeta *meta) {
+  assert(edr_command_cancel_active(id) && !edr_command_cancel_requested(id));
+  assert(edr_command_state_count_inbox() == 1 && edr_command_state_has_final(id, meta) == 0);
+  assert(edr_command_replay_persisted_inbox_once() == 0);
+  assert(edr_command_state_count_inbox() == 1 && edr_command_state_has_final(id, meta) == 0);
+  edr_command_cancel_end(id);
+  edr_command_executor_wake();
+  for (;;) {
+    int final = edr_command_state_has_final(id, meta);
+    assert(final >= 0);
+    if (final && edr_command_state_count_inbox() == 0 && !edr_command_cancel_active(id)) return;
+    if (edr_monotonic_ns() >= replay_deadline_ns) {
+      fprintf(stderr, "signed command did not reach its durable terminal: %s\n", id);
+      assert(0);
+    }
+#ifdef _WIN32
+    Sleep(5);
+#else
+    struct timespec delay = {0, 5000000L};
+    nanosleep(&delay, NULL);
+#endif
+  }
+}
 
 static void make_request(int64_t anchor) {
   int n = snprintf(
@@ -247,8 +283,10 @@ static void ordered_go_receipt(const char *envelope_path, const char *transport_
   m.issued_at_unix_ms=(int64_t)cJSON_GetNumberValue(cJSON_GetObjectItemCaseSensitive(env,"issued_at_unix_ms"));
   m.deadline_ms=(uint32_t)cJSON_GetNumberValue(cJSON_GetObjectItemCaseSensitive(env,"deadline_ms"));
   assert(m.deadline_ms==60000);
+  start_replay_executor();
+  assert(edr_command_cancel_begin(id));
   assert(edr_command_receive_envelope(id,type,(const uint8_t *)raw_payload,strlen(raw_payload),&m)==1);
-  assert(edr_command_replay_persisted_inbox_once()==1);
+  replay_held_command(id, &m);
   EdrCommandStateRecord *r=calloc(1,sizeof(*r));
   assert(r && edr_command_state_begin(id,type,&m,NULL,r)==EDR_COMMAND_STATE_BEGIN_DUP_FINAL);
   assert(r->execution_status==1 && !r->exit_code && r->report_pending && !r->report_policy_held);
@@ -256,8 +294,10 @@ static void ordered_go_receipt(const char *envelope_path, const char *transport_
   m.result_finished_unix_ms=r->result_finished_unix_ms;
   assert(edr_ingest_http_post_command_result_typed(id,type,&m,1,0,r->detail)==0);
   assert(edr_command_state_mark_reported(r)==0);
+  assert(edr_command_executor_shutdown_timeout(1000));
   free(r);
   edr_local_evidence_cache_close();
+  edr_command_bind_config(NULL);
   cJSON_Delete(request);
   cJSON_Delete(transport);
   cJSON_Delete(job);
@@ -287,11 +327,13 @@ int main(int argc, char **argv) {
   meta.issued_at_unix_ms = anchor / INT64_C(1000000);
   meta.deadline_ms = 60000;
   EVP_PKEY *key = test_signer();
+  start_replay_executor();
   sign_command(key, id, &meta);
   assert(edr_command_receive_envelope(id, type, (const uint8_t *)"{}", 2, &meta) == 0);
   assert(edr_command_state_has_final(id, &meta) == 0 && edr_command_state_count_inbox() == 0);
+  assert(edr_command_cancel_begin(id));
   assert(edr_command_receive_envelope(id, type, (const uint8_t *)payload, strlen(payload), &meta) == 1);
-  assert(edr_command_state_count_inbox() == 1 && edr_command_replay_persisted_inbox_once() == 1);
+  replay_held_command(id, &meta);
   assert(edr_command_state_count_inbox() == 0);
   EdrCommandStateRecord *r = calloc(1, sizeof(*r));
   assert(r && edr_command_state_begin(id, type, &meta, NULL, r) == EDR_COMMAND_STATE_BEGIN_DUP_FINAL);
@@ -318,8 +360,9 @@ int main(int argc, char **argv) {
   assert(sscanf(request_id, "lcq1.%lld.", &key_time_ms) == 1 && key_time_ms == meta.issued_at_unix_ms);
   id = task_id;
   sign_command(key, id, &meta);
+  assert(edr_command_cancel_begin(id));
   assert(edr_command_receive_envelope(id, type, (const uint8_t *)payload, strlen(payload), &meta) == 1);
-  assert(edr_command_replay_persisted_inbox_once() == 1);
+  replay_held_command(id, &meta);
   assert(edr_command_state_begin(id, type, &meta, NULL, r) == EDR_COMMAND_STATE_BEGIN_DUP_FINAL);
   assert(r->execution_status == 1 && r->exit_code == 0 && r->report_pending && !r->report_policy_held);
   receipt = cJSON_Parse(r->detail);
@@ -358,10 +401,11 @@ int main(int argc, char **argv) {
 
   id = "lcq-synthetic-rebound";
   sign_command(key, id, &meta);
+  assert(edr_command_cancel_begin(id));
   assert(edr_command_receive_envelope(id, type, (const uint8_t *)payload, strlen(payload), &meta) == 1);
   strcpy(cfg.agent.tenant_id, "other");
   edr_command_bind_config(&cfg);
-  assert(edr_command_replay_persisted_inbox_once() == 1);
+  replay_held_command(id, &meta);
   assert(edr_command_state_begin(id, type, &meta, NULL, r) == EDR_COMMAND_STATE_BEGIN_DUP_FINAL);
   assert(r->execution_status != 1 && !strstr(r->detail, "edr.alert-window.v1"));
   strcpy(cfg.agent.tenant_id, "t");
@@ -369,9 +413,10 @@ int main(int argc, char **argv) {
 
   id = "lcq-synthetic-window-disabled";
   sign_command(key, id, &meta);
+  assert(edr_command_cancel_begin(id));
   assert(edr_command_receive_envelope(id, type, (const uint8_t *)payload, strlen(payload), &meta) == 1);
   assert(test_env("EDR_RTQ_READONLY_ENABLED", "0") == 0);
-  assert(edr_command_replay_persisted_inbox_once() == 1);
+  replay_held_command(id, &meta);
   assert(edr_command_state_begin(id, type, &meta, NULL, r) == EDR_COMMAND_STATE_BEGIN_DUP_FINAL);
   assert(r->execution_status != 1 && !strstr(r->detail, "edr.alert-window.v1"));
 
@@ -385,6 +430,7 @@ int main(int argc, char **argv) {
 
   edr_command_result_json_free(http);
   cJSON_Delete(receipt);
+  assert(edr_command_executor_shutdown_timeout(1000));
   free(r);
   EVP_PKEY_free(key);
   edr_local_evidence_cache_close();
