@@ -305,7 +305,7 @@ static void test_registry_sidecar_wrap(void) {
   window_registry_input(r, "wrap-stale", base, -40 * sec, "HKCU/Stale", "stale", 0);
   for (unsigned n = 0; n < 257; ++n) {
     char id[40]; snprintf(id, sizeof(id), "wrap-nonreg-%u", n);
-    window_deliver(r, id, base, -39 * sec + n, 54000 + n, 1);
+    window_deliver(r, id, base, -39 * sec + n, 54000 + n, n != 256);
   }
   window_registry_input(r, "wrap-max", base, -2 * sec, key, value, 0);
   init_window_registry(r, "wrap-clipped", base, -sec, "HKCU/Clipped", "", 0);
@@ -348,11 +348,20 @@ static void test_registry_sidecar_wrap(void) {
   cJSON *legacy = cJSON_Parse((const char *)sqlite3_column_text(st, 0));
   assert(legacy); sqlite3_finalize(st);
   cJSON *item;
+  unsigned same_generation_network = 0;
   cJSON_ArrayForEach(item, cJSON_GetObjectItemCaseSensitive(legacy, "context")) {
+    const cJSON *type = cJSON_GetObjectItemCaseSensitive(item, "type");
+    if (type && type->valueint == EDR_EVENT_NET_CONNECT) {
+      ++same_generation_network;
+      assert(!cJSON_HasObjectItem(item, "registry_key"));
+      assert(!cJSON_HasObjectItem(item, "registry_value"));
+      assert(!cJSON_HasObjectItem(item, "registry_op"));
+    }
     cJSON_DeleteItemFromObjectCaseSensitive(item, "registry_key");
     cJSON_DeleteItemFromObjectCaseSensitive(item, "registry_value");
     cJSON_DeleteItemFromObjectCaseSensitive(item, "registry_op");
   }
+  assert(same_generation_network == 1);
   char *text = cJSON_PrintUnformatted(legacy); assert(text);
   assert(sqlite3_prepare_v2(db, "UPDATE artifacts SET manifest_json=? WHERE artifact_type='p0_context_bundle'", -1, &st, NULL) == SQLITE_OK);
   assert(sqlite3_bind_text(st, 1, text, -1, SQLITE_STATIC) == SQLITE_OK && sqlite3_step(st) == SQLITE_DONE);
