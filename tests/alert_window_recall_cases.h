@@ -53,7 +53,7 @@ static cJSON *window_answer(const EdrAlertWindowQuery *q) {
   return root;
 }
 
-static void test_alert_window_recall(void) {
+static void test_alert_window_recall_contract(int require_registry_pre) {
   const int64_t sec = INT64_C(1000000000), base = INT64_C(1750061200000000101);
   for (int compact = 0; compact < 2; ++compact) {
     char path[640], shared[65] = {0};
@@ -126,23 +126,25 @@ static void test_alert_window_recall(void) {
     q.source_event_id = "anchor-A";
     q.source_time_ns = base;
     cJSON *registry = window_answer(&q), *reg_rows = cJSON_GetObjectItemCaseSensitive(registry, "rows");
-    assert(cJSON_GetArraySize(reg_rows) == 2);
-    int unicode = 0, default_value = 0;
+    assert(cJSON_GetArraySize(reg_rows) == (require_registry_pre ? 3 : 2));
+    int unicode = 0, default_value = 0, pre_value = 0;
     const cJSON *reg;
     cJSON_ArrayForEach(reg, reg_rows) {
       const char *key = cJSON_GetObjectItemCaseSensitive(reg, "registry_key")->valuestring;
       const char *value = cJSON_GetObjectItemCaseSensitive(reg, "registry_value")->valuestring;
       assert(!strcmp(cJSON_GetObjectItemCaseSensitive(reg, "registry_op")->valuestring, "set_value"));
       assert(!cJSON_HasObjectItem(reg, "reg_value_data"));
+      pre_value += !strcmp(key, "HKCU/Software/Pre") && !strcmp(value, "pre");
       unicode += !strcmp(key, "HKCU/Software/Post") && !strcmp(value, "调查值");
       default_value += !strcmp(key, "HKCU/Software/Default") && !*value;
     }
     assert(unicode == 1 && default_value == 1);
+    assert(pre_value == require_registry_pre);
     int legacy_gap = 0;
     const cJSON *gap;
     cJSON_ArrayForEach(gap, cJSON_GetObjectItemCaseSensitive(registry, "gap_reasons")) legacy_gap |=
         !strcmp(gap->valuestring, "registry_fields_missing");
-    assert(legacy_gap);
+    assert(legacy_gap == !require_registry_pre);
     cJSON_Delete(registry);
     q.kind = "network";
     q.alert_id = "alert-B";
@@ -269,3 +271,5 @@ static void test_registry_source_fidelity(void) {
   s_test_monotonic_ns = 0;
   free(r);
 }
+
+static void test_alert_window_recall(void) { test_alert_window_recall_contract(0); }
