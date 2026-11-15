@@ -15593,7 +15593,7 @@ int main(int argc, char **argv) {
 #endif
 #if defined(EDR_HAVE_SQLITE)
   if (argc == 2 && !strcmp(argv[1], "--registry-pre-window-contract")) {
-    test_alert_window_recall_contract(1); return 0;
+    test_alert_window_recall_contract(1); test_registry_sidecar_wrap(); return 0;
   }
   if (argc == 2 && !strcmp(argv[1], "--alert-window-recall")) {
     test_alert_window_recall();

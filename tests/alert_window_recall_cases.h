@@ -287,3 +287,86 @@ static void test_registry_source_fidelity(void) {
 }
 
 static void test_alert_window_recall(void) { test_alert_window_recall_contract(1); }
+
+#if defined(EDR_HAVE_SQLITE)
+static void test_registry_sidecar_wrap(void) {
+  const int64_t base = INT64_C(1750061200000000101), sec = INT64_C(1000000000);
+  char path[640], key[1024], value[512];
+  EdrBehaviorRecord *r = calloc(1, sizeof(*r));
+  assert(r && make_test_sqlite_path(path, sizeof(path)) == 0);
+  memset(key, 'k', sizeof(key)); key[1023] = 0;
+  memset(value, 'v', sizeof(value)); value[511] = 0;
+  /* Complete UTF-8 at each actual source capacity, not byte-truncated text. */
+  memcpy(key + 1020, "键", 3); memcpy(value + 508, "值", 3);
+  test_setenv("EDR_EVIDENCE_CONTEXT_WINDOW_S", "45");
+  edr_local_evidence_cache_test_set_now_unix_ns(base - 40 * sec);
+  edr_local_evidence_cache_test_set_retention_monotonic_ms(1000000);
+  assert(edr_local_evidence_cache_open(path, 16, 24) == 0);
+  window_registry_input(r, "wrap-stale", base, -40 * sec, "HKCU/Stale", "stale", 0);
+  for (unsigned n = 0; n < 257; ++n) {
+    char id[40]; snprintf(id, sizeof(id), "wrap-nonreg-%u", n);
+    window_deliver(r, id, base, -39 * sec + n, 54000 + n, 1);
+  }
+  window_registry_input(r, "wrap-max", base, -2 * sec, key, value, 0);
+  init_window_registry(r, "wrap-clipped", base, -sec, "HKCU/Clipped", "", 0);
+  edr_behavior_mark_source_truncated(r, "source.reg_value_name");
+  edr_local_evidence_cache_record_behavior(r);
+  window_registry_input(r, "wrap-default", base, -sec + 1, "HKCU/Default", "", 0);
+  window_deliver(r, "wrap-anchor", base, 0, 0, 0);
+  window_registry_input(r, "wrap-post", base, sec, "HKCU/Post", "post", 0);
+  edr_local_evidence_cache_close();
+  assert(edr_local_evidence_cache_open(path, 16, 24) == 0);
+  EdrAlertWindowQuery q = {0};
+  q.tenant_id = r->tenant_id; q.endpoint_id = r->endpoint_id;
+  q.alert_id = "wrap-alert"; q.source_event_id = "wrap-anchor";
+  q.pid = r->pid; q.process_start_key = r->process_start_key;
+  q.process_creation_filetime_100ns = r->process_creation_filetime_100ns;
+  q.source_time_ns = base; q.from_ns = base - 45 * sec; q.until_ns = base + 2 * sec;
+  q.expires_unix_ms = q.until_ns / 1000000 + 30000;
+  q.kind = "registry"; q.limit = 50; q.max_bytes = 8192;
+  cJSON *answer = window_answer(&q);
+  const cJSON *row; unsigned seen = 0, gaps = 0;
+  assert(cJSON_GetArraySize(cJSON_GetObjectItemCaseSensitive(answer, "rows")) == 3);
+  cJSON_ArrayForEach(row, cJSON_GetObjectItemCaseSensitive(answer, "rows")) {
+    const char *k = cJSON_GetObjectItemCaseSensitive(row, "registry_key")->valuestring;
+    const char *v = cJSON_GetObjectItemCaseSensitive(row, "registry_value")->valuestring;
+    assert(!strcmp(cJSON_GetObjectItemCaseSensitive(row, "registry_op")->valuestring, "set_value"));
+    if (!strcmp(k, key)) { assert(!strcmp(v, value)); seen |= 1; }
+    else if (!strcmp(k, "HKCU/Default")) { assert(!*v); seen |= 2; }
+    else { assert(!strcmp(k, "HKCU/Post") && !strcmp(v, "post")); seen |= 4; }
+  }
+  cJSON_ArrayForEach(row, cJSON_GetObjectItemCaseSensitive(answer, "gap_reasons"))
+    gaps += !strcmp(row->valuestring, "registry_fields_missing");
+  assert(seen == 7 && gaps == 1);
+  cJSON_Delete(answer); edr_local_evidence_cache_close();
+  /* Recreate the old TEXT owner's absent optional registry fields, rather than
+   * asking today's writer to reproduce the old omission. */
+  sqlite3 *db = NULL; sqlite3_stmt *st = NULL;
+  assert(sqlite3_open(path, &db) == SQLITE_OK);
+  assert(sqlite3_prepare_v2(db, "SELECT manifest_json FROM artifacts WHERE artifact_type='p0_context_bundle'", -1, &st, NULL) == SQLITE_OK);
+  assert(sqlite3_step(st) == SQLITE_ROW);
+  cJSON *legacy = cJSON_Parse((const char *)sqlite3_column_text(st, 0));
+  assert(legacy); sqlite3_finalize(st);
+  cJSON *item;
+  cJSON_ArrayForEach(item, cJSON_GetObjectItemCaseSensitive(legacy, "context")) {
+    cJSON_DeleteItemFromObjectCaseSensitive(item, "registry_key");
+    cJSON_DeleteItemFromObjectCaseSensitive(item, "registry_value");
+    cJSON_DeleteItemFromObjectCaseSensitive(item, "registry_op");
+  }
+  char *text = cJSON_PrintUnformatted(legacy); assert(text);
+  assert(sqlite3_prepare_v2(db, "UPDATE artifacts SET manifest_json=? WHERE artifact_type='p0_context_bundle'", -1, &st, NULL) == SQLITE_OK);
+  assert(sqlite3_bind_text(st, 1, text, -1, SQLITE_STATIC) == SQLITE_OK && sqlite3_step(st) == SQLITE_DONE);
+  sqlite3_finalize(st); sqlite3_close(db); cJSON_free(text); cJSON_Delete(legacy);
+  assert(edr_local_evidence_cache_open(path, 16, 24) == 0);
+  answer = window_answer(&q);
+  assert(cJSON_GetArraySize(cJSON_GetObjectItemCaseSensitive(answer, "rows")) == 1);
+  gaps = 0;
+  cJSON_ArrayForEach(row, cJSON_GetObjectItemCaseSensitive(answer, "gap_reasons"))
+    gaps += !strcmp(row->valuestring, "registry_fields_missing");
+  assert(gaps == 1); cJSON_Delete(answer);
+  edr_local_evidence_cache_close(); cleanup_test_sqlite_path(path);
+  edr_local_evidence_cache_test_set_now_unix_ns(0);
+  edr_local_evidence_cache_test_set_retention_monotonic_ms(-1);
+  s_test_monotonic_ns = 0; free(r);
+}
+#endif
