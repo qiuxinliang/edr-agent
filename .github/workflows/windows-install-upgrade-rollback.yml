@@ -100,6 +100,11 @@ on:
         required: false
         default: ''
         type: string
+      preflight_diagnostic:
+        description: Fixed 746-to-723 AMD64 preflight diagnosis using the original failed release; requires headless, amd64, one round and installer timeout recovery
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   # GitHub hides draft releases from tokens without push-level contents access.
@@ -115,8 +120,91 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  preflight-diagnostic:
+    if: github.event_name == 'workflow_dispatch' && inputs.preflight_diagnostic && github.repository == 'qiuxinliang/edr-agent'
+    runs-on: windows-2022
+    timeout-minutes: 20
+    permissions:
+      # Existing draft assets require contents access. This job only reads them.
+      contents: write
+      actions: read
+    steps:
+      - name: Require the fixed disposable preflight diagnostic
+        shell: pwsh
+        env:
+          INPUTS: ${{ toJSON(inputs) }}
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        run: |
+          $v=$env:INPUTS|ConvertFrom-Json
+          if ($env:RUNNER_ENVIRONMENT -cne 'github-hosted' -or
+              $v.target_tag -cne 'win_3.2.746' -or $v.baseline_tag -cne 'win_3.2.723' -or
+              $v.package_scope -cne 'headless' -or $v.architecture -cne 'amd64' -or
+              $v.native_repeat_count -ne 1 -or -not $v.installer_timeout_recovery -or
+              $v.cache_recovery_subset -or $v.publisher_validation_request -or
+              $v.backend_builder_base64 -or $v.handler_verification_json -or
+              $v.handler_verification_sha256 -or $v.higher_min_free_bytes -cne '0') {
+            throw 'Diagnostic requires only original 746/723 Headless AMD64 inputs, one round and original timeout recovery'
+          }
+      - uses: actions/checkout@v6
+      - uses: actions/checkout@v6
+        with:
+          ref: b51bc3d825e6d5666535463b34eb708201e6fda7
+          path: baseline-source
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12.10'
+          architecture: x64
+      - name: Verify bounded diagnostic contracts
+        shell: pwsh
+        run: |
+          python tests/test_windows_preflight_diagnostic_workflow.py
+          if ($LASTEXITCODE -ne 0) { throw 'Diagnostic workflow contract failed' }
+          python tests/preflight_diagnostic/capture_test.py
+          if ($LASTEXITCODE -ne 0) { throw 'Diagnostic collector contract failed' }
+          ./tests/test_windows_immutable_download.ps1
+      - name: Admit the original failed 746 release and published 723
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: ./tests/preflight_diagnostic/run_workflow.ps1 -Mode prepare
+      - name: Build and verify only the frozen preflight pair
+        shell: pwsh
+        run: |
+          ./scripts/Initialize-VSEnvironment.ps1 -Architecture x64
+          python tests/preflight_diagnostic/build.py --baseline-source baseline-source --baseline-runtime packages/baseline --output "$env:RUNNER_TEMP/preflight-diagnostic-probe"
+          if ($LASTEXITCODE -ne 0) { throw 'Frozen preflight pair build failed' }
+          python tests/preflight_diagnostic/verify.py --probe-root "$env:RUNNER_TEMP/preflight-diagnostic-probe" --output "$env:RUNNER_TEMP/preflight-diagnostic-contracts"
+          if ($LASTEXITCODE -ne 0) { throw 'Frozen preflight pair safety controls failed' }
+      - name: Diagnose one original Setup lifecycle
+        shell: pwsh
+        timeout-minutes: 13
+        run: ./tests/preflight_diagnostic/run_workflow.ps1 -Mode run
+      - name: Retain diagnostic outcome independently of release acceptance
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: preflight-diagnostic-746-amd64-${{ github.run_id }}-${{ github.run_attempt }}
+          retention-days: 7
+          if-no-files-found: warn
+          path: |
+            preflight-diagnostic-evidence/*.json
+            preflight-diagnostic-evidence/collector-*.stdout
+            preflight-diagnostic-evidence/collector-*.stderr
+            preflight-diagnostic-evidence/capture/*.json
+            preflight-diagnostic-evidence/capture/*.stdout
+            preflight-diagnostic-evidence/capture/*.stderr
+            setup-exe-evidence/summary.json
+            setup-exe-evidence/rollback-baseline.setup.log
+            ${{ runner.temp }}/preflight-diagnostic-probe/*.json
+            ${{ runner.temp }}/preflight-diagnostic-probe/*.stdout
+            ${{ runner.temp }}/preflight-diagnostic-probe/*.stderr
+            ${{ runner.temp }}/preflight-diagnostic-contracts/*.json
+            ${{ runner.temp }}/preflight-diagnostic-contracts/*.stdout
+            ${{ runner.temp }}/preflight-diagnostic-contracts/*.stderr
+
   native-lifecycle:
-    if: ${{ !inputs.cache_recovery_subset && !inputs.publisher_validation_request }}
+    if: ${{ !inputs.preflight_diagnostic && !inputs.cache_recovery_subset && !inputs.publisher_validation_request }}
     strategy:
       fail-fast: false
       matrix:
@@ -635,7 +723,7 @@ jobs:
           retention-days: 7
 
   recover-synthetic-owner:
-    if: github.event_name == 'workflow_dispatch' && inputs.cache_recovery_subset == true && !inputs.publisher_validation_request && github.repository == 'qiuxinliang/edr-agent'
+    if: github.event_name == 'workflow_dispatch' && !inputs.preflight_diagnostic && inputs.cache_recovery_subset == true && !inputs.publisher_validation_request && github.repository == 'qiuxinliang/edr-agent'
     permissions:
       contents: read
       actions: read
@@ -814,7 +902,7 @@ jobs:
 
   storage-compat-native-tools:
     name: Storage compatibility tools (${{ matrix.arch }})
-    if: github.event_name == 'workflow_dispatch' && inputs.publisher_validation_request && github.repository == 'qiuxinliang/edr-agent'
+    if: github.event_name == 'workflow_dispatch' && inputs.publisher_validation_request && !inputs.preflight_diagnostic && github.repository == 'qiuxinliang/edr-agent'
     strategy:
       fail-fast: false
       matrix:
@@ -957,7 +1045,7 @@ jobs:
 
   signed-publisher-lifecycle:
     name: Signed publisher (${{ matrix.arch }}, ${{ matrix.runtime_mode }})
-    if: github.event_name == 'workflow_dispatch' && inputs.publisher_validation_request && github.repository == 'qiuxinliang/edr-agent'
+    if: github.event_name == 'workflow_dispatch' && inputs.publisher_validation_request && !inputs.preflight_diagnostic && github.repository == 'qiuxinliang/edr-agent'
     needs: storage-compat-native-tools
     strategy:
       fail-fast: false
