@@ -1,0 +1,30 @@
+--- src/storage/evidence_cache_migration.c
++++ temporary/evidence_cache_migration.traced.c
+@@ -122,0 +123 @@
++  DIAG_MARK("path_validation");
+@@ -123,0 +125 @@
++  DIAG_MARK("file_stat");
+@@ -129,0 +132 @@
++  DIAG_MARK("readonly_open");
+@@ -134,0 +138 @@
++  DIAG_MARK("snapshot_begin");
+@@ -136,0 +141 @@
++  DIAG_MARK("format_check");
+@@ -138,0 +144 @@
++  DIAG_MARK("page_metrics");
+@@ -142,0 +149 @@
++  DIAG_MARK("retirement_schema_pages");
+@@ -145,0 +153 @@
++  DIAG_MARK("metrics_inventory");
+@@ -146,0 +155 @@
++  DIAG_MARK("retention_clock_presence");
+@@ -148,0 +158 @@
++  DIAG_MARK("retention_clock_validity");
+@@ -151,0 +162 @@
++  DIAG_MARK("guard_inventory");
+@@ -155,0 +167 @@
++  DIAG_MARK("capacity_decision");
+@@ -161 +173,2 @@
+-  if (interrupted(&deadline)) result=-1;
++  if (interrupted(&deadline)) { DIAG_MARK("deadline"); result=-1; }
++  diag_complete(result,db);
