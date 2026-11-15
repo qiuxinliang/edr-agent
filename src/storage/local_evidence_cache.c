@@ -60,12 +60,13 @@
 #define EDR_EVIDENCE_CANDIDATE_DEDUP_SLOTS 512u
 #define EDR_EVIDENCE_AGG_SLOTS 512u
 /* Context has at most 32 RingSlot records. Escape expansion is at most six
- * bytes/source byte. One item has <=1032 bytes of variable text
+ * bytes/source byte. One item has <=2597 bytes of variable text
  * (47 endpoint + 63 self source + 63 parent source + 31 source status +
- * 383 source omissions + 127 name + 255 path + 63 network), and <=450 bytes
+ * 383 source omissions + 127 name + 255 path + 63 network + 1023 registry key + 511 registry value +
+ * 31 registry operation), and <=520 bytes
  * of fixed keys, quotes, commas, and decimal fields. Thus
- * 32 * 6 * 1482 < 279 KiB. The pre root is <6 KiB before escaping (<36 KiB),
- * so a maximum pre manifest remains <315 KiB. The post root (4095 path +
+ * 32 * 6 * 3117 < 585 KiB. The pre root is <6 KiB before escaping (<36 KiB),
+ * so a maximum pre manifest remains <621 KiB. The post root (4095 path +
  * 511 DNS + 1023 registry key + 511 registry value + source omissions and
  * all remaining fields) is <8 KiB before escaping, or <48 KiB. Retain a
  * fixed 1 MiB envelope (well below the 4 MiB cap) for cJSON allocation and
@@ -301,6 +302,14 @@ static ProcSlot s_proc[EDR_EVIDENCE_PROC_SLOTS];
 static RingSlot s_ring[EDR_EVIDENCE_RING_SLOTS];
 /* hot ring: never persisted as raw rows; used to build P0 context packages. */
 static RingSlot s_context_ring[EDR_EVIDENCE_CONTEXT_RING_SLOTS];
+/* Bound to the same physical hot-ring index; never promoted to the RTQ ring. */
+typedef struct {
+  char reg_key_path[sizeof(((EdrBehaviorRecord *)0)->reg_key_path)];
+  char reg_value_name[sizeof(((EdrBehaviorRecord *)0)->reg_value_name)];
+  char reg_op[sizeof(((EdrBehaviorRecord *)0)->reg_op)];
+} RegistryContextSlot;
+static RegistryContextSlot s_registry_context[EDR_EVIDENCE_CONTEXT_RING_SLOTS];
+_Static_assert(sizeof(s_registry_context) == 401408u, "registry context budget");
 static ContextWindowSlot s_context_windows[EDR_EVIDENCE_CONTEXT_WINDOWS];
 static MetricSlot s_metrics[EDR_EVIDENCE_METRIC_SLOTS];
 static uint64_t s_metric_retry_after_ns;
@@ -1682,7 +1691,19 @@ static void ring_record(const EdrBehaviorRecord *r) {
   }
 }
 
+static int is_registry_event_type(uint32_t type);
+
 static void context_ring_capture(const EdrBehaviorRecord *r) {
+  RegistryContextSlot *registry =
+      &s_registry_context[s_context_ring_pos % EDR_EVIDENCE_CONTEXT_RING_SLOTS];
+  registry->reg_key_path[0] = '\0';
+  registry->reg_value_name[0] = '\0';
+  registry->reg_op[0] = '\0';
+  if (is_registry_event_type((uint32_t)r->type)) {
+    copy_s(registry->reg_key_path, sizeof(registry->reg_key_path), r->reg_key_path);
+    copy_s(registry->reg_value_name, sizeof(registry->reg_value_name), r->reg_value_name);
+    copy_s(registry->reg_op, sizeof(registry->reg_op), r->reg_op);
+  }
   if (ring_record_to(s_context_ring, EDR_EVIDENCE_CONTEXT_RING_SLOTS, &s_context_ring_pos, r)) {
     s_status.hot_ring_evictions++;
   }
@@ -4679,8 +4700,14 @@ static int build_context_manifest_json(const EdrBehaviorRecord *r, const char *c
         s->event_time_ns > record_time_ns(r) || !ring_related_to_record(s, r, &relation)) {
       continue;
     }
+    const RegistryContextSlot *registry = &s_registry_context[
+        (pos + EDR_EVIDENCE_CONTEXT_RING_SLOTS - 1u - i) % EDR_EVIDENCE_CONTEXT_RING_SLOTS];
     item = cJSON_CreateObject();
     ok = item &&
+         (!is_registry_event_type(s->type) ||
+          (manifest_add_text(item, "registry_key", registry->reg_key_path) &&
+           manifest_add_text(item, "registry_value", registry->reg_value_name) &&
+           manifest_add_text(item, "registry_op", registry->reg_op))) &&
          manifest_add_i64(item, "event_time_ns", s->event_time_ns) &&
          manifest_add_u64(item, "type", s->type) &&
          manifest_add_u64(item, "pid", s->pid) &&
@@ -8040,6 +8067,7 @@ int edr_local_evidence_cache_open_with_policy(const char *path, uint32_t max_db_
   memset(s_proc, 0, sizeof(s_proc));
   memset(s_ring, 0, sizeof(s_ring));
   memset(s_context_ring, 0, sizeof(s_context_ring));
+  memset(s_registry_context, 0, sizeof(s_registry_context));
   memset(s_context_windows, 0, sizeof(s_context_windows));
   memset(s_metrics, 0, sizeof(s_metrics));
   s_metric_retry_after_ns = 0u;
