@@ -66,6 +66,8 @@ static void test_alert_window_recall_contract(int require_registry_pre) {
     assert((compact ? edr_local_evidence_cache_open(path, 16, 24) : test_open_legacy_context(path, 16, 24)) == 0);
     window_deliver(r, "only-A", base, -35 * sec, 51741, 0);
     window_registry_input(r, "reg-pre", base, -30 * sec, "HKCU/Software/Pre", "pre", 0);
+    window_registry_input(r, "reg-pre-default", base, -30 * sec + 1, "HKCU/Software/前窗", "", 0);
+    window_registry_input(r, "reg-pre-wrong", base, -29 * sec, "HKCU/Software/WrongPre", "wrong", 1);
     window_deliver(r, "anchor-A", base, 0, 0, 0);
     window_deliver(r, "anchor-B", base, 20 * sec, 0, 0);
     window_deliver(r, "shared", base, 25 * sec, 51742, 0);
@@ -126,20 +128,32 @@ static void test_alert_window_recall_contract(int require_registry_pre) {
     q.source_event_id = "anchor-A";
     q.source_time_ns = base;
     cJSON *registry = window_answer(&q), *reg_rows = cJSON_GetObjectItemCaseSensitive(registry, "rows");
-    assert(cJSON_GetArraySize(reg_rows) == (require_registry_pre ? 3 : 2));
-    int unicode = 0, default_value = 0, pre_value = 0;
+    assert(cJSON_GetArraySize(reg_rows) == (require_registry_pre ? 4 : 2));
+    int unicode = 0, default_value = 0, pre_value = 0, pre_default = 0;
     const cJSON *reg;
     cJSON_ArrayForEach(reg, reg_rows) {
       const char *key = cJSON_GetObjectItemCaseSensitive(reg, "registry_key")->valuestring;
       const char *value = cJSON_GetObjectItemCaseSensitive(reg, "registry_value")->valuestring;
       assert(!strcmp(cJSON_GetObjectItemCaseSensitive(reg, "registry_op")->valuestring, "set_value"));
       assert(!cJSON_HasObjectItem(reg, "reg_value_data"));
+      pre_default += !strcmp(key, "HKCU/Software/前窗") && !*value;
       pre_value += !strcmp(key, "HKCU/Software/Pre") && !strcmp(value, "pre");
       unicode += !strcmp(key, "HKCU/Software/Post") && !strcmp(value, "调查值");
       default_value += !strcmp(key, "HKCU/Software/Default") && !*value;
     }
     assert(unicode == 1 && default_value == 1);
-    assert(pre_value == require_registry_pre);
+    assert(pre_value == require_registry_pre && pre_default == require_registry_pre);
+    /* Recall preserves integer nanoseconds for the adjacent pre-window facts. */
+    cJSON_ArrayForEach(reg, reg_rows) {
+      const char *key = cJSON_GetObjectItemCaseSensitive(reg, "registry_key")->valuestring;
+      if (!strcmp(key, "HKCU/Software/Pre") || !strcmp(key, "HKCU/Software/前窗")) {
+        char expected[32];
+        int64_t ts = base - 30 * sec + !strcmp(key, "HKCU/Software/前窗");
+        snprintf(expected, sizeof(expected), "%lld", (long long)ts);
+        assert(!strcmp(cJSON_GetObjectItemCaseSensitive(reg, "event_time_ns")->valuestring, expected));
+        assert(!strcmp(cJSON_GetObjectItemCaseSensitive(reg, "phase")->valuestring, "pre"));
+      }
+    }
     int legacy_gap = 0;
     const cJSON *gap;
     cJSON_ArrayForEach(gap, cJSON_GetObjectItemCaseSensitive(registry, "gap_reasons")) legacy_gap |=
@@ -272,4 +286,4 @@ static void test_registry_source_fidelity(void) {
   free(r);
 }
 
-static void test_alert_window_recall(void) { test_alert_window_recall_contract(0); }
+static void test_alert_window_recall(void) { test_alert_window_recall_contract(1); }
