@@ -218,8 +218,11 @@ class CaptureTests(unittest.TestCase):
         self.assertEqual(result["probes"]["trace"]["inspection"]["result"], -1)
         current = {suffix: capture.digest(Path(str(source)+suffix), time.monotonic()+3) for suffix in previous}
         self.assertEqual(previous, current)
-        with sqlite3.connect(self.args.output_root / "stable.db") as copied:
+        copied = sqlite3.connect(self.args.output_root / "stable.db")
+        try:
             self.assertEqual(copied.execute("SELECT value FROM fact").fetchall(), [("committed WAL fact",)])
+        finally:
+            copied.close()
 
 
 if __name__ == "__main__":
