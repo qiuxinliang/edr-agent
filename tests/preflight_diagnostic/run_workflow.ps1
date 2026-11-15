@@ -85,7 +85,7 @@ if ($Mode -ceq 'prepare') {
 }
 
 function Invoke-PreflightCollector([string]$Stage, [string]$Failure='') {
-  $arguments = @('-I','-B',(Join-Path $PSScriptRoot 'capture.py'),$Stage,
+  $arguments = @('-I','-B',(Join-Path $repo 'tests/preflight_diagnostic/capture.py'),$Stage,
     '--install-dir',$install,'--probe-root',$probeRoot,'--output-root',(Join-Path $evidence 'capture'),'--synthetic-ci')
   if ($Stage -ceq 'after') {
     $arguments += @('--baseline-exe',(Join-Path $repo 'packages/baseline/FDSensor.exe'),'--failure',$Failure,
