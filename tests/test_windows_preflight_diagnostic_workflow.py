@@ -80,6 +80,24 @@ class WindowsPreflightDiagnosticWorkflowTests(unittest.TestCase):
         self.assertNotIn('--expected-run-id '+RUN, native)
         self.assertNotIn('--expected-source-commit '+SOURCE, native)
 
+    def test_updater_retention_is_after_the_original_lifecycle_and_always_runs(self):
+        diagnostic = job(self.text, 'preflight-diagnostic')
+        original = diagnostic.index('      - name: Diagnose one original Setup lifecycle\n')
+        retain = diagnostic.index('      - name: Retain the old updater first-cause materials\n')
+        upload = diagnostic.index('      - name: Retain diagnostic outcome independently of release acceptance\n')
+        self.assertLess(original, retain)
+        self.assertLess(retain, upload)
+        step = diagnostic[retain:upload]
+        self.assertIn('        if: always()\n', step)
+        self.assertIn('        timeout-minutes: 1\n', step)
+        self.assertIn('python -IB tests/preflight_diagnostic/retain_updater.py', step)
+        self.assertIn("if ($LASTEXITCODE -ne 0) { throw", step)
+        self.assertNotIn('continue-on-error', step)
+        self.assertIn('preflight-diagnostic-evidence/updater/*.json', diagnostic[upload:])
+        self.assertIn('preflight-diagnostic-evidence/updater/*.log', diagnostic[upload:])
+        self.assertIn('preflight-diagnostic-evidence/updater/installer.log.redacted', diagnostic[upload:])
+        self.assertIn('python tests/preflight_diagnostic/test_retain_updater.py', diagnostic[:original])
+
     def test_disabling_opt_in_or_exclusion_is_rejected(self):
         for original, replacement in (
             ('default: false\n        type: boolean\n\npermissions:', 'default: true\n        type: boolean\n\npermissions:'),

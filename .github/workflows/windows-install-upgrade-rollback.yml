@@ -162,6 +162,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Diagnostic workflow contract failed' }
           python tests/preflight_diagnostic/capture_test.py
           if ($LASTEXITCODE -ne 0) { throw 'Diagnostic collector contract failed' }
+          python tests/preflight_diagnostic/test_retain_updater.py
+          if ($LASTEXITCODE -ne 0) { throw 'Updater evidence retention contract failed' }
           ./tests/test_windows_immutable_download.ps1
       - name: Admit the original failed 746 release and published 723
         shell: pwsh
@@ -180,6 +182,13 @@ jobs:
         shell: pwsh
         timeout-minutes: 13
         run: ./tests/preflight_diagnostic/run_workflow.ps1 -Mode run
+      - name: Retain the old updater first-cause materials
+        if: always()
+        shell: pwsh
+        timeout-minutes: 1
+        run: |
+          python -IB tests/preflight_diagnostic/retain_updater.py
+          if ($LASTEXITCODE -ne 0) { throw 'Old updater evidence collection failed; original lifecycle outcome retained separately' }
       - name: Retain diagnostic outcome independently of release acceptance
         if: always()
         uses: actions/upload-artifact@v4
@@ -194,6 +203,9 @@ jobs:
             preflight-diagnostic-evidence/capture/*.json
             preflight-diagnostic-evidence/capture/*.stdout
             preflight-diagnostic-evidence/capture/*.stderr
+            preflight-diagnostic-evidence/updater/*.json
+            preflight-diagnostic-evidence/updater/*.log
+            preflight-diagnostic-evidence/updater/installer.log.redacted
             setup-exe-evidence/summary.json
             setup-exe-evidence/rollback-baseline.setup.log
             ${{ runner.temp }}/preflight-diagnostic-probe/*.json
