@@ -79,6 +79,7 @@ if ($Mode -ceq 'prepare') {
     schema='edr.test.preflight-diagnostic-inputs.v1'; diagnostic_only=$true;
     harness_commit=$env:GITHUB_SHA; source_commit=$source; source_run=$originalRun; source_attempt=1;
     baseline_source=$baselineSource; baseline_release=$baseline.id; target_release=$target.id;
+    before_scope='pre_upgrade_snapshot'; before_is_rollback_immediate=$false;
     transition=($binding | ConvertFrom-Json)
   }
   return
@@ -135,11 +136,13 @@ finally { $hasher.Dispose() }
 if ($hash -cne 'cab5d85fa748c98ca4e06a759774b61c5ff505114332dd86c56b8a6edc158cb0') {
   throw 'Original 984 lifecycle harness changed'
 }
-$before = '    Invoke-Installer $BaselineSetupExe "rollback-baseline" $true'
+$before = '  Invoke-Installer $TargetSetupExe "upgrade-target" $true'
+$rollback = '    Invoke-Installer $BaselineSetupExe "rollback-baseline" $true'
 $failed = '  $lifecycleFailure = $_'
 if (($body.Split(@($before),[StringSplitOptions]::None).Length -ne 2) -or
+    ($body.Split(@($rollback),[StringSplitOptions]::None).Length -ne 2) -or
     ($body.Split(@($failed),[StringSplitOptions]::None).Length -ne 2)) {
-  throw 'Original rollback/catch boundary is ambiguous'
+  throw 'Original upgrade/rollback/catch boundary is ambiguous'
 }
 $captureBefore = @'
     try { Invoke-PreflightCollector 'before' }
@@ -147,7 +150,7 @@ $captureBefore = @'
       Write-NewJson (Join-Path $evidence 'before-error.json') @{
         status='diagnostic_unavailable'; original_rollback_executed=$false; cause=$_.Exception.GetType().Name
       }
-      Write-Warning 'Before sampling failed; original rollback will still execute'
+      Write-Warning 'Pre-upgrade sampling failed; original lifecycle will still execute'
     }
 '@
 $body = $body.Replace($before, $captureBefore+"`n"+$before)

@@ -46,6 +46,8 @@ def check_scope(text, driver):
                   'prepare-lifecycle-upgrade', '$clock.ElapsedMilliseconds -ge 90000', '$job.StopAndDrain(5000)',
                   '-ExerciseInstallerTimeout', "Invoke-PreflightCollector 'before'",
                   "Invoke-PreflightCollector 'after' $lifecycleFailure.Exception.Message",
+                  "$before = '  Invoke-Installer $TargetSetupExe \"upgrade-target\" $true'",
+                  "before_scope='pre_upgrade_snapshot'; before_is_rollback_immediate=$false",
                   "status='not_reproduced'", "cause='unknown'", '  throw\n} finally'):
         if value not in driver:
             raise AssertionError('missing original-input/failure boundary '+value)
@@ -94,7 +96,8 @@ class WindowsPreflightDiagnosticWorkflowTests(unittest.TestCase):
     def test_losing_binding_timeout_or_first_failure_is_rejected(self):
         for original in ('--expected-run-id $originalRun', '--expected-source-commit $source',
                          '$clock.ElapsedMilliseconds -ge 90000', '$job.StopAndDrain(5000)',
-                         '  throw\n} finally', '-ExerciseInstallerTimeout'):
+                         '  throw\n} finally', '-ExerciseInstallerTimeout',
+                         "before_scope='pre_upgrade_snapshot'; before_is_rollback_immediate=$false"):
             with self.subTest(boundary=original), self.assertRaises(AssertionError):
                 check_scope(self.text, self.driver.replace(original, '', 1))
 
@@ -122,6 +125,24 @@ class WindowsPreflightDiagnosticWorkflowTests(unittest.TestCase):
         self.assertIn('--stable-copy-on-change', self.driver)
         self.assertIn("status='diagnostic_unavailable'; original_rollback_executed=$false", self.driver)
         self.assertIn("before_unavailable=(Test-Path (Join-Path $evidence 'before-error.json'))", self.driver)
+        # Apply the two actual template substitutions and compare the complete
+        # original upgrade-to-rollback segment, including validation and order.
+        # A collector before rollback would fail this comparison.
+        original = (ROOT / 'scripts/windows_setup_exe_lifecycle_smoke.ps1').read_text(encoding='utf-8')
+        values = {}
+        for variable in ('before', 'rollback', 'failed'):
+            values[variable] = re.search(r'^\$'+variable+r" = '([^\n]+)'$", self.driver, re.M).group(1)
+            self.assertEqual(original.count(values[variable]), 1)
+        self.assertEqual(values['before'], '  Invoke-Installer $TargetSetupExe "upgrade-target" $true')
+        captures = {}
+        for variable in ('captureBefore', 'after'):
+            captures[variable] = re.search(r'^\$'+variable+r" = @'\n(.*?)\n'@$", self.driver, re.M | re.S).group(1)
+        patched = original.replace(values['before'], captures['captureBefore']+'\n'+values['before'])
+        patched = patched.replace(values['failed'], values['failed']+'\n'+captures['after'])
+        def critical_segment(text):
+            return text[text.index(values['before']):text.index(values['rollback'])+len(values['rollback'])]
+        self.assertEqual(critical_segment(patched), critical_segment(original))
+        self.assertNotIn('Invoke-PreflightCollector', critical_segment(patched))
 
     def test_private_tag_lookup_retains_original_checkout_authentication(self):
         diagnostic = job(self.text, 'preflight-diagnostic')
