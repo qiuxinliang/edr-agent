@@ -360,6 +360,10 @@ static void test_registry_sidecar_wrap(void) {
   assert(edr_local_evidence_cache_open(path, 16, 24) == 0);
   answer = window_answer(&q);
   assert(cJSON_GetArraySize(cJSON_GetObjectItemCaseSensitive(answer, "rows")) == 1);
+  row = cJSON_GetArrayItem(cJSON_GetObjectItemCaseSensitive(answer, "rows"), 0);
+  assert(!strcmp(cJSON_GetObjectItemCaseSensitive(row, "registry_key")->valuestring, "HKCU/Post"));
+  assert(!strcmp(cJSON_GetObjectItemCaseSensitive(row, "registry_value")->valuestring, "post"));
+  assert(!strcmp(cJSON_GetObjectItemCaseSensitive(row, "phase")->valuestring, "post"));
   gaps = 0;
   cJSON_ArrayForEach(row, cJSON_GetObjectItemCaseSensitive(answer, "gap_reasons"))
     gaps += !strcmp(row->valuestring, "registry_fields_missing");
