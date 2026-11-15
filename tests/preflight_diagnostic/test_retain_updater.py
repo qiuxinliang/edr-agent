@@ -35,14 +35,14 @@ class RetentionTests(unittest.TestCase):
         self.assertEqual(json.loads(manifest.read_text()), value)
         self.assertLessEqual(manifest.stat().st_size, retain.MANIFEST_LIMIT)
         self.assertLessEqual(sum(p.stat().st_size for p in self.destination.iterdir()),
-                             4 * retain.FILE_LIMIT + retain.MANIFEST_LIMIT)
+                             4 * retain.FILE_LIMIT + retain.SNAPSHOT_LIMIT + retain.MANIFEST_LIMIT)
         return value
 
     def test_exact_four_files_and_original_hashes(self):
         self.seed()
         (self.source / "unrelated-secret.json").write_text("never read or copy")
         value = self.report()
-        self.assertEqual(value["retention_status"], "collected")
+        self.assertEqual(value["retention_status"], "collected_with_gaps")
         self.assertIsNone(value["first_error"])
         self.assertEqual(value["scope"], "retention only; identity/result not validated")
         self.assertEqual({p.name for p in self.destination.iterdir()}, {*retain.FILES, "manifest.json"})
@@ -90,7 +90,7 @@ class RetentionTests(unittest.TestCase):
         (self.source / retain.FILES[0]).write_bytes(b"x" * retain.FILE_LIMIT)
         (self.source / retain.FILES[2]).write_bytes(b"")
         value = self.report()
-        self.assertEqual(value["retention_status"], "collected")
+        self.assertEqual(value["retention_status"], "collected_with_gaps")
         self.assertEqual(value["items"][2]["original_sha256"], hashlib.sha256(b"").hexdigest())
 
     def test_existing_destination_is_never_overwritten(self):
@@ -178,6 +178,98 @@ class RetentionTests(unittest.TestCase):
             with self.assertRaisesRegex(OSError, "retention manifest"):
                 retain.retain(self.repo)
         self.assertFalse(self.destination.exists())
+
+    def snapshot_inputs(self, include_report_leaf=True):
+        self.seed()
+        cid = "ci-old-updater-" + "a" * 32
+        leaf = "agent-update-" + cid + "-" + cid + "-installer.log.redacted"
+        raw = b"original-owner redacted INSTALL_WORKFLOW_FAILED\n"
+        sha = hashlib.sha256(raw).hexdigest()
+        report = dict(installer_log_status="ready", installer_log_sha256=sha, installer_log_size=len(raw))
+        if include_report_leaf:
+            report["installer_log_path"] = leaf
+        journal = dict(command_id=cid, task_id=cid, installer_log_file=leaf,
+                       installer_log_sha256=sha, installer_log_size=len(raw))
+        (self.source / retain.FILES[0]).write_text(json.dumps(report))
+        (self.source / retain.FILES[1]).write_text(json.dumps(journal))
+        summary = dict(events=[dict(stage="old-updater-upgrade", status="started", detail="command_id="+cid+" class=installer_required")])
+        (self.source / "summary.json").write_text(json.dumps(summary))
+        logs = self.repo / "fixed-programdata-logs"
+        logs.mkdir()
+        (logs / leaf).write_bytes(raw)
+        patch = mock.patch.object(retain, "SNAPSHOT_ROOT", logs)
+        patch.start()
+        self.addCleanup(patch.stop)
+        return report, journal, summary, logs / leaf, raw
+
+    def test_existing_redacted_snapshot_is_bound_and_retained(self):
+        report, journal, summary, path, raw = self.snapshot_inputs()
+        value = self.report()
+        self.assertEqual(value["retention_status"], "collected")
+        self.assertEqual(value["installer_snapshot"]["status"], "retained")
+        self.assertTrue(value["installer_snapshot"]["report_leaf_present"])
+        self.assertEqual((self.destination / "installer.log.redacted").read_bytes(), raw)
+        self.assertEqual(value["installer_snapshot"]["sha256"], hashlib.sha256(raw).hexdigest())
+
+    def test_original_723_failure_report_may_omit_leaf(self):
+        report, journal, summary, path, raw = self.snapshot_inputs(include_report_leaf=False)
+        value = self.report()
+        self.assertEqual(value["retention_status"], "collected")
+        self.assertFalse(value["installer_snapshot"]["report_leaf_present"])
+        self.assertEqual((self.destination / "installer.log.redacted").read_bytes(), raw)
+
+    def test_snapshot_digest_mismatch_never_retains_log(self):
+        report, journal, summary, path, raw = self.snapshot_inputs()
+        path.write_bytes(b"X" * len(raw))
+        value = self.report()
+        self.assertEqual(value["installer_snapshot"]["reason"], "snapshot_digest_mismatch")
+        self.assertEqual(value["retention_status"], "collected_with_gaps")
+        self.assertFalse((self.destination / "installer.log.redacted").exists())
+
+    def test_foreign_task_or_arbitrary_report_path_is_not_followed(self):
+        report, journal, summary, path, raw = self.snapshot_inputs()
+        report["installer_log_path"] = "../../unredacted.log"
+        (self.source / retain.FILES[0]).write_text(json.dumps(report))
+        reader = retain.source_bytes
+        opened = []
+        def record_open(path, value, offset):
+            opened.append(path)
+            return reader(path, value, offset)
+        with mock.patch.object(retain, "source_bytes", side_effect=record_open):
+            value = self.report()
+        self.assertEqual(value["installer_snapshot"]["status"], "installer_snapshot_unavailable")
+        self.assertFalse(any(p.parent == path.parent for p in opened))
+
+    def test_duplicate_started_command_is_not_bound(self):
+        report, journal, summary, path, raw = self.snapshot_inputs()
+        summary["events"].append(dict(summary["events"][0]))
+        (self.source / "summary.json").write_text(json.dumps(summary))
+        value = self.report()
+        self.assertEqual(value["installer_snapshot"]["status"], "installer_snapshot_unavailable")
+        self.assertFalse((self.destination / "installer.log.redacted").exists())
+
+    def test_journal_task_must_match_the_same_started_command(self):
+        report, journal, summary, path, raw = self.snapshot_inputs()
+        journal["task_id"] = "ci-old-updater-" + "b" * 32
+        (self.source / retain.FILES[1]).write_text(json.dumps(journal))
+        value = self.report()
+        self.assertEqual(value["installer_snapshot"]["status"], "installer_snapshot_unavailable")
+        self.assertFalse((self.destination / "installer.log.redacted").exists())
+
+    def test_oversize_redacted_snapshot_is_never_read(self):
+        report, journal, summary, path, raw = self.snapshot_inputs()
+        for item in (report, journal):
+            item["installer_log_size"] = retain.SNAPSHOT_LIMIT + 1
+        (self.source / retain.FILES[0]).write_text(json.dumps(report))
+        (self.source / retain.FILES[1]).write_text(json.dumps(journal))
+        path.write_bytes(b"x" * (retain.SNAPSHOT_LIMIT + 1))
+        reader = retain.source_bytes
+        def reject_snapshot(candidate, value, offset):
+            self.assertNotEqual(candidate, path)
+            return reader(candidate, value, offset)
+        with mock.patch.object(retain, "source_bytes", side_effect=reject_snapshot):
+            value = self.report()
+        self.assertEqual(value["installer_snapshot"]["status"], "installer_snapshot_unavailable")
 
 
 if __name__ == "__main__":

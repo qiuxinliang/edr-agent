@@ -3,6 +3,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import stat
 import sys
@@ -10,9 +11,11 @@ import sys
 FILES = ("old-updater-report.json", "old-updater-journal.json",
          "old-updater.stdout.log", "old-updater.stderr.log")
 FILE_LIMIT = 256 * 1024
+SNAPSHOT_LIMIT = 4096
 MANIFEST_LIMIT = 8192
 FLOOR = 2 * 1024**3
 ALLOCATION_ALLOWANCE = 64 * 1024
+SNAPSHOT_ROOT = Path(r"C:\ProgramData\FDSecurity\logs")
 
 
 def regular_metadata(path):
@@ -73,6 +76,67 @@ def failure(error, name, phase):
                 errno=getattr(error, "errno", None), winerror=getattr(error, "winerror", None))
 
 
+def retained_json(path):
+    value = regular_metadata(path)
+    if value.st_size > FILE_LIMIT:
+        raise ValueError("fixed JSON input exceeds its retention bound")
+    def unique(pairs):
+        if len({key for key, value in pairs}) != len(pairs):
+            raise ValueError("duplicate JSON member")
+        return dict(pairs)
+    parsed = json.loads(source_bytes(path, value, 0).decode("utf-8-sig"), object_pairs_hook=unique)
+    if not isinstance(parsed, dict):
+        raise ValueError("fixed JSON input must be an object")
+    return parsed
+
+
+def retain_installer_snapshot(source, destination):
+    unavailable = dict(status="installer_snapshot_unavailable", reason="binding_not_available")
+    try:
+        report = retained_json(destination / FILES[0])
+        journal = retained_json(destination / FILES[1])
+        summary = retained_json(source / "summary.json")
+        events = [event for event in summary["events"] if event.get("stage") == "old-updater-upgrade"
+                  and event.get("status") == "started"]
+        cid = journal["command_id"]
+        if not isinstance(cid, str) or not re.fullmatch(r"ci-old-updater-[0-9a-f]{32}", cid):
+            return unavailable
+        if journal["task_id"] != cid or len(events) != 1:
+            return unavailable
+        if not re.fullmatch(r"command_id=" + re.escape(cid) + r"(?:\s.*)?", events[0]["detail"]):
+            return unavailable
+        leaf = "agent-update-" + cid + "-" + cid + "-installer.log.redacted"
+        expected = report["installer_log_sha256"]
+        size = report["installer_log_size"]
+        if (report.get("installer_log_status") != "ready" or
+                ("installer_log_path" in report and report["installer_log_path"] != leaf) or
+                journal["installer_log_file"] != leaf or type(size) is not int or not 0 <= size <= SNAPSHOT_LIMIT or
+                journal["installer_log_size"] != size or type(journal["installer_log_size"]) is not int or
+                not isinstance(expected, str) or not re.fullmatch(r"[0-9a-f]{64}", expected) or
+                journal["installer_log_sha256"] != expected):
+            return unavailable
+        # No report-selected path is followed, and the unredacted log is never opened.
+        path = SNAPSHOT_ROOT / leaf
+        directories(SNAPSHOT_ROOT)
+        metadata = regular_metadata(path)
+        if metadata.st_size != size:
+            return dict(status="installer_snapshot_unavailable", reason="snapshot_size_mismatch")
+        raw = source_bytes(path, metadata, 0)
+        if hashlib.sha256(raw).hexdigest() != expected:
+            return dict(status="installer_snapshot_unavailable", reason="snapshot_digest_mismatch")
+        if shutil.disk_usage(destination).free < FLOOR + size + MANIFEST_LIMIT + ALLOCATION_ALLOWANCE:
+            raise OSError("original disk reserve reached before snapshot retention")
+        save_bytes(destination / "installer.log.redacted", raw)
+        return dict(status="retained", source_leaf=leaf, command_id=cid, bytes=size,
+                    sha256=expected, source_file_id=metadata.st_ino,
+                    report_leaf_present="installer_log_path" in report,
+                    scope="hosted CI only; existing redacted snapshot bound to the unique started CI command")
+    except FileNotFoundError:
+        return dict(status="installer_snapshot_unavailable", reason="fixed_input_missing")
+    except (ValueError, KeyError, TypeError, UnicodeError, AttributeError):
+        return dict(status="installer_snapshot_unavailable", reason="binding_invalid")
+
+
 def retain(repo):
     os.umask(0o077)
     repo = Path(repo).absolute()
@@ -94,7 +158,7 @@ def retain(repo):
                   retention_status="collected", first_error=None, items=[])
     try:
         directories(destination)
-        if shutil.disk_usage(destination).free < FLOOR + 4 * FILE_LIMIT + MANIFEST_LIMIT + ALLOCATION_ALLOWANCE:
+        if shutil.disk_usage(destination).free < FLOOR + 4 * FILE_LIMIT + SNAPSHOT_LIMIT + MANIFEST_LIMIT + ALLOCATION_ALLOWANCE:
             raise OSError("original disk reserve cannot accommodate the bounded retention peak")
         for name in FILES:
             item = dict(name=name, status="not_attempted")
@@ -139,9 +203,17 @@ def retain(repo):
         report["first_error"] = failure(error, None, "retention_admission")
     completed = {item["name"] for item in report["items"]}
     report["items"].extend(dict(name=name, status="not_attempted") for name in FILES if name not in completed)
+    report["installer_snapshot"] = dict(status="installer_snapshot_unavailable", reason="original_collection_incomplete")
+    if report["first_error"] is None:
+        try:
+            report["installer_snapshot"] = retain_installer_snapshot(source, destination)
+        except Exception as error:
+            report["installer_snapshot"]["reason"] = "snapshot_collection_error"
+            report["first_error"] = failure(error, "installer.log.redacted", "snapshot_retention")
     if report["first_error"]:
         report["retention_status"] = "failed"
-    elif any(item["status"] != "retained" for item in report["items"]):
+    elif (any(item["status"] != "retained" for item in report["items"]) or
+          report["installer_snapshot"]["status"] != "retained"):
         report["retention_status"] = "collected_with_gaps"
     encoded = (json.dumps(report, ensure_ascii=True, indent=2) + "\n").encode()
     if len(encoded) > MANIFEST_LIMIT:
