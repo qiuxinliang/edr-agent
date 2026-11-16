@@ -115,3 +115,7 @@ endif()
 if(TEST p0_runtime_delivery)
   edr_agent_runtime_gate(p0_runtime_delivery test_p0_runtime_delivery)
 endif()
+
+if(TEST alert_window_signed_network_port)
+  edr_agent_runtime_gate(alert_window_signed_network_port test_alert_window_signed_replay)
+endif()
