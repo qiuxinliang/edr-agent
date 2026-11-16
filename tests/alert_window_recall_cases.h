@@ -125,6 +125,36 @@ static void test_alert_window_recall_contract(int require_registry_pre) {
       }
       assert(mask == (unsigned)(b ? 22 : 19));
       cJSON_Delete(root);
+      /* A new signed port scope finds post evidence hidden by the original
+       * mixed window limit, without changing that limit or scanning budget. */
+      q.limit = 1;
+      root = window_answer(&q);
+      assert(cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(root, "output_truncated")));
+      cJSON_Delete(root);
+      q.kind = "network_port"; q.remote_port = 51742;
+      root = window_answer(&q); rows = cJSON_GetObjectItemCaseSensitive(root, "rows");
+      assert(cJSON_GetArraySize(rows) == 1);
+      assert(cJSON_GetObjectItemCaseSensitive(rows->child, "remote_port")->valueint == 51742);
+      assert(!strcmp(cJSON_GetObjectItemCaseSensitive(rows->child, "phase")->valuestring, "post"));
+      assert(cJSON_GetObjectItemCaseSensitive(cJSON_GetObjectItemCaseSensitive(root, "scope"), "remote_port")->valueint == 51742);
+      cJSON_Delete(root);
+      q.remote_port = 51741;
+      root = window_answer(&q); rows = cJSON_GetObjectItemCaseSensitive(root, "rows");
+      assert(cJSON_GetArraySize(rows) == !b);
+      if (!b) assert(!strcmp(cJSON_GetObjectItemCaseSensitive(rows->child, "phase")->valuestring, "pre"));
+      cJSON_Delete(root);
+      q.remote_port = 51744; /* Wrong generation stays absent. */
+      root = window_answer(&q); assert(!cJSON_GetArraySize(cJSON_GetObjectItemCaseSensitive(root, "rows"))); cJSON_Delete(root);
+      char invalid[8193]; q.remote_port = 0;
+      assert(edr_local_evidence_cache_query_alert_window_json(&q, invalid, sizeof(invalid)) == EDR_PARENT_CONTEXT_ERROR_INVALID);
+      q.remote_port = 65536;
+      assert(edr_local_evidence_cache_query_alert_window_json(&q, invalid, sizeof(invalid)) == EDR_PARENT_CONTEXT_ERROR_INVALID);
+      q.remote_port = 51742; q.pre_snapshot_sha256 = "";
+      assert(edr_local_evidence_cache_query_alert_window_json(&q, invalid, sizeof(invalid)) == EDR_PARENT_CONTEXT_ERROR_INVALID);
+      q.pre_snapshot_sha256 = NULL; q.kind = "network";
+      assert(edr_local_evidence_cache_query_alert_window_json(&q, invalid, sizeof(invalid)) == EDR_PARENT_CONTEXT_ERROR_INVALID);
+      q.remote_port = 0; q.limit = 50;
+
     }
     q.kind = "registry";
     q.alert_id = "alert-A";

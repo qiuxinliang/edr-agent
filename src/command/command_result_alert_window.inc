@@ -39,9 +39,9 @@ static int window_result_row(const cJSON *row, const EdrAlertWindowQuery *q, uin
            : (window_uint(prior, "slot", 0, 31, &previous) && (q->pre_snapshot_sha256 ? previous >= slot : previous == slot)))
       return 0;
   }
-  if (!strcmp(q->kind, "network"))
+  if (!strcmp(q->kind, "network") || !strcmp(q->kind, "network_port"))
     return cJSON_GetArraySize(row) == 8 && window_literal_ip(window_string(row, "remote_ip")) &&
-           window_uint(row, "remote_port", 1, 65535, &port);
+           window_uint(row, "remote_port", 1, 65535, &port) && (!q->remote_port || port == q->remote_port);
   return cJSON_GetArraySize(row) == 9 && *result_text(row, "registry_key") && window_string(row, "registry_value") &&
          result_member(result_text(row, "registry_op"), "set_value|create_key|delete_key|delete_value");
 }

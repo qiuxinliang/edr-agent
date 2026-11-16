@@ -32,6 +32,7 @@ static const char type[] = "alert_window_query_v2";
 static char payload[640];
 static uint64_t replay_deadline_ns;
 static int registry_observation_mode;
+static int network_port_mode;
 
 static void start_replay_executor(void) {
   replay_deadline_ns = edr_monotonic_ns() + UINT64_C(20000000000);
@@ -73,6 +74,13 @@ static void make_request(int64_t anchor) {
       "\"until_ns\":\"%lld\",\"limit\":50,\"max_bytes\":8192}",
       (long long)anchor, (long long)(anchor - INT64_C(120000000000)), (long long)(anchor + INT64_C(120000000000)));
   assert(n > 0 && (size_t)n < sizeof(payload));
+  if(network_port_mode) {
+    cJSON *q=cJSON_Parse(payload); assert(q);
+    assert(cJSON_SetValuestring(cJSON_GetObjectItemCaseSensitive(q,"kind"),"network_port"));
+    assert(cJSON_AddNumberToObject(q,"remote_port",51742));
+    char *wire=cJSON_PrintUnformatted(q); assert(wire && strlen(wire)<sizeof(payload));
+    strcpy(payload,wire); cJSON_free(wire); cJSON_Delete(q);
+  }
   if(registry_observation_mode) {
     cJSON *q=cJSON_Parse(payload); assert(q);
     assert(cJSON_SetValuestring(cJSON_GetObjectItemCaseSensitive(q,"kind"),"registry"));
@@ -338,6 +346,8 @@ int main(int argc, char **argv) {
   }
   assert(argc == 1 || argc == 2 || (argc == 3 && !strcmp(argv[1],"--private-transport")));
   registry_observation_mode=getenv("EDR_TEST_SIGNED_REGISTRY_OBSERVATION")!=NULL;
+  network_port_mode=getenv("EDR_TEST_SIGNED_NETWORK_PORT")!=NULL;
+  assert(!(network_port_mode && registry_observation_mode));
   const char *id = "lcq-synthetic-window-signed";
   EdrConfig cfg = {0};
   strcpy(cfg.agent.tenant_id, "t");
@@ -358,6 +368,12 @@ int main(int argc, char **argv) {
   EVP_PKEY *key = test_signer();
   start_replay_executor();
   sign_command(key, id, &meta);
+  if(network_port_mode) {
+    char altered[sizeof(payload)]; strcpy(altered,payload);
+    char *port=strstr(altered,"51742"); assert(port);port[4]='3';
+    assert(edr_command_receive_envelope(id,type,(const uint8_t*)altered,strlen(altered),&meta)==0);
+    assert(edr_command_state_count_inbox()==0);
+  }
   assert(edr_command_receive_envelope(id, type, (const uint8_t *)"{}", 2, &meta) == 0);
   assert(edr_command_state_has_final(id, &meta) == 0 && edr_command_state_count_inbox() == 0);
   assert(edr_command_cancel_begin(id));

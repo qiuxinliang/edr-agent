@@ -89,6 +89,24 @@ static int alert_window_command_results(void) {
   CHECK(edr_command_result_bind_contract(&wrong, (const uint8_t *)window_request, strlen(window_request),
                                          m.issued_at_unix_ms) != 0);
   assert_window_project(a, r, 1);
+  cJSON *port_result = cJSON_Duplicate(r, 1);
+  CHECK(port_result);
+  cJSON *port_scope = cJSON_GetObjectItemCaseSensitive(port_result, "scope");
+  CHECK(cJSON_SetValuestring(cJSON_GetObjectItemCaseSensitive(port_scope, "kind"), "network_port"));
+  CHECK(cJSON_AddNumberToObject(port_scope, "remote_port", 443));
+  char *port_request = cJSON_PrintUnformatted(port_scope);
+  EdrCommandResultAuthorization port_auth = *a;
+  CHECK(port_request && !edr_command_result_bind_contract(&port_auth, (const uint8_t *)port_request, strlen(port_request), m.issued_at_unix_ms));
+  cJSON_free(port_request);
+  assert_window_project(&port_auth, port_result, 1);
+  cJSON *selected_port = cJSON_GetObjectItemCaseSensitive(cJSON_GetArrayItem(cJSON_GetObjectItemCaseSensitive(port_result, "rows"), 0), "remote_port");
+  cJSON_SetNumberValue(selected_port, 444); assert_window_project(&port_auth, port_result, 0);
+  cJSON_SetNumberValue(selected_port, 443);
+  cJSON_SetNumberValue(cJSON_GetObjectItemCaseSensitive(port_scope, "remote_port"), 444);
+  assert_window_project(&port_auth, port_result, 0);
+  cJSON_SetNumberValue(cJSON_GetObjectItemCaseSensitive(port_scope, "remote_port"), 443);
+  CHECK(cJSON_AddObjectToObject(port_scope, "pre_page")); assert_window_project(&port_auth, port_result, 0);
+  cJSON_Delete(port_result);
   cJSON *from = cJSON_GetObjectItemCaseSensitive(r, "window_from_ns");
   CHECK(cJSON_SetValuestring(from, "1699999970000000000"));
   assert_window_project(a, r, 0);

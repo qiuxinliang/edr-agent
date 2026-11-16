@@ -34,6 +34,19 @@ static void test_alert_window_contract(void) {
       "\"limit\":50,\"max_bytes\":8192}";
   char reason[192];
   require_true(validate("alert_window_query_v2",payload,reason,sizeof(reason)), "signed alert window scope accepted");
+  const char *kind_at = strstr(payload, "\"kind\":\"registry\"");
+  const char *kind_end = kind_at + strlen("\"kind\":\"registry\"");
+  const char *ports[] = {"1", "65535", "0", "65536", "443.0", "443e0", "\"443\"", "true", "null", "-1"};
+  for (size_t i=0;i<COUNT_OF(ports);i++) {
+    char selected[1200];
+    snprintf(selected,sizeof(selected),"%.*s\"kind\":\"network_port\",\"remote_port\":%s%s",(int)(kind_at-payload),payload,ports[i],kind_end);
+    require_true(validate("alert_window_query_v2",selected,reason,sizeof(reason)) == (i<2), "port selector uses strict bounded integers");
+  }
+  char missing[1200];
+  snprintf(missing,sizeof(missing),"%.*s\"kind\":\"network_port\"%s",(int)(kind_at-payload),payload,kind_end);
+  require_true(!validate("alert_window_query_v2",missing,reason,sizeof(reason)), "port selector required");
+  snprintf(missing,sizeof(missing),"%.*s\"kind\":\"network\",\"remote_port\":443%s",(int)(kind_at-payload),payload,kind_end);
+  require_true(!validate("alert_window_query_v2",missing,reason,sizeof(reason)), "original network shape stays closed");
   test_setenv("EDR_COMMAND_ALLOW_UNSIGNED","1");
   require_true(edr_command_contract_signature_required("test","alert_window_query_v2"), "window reads always require a signature");
   test_setenv("EDR_COMMAND_ALLOW_UNSIGNED","0");

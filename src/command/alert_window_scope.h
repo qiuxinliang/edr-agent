@@ -76,16 +76,21 @@ static inline int window_identifier(const char *s, size_t max) {
 static inline int window_scope(const cJSON *request, EdrAlertWindowQuery *q) {
   uint64_t from, anchor, until;
   const cJSON *page = cJSON_GetObjectItemCaseSensitive(request, "pre_page");
-  if (!cJSON_IsObject(request) || cJSON_GetArraySize(request) != (page ? 14 : 13)) return 0;
+  if (!cJSON_IsObject(request)) return 0;
   q->tenant_id = window_string(request, "tenant_id");
   q->endpoint_id = window_string(request, "endpoint_id");
   q->alert_id = window_string(request, "alert_id");
   q->source_event_id = window_string(request, "source_event_id");
   q->kind = window_string(request, "kind");
+  int port_query = q->kind && !strcmp(q->kind, "network_port");
+  q->remote_port = 0;
+  if (cJSON_GetArraySize(request) != 13 + (page != NULL) + port_query ||
+      (port_query ? page || !window_uint(request, "remote_port", 1, 65535, &q->remote_port)
+                  : cJSON_GetObjectItemCaseSensitive(request, "remote_port") != NULL)) return 0;
   if (!window_identifier(q->tenant_id, sizeof(((EdrBehaviorRecord *)0)->tenant_id) - 1u) ||
       !window_identifier(q->endpoint_id, EDR_BR_ID_LEN - 1u) || !window_identifier(q->alert_id, 127) ||
       !window_identifier(q->source_event_id, EDR_BR_ID_LEN - 1u) || !q->kind ||
-      (strcmp(q->kind, "network") && strcmp(q->kind, "registry")) ||
+      (strcmp(q->kind, "network") && strcmp(q->kind, "registry") && !port_query) ||
       !window_uint(request, "pid", 1, UINT32_MAX, &q->pid) || !window_uint(request, "limit", 1, 50, &q->limit) ||
       !window_uint(request, "max_bytes", 512, ALERT_WINDOW_MAX_BYTES, &q->max_bytes) ||
       !window_decimal(request, "process_start_key", UINT64_MAX, &q->process_start_key) ||
@@ -116,7 +121,7 @@ static inline int window_same_scope(const EdrAlertWindowQuery *a, const EdrAlert
              !strcmp(a->previous_result_sha256, b->previous_result_sha256) : !b->pre_snapshot_sha256) &&
          !strcmp(a->tenant_id, b->tenant_id) && !strcmp(a->endpoint_id, b->endpoint_id) &&
          !strcmp(a->alert_id, b->alert_id) && !strcmp(a->source_event_id, b->source_event_id) &&
-         !strcmp(a->kind, b->kind) && a->pid == b->pid && a->limit == b->limit && a->max_bytes == b->max_bytes &&
+         !strcmp(a->kind, b->kind) && a->remote_port == b->remote_port && a->pid == b->pid && a->limit == b->limit && a->max_bytes == b->max_bytes &&
          a->from_ns == b->from_ns && a->until_ns == b->until_ns && a->source_time_ns == b->source_time_ns &&
          a->process_start_key == b->process_start_key &&
          a->process_creation_filetime_100ns == b->process_creation_filetime_100ns;

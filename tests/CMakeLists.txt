@@ -2303,6 +2303,11 @@ if(SQLite3_FOUND AND OpenSSL_FOUND)
     "import subprocess,sys,tempfile; d=tempfile.TemporaryDirectory(); subprocess.run([sys.argv[1]],cwd=d.name,check=True)"
     $<TARGET_FILE:test_alert_window_signed_replay>)
   set_tests_properties(alert_window_signed_replay PROPERTIES TIMEOUT 30)
+  add_test(NAME alert_window_signed_network_port COMMAND ${Python3_EXECUTABLE} -c
+    "import subprocess,sys,tempfile; d=tempfile.TemporaryDirectory(); subprocess.run([sys.argv[1]],cwd=d.name,check=True)"
+    $<TARGET_FILE:test_alert_window_signed_replay>)
+  set_tests_properties(alert_window_signed_network_port PROPERTIES TIMEOUT 30
+    ENVIRONMENT "EDR_TEST_SIGNED_NETWORK_PORT=1")
   add_test(NAME alert_window_signed_registry_observation COMMAND ${Python3_EXECUTABLE} -c
     "import subprocess,sys,tempfile; d=tempfile.TemporaryDirectory(); subprocess.run([sys.argv[1]],cwd=d.name,check=True)"
     $<TARGET_FILE:test_alert_window_signed_replay>)

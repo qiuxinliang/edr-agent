@@ -411,6 +411,8 @@ typedef struct {
   uint32_t pre_start_slot;
   /* NULL selects the original mixed window. An empty digest starts a frozen registry page. */
   const char *pre_snapshot_sha256, *previous_task_id, *previous_result_sha256;
+  /* Exact remote port only for network_port; zero for the original kinds. */
+  uint32_t remote_port;
 } EdrAlertWindowQuery;
 int edr_local_evidence_cache_query_alert_window_json(
     const EdrAlertWindowQuery *query, char *out, size_t cap);

@@ -11224,6 +11224,7 @@ static int window_scope_json(const EdrAlertWindowQuery *q, cJSON *root) {
          manifest_add_u64_text(scope, "from_ns", (uint64_t)q->from_ns) &&
          manifest_add_u64_text(scope, "until_ns", (uint64_t)q->until_ns) &&
          manifest_add_u64(scope, "limit", q->limit) && manifest_add_u64(scope, "max_bytes", q->max_bytes);
+  if (ok && !strcmp(q->kind, "network_port")) ok = manifest_add_u64(scope, "remote_port", q->remote_port);
   if (!ok || !q->pre_snapshot_sha256) return ok;
   cJSON *page = cJSON_AddObjectToObject(scope, "pre_page");
   return page && manifest_add_u64(page, "start_slot", q->pre_start_slot) &&
@@ -11260,7 +11261,7 @@ static int window_project_event(AlertWindowRead *r, const cJSON *event, int64_t 
       !window_matches(event, "process_start_key", r->start) ||
       !window_matches(event, "process_creation_filetime_100ns", r->birth))
     return 0;
-  int net = !strcmp(q->kind, "network");
+  int net = !strcmp(q->kind, "network") || !strcmp(q->kind, "network_port");
   if (net ? type != EDR_EVENT_NET_CONNECT : !is_registry_event_type(type)) return 0;
   uint32_t port = 0;
   const char *ip = parent_context_text(event, "remote_ip");
@@ -11273,6 +11274,7 @@ static int window_project_event(AlertWindowRead *r, const cJSON *event, int64_t 
     if (!ip || !*ip || strlen(ip) >= sizeof(((EdrBehaviorRecord *)0)->net_dst) || !manifest_utf8_valid(ip) ||
         !parent_context_number(event, "remote_port", &port) || !port || port > 65535)
       return EDR_PARENT_CONTEXT_ERROR_INTEGRITY;
+    if (q->remote_port && port != q->remote_port) return 0;
   } else {
     const char *quality = authorized_context_text(event, "source_completeness");
     if (!quality) return EDR_PARENT_CONTEXT_ERROR_INTEGRITY;
@@ -11627,7 +11629,8 @@ int edr_local_evidence_cache_query_alert_window_json(const EdrAlertWindowQuery *
       !parent_context_scope_text(q->endpoint_id, sizeof(((EdrBehaviorRecord *)0)->endpoint_id)) ||
       !parent_context_scope_text(q->source_event_id, sizeof(((EdrBehaviorRecord *)0)->event_id)) ||
       !parent_context_scope_text(q->alert_id, 128) || !q->kind ||
-      (strcmp(q->kind, "network") && strcmp(q->kind, "registry")) || !q->pid || !q->process_start_key ||
+      (strcmp(q->kind, "network") && strcmp(q->kind, "registry") && strcmp(q->kind, "network_port")) ||
+      (!strcmp(q->kind, "network_port") ? !q->remote_port || q->remote_port > 65535 : q->remote_port != 0) || !q->pid || !q->process_start_key ||
       !q->process_creation_filetime_100ns || q->from_ns <= 0 || q->from_ns > q->source_time_ns ||
       q->source_time_ns > q->until_ns || q->until_ns - q->from_ns > 600000000000LL || !q->limit || q->limit > 50 ||
       q->max_bytes < 512 || q->max_bytes > 8192 || cap <= (size_t)q->max_bytes)
