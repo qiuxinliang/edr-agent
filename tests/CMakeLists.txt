@@ -1689,6 +1689,16 @@ target_link_libraries(test_local_evidence_cache_candidate PRIVATE edr_egress_pol
 edr_apply_test_warnings(test_local_evidence_cache_candidate)
 if(SQLite3_FOUND)
   add_test(NAME alert_window_recall COMMAND test_local_evidence_cache_candidate --alert-window-recall WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+  add_test(NAME registry_pre_window_contract COMMAND test_local_evidence_cache_candidate --registry-pre-window-contract
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+  add_test(NAME registry_source_fidelity COMMAND test_local_evidence_cache_candidate --registry-source-fidelity
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+  set_tests_properties(alert_window_recall registry_pre_window_contract registry_source_fidelity
+    PROPERTIES TIMEOUT 150 RESOURCE_LOCK local_evidence_cache_fixture)
+  if(TEST owner_manifest_frame)
+    set_tests_properties(owner_manifest_frame PROPERTIES TIMEOUT 150
+      RESOURCE_LOCK local_evidence_cache_fixture)
+  endif()
 endif()
 add_test(NAME local_evidence_cache_candidate COMMAND test_local_evidence_cache_candidate --suite context WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 if(SQLite3_FOUND)
@@ -1753,6 +1763,30 @@ if(WIN32)
                  test_local_evidence_cache_candidate)
     target_link_libraries(${target} PRIVATE ws2_32)
   endforeach()
+endif()
+
+if(WIN32)
+  # Same cache/admission/encoder owners as the cache contracts; only the TDH
+  # property lookup is replaced in the native UTF-16 producer fixture.
+  get_target_property(registry_observation_sources test_local_evidence_cache_candidate SOURCES)
+  list(REMOVE_ITEM registry_observation_sources ${CMAKE_CURRENT_SOURCE_DIR}/test_local_evidence_cache_candidate.c)
+  add_executable(test_registry_name_observation_windows
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_registry_name_observation_windows.c
+    ${registry_observation_sources}
+    ${CMAKE_SOURCE_DIR}/src/collector/etw_tdh_win.c
+    ${CMAKE_SOURCE_DIR}/src/preprocess/telemetry_admission.c)
+  target_include_directories(test_registry_name_observation_windows PRIVATE
+    $<TARGET_PROPERTY:test_local_evidence_cache_candidate,INCLUDE_DIRECTORIES>)
+  target_compile_definitions(test_registry_name_observation_windows PRIVATE
+    $<TARGET_PROPERTY:test_local_evidence_cache_candidate,COMPILE_DEFINITIONS>
+    EDR_TDH_TESTING=1)
+  target_link_libraries(test_registry_name_observation_windows PRIVATE
+    $<TARGET_PROPERTY:test_local_evidence_cache_candidate,LINK_LIBRARIES> tdh)
+  edr_apply_test_warnings(test_registry_name_observation_windows)
+  add_test(NAME registry_name_observation_native COMMAND test_registry_name_observation_windows
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+  set_tests_properties(registry_name_observation_native PROPERTIES TIMEOUT 150
+    RESOURCE_LOCK local_evidence_cache_fixture)
 endif()
 
 if(SQLite3_FOUND)
