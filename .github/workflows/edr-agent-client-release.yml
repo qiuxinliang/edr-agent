@@ -1486,19 +1486,23 @@ jobs:
         id: signer
         env:
           GH_TOKEN: ${{ secrets.USB_SIGNING_TOKEN }}
+          USB_SIGNING_RELEASE_TOKEN: ${{ secrets.USB_SIGNING_RELEASE_TOKEN }}
         shell: pwsh
         run: |
+          if (-not $env:USB_SIGNING_RELEASE_TOKEN) { throw 'Private Release Contents credential missing; no signing request sent' }
           $version=$env:EDR_AGENT_RELEASE_TAG.Substring(4)
           python scripts/private_signing_bridge.py dispatch --run $env:GITHUB_RUN_ID --attempt $env:GITHUB_RUN_ATTEMPT --commit $env:GITHUB_SHA --version $version
           if ($LASTEXITCODE -ne 0) { throw 'USB finalization failed; rerun failed jobs, not the native build' }
-      - uses: actions/download-artifact@v4
+      - name: Download immutable private Release result
         if: env.WINDOWS_RELEASE_MODE == 'usb' && steps.final-resume.outputs.restored != 'true'
-        with:
-          repository: qiuxinliang/edr-agent-signing
-          run-id: ${{ steps.signer.outputs.signing_run_id }}
-          github-token: ${{ secrets.USB_SIGNING_TOKEN }}
-          name: usb-finalized
-          path: finalized
+        env:
+          GH_TOKEN: ${{ secrets.USB_SIGNING_TOKEN }}
+          USB_SIGNING_RELEASE_TOKEN: ${{ secrets.USB_SIGNING_RELEASE_TOKEN }}
+        shell: pwsh
+        run: |
+          $version=$env:EDR_AGENT_RELEASE_TAG.Substring(4)
+          python scripts/private_signing_bridge.py download --run $env:GITHUB_RUN_ID --attempt $env:GITHUB_RUN_ATTEMPT --commit $env:GITHUB_SHA --version $version --request-id $env:REQUEST_ID --signing-run $env:SIGNING_RUN --directory finalized
+          if ($LASTEXITCODE -ne 0) { throw 'Private Release response validation failed; do not rerun signing blindly' }
       - name: Independently verify signed payloads before uploading
         if: env.WINDOWS_RELEASE_MODE == 'usb'
         env:

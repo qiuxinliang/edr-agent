@@ -99,6 +99,76 @@ def admit(args):
     output(artifact_ids=",".join(select_artifacts(items, args.run, args.commit)))
 
 
+def context(args):
+    # Normal finalization only: an independent executor/recovery is not exposed.
+    run, attempt = str(args.run), str(args.attempt)
+    validate_request(run,attempt,args.commit,args.version,args.request_id)
+    if os.environ.get('RECOVERY_MODE','false') not in ('false',''):
+        raise ValueError('Normal finalization cannot enable recovery')
+    source=dict(repository=SOURCE,run_id=run,attempt=attempt,commit=args.commit)
+    executor=dict(source)
+    for key,want in (('EXECUTOR_RUN',run),('EXECUTOR_ATTEMPT',attempt),('EXECUTOR_COMMIT',args.commit)):
+        if os.environ.get(key,want)!=want:raise ValueError('Normal executor differs from source')
+    validate_source(run,attempt,args.commit,args.version,api(f'repos/{SOURCE}/actions/runs/{run}'))
+    items=[];page=1
+    while True:
+        batch=api(f'repos/{SOURCE}/actions/runs/{run}/artifacts?per_page=100&page={page}')['artifacts'];items.extend(batch)
+        if len(batch)<100:break
+        page+=1
+        if page>100:raise ValueError('Artifact inventory exceeded bound')
+    ids=select_artifacts(items,run,args.commit)
+    inputs=[dict(id=i,name=x['name'],size_in_bytes=x['size_in_bytes'],digest=x['digest']) for i in ids for x in items if str(x['id'])==i]
+    return dict(source=source,executor=executor,version=args.version,request_id=args.request_id,scope='headless',inputs=inputs)
+
+def validate_private_run(info, expected_title, *, expected_run=None, expected_commit=None, expected_attempt=None):
+    if (info.get('repository', {}).get('full_name') != SIGNER
+            or info.get('head_repository', {}).get('full_name') != SIGNER
+            or info.get('path') != '.github/workflows/' + WORKFLOW
+            or info.get('event') != 'workflow_dispatch' or info.get('head_branch') != 'main'
+            or info.get('display_title') != expected_title
+            or not re.fullmatch(r'[a-f0-9]{40}', info.get('head_sha', ''))
+            or not re.fullmatch(r'[1-9][0-9]*', str(info.get('run_attempt', '')))
+            or (expected_run is not None and str(info.get('id')) != str(expected_run))
+            or (expected_commit is not None and info.get('head_sha') != expected_commit)
+            or (expected_attempt is not None and str(info.get('run_attempt')) != str(expected_attempt))):
+        raise ValueError('Private signing run identity or request binding changed')
+
+
+def save_signing_result(private_run, private_commit, private_attempt, request_id):
+    output(signing_run_id=private_run, request_id=request_id,
+           signing_commit=private_commit, signing_attempt=private_attempt)
+    with Path(os.environ['GITHUB_ENV']).open('a', encoding='utf-8') as stream:
+        for key, value in dict(REQUEST_ID=request_id, SIGNING_RUN=private_run,
+                               SIGNING_ATTEMPT=private_attempt, SIGNING_COMMIT=private_commit).items():
+            stream.write(f'{key}={value}\n')
+
+
+def download(args):
+    value = context(args)
+    run = str(args.signing_run or os.environ.get('SIGNING_RUN', ''))
+    commit, attempt = os.environ.get('SIGNING_COMMIT', ''), os.environ.get('SIGNING_ATTEMPT', '')
+    validate_request(run, attempt, commit, value['version'], value['request_id'])
+    info = api(f'repos/{SIGNER}/actions/runs/{run}')
+    source = value['source']
+    validate_private_run(info, title(source['run_id'], source['attempt'], value['request_id']),
+                         expected_run=run, expected_commit=commit, expected_attempt=attempt)
+    if info.get('status') != 'completed' or info.get('conclusion') != 'success':
+        raise ValueError('Private result is not a successful complete signing run')
+    args.signing_run, args.signing_commit, args.signing_attempt = run, commit, attempt
+    from usb_release_transport import download as download_release
+    release_token = os.environ.get('USB_SIGNING_RELEASE_TOKEN', '')
+    if not release_token:
+        raise RuntimeError('USB_SIGNING_RELEASE_TOKEN missing: configure the private-repository Contents credential')
+    actions_token = os.environ['GH_TOKEN']
+    try:
+        # Admission uses the two-repository Actions credential. Only the private
+        # Release transfer receives this separately scoped Contents credential.
+        os.environ['GH_TOKEN'] = release_token
+        download_release(args, value)
+    finally:
+        os.environ['GH_TOKEN'] = actions_token
+
+
 def dispatch(args):
     request_id = uuid.uuid4().hex
     validate_request(args.run, args.attempt, args.commit, args.version, request_id)
@@ -106,6 +176,7 @@ def dispatch(args):
                     api(f"repos/{SOURCE}/actions/runs/{args.run}"))
     expected_title = title(args.run, args.attempt, request_id)
     private_run = None
+    private_commit = private_attempt = None
     succeeded = False
     last_progress = None
     hardware_queue_since = None
@@ -115,7 +186,9 @@ def dispatch(args):
     try:
         api(f"repos/{SIGNER}/actions/workflows/{WORKFLOW}/dispatches", {
             "ref": "main", "inputs": {"source_run": str(args.run), "source_attempt": str(args.attempt),
-            "source_commit": args.commit, "version": args.version, "request_id": request_id}})
+            "source_commit": args.commit, "version": args.version, "request_id": request_id,
+            "executor_run": str(args.run), "executor_attempt": str(args.attempt),
+            "executor_commit": args.commit, "recovery": False}})
         deadline = time.monotonic() + 1800
         while time.monotonic() < deadline:
             if private_run is None:
@@ -128,10 +201,13 @@ def dispatch(args):
                     print(f"Private signing run: {private_run}", flush=True)
             if private_run is not None:
                 state = api(f"repos/{SIGNER}/actions/runs/{private_run}")
+                validate_private_run(state,expected_title,expected_run=private_run,expected_commit=private_commit,expected_attempt=private_attempt)
+                private_commit, private_attempt = state["head_sha"], str(state["run_attempt"])
                 if state["status"] == "completed":
                     if state["conclusion"] != "success":
                         raise RuntimeError(f"Private signing run {private_run} failed: {state['conclusion']}; inspect its admission/USB diagnostics")
-                    output(signing_run_id=private_run)
+                    validate_source(args.run,args.attempt,args.commit,args.version,api(f"repos/{SOURCE}/actions/runs/{args.run}"))
+                    save_signing_result(private_run,private_commit,private_attempt,request_id)
                     succeeded = True
                     return
                 jobs = api(f"repos/{SIGNER}/actions/runs/{private_run}/jobs?per_page=100")["jobs"]
@@ -158,14 +234,16 @@ def dispatch(args):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("mode", choices=("dispatch", "admit"))
+    parser.add_argument("mode", choices=("dispatch", "admit", "download"))
     for name in ("run", "attempt", "commit", "version"):
         parser.add_argument("--" + name, required=True)
     parser.add_argument("--request-id", default="")
+    parser.add_argument("--signing-run", default="")
+    parser.add_argument("--directory", default="finalized")
     args = parser.parse_args()
     if not os.environ.get("GH_TOKEN"):
         raise RuntimeError("USB_SIGNING_TOKEN missing: configure the dedicated cross-repository Actions credential")
-    (dispatch if args.mode == "dispatch" else admit)(args)
+    {'dispatch':dispatch,'admit':admit,'download':download}[args.mode](args)
 
 
 if __name__ == "__main__":
