@@ -1700,12 +1700,12 @@ static void ring_record(const EdrBehaviorRecord *r) {
 static int is_registry_event_type(uint32_t type);
 
 static void context_ring_capture(const EdrBehaviorRecord *r) {
-  RegistryContextSlot *registry =
-      &s_registry_context[s_context_ring_pos % EDR_EVIDENCE_CONTEXT_RING_SLOTS];
-  registry->reg_key_path[0] = '\0';
-  registry->reg_value_name[0] = '\0';
-  registry->reg_op[0] = '\0';
+  /* The common slot's type gates the sole sidecar reader. A non-registry
+   * overwrite cannot consume old registry text, and the next registry write
+   * replaces all three strings, including empty values. */
   if (is_registry_event_type((uint32_t)r->type)) {
+    RegistryContextSlot *registry =
+        &s_registry_context[s_context_ring_pos % EDR_EVIDENCE_CONTEXT_RING_SLOTS];
     copy_s(registry->reg_key_path, sizeof(registry->reg_key_path), r->reg_key_path);
     copy_s(registry->reg_value_name, sizeof(registry->reg_value_name), r->reg_value_name);
     copy_s(registry->reg_op, sizeof(registry->reg_op), r->reg_op);
