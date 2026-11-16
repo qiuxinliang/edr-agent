@@ -11303,9 +11303,7 @@ static int window_project_event(AlertWindowRead *r, const cJSON *event, int64_t 
       !(fact_id ? manifest_add_text(row, "fact_id", fact_id) : manifest_add_u64(row, "slot", slot)) ||
       !(net ? manifest_add_text(row, "remote_ip", ip) && manifest_add_u64(row, "remote_port", port)
             : manifest_add_text(row, "registry_key", key) && manifest_add_text(row, "registry_value", value) &&
-                  manifest_add_text(row, "registry_op", op) &&
-                  (strcmp(op, "set_value") || value[0] ||
-                   cJSON_AddBoolToObject(row, "default_observed", 1))) ||
+                  manifest_add_text(row, "registry_op", op)) ||
       !cJSON_AddItemToArray(r->rows, row)) {
     cJSON_Delete(row);
     return EDR_PARENT_CONTEXT_ERROR_STORAGE;

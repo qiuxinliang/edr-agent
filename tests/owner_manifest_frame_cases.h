@@ -69,14 +69,13 @@ static void test_registry_observation_reopen(void) {
   q.alert_id=q.source_event_id="observation-owner"; q.source_time_ns=r->event_time_ns;
   q.pid=r->pid; q.process_start_key=r->process_start_key;
   q.process_creation_filetime_100ns=r->process_creation_filetime_100ns;
-  q.kind="registry"; q.from_ns=base; q.until_ns=q.source_time_ns;
+  q.kind="registry"; q.from_ns=q.source_time_ns-120*sec; q.until_ns=q.source_time_ns+120*sec;
   q.limit=20; q.max_bytes=8192; q.expires_unix_ms=base/1000000+60000;
   init_window_registry(r, "post-default", base, 5*sec, "HKCU/Software/Post", "", 0);
   r->registry_name_observation=EDR_REG_NAME_DEFAULT;
   edr_local_evidence_cache_record_behavior(r);
   init_window_registry(r, "post-unknown", base, 6*sec, "HKCU/Software/Post", "", 0);
   edr_local_evidence_cache_record_behavior(r);
-  q.until_ns=base+7*sec;
   edr_local_evidence_cache_close();
   /* A historical owner writer emitted empty strings without proof. Preserve
    * that ambiguity on reopen alongside a new post-context omitted name. */
@@ -105,7 +104,7 @@ static void test_registry_observation_reopen(void) {
   unsigned defaults=0, names=0;
   for(cJSON *row=rows->child;row;row=row->next) {
     const char *value=page_string(row,"registry_value");
-    if(!*value) { assert(cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(row,"default_observed"))); ++defaults; }
+    if(!*value) { assert(cJSON_GetArraySize(row)==9 && !cJSON_HasObjectItem(row,"default_observed")); ++defaults; }
     else { assert(!strcmp(value,"A")); ++names; }
   }
   assert(defaults==2 && names==1);
@@ -114,6 +113,13 @@ static void test_registry_observation_reopen(void) {
   for(cJSON *gap=gaps->child;gap;gap=gap->next)
     missing += !strcmp(gap->valuestring,"registry_fields_missing");
   assert(missing==1);
+  const char *window_export=getenv("EDR_REGISTRY_WINDOW_EXPORT");
+  if(window_export && window_export[0]) {
+    char *raw=cJSON_PrintUnformatted(answer); assert(raw);
+    FILE *f=fopen(window_export,"wb"); assert(f);
+    assert(fwrite(raw,1,strlen(raw),f)==strlen(raw) && !fclose(f));
+    cJSON_free(raw);
+  }
   cJSON_Delete(answer);
   EdrSoarCommandMeta meta;
   edr_local_evidence_cache_test_set_now_unix_ns(base+7*sec);
@@ -127,6 +133,7 @@ static void test_registry_observation_reopen(void) {
   int query_rc=edr_local_evidence_cache_query_authorized_json(meta.result_authorization.command_id,&meta,recalled,sizeof(recalled));
   if(query_rc) fprintf(stderr,"registry observation RTQ: %s\n",recalled);
   assert(!query_rc);
+  retained_recall_export("EDR_REGISTRY_RTQ_EXPORT",&meta,recalled);
   answer=cJSON_Parse(recalled); assert(answer);
   rows=cJSON_GetObjectItemCaseSensitive(answer,"rows");
   unsigned unknown=0; defaults=names=0;

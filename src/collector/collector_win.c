@@ -48,6 +48,7 @@
 #include "security_event_xml.h"
 #include "security_event_time_win.h"
 #include "process_command_preview.h"
+#include "registry_name_observation.h"
 #include "collector_self_identity.h"
 
 #ifdef EDR_COLLECTOR_FILE_IO_TESTING
@@ -1458,10 +1459,9 @@ static int edr_registry_snapshot_capture(HKEY key,
       continue;
     }
     char rendered[EDR_REGISTRY_VALUE_DATA_MAX];
-    const char *display_name = name[0] ? name : "(Default)";
     edr_registry_value_data_text(type, data, data_len, rendered,
                                  sizeof(rendered));
-    values[captured].name = _strdup(display_name);
+    values[captured].name = _strdup(name);
     values[captured].data = _strdup(rendered);
     if (!values[captured].name || !values[captured].data) {
       free(name);
@@ -1556,6 +1556,11 @@ static void edr_registry_watch_emit(const char *path, const char *value_name,
                   ? EDR_EVENT_REG_DELETE_KEY
                   : EDR_EVENT_REG_SET_VALUE;
   slot.priority = 0u;
+  /* Only a successful enum-derived SetValue snapshot proves a value name.
+   * Baseline/unavailable notifications carry no observation. */
+  slot.registry_name_observation = edr_registry_captured_name_observation(
+      value_name, safe_name, operation && !strcmp(operation, "set_value") &&
+      detail_status && !strcmp(detail_status, "captured"));
   n = snprintf((char *)slot.data, sizeof(slot.data),
                "ETW1\nprov=regnotify_snapshot\npid=0\nregkey=%s\nregname=%s\n"
                "regdata=%s\nregop=%s\nregistry_source=regnotify_snapshot\n"
@@ -1773,6 +1778,7 @@ static void edr_security_emit_registry_4657(const char *xml, uint64_t event_time
       xml, "ObjectName", key_raw, sizeof(key_raw));
   slot.registry_value_name_incomplete = edr_security_4657_identity_incomplete(
       xml, "ObjectValueName", value_name, sizeof(value_name));
+
   (void)edr_xml_get_data_utf8(xml, "OldValue", old_value, sizeof(old_value));
   (void)edr_xml_get_data_utf8(xml, "NewValue", new_value, sizeof(new_value));
   (void)edr_xml_get_data_utf8(xml, "SubjectUserName", user, sizeof(user));
@@ -1786,6 +1792,8 @@ static void edr_security_emit_registry_4657(const char *xml, uint64_t event_time
   edr_etw1_sanitize_value(safe_img, sizeof(safe_img), img);
   edr_etw1_sanitize_value(safe_key, sizeof(safe_key), key);
   edr_etw1_sanitize_value(safe_name, sizeof(safe_name), value_name);
+  slot.registry_name_observation = edr_registry_captured_name_observation(
+      value_name, safe_name, !slot.registry_value_name_incomplete);
   edr_etw1_sanitize_value(safe_old, sizeof(safe_old), old_value);
   edr_etw1_sanitize_value(safe_new, sizeof(safe_new), new_value);
 
