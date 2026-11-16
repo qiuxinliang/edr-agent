@@ -31,6 +31,7 @@
 static const char type[] = "alert_window_query_v2";
 static char payload[640];
 static uint64_t replay_deadline_ns;
+static int registry_observation_mode;
 
 static void start_replay_executor(void) {
   replay_deadline_ns = edr_monotonic_ns() + UINT64_C(20000000000);
@@ -72,6 +73,12 @@ static void make_request(int64_t anchor) {
       "\"until_ns\":\"%lld\",\"limit\":50,\"max_bytes\":8192}",
       (long long)anchor, (long long)(anchor - INT64_C(120000000000)), (long long)(anchor + INT64_C(120000000000)));
   assert(n > 0 && (size_t)n < sizeof(payload));
+  if(registry_observation_mode) {
+    cJSON *q=cJSON_Parse(payload); assert(q);
+    assert(cJSON_SetValuestring(cJSON_GetObjectItemCaseSensitive(q,"kind"),"registry"));
+    char *wire=cJSON_PrintUnformatted(q); assert(wire && strlen(wire)<sizeof(payload));
+    strcpy(payload,wire); cJSON_free(wire); cJSON_Delete(q);
+  }
 }
 
 /* Match cachedInvestigationTaskID's JSON array and 24-byte SHA-256 prefix.
@@ -105,6 +112,14 @@ static void record_connection(int64_t anchor, char fact_id[65]) {
   r->file_actor_generation_validated = 1;
   strcpy(r->file_path, "C:/synthetic/window-source.exe");
   strcpy(r->detection_context, "{\"severity\":\"P1\"}");
+  if(registry_observation_mode) {
+    EdrBehaviorRecord *pre=malloc(sizeof(*pre)); assert(pre); *pre=*r;
+    pre->type=EDR_EVENT_REG_SET_VALUE; pre->priority=0; pre->detection_context[0]=0;
+    strcpy(pre->event_id,"registry-pre-default"); pre->event_time_ns=anchor-1;
+    strcpy(pre->reg_key_path,"HKCU\\SyntheticDefault"); strcpy(pre->reg_op,"set_value");
+    pre->registry_name_observation=EDR_REG_NAME_DEFAULT;
+    edr_local_evidence_cache_record_behavior(pre); free(pre);
+  }
   assert(edr_local_evidence_cache_is_candidate(r));
   edr_local_evidence_cache_record_behavior(r);
   r->type = EDR_EVENT_NET_CONNECT;
@@ -120,6 +135,19 @@ static void record_connection(int64_t anchor, char fact_id[65]) {
   r->net_dport = 51744;
   strcpy(r->event_id, "synthetic-recycled");
   edr_local_evidence_cache_record_behavior(r);
+  if(registry_observation_mode) {
+    r->process_creation_filetime_100ns--; r->type=EDR_EVENT_REG_SET_VALUE;
+    r->net_dport=0; r->net_dst[0]=0; r->priority=0;
+    strcpy(r->reg_key_path,"HKCU\\SyntheticDefault"); strcpy(r->reg_op,"set_value");
+    strcpy(r->event_id,"registry-post-default"); r->event_time_ns=anchor+3;
+    r->registry_name_observation=EDR_REG_NAME_DEFAULT;
+    edr_local_evidence_cache_record_behavior(r);
+    strcpy(r->event_id,"registry-post-unknown"); r->event_time_ns=anchor+4;
+    r->registry_name_observation=EDR_REG_NAME_UNKNOWN;
+    edr_local_evidence_cache_record_behavior(r);
+    edr_local_evidence_cache_close();
+    assert(!edr_local_evidence_cache_open_with_policy("synthetic-cache.db",16,1,4));
+  }
   free(r);
 
   sqlite3 *db = NULL;
@@ -309,6 +337,7 @@ int main(int argc, char **argv) {
     return 0;
   }
   assert(argc == 1 || argc == 2 || (argc == 3 && !strcmp(argv[1],"--private-transport")));
+  registry_observation_mode=getenv("EDR_TEST_SIGNED_REGISTRY_OBSERVATION")!=NULL;
   const char *id = "lcq-synthetic-window-signed";
   EdrConfig cfg = {0};
   strcpy(cfg.agent.tenant_id, "t");
@@ -366,14 +395,29 @@ int main(int argc, char **argv) {
   assert(edr_command_state_begin(id, type, &meta, NULL, r) == EDR_COMMAND_STATE_BEGIN_DUP_FINAL);
   assert(r->execution_status == 1 && r->exit_code == 0 && r->report_pending && !r->report_policy_held);
   receipt = cJSON_Parse(r->detail);
+  assert(receipt);
+  const cJSON *rows=cJSON_GetObjectItemCaseSensitive(receipt,"rows");
+  if(registry_observation_mode) {
+    assert(!strcmp(cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(receipt,"coverage")),"retained_window"));
+    char *gaps=cJSON_PrintUnformatted(cJSON_GetObjectItemCaseSensitive(receipt,"gap_reasons"));
+    assert(gaps && strstr(gaps,"registry_fields_missing")); cJSON_free(gaps);
+    assert(cJSON_GetArraySize(rows)==2);
+    for(int i=0;i<2;i++) {
+      const cJSON *row=cJSON_GetArrayItem(rows,i);
+      const cJSON *value=cJSON_GetObjectItemCaseSensitive(row,"registry_value");
+      assert(cJSON_IsString(value) && !value->valuestring[0]);
+      assert(!cJSON_GetObjectItemCaseSensitive(row,"default_observed"));
+      assert(cJSON_GetArraySize(row)==9);
+    }
+  } else {
   assert(receipt &&
          !strcmp(cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(receipt, "coverage")), "retained_window"));
-  const cJSON *rows = cJSON_GetObjectItemCaseSensitive(receipt, "rows");
   assert(cJSON_GetArraySize(rows) == 1);
   const cJSON *row = cJSON_GetArrayItem(rows, 0);
   assert(!strcmp(cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(row, "fact_id")), fact_id));
   assert(cJSON_GetNumberValue(cJSON_GetObjectItemCaseSensitive(row, "remote_port")) == 51742);
   assert(!strcmp(cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(row, "remote_ip")), "192.0.2.74"));
+  }
   assert(!strcmp(r->soar_correlation_id, id));
   http = edr_command_result_http_json("ep", "test", id, type, 1, 0, r->detail, r->result_finished_unix_ms,
                                       r->soar_correlation_id, "", "");

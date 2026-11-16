@@ -15,6 +15,11 @@ endif()
 
 add_test(NAME edr_agent_help COMMAND edr_agent --help)
 
+add_executable(test_registry_producer_observation test_registry_producer_observation.c)
+target_include_directories(test_registry_producer_observation PRIVATE ${CMAKE_SOURCE_DIR}/include)
+edr_apply_test_warnings(test_registry_producer_observation)
+add_test(NAME registry_producer_observation COMMAND test_registry_producer_observation)
+
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 add_test(NAME evidence_storage_inventory
   COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/test_evidence_storage_inventory.py)
@@ -2264,6 +2269,11 @@ if(SQLite3_FOUND AND OpenSSL_FOUND)
     "import subprocess,sys,tempfile; d=tempfile.TemporaryDirectory(); subprocess.run([sys.argv[1]],cwd=d.name,check=True)"
     $<TARGET_FILE:test_alert_window_signed_replay>)
   set_tests_properties(alert_window_signed_replay PROPERTIES TIMEOUT 30)
+  add_test(NAME alert_window_signed_registry_observation COMMAND ${Python3_EXECUTABLE} -c
+    "import subprocess,sys,tempfile; d=tempfile.TemporaryDirectory(); subprocess.run([sys.argv[1]],cwd=d.name,check=True)"
+    $<TARGET_FILE:test_alert_window_signed_replay>)
+  set_tests_properties(alert_window_signed_registry_observation PROPERTIES TIMEOUT 30
+    ENVIRONMENT "EDR_TEST_SIGNED_REGISTRY_OBSERVATION=1")
   add_test(NAME alert_window_private_transport COMMAND ${Python3_EXECUTABLE} -B
     ${CMAKE_SOURCE_DIR}/tests/test_alert_window_transport.py $<TARGET_FILE:test_alert_window_signed_replay>)
   set_tests_properties(alert_window_private_transport PROPERTIES TIMEOUT 45)

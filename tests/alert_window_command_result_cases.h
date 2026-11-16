@@ -142,6 +142,11 @@ static int alert_window_command_results(void) {
   CHECK(cJSON_AddStringToObject(row, "registry_value", ""));
   CHECK(cJSON_AddStringToObject(row, "registry_op", "set_value"));
   assert_window_project(a, r, 1);
+  CHECK(cJSON_AddBoolToObject(row,"default_observed",1));
+  assert_window_project(a,r,0);
+  puts("verified real final validator rejects prior ten-field default row");
+  cJSON_DeleteItemFromObjectCaseSensitive(row,"default_observed");
+  assert_window_project(a,r,1);
   assert_registry_page_projection(*a, r, m.issued_at_unix_ms);
   CHECK(cJSON_AddStringToObject(row, "value_data", "secret"));
   assert_window_project(a, r, 0);
