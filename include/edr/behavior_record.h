@@ -69,6 +69,8 @@ typedef struct {
   /* Comma-delimited `source.<field>` names withheld before rule evaluation.
    * This is source provenance, distinct from encoder-side clipping. */
   char source_truncated_fields[EDR_BR_SOURCE_TRUNCATED_FIELDS_LEN];
+  /* Private collector observation, not a wire field. */
+  uint8_t registry_name_observation;
   uint32_t evidence_revision;
   /* Producer-only authority copied from the detector's immutable decision.
    * Full local snapshots retain it; only the outbound encoder applies it. */
@@ -215,6 +217,13 @@ typedef struct {
   char wmi_filter[512];
   char scheduled_task_path[1024];
 } EdrBehaviorRecord;
+#if defined(_WIN64) && !defined(__cplusplus)
+_Static_assert(sizeof(EdrBehaviorRecord) == 82824u, "behavior record memory budget");
+_Static_assert(offsetof(EdrBehaviorRecord, registry_name_observation) == 21490u,
+               "registry observation occupies existing record padding");
+_Static_assert(offsetof(EdrBehaviorRecord, evidence_revision) == 21492u,
+               "record ABI unchanged");
+#endif
 
 /* Relationship conflict/invalidity withholds borrowed parent facts, without
  * erasing the original PPID or the child's exact process identity. */

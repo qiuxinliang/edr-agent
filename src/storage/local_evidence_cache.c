@@ -130,6 +130,7 @@ typedef struct {
 
 typedef struct {
   uint8_t used;
+  uint8_t registry_name_observation;
   int64_t event_time_ns;
   uint32_t type;
   uint32_t pid;
@@ -148,6 +149,10 @@ typedef struct {
   char net_dst[64];
   uint32_t net_dport;
 } RingSlot;
+_Static_assert(sizeof(RingSlot) == 1192u, "ring memory budget unchanged");
+_Static_assert(offsetof(RingSlot, registry_name_observation) == 1u,
+               "registry observation occupies ring padding");
+_Static_assert(offsetof(RingSlot, event_time_ns) == 8u, "ring ABI unchanged");
 
 /* Resolve the trigger's two tuples once for an existing bounded ring pass.
  * Repeating process-tree lookup for every slot adds no identity evidence. */
@@ -1650,6 +1655,7 @@ static int ring_record_to(RingSlot *ring, uint32_t slots, uint32_t *pos,
   int evicted = s->used ? 1 : 0;
   memset(s, 0, sizeof(*s));
   s->used = 1u;
+  s->registry_name_observation = r->registry_name_observation;
   s->event_time_ns = record_time_ns(r);
   s->type = (uint32_t)r->type;
   s->pid = r->pid;
@@ -2234,6 +2240,11 @@ static int ordinary_aggregate_digest(const EdrBehaviorRecord *r, uint32_t kind,
     candidate_digest_u64(&ctx, r->file_key);
     candidate_digest_u64(&ctx, r->file_target_has_motw);
   } else if (kind == 2u) {
+    /* Local representatives cannot merge observed default and unavailable
+     * names. This does not change upload admission or shared wire fields. */
+    if (r->type == EDR_EVENT_REG_SET_VALUE)
+      candidate_digest_u64(&ctx, r->registry_name_observation <= EDR_REG_NAME_LOSS
+          ? r->registry_name_observation : EDR_REG_NAME_UNKNOWN);
     candidate_digest_text(&ctx, r->reg_op);
     candidate_digest_text(&ctx, r->reg_key_path);
     candidate_digest_text(&ctx, r->reg_value_name);
@@ -4194,6 +4205,20 @@ static int manifest_add_text(cJSON *object, const char *name, const char *value)
   return 1;
 }
 
+/* Empty SetValue names require an observation made before queueing. Older
+ * empty records and missing TDH properties remain unknown, including on reopen. */
+static int manifest_registry_value(cJSON *object, EdrEventType type,
+                                   const char *value, uint8_t observation) {
+  if (type != EDR_EVENT_REG_SET_VALUE || (value && value[0]))
+    return manifest_add_text(object, "registry_value", value);
+  if (observation == EDR_REG_NAME_DEFAULT)
+    return manifest_add_text(object, "registry_value", "") &&
+           cJSON_AddBoolToObject(object, "default_observed", 1) != NULL;
+  return manifest_add_text(object, "registry_name_observation",
+      observation == EDR_REG_NAME_CONFLICT ? "conflict" :
+      observation == EDR_REG_NAME_LOSS ? "loss" : "unavailable");
+}
+
 /* cJSON's number representation is a double.  Preserve source event times
  * and FILETIME-derived values exactly by attaching trusted decimal digits as
  * a cJSON raw number, while cJSON still owns all JSON structure/escaping. */
@@ -4706,7 +4731,8 @@ static int build_context_manifest_json(const EdrBehaviorRecord *r, const char *c
     ok = item &&
          (!is_registry_event_type(s->type) ||
           (manifest_add_text(item, "registry_key", registry->reg_key_path) &&
-           manifest_add_text(item, "registry_value", registry->reg_value_name) &&
+           manifest_registry_value(item, (EdrEventType)s->type, registry->reg_value_name,
+                                   s->registry_name_observation) &&
            manifest_add_text(item, "registry_op", registry->reg_op))) &&
          manifest_add_i64(item, "event_time_ns", s->event_time_ns) &&
          manifest_add_u64(item, "type", s->type) &&
@@ -4819,7 +4845,7 @@ static int build_post_context_manifest_template_json(const EdrBehaviorRecord *r,
        manifest_add_text(root, "remote_ip", r->net_dst) &&
        manifest_add_u64(root, "remote_port", r->net_dport) &&
        manifest_add_text(root, "registry_key", r->reg_key_path) &&
-       manifest_add_text(root, "registry_value", r->reg_value_name) &&
+       manifest_registry_value(root, r->type, r->reg_value_name, r->registry_name_observation) &&
        manifest_add_text(root, "registry_op", r->reg_op);
   if (!ok) {
     manifest_rejected("post-context manifest allocation or UTF-8 validation failed");
@@ -10451,6 +10477,7 @@ static cJSON *authorized_query_row(const RtqFilter *f, const char *source,
     if (i == 5 && (!f->has_type || f->type != EDR_EVENT_NET_DNS_QUERY)) continue;
     if (i == 6 && !f->remote_ip[0] && !f->remote_port && (!f->has_type || f->type != EDR_EVENT_NET_CONNECT)) continue;
     if (i >= 7 && i <= 9 && !f->registry_key_contains[0] && (!f->has_type || f->type != EDR_EVENT_REG_SET_VALUE)) continue;
+    if (i == 8 && !fields[i]) continue; /* Unobserved registry name is not a default. */
     const char *value = fields[i] ? fields[i] : "";
     if (strlen(value) > 8192u || !manifest_utf8_valid(value) || !cJSON_AddStringToObject(row, names[i], value)) goto failed;
   }
@@ -10688,8 +10715,18 @@ static int authorized_context_row(EvidenceQueueQuery *q, const cJSON *event,
       authorized_context_text(event, "process_generation_source"),
       authorized_context_text(event, "source_completeness"),
       authorized_context_text(event, "source_truncated_fields"), port_text};
-  for (unsigned i = 0; i < 16; ++i)
+  /* Older retained writers used an empty string for both default and unknown.
+   * Do not upgrade that ambiguity into an observed default in signed recall. */
+  const cJSON *registry_value = cJSON_GetObjectItemCaseSensitive(event, "registry_value");
+  if (!registry_value || (cJSON_IsString(registry_value) &&
+      registry_value->valuestring && !registry_value->valuestring[0] &&
+      !cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(event, "default_observed"))))
+    fields[8] = NULL;
+  for (unsigned i = 0; i < 16; ++i) {
+    if (i == 8 && !fields[i] && !registry_value) continue;
+    if (i == 8 && !fields[i] && cJSON_IsString(registry_value)) continue;
     if (!fields[i] || strlen(fields[i]) > 8192u || !manifest_utf8_valid(fields[i])) goto invalid;
+  }
   if (pre) {
     const char *captured_endpoint = authorized_context_text(event, "endpoint_id");
     if (!captured_endpoint || strcmp(captured_endpoint, endpoint)) goto invalid;
@@ -10698,6 +10735,11 @@ static int authorized_context_row(EvidenceQueueQuery *q, const cJSON *event,
         fields[3], fields[2], fields[4], fields[6], (uint32_t)port, fields[7], start, birth)) return 1;
   cJSON *row = authorized_query_row(f, pre ? "context_pre" : "context_post", ts,
       (uint32_t)type, (uint32_t)pid, (uint32_t)ppid, fields);
+  if (row && fields[8] && !fields[8][0] &&
+      cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(event, "default_observed")) &&
+      !cJSON_AddBoolToObject(row, "default_observed", 1)) {
+    cJSON_Delete(row); row = NULL;
+  }
   if (row) {
     cJSON_DeleteItemFromObjectCaseSensitive(row, "event_time_ns");
     if (!manifest_add_i64(row, "event_time_ns", ts)) { cJSON_Delete(row); row=NULL; }
@@ -11237,6 +11279,8 @@ static int window_project_event(AlertWindowRead *r, const cJSON *event, int64_t 
     if (!key || !*key || !value || !op ||
         (strcmp(op, "set_value") && strcmp(op, "create_key") && strcmp(op, "delete_key") &&
          strcmp(op, "delete_value")) ||
+        (!strcmp(op, "set_value") && !value[0] &&
+         !cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(event, "default_observed"))) ||
         window_registry_incomplete(quality, trunc)) {
       r->registry_missing = 1;
       return 0;
@@ -11259,7 +11303,9 @@ static int window_project_event(AlertWindowRead *r, const cJSON *event, int64_t 
       !(fact_id ? manifest_add_text(row, "fact_id", fact_id) : manifest_add_u64(row, "slot", slot)) ||
       !(net ? manifest_add_text(row, "remote_ip", ip) && manifest_add_u64(row, "remote_port", port)
             : manifest_add_text(row, "registry_key", key) && manifest_add_text(row, "registry_value", value) &&
-                  manifest_add_text(row, "registry_op", op)) ||
+                  manifest_add_text(row, "registry_op", op) &&
+                  (strcmp(op, "set_value") || value[0] ||
+                   cJSON_AddBoolToObject(row, "default_observed", 1))) ||
       !cJSON_AddItemToArray(r->rows, row)) {
     cJSON_Delete(row);
     return EDR_PARENT_CONTEXT_ERROR_STORAGE;

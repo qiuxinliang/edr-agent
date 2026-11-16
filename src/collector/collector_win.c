@@ -4517,8 +4517,8 @@ static void edr_collector_decode_mapped_event(PEVENT_RECORD event_record, EdrEve
   size_t plen = is_file_io
                     ? edr_collector_build_file_io_slot_payload(
                           event_record, tag, slot.data, EDR_MAX_EVENT_PAYLOAD)
-                    : edr_tdh_build_slot_payload(event_record, tag, slot.data,
-                                                 EDR_MAX_EVENT_PAYLOAD);
+                    : edr_tdh_build_slot_payload_observed(event_record, tag, slot.data,
+                        EDR_MAX_EVENT_PAYLOAD, ty, &slot.registry_name_observation);
   if (plen == 0) {
     edr_etw_observability_on_slot_payload_empty();
     if (is_file_io && ty != EDR_EVENT_FILE_READ && ty != EDR_EVENT_FILE_WRITE)

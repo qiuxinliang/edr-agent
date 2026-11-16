@@ -2203,6 +2203,11 @@ void edr_behavior_from_slot(const EdrEventSlot *slot, EdrBehaviorRecord *r) {
   if (!slot || !r) {
     return;
   }
+  /* Only the in-process collector can supply this observation. */
+  r->registry_name_observation =
+      slot->type == EDR_EVENT_REG_SET_VALUE &&
+      slot->registry_name_observation <= EDR_REG_NAME_LOSS
+          ? slot->registry_name_observation : EDR_REG_NAME_UNKNOWN;
 
   r->event_time_ns = (int64_t)slot->timestamp_ns;
   r->type = slot->type;

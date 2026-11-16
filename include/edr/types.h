@@ -6,6 +6,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <stddef.h>
 
 /** 单条事件载荷上限（§2.3） */
 #define EDR_MAX_EVENT_PAYLOAD 4096u
@@ -80,9 +81,18 @@ typedef struct {
   uint8_t region_count;
 } EdrRansomContentSample;
 
+enum {
+  EDR_REG_NAME_UNKNOWN = 0,
+  EDR_REG_NAME_OBSERVED = 1,
+  EDR_REG_NAME_DEFAULT = 2,
+  EDR_REG_NAME_CONFLICT = 3,
+  EDR_REG_NAME_LOSS = 4
+};
 typedef struct {
   uint8_t data[EDR_MAX_EVENT_PAYLOAD];
   uint32_t size;
+  /* Collector-only registry SetValue observation; never parsed from ETW1. */
+  uint8_t registry_name_observation;
   uint64_t timestamp_ns;
   /* Collector-owned, in-memory snapshot captured before queueing a file
    * mutation. It is accepted only after preprocess proves the same immutable
@@ -111,5 +121,11 @@ typedef struct {
   uint8_t registry_key_incomplete;
   uint8_t registry_value_name_incomplete;
 } EdrEventSlot;
+#if defined(_WIN64) && !defined(__cplusplus)
+_Static_assert(sizeof(EdrEventSlot) == 4184u, "event slot memory budget");
+_Static_assert(offsetof(EdrEventSlot, registry_name_observation) == 4100u,
+               "registry observation occupies existing slot padding");
+_Static_assert(offsetof(EdrEventSlot, timestamp_ns) == 4104u, "slot ABI unchanged");
+#endif
 
 #endif

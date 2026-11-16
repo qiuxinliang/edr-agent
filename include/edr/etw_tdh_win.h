@@ -27,6 +27,10 @@
 size_t edr_tdh_build_slot_payload(PEVENT_RECORD rec, const char *prov_tag,
                                   uint8_t *out, size_t out_cap);
 
+/* Internal collector variant: SetValue-only strict text and observation. */
+size_t edr_tdh_build_slot_payload_observed(PEVENT_RECORD rec, const char *prov_tag,
+    uint8_t *out, size_t out_cap, EdrEventType type, uint8_t *observation);
+
 /**
  * P1 规则驱动采集：只提取 ETW 热路径第一道过滤需要的最小字段。
  * 通过兴趣集后才调用 `edr_tdh_build_slot_payload` 构造完整 BehaviorRecord 载荷。

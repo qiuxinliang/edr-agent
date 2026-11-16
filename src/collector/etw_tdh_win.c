@@ -339,6 +339,80 @@ static int edr_append_process_kv(char *out, size_t cap, size_t *off,
   return append_utf8(out, cap, off, "%s=%s\n", key, value) != 0u;
 }
 
+/* Registry string properties have a text schema; byte count is not a type.
+ * In particular UTF16 "A\\0" is four bytes, not integer 65. */
+static ULONG edr_registry_text_decode(PEVENT_RECORD rec, PCWSTR name, char *out, size_t cap) {
+  PROPERTY_DATA_DESCRIPTOR d;
+  WCHAR raw[2048]; ULONG bytes = 0, status;
+  memset(&d, 0, sizeof(d)); d.PropertyName = (ULONGLONG)(ULONG_PTR)name;
+  d.ArrayIndex = ULONG_MAX; out[0] = 0;
+  status = EDR_TDH_GET_PROPERTY_SIZE(rec, 0, NULL, 1, &d, &bytes);
+  if (status != ERROR_SUCCESS) return status;
+  if (bytes < 2 || bytes % 2 || bytes > sizeof(raw)) return ERROR_INVALID_DATA;
+  status = EDR_TDH_GET_PROPERTY(rec, 0, NULL, 1, &d, bytes, (PBYTE)raw);
+  if (status != ERROR_SUCCESS) return status;
+  const WCHAR *w = (const WCHAR *)raw;
+  size_t count = bytes / 2u;
+  if (w[count - 1] != 0) return ERROR_INVALID_DATA;
+  for (size_t i = 0; i + 1 < count; ++i)
+    if (!w[i] || w[i] == L'\r' || w[i] == L'\n') return ERROR_INVALID_DATA;
+  if (count == 1) return ERROR_SUCCESS;
+  int n = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, w,
+      (int)count - 1, out, (int)cap - 1, NULL, NULL);
+  if (!n) { out[0] = 0; return GetLastError(); }
+  out[n] = 0; return ERROR_SUCCESS;
+}
+
+static ULONG edr_registry_text(PEVENT_RECORD rec, PCWSTR name, char *out, size_t cap) {
+  ULONG status = edr_registry_text_decode(rec, name, out, cap);
+  edr_tdh_note_property_status(status);
+  return status;
+}
+
+static int edr_registry_missing(ULONG status) {
+  return status == ERROR_NOT_FOUND;
+}
+
+static int edr_registry_set_payload(PEVENT_RECORD rec, char *out, size_t cap,
+    size_t *off, uint8_t *observation) {
+  /* Reserve complete loss metadata before writing any registry text. */
+  if (*off >= cap || cap - *off <= 160u) return 0;
+  size_t text_cap = cap - 160u;
+  char a[512], b[512], key[1024];
+  ULONG sa = edr_registry_text(rec, L"ValueName", a, sizeof(a));
+  ULONG sb = edr_registry_text(rec, L"CapturedValueName", b, sizeof(b));
+  uint8_t state = EDR_REG_NAME_UNKNOWN;
+  const char *value = NULL;
+  if (sa == ERROR_SUCCESS && sb == ERROR_SUCCESS && strcmp(a,b))
+    state = EDR_REG_NAME_CONFLICT;
+  else if ((!edr_registry_missing(sa) && sa != ERROR_SUCCESS) ||
+           (!edr_registry_missing(sb) && sb != ERROR_SUCCESS)) state = EDR_REG_NAME_LOSS;
+  else if (sa == ERROR_SUCCESS || sb == ERROR_SUCCESS) {
+    value = sa == ERROR_SUCCESS ? a : b;
+    state = value[0] ? EDR_REG_NAME_OBSERVED : EDR_REG_NAME_DEFAULT;
+  }
+  if (value && !edr_append_process_kv(out, text_cap, off, "regname", (char *)value))
+    state = EDR_REG_NAME_LOSS;
+  if (observation) *observation = state;
+  int name_lost = state == EDR_REG_NAME_CONFLICT || state == EDR_REG_NAME_LOSS;
+  int key_lost = 0;
+  ULONG sk = edr_registry_text(rec, L"KeyName", key, sizeof(key));
+  if (sk == ERROR_SUCCESS && key[0])
+    key_lost = !edr_append_process_kv(out, text_cap, off, "regkey", key);
+  else if (!edr_registry_missing(sk) && sk != ERROR_SUCCESS) key_lost = 1;
+  ULONG sr = edr_registry_text(rec, L"RelativeName", key, sizeof(key));
+  if (sr == ERROR_SUCCESS && key[0]) {
+    if (!edr_append_process_kv(out, text_cap, off, "regpath", key)) key_lost = 1;
+  } else if (!edr_registry_missing(sr) && sr != ERROR_SUCCESS) key_lost = 1;
+  if (name_lost || key_lost) {
+    if (!append_utf8(out, cap, off, "source_completeness=TRUNCATED\n")) return 0;
+    if (!append_utf8(out, cap, off, "source_truncated_fields=%s%s%s\n",
+        name_lost ? "source.reg_value_name" : "",
+        name_lost && key_lost ? "," : "", key_lost ? "source.reg_key_path" : "")) return 0;
+  }
+  return 1;
+}
+
 static void edr_process_loss(char *lost, size_t cap, const char *field) {
   size_t used = strlen(lost), len = strlen(field);
   if (used + (used ? 1u : 0u) + len >= cap) {
@@ -756,8 +830,9 @@ int edr_tdh_build_sensor_interest_event(PEVENT_RECORD rec, EdrEventType type,
   return 1;
 }
 
-size_t edr_tdh_build_slot_payload(PEVENT_RECORD rec, const char *prov_tag,
-                                  uint8_t *out, size_t out_cap) {
+size_t edr_tdh_build_slot_payload_observed(PEVENT_RECORD rec, const char *prov_tag,
+    uint8_t *out, size_t out_cap, EdrEventType type, uint8_t *observation) {
+  if (observation) *observation = EDR_REG_NAME_UNKNOWN;
   if (!rec || !out || out_cap < 32) {
     return 0;
   }
@@ -987,8 +1062,15 @@ size_t edr_tdh_build_slot_payload(PEVENT_RECORD rec, const char *prov_tag,
   } else if (memcmp(g, &EDR_ETW_GUID_KERNEL_REGISTRY, sizeof(GUID)) == 0 ||
              memcmp(g, &EDR_ETW_GUID_SYSTEM_REGISTRY, sizeof(GUID)) == 0 ||
              memcmp(g, &EDR_ETW_GUID_LEGACY_REGISTRY, sizeof(GUID)) == 0) {
-    edr_try_append_all(rec, reg_try, sizeof(reg_try) / sizeof(reg_try[0]), line,
-                       sizeof(line), (char *)out, out_cap, &off);
+    if (type == EDR_EVENT_REG_SET_VALUE) {
+      /* Keep numeric actor/data behavior; text names share strict decoding. */
+      edr_try_append_all(rec, reg_try, 3u, line, sizeof(line), (char *)out, out_cap, &off);
+      if (!edr_registry_set_payload(rec, (char *)out, out_cap, &off, observation)) return 0u;
+      edr_try_append_all(rec, reg_try + 7u, 1u, line, sizeof(line), (char *)out, out_cap, &off);
+    } else {
+      edr_try_append_all(rec, reg_try, sizeof(reg_try) / sizeof(reg_try[0]), line,
+                         sizeof(line), (char *)out, out_cap, &off);
+    }
     if (memcmp(g, &EDR_ETW_GUID_LEGACY_REGISTRY, sizeof(GUID)) == 0 &&
         edr_legacy_registry_key_utf8(rec, line, sizeof(line))) {
       append_utf8((char *)out, out_cap, &off, "regkey=%s\n", line);
@@ -1089,4 +1171,10 @@ size_t edr_tdh_extract_ave_net_fields(PEVENT_RECORD rec, EdrEventType ty, char *
     }
   }
   return 1;
+}
+
+size_t edr_tdh_build_slot_payload(PEVENT_RECORD rec, const char *prov_tag,
+    uint8_t *out, size_t out_cap) {
+  return edr_tdh_build_slot_payload_observed(rec, prov_tag, out, out_cap,
+      (EdrEventType)0, NULL);
 }

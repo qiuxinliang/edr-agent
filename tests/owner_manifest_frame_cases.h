@@ -44,6 +44,104 @@ static void replace_frame_test_member(sqlite3_stmt *st, const char *owner, size_
   ZSTD_freeCCtx(cc); free(frame); free(json);
 }
 
+static void test_registry_observation_reopen(void) {
+  const int64_t sec = INT64_C(1000000000), base = INT64_C(1750062200000000101);
+  EdrBehaviorRecord *r = calloc(1, sizeof(*r));
+  char path[640], queue_path[640]; assert(r && !make_test_sqlite_path(path, sizeof(path)));
+  assert(!make_test_sqlite_path(queue_path,sizeof(queue_path)));
+  edr_storage_queue_configure(16,24);
+  assert(edr_storage_queue_open(queue_path)==EDR_OK);
+  edr_local_evidence_cache_test_set_now_unix_ns(base);
+  assert(!edr_local_evidence_cache_open(path, 512, 72));
+  init_window_registry(r, "observed-default", base, sec, "HKCU/Software/Observed", "", 0);
+  r->registry_name_observation = EDR_REG_NAME_DEFAULT;
+  record_ordinary_expected(r,0);
+  strcpy(r->event_id,"duplicate-observed-default");
+  record_ordinary_expected(r,1);
+  init_window_registry(r, "unknown-name", base, 2*sec, "HKCU/Software/Observed", "", 0);
+  record_ordinary_expected(r,0);
+  init_window_registry(r, "observed-A", base, 3*sec, "HKCU/Software/Observed", "A", 0);
+  r->registry_name_observation = EDR_REG_NAME_OBSERVED;
+  edr_local_evidence_cache_record_behavior(r);
+  window_deliver(r, "observation-owner", base, 4*sec, 0, 0);
+  EdrAlertWindowQuery q = {0};
+  q.tenant_id=r->tenant_id; q.endpoint_id=r->endpoint_id;
+  q.alert_id=q.source_event_id="observation-owner"; q.source_time_ns=r->event_time_ns;
+  q.pid=r->pid; q.process_start_key=r->process_start_key;
+  q.process_creation_filetime_100ns=r->process_creation_filetime_100ns;
+  q.kind="registry"; q.from_ns=base; q.until_ns=q.source_time_ns;
+  q.limit=20; q.max_bytes=8192; q.expires_unix_ms=base/1000000+60000;
+  init_window_registry(r, "post-default", base, 5*sec, "HKCU/Software/Post", "", 0);
+  r->registry_name_observation=EDR_REG_NAME_DEFAULT;
+  edr_local_evidence_cache_record_behavior(r);
+  init_window_registry(r, "post-unknown", base, 6*sec, "HKCU/Software/Post", "", 0);
+  edr_local_evidence_cache_record_behavior(r);
+  q.until_ns=base+7*sec;
+  edr_local_evidence_cache_close();
+  /* A historical owner writer emitted empty strings without proof. Preserve
+   * that ambiguity on reopen alongside a new post-context omitted name. */
+  sqlite3 *legacy_db=NULL; sqlite3_stmt *legacy_st=NULL;
+  assert(sqlite3_open(path,&legacy_db)==SQLITE_OK);
+  assert(sqlite3_prepare_v2(legacy_db,"SELECT manifest_json FROM artifacts WHERE artifact_type='p0_context_bundle'",-1,&legacy_st,NULL)==SQLITE_OK);
+  assert(sqlite3_step(legacy_st)==SQLITE_ROW);
+  cJSON *legacy=cJSON_Parse((const char *)sqlite3_column_text(legacy_st,0)); assert(legacy);
+  sqlite3_finalize(legacy_st);
+  cJSON *context=cJSON_GetObjectItemCaseSensitive(legacy,"context"); unsigned converted=0;
+  for(cJSON *event=context->child;event;event=event->next) {
+    if(cJSON_HasObjectItem(event,"registry_name_observation")) {
+      assert(!cJSON_HasObjectItem(event,"registry_value"));
+      cJSON_DeleteItemFromObjectCaseSensitive(event,"registry_name_observation");
+      assert(cJSON_AddStringToObject(event,"registry_value","")); ++converted;
+    }
+  }
+  assert(converted==1);
+  char *legacy_json=cJSON_PrintUnformatted(legacy); assert(legacy_json);
+  assert(sqlite3_prepare_v2(legacy_db,"UPDATE artifacts SET manifest_json=? WHERE artifact_type='p0_context_bundle'",-1,&legacy_st,NULL)==SQLITE_OK);
+  assert(sqlite3_bind_text(legacy_st,1,legacy_json,-1,SQLITE_TRANSIENT)==SQLITE_OK && sqlite3_step(legacy_st)==SQLITE_DONE);
+  sqlite3_finalize(legacy_st); sqlite3_close(legacy_db); cJSON_free(legacy_json); cJSON_Delete(legacy);
+  assert(!edr_local_evidence_cache_open(path,512,72));
+  cJSON *answer=window_answer(&q), *rows=cJSON_GetObjectItemCaseSensitive(answer,"rows");
+  assert(cJSON_GetArraySize(rows)==3);
+  unsigned defaults=0, names=0;
+  for(cJSON *row=rows->child;row;row=row->next) {
+    const char *value=page_string(row,"registry_value");
+    if(!*value) { assert(cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(row,"default_observed"))); ++defaults; }
+    else { assert(!strcmp(value,"A")); ++names; }
+  }
+  assert(defaults==2 && names==1);
+  unsigned missing=0;
+  cJSON *gaps=cJSON_GetObjectItemCaseSensitive(answer,"gap_reasons");
+  for(cJSON *gap=gaps->child;gap;gap=gap->next)
+    missing += !strcmp(gap->valuestring,"registry_fields_missing");
+  assert(missing==1);
+  cJSON_Delete(answer);
+  EdrSoarCommandMeta meta;
+  edr_local_evidence_cache_test_set_now_unix_ns(base+7*sec);
+  retained_recall_contract(&meta,r,base+7*sec,"{\"event_type\":\"registry\"}",50);
+  cJSON *contract=cJSON_Parse(meta.result_authorization.content_contract); assert(contract);
+  cJSON_SetNumberValue(cJSON_GetObjectItemCaseSensitive(contract,"event_type"),31);
+  char *contract_json=cJSON_PrintUnformatted(contract); assert(contract_json);
+  snprintf(meta.result_authorization.content_contract,sizeof(meta.result_authorization.content_contract),"%s",contract_json);
+  cJSON_free(contract_json); cJSON_Delete(contract);
+  char recalled[16384];
+  int query_rc=edr_local_evidence_cache_query_authorized_json(meta.result_authorization.command_id,&meta,recalled,sizeof(recalled));
+  if(query_rc) fprintf(stderr,"registry observation RTQ: %s\n",recalled);
+  assert(!query_rc);
+  answer=cJSON_Parse(recalled); assert(answer);
+  rows=cJSON_GetObjectItemCaseSensitive(answer,"rows");
+  unsigned unknown=0; defaults=names=0;
+  for(cJSON *row=rows->child;row;row=row->next) {
+    cJSON *value=cJSON_GetObjectItemCaseSensitive(row,"registry_value");
+    if(!value) ++unknown;
+    else if(!value->valuestring[0]) { assert(cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(row,"default_observed"))); ++defaults; }
+    else { assert(!strcmp(value->valuestring,"A")); ++names; }
+  }
+  assert(unknown==2 && defaults==2 && names==1);
+  cJSON_Delete(answer); edr_local_evidence_cache_close();
+  edr_storage_queue_close(); cleanup_test_sqlite_path(queue_path);
+  cleanup_test_sqlite_path(path); edr_local_evidence_cache_test_set_now_unix_ns(0); free(r);
+}
+
 static void test_owner_manifest_frame(void) {
   const int64_t sec = INT64_C(1000000000), base = INT64_C(1750061200000000101);
   EdrBehaviorRecord *r = calloc(1, sizeof(*r));
@@ -133,5 +231,6 @@ static void test_owner_manifest_frame(void) {
   cleanup_test_sqlite_path(path);
   edr_local_evidence_cache_test_set_now_unix_ns(0);
   free(r);
+  test_registry_observation_reopen();
 }
 #endif

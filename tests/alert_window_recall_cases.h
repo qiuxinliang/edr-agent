@@ -39,6 +39,9 @@ static void init_window_registry(EdrBehaviorRecord *r, const char *id, int64_t b
 static void window_registry_input(EdrBehaviorRecord *r, const char *id, int64_t base, int64_t offset,
                                   const char *key, const char *value, int wrong) {
   init_window_registry(r, id, base, offset, key, value, wrong);
+  /* This helper models an explicitly observed native value name. Unknown
+   * historical empty records use init_window_registry directly instead. */
+  r->registry_name_observation = value[0] ? EDR_REG_NAME_OBSERVED : EDR_REG_NAME_DEFAULT;
   assert(!edr_local_evidence_cache_is_candidate(r));
   edr_local_evidence_cache_record_behavior(r);
 }
