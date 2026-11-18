@@ -12,7 +12,7 @@ param(
   [string] $ServiceName = "FDSecurityAgent",
   [ValidateSet('service','scheduled_task')] [string] $RuntimeMode = 'service',
   [string] $EvidenceDir = "setup-exe-evidence",
-  [Parameter(Mandatory = $true)] [string] $UpgradeInput,
+  [string] $UpgradeInput = '',
   [Parameter(Mandatory = $true)] [string] $BaselineConfigTemplate,
   [switch] $ExerciseInstallerTimeout,
   [switch] $SkipSetupRollback,
@@ -20,7 +20,9 @@ param(
   [string] $LegacySetupExe = '',
   [string] $LegacyVersion = '',
   [string] $MigrationInput = '',
-  [string] $StorageToolsInput = ''
+  [string] $StorageToolsInput = '',
+  [string] $ExactInstalledTransitionInput = '',
+  [string] $ExactInstalledTransitionInputSha256 = ''
 )
 
 $ErrorActionPreference = "Stop"
@@ -28,6 +30,16 @@ $repoRoot = Split-Path -Parent $PSScriptRoot
 . (Join-Path $PSScriptRoot 'Start-LifecycleWindowsPowerShell.ps1')
 . (Join-Path $repoRoot 'tests\Invoke-LifecycleStorageCompatibility.ps1')
 $archVerifier = Join-Path $PSScriptRoot "Assert-WindowsPeArchitecture.ps1"
+. (Join-Path $PSScriptRoot 'Exact-Installed742Qualification.ps1')
+$exactFixture=$null
+if($ExactInstalledTransitionInput){
+ $null=Assert-LifecycleStorageRegular $ExactInstalledTransitionInput 65536
+ if($ExactInstalledTransitionInputSha256 -cnotmatch '^[a-f0-9]{64}$' -or (Get-FileHash $ExactInstalledTransitionInput).Hash.ToLowerInvariant() -cne $ExactInstalledTransitionInputSha256){throw 'Qualification parameter file SHA mismatch'}
+ $exactFixture=[IO.File]::ReadAllText($ExactInstalledTransitionInput)|ConvertFrom-Json
+ if($SignedPublisherValidation -or $LegacySetupExe -or $LegacyVersion -or $MigrationInput -or $SkipSetupRollback -or $ExerciseInstallerTimeout){throw 'Exact installed qualification cannot mix legacy, rollback or timeout modes'}
+ Assert-Exact742QualificationContract $exactFixture $InstallDir $Architecture $RuntimeMode $ServiceName
+}
+if(-not $exactFixture -and -not $UpgradeInput){throw 'Lifecycle upgrade input is required'}
 $bootstrapVerifier = Join-Path $PSScriptRoot "Assert-WindowsInstallerBootstrapArchitecture.ps1"
 $BaselineSetupExe = (Resolve-Path -LiteralPath $BaselineSetupExe).Path
 $TargetSetupExe = (Resolve-Path -LiteralPath $TargetSetupExe).Path
@@ -40,7 +52,7 @@ $principal = New-Object Security.Principal.WindowsPrincipal($identity)
 if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
   throw "Setup EXE lifecycle smoke must run elevated"
 }
-if ($InstallDir -notmatch '^C:\\edr-agent-setup-lifecycle-[A-Za-z0-9._-]+$') {
+if (-not $exactFixture -and $InstallDir -notmatch '^C:\\edr-agent-setup-lifecycle-[A-Za-z0-9._-]+$') {
   throw "Refusing unsafe lifecycle install directory: $InstallDir"
 }
 if (Test-Path -LiteralPath $InstallDir) {
@@ -49,7 +61,11 @@ if (Test-Path -LiteralPath $InstallDir) {
 
 & $bootstrapVerifier -Path $BaselineSetupExe -PayloadArchitecture $Architecture
 & $bootstrapVerifier -Path $TargetSetupExe -PayloadArchitecture $Architecture
-if ($SignedPublisherValidation) {
+if($exactFixture){
+ if($ServiceName -cne 'FDSecurityAgent' -or $BaselineVersion -cne '3.2.742' -or $TargetVersion -cne '3.2.747' -or $BaselineSetupExe -ine [IO.Path]::GetFullPath($exactFixture.source_setup_exe) -or $TargetSetupExe -ine [IO.Path]::GetFullPath($exactFixture.target_setup_exe) -or $UpgradeInput -or $StorageToolsInput -or $exactFixture.upgrade_input -or $exactFixture.storage_tools_input -or $exactFixture.first_hop_inputs_staged -ne $false){throw 'Exact fixture caller/input mismatch'}
+ Assert-Exact742CleanHost
+ # Qualification does not consume storage tools or stage a first-hop transition.
+} elseif ($SignedPublisherValidation) {
   if ($env:GITHUB_ACTIONS -cne 'true' -or -not $LegacySetupExe -or -not $MigrationInput -or
       $LegacyVersion -cne '3.2.723' -or [version]$BaselineVersion -ge [version]$TargetVersion -or
       [version]$LegacyVersion -ge [version]$BaselineVersion -or $SkipSetupRollback -or -not $StorageToolsInput) {
@@ -61,7 +77,7 @@ if ($SignedPublisherValidation) {
 } elseif ($LegacySetupExe -or $LegacyVersion -or $MigrationInput -or $StorageToolsInput) {
   throw 'legacy migration inputs require signed publisher validation'
 }
-if ($RuntimeMode -ceq 'scheduled_task' -and -not $SignedPublisherValidation) {
+if ($RuntimeMode -ceq 'scheduled_task' -and -not $SignedPublisherValidation -and -not $exactFixture) {
   throw 'scheduled-task lifecycle requires the explicitly bound signed validation path'
 }
 
@@ -853,6 +869,11 @@ $status = "failed"
 $script:LastLifecycleStage = "lifecycle"
 $script:LastSetupLog = ""
 try {
+  if($exactFixture){
+   Invoke-Exact742Qualification $exactFixture
+   $status='qualification-only'
+   return
+  }
   $upgradeBinding = Get-Content -LiteralPath $UpgradeInput -Raw | ConvertFrom-Json
   if ($SignedPublisherValidation) {
     $migrationBinding=Get-Content -LiteralPath $MigrationInput -Raw | ConvertFrom-Json
@@ -999,6 +1020,7 @@ try {
     runtime_mode = $RuntimeMode
     baseline_version = $BaselineVersion
     target_version = $TargetVersion
+    exact_installed_qualification_only = [bool]$exactFixture
     signed_publisher_validation = [bool]$SignedPublisherValidation
     legacy_migration_version = $LegacyVersion
     setup_rollback_skipped = [bool]$SkipSetupRollback
