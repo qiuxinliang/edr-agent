@@ -1,7 +1,7 @@
 #Requires -Version 5.1
 # Disposable cloud fixture only: direct signed Setup maintenance and formal recovery.
 [CmdletBinding()]
-param([Parameter(Mandatory=$true)][string]$QualificationInput,[Parameter(Mandatory=$true)][string]$QualificationInputSha256,[Parameter(Mandatory=$true)][string]$SourceConsumerReceipt,[Parameter(Mandatory=$true)][string]$SourceConsumerReceiptSha256,[Parameter(Mandatory=$true)][string]$EvidenceDir)
+param([Parameter(Mandatory=$true)][string]$QualificationInput,[Parameter(Mandatory=$true)][string]$QualificationInputSha256,[Parameter(Mandatory=$true)][string]$SourceConsumerReceipt,[Parameter(Mandatory=$true)][string]$SourceConsumerReceiptSha256,[Parameter(Mandatory=$true)][string]$EvidenceDir,[string]$StorageToolsInput='',[string]$StorageToolsInputSha256='')
 $ErrorActionPreference='Stop'
 . (Join-Path $PSScriptRoot 'Exact742FirstHopRecovery.Common.ps1')
 . Import-Exact742TestDefinitions
@@ -11,6 +11,14 @@ $inputBinding=Read-Exact742BoundJson $QualificationInput $QualificationInputSha2
 $source=Read-Exact742BoundJson $SourceConsumerReceipt $SourceConsumerReceiptSha256
 Assert-Exact742MaintenanceContext $inputBinding $source
 Assert-Exact742FileBindings $inputBinding
+$events=New-Object 'System.Collections.Generic.List[object]'
+$storageTools=$null;$storageContext=$null;$storageStages=@();$storageRetiredHandles=@()
+if($StorageToolsInput -or $StorageToolsInputSha256){
+ if(!$StorageToolsInput -or !$StorageToolsInputSha256){throw 'Phase2 storage tools require a path and exact digest together'}
+ $null=Read-Exact742BoundJson $StorageToolsInput $StorageToolsInputSha256
+ $pe=Join-Path (Split-Path -Parent $PSScriptRoot) 'scripts/Assert-WindowsPeArchitecture.ps1'
+ $storageTools=Import-LifecycleStorageTools $StorageToolsInput 'arm64' $pe 'installed742-to747'
+}
 $EvidenceDir=[IO.Path]::GetFullPath($EvidenceDir)
 if(Test-Path $EvidenceDir){throw 'Fresh direct maintenance evidence directory required'}
 New-Item -ItemType Directory $EvidenceDir|Out-Null
@@ -39,9 +47,16 @@ $ast=[Management.Automation.Language.Parser]::ParseFile($updater,[ref]$tokens,[r
 $initializers=@($ast.FindAll({param($n)$n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -ceq 'Initialize-InstallerJobType'},$true))
 if(@($errors).Count -or $initializers.Count -ne 1){throw 'Original742 bounded Setup owner is not unique/parseable'}
 . ([scriptblock]::Create($initializers[0].Extent.Text));Initialize-InstallerJobType
-$result=[ordered]@{schema='edr.exact742.direct-setup-maintenance-recovery.v1';started_utc=[DateTime]::UtcNow.ToString('o');controller_principal=$principal.Name;controller_sid=$principal.User.Value;controller_temp_path=[IO.Path]::GetTempPath();controller_scope='Actual elevated hosted controller; not claimed original SYSTEM/SystemTemp controller';case_passed=$false;maintenance_passed=$false;signed_setup_recovery_passed=$false;full_gate=$false;full_gate_passed=$false;deployment_authorized=$false;automatic_updater_recovery_tested=$false;controlled_acceptance_refusal_injected=$false;acceptance_error_code=$null;acceptance_first_failure=$null;failure_recovery_tested=$false;failure_recovery_scope='controlled post-install acceptance refusal after real747 Setup exit0/Jobempty/30s healthy only';setup_midflight_recovery_tested=$false;setup_timeout_recovery_tested=$false;data_scope=$false;data_note='No real database copy; this case does not prove synthetic WAL/queue reader preservation or ACK';first_failure=$null;cleanup_failure=$null;registry_before=$beforeRegistry;maintenance=$null;recovery=$null}
+$result=[ordered]@{schema='edr.exact742.direct-setup-maintenance-recovery.v1';started_utc=[DateTime]::UtcNow.ToString('o');controller_principal=$principal.Name;controller_sid=$principal.User.Value;controller_temp_path=[IO.Path]::GetTempPath();controller_scope='Actual elevated hosted controller; not claimed original SYSTEM/SystemTemp controller';case_passed=$false;maintenance_passed=$false;signed_setup_recovery_passed=$false;full_gate=$false;full_gate_passed=$false;deployment_authorized=$false;automatic_updater_recovery_tested=$false;controlled_acceptance_refusal_injected=$false;acceptance_error_code=$null;acceptance_first_failure=$null;failure_recovery_tested=$false;failure_recovery_scope='controlled post-install acceptance refusal after real747 Setup exit0/Jobempty/30s healthy only';setup_midflight_recovery_tested=$false;setup_timeout_recovery_tested=$false;data_scope=$false;data_preservation_passed=$false;queue_retry_metadata_preservation_tested=$false;shared_owner_ref_tested=$false;protection_deadline_tested=$false;cross_database_atomic=$false;outbox_tested=$false;server_ack_tested=$false;data_note='No real database copy; this case does not prove synthetic WAL/queue reader preservation or ACK';first_failure=$null;cleanup_failure=$null;registry_before=$beforeRegistry;maintenance=$null;recovery=$null}
 $oldHandle=[IntPtr]::Zero;$targetRuntime=$null;$recoveredRuntime=$null;$first=$null
 try{
+ if($storageTools){
+  $storageContext=New-LifecycleStorageChain $storageTools 'exact742-maintenance-data'
+  Write-LifecycleStorageFixture $storageContext 'seed' 'source742-seed'
+  Test-LifecycleStorageReadback $storageContext 'source742-restarted'
+  $storageStages+=Get-ExactMaintenanceStorageStage $storageContext 'source742-restarted'
+ }
+ # Hold only the current source generation AFTER seed/restart, never its predecessor.
  $old=Get-LifecycleRuntimeProcess
  if($old.State -cne 'Running' -or $old.ProcessId -le 0){throw 'Direct maintenance source runtime is not running'}
  $oldHandle=[LifecycleInstallerFault]::Open([uint32]$old.ProcessId,$false);$oldBirth=[LifecycleInstallerFault]::Created($oldHandle)
@@ -55,6 +70,15 @@ try{
  $targetRuntime=Get-ExactMaintenanceHealthyRuntime '3.2.747' $proof.artifact_sha256 $raw[0].update.runtime_identity_sha256 $oldBirth $oldHandle
  if((Get-FileHash (Join-Path $InstallDir 'agent.toml')).Hash.ToLowerInvariant() -cne $source.config_sha256){throw 'Direct747 maintenance changed protected synthetic config'}
  $result.target_generation=@{pid=$targetRuntime.pid;birth=$targetRuntime.birth};$result.registry_at747=$targetRuntime.registry;$result.maintenance_passed=$true
+ if($storageContext){
+  $previousTarget=$targetRuntime
+  Write-LifecycleStorageFixture $storageContext 'append' 'target747-append'
+  Test-LifecycleStorageReadback $storageContext 'target747-restarted'
+  $storageStages+=Get-ExactMaintenanceStorageStage $storageContext 'target747-restarted'
+  $afterAppend=Get-ExactMaintenanceHealthyRuntime '3.2.747' $proof.artifact_sha256 $raw[0].update.runtime_identity_sha256 $previousTarget.birth $previousTarget.handle
+  $storageRetiredHandles+=$previousTarget.handle;$targetRuntime=$afterAppend
+  $result.target_generation=@{pid=$targetRuntime.pid;birth=$targetRuntime.birth}
+ }
  # The only simulated failure is this late test-side acceptance refusal.
  # A genuine Setup/health/Job failure never reaches this boundary or a blind retry.
  $acceptanceObservation=@{version=$targetRuntime.version;agent_sha256=(Get-FileHash (Join-Path $InstallDir 'FDSensor.exe')).Hash.ToLowerInvariant();setup_exit_code=$result.maintenance.exit_code;setup_job_empty=$result.maintenance.job_empty;setup_cleanup_failure=$result.maintenance.cleanup_failure;health_observe_ms=$targetRuntime.health_observe_ms;target_generation_alive=(![LifecycleInstallerFault]::Exited($targetRuntime.handle));task_mode=(Get-LifecycleRuntimeOwner).mode;registry=@(Get-Exact742RegistryState)}
@@ -87,11 +111,18 @@ try{
  $result.registry_after=$recoveredRuntime.registry
  Assert-Exact742RegistryRestored $beforeRegistry $result.registry_after
  if(($recoveredRuntime.task_owner|ConvertTo-Json -Depth 8 -Compress) -cne ($beforeOwner|ConvertTo-Json -Depth 8 -Compress)){throw 'Signed742 Setup recovery changed original SYSTEM task identity'}
+ if($storageContext){
+  Test-LifecycleStorageReadback $storageContext 'source742-after-recovery'
+  $storageStages+=Get-ExactMaintenanceStorageStage $storageContext 'source742-after-recovery'
+  $result.data_scope=$true;$result.data_preservation_passed=$true;$result.storage_stages=$storageStages
+  $result.data_note='Synthetic frozen writer records checked field-by-field by b307/388d consumers on separate committed SQLite snapshots per database; WAL resolved if present, no cross-database atomicity, outbox or ACK claim'
+ }
  $result.recovered_generation=@{pid=$recoveredRuntime.pid;birth=$recoveredRuntime.birth};$result.signed_setup_recovery_passed=$true;$result.failure_recovery_tested=$true;$result.case_passed=$true
 }catch{$first=$_;$result.first_failure=$_.Exception.Message}
 finally{
- $handles=@($oldHandle);if($targetRuntime){$handles+=$targetRuntime.handle};if($recoveredRuntime){$handles+=$recoveredRuntime.handle}
+ $handles=@($oldHandle)+@($storageRetiredHandles);if($targetRuntime){$handles+=$targetRuntime.handle};if($recoveredRuntime){$handles+=$recoveredRuntime.handle}
  foreach($handle in $handles){if($handle -ne [IntPtr]::Zero){try{if(![LifecycleInstallerFault]::CloseHandle($handle)){throw 'Direct maintenance runtime handle release failed'}}catch{if(!$result.cleanup_failure){$result.cleanup_failure=$_.Exception.Message};if(!$first){$first=$_;$result.first_failure=$_.Exception.Message}}}}
+ $result.storage_events=$events.ToArray()
  $result.completed_utc=[DateTime]::UtcNow.ToString('o');$result.case_passed=($result.case_passed -and !$first)
  try{$result|ConvertTo-Json -Depth 10|Set-Content (Join-Path $EvidenceDir 'result.json') -Encoding UTF8}catch{if(!$first){$first=$_}else{Write-Warning 'Cannot retain direct maintenance result; first failure preserved'}}
 }

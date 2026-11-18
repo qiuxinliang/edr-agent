@@ -84,3 +84,24 @@ function Invoke-ExactMaintenanceAcceptanceBoundary($Observed) {
  $failure.Data['exact_maintenance_fault']='TEST_POST_INSTALL_ACCEPTANCE_REFUSED'
  throw $failure
 }
+
+# Phase2 only: summarize receipts already fully checked by the existing storage owner.
+function Get-ExactMaintenanceStorageStage($Context,[string]$Stage) {
+ $databases=@()
+ foreach($kind in @('cache','queue')){
+  $proofPath=Join-Path $Context.root ($Stage+'-'+$kind+'-snapshot.stdout.json')
+  $null=Assert-LifecycleStorageRegular $proofPath 65536
+  $proof=[IO.File]::ReadAllText($proofPath)|ConvertFrom-Json
+  if($proof.database_kind -cne $kind -or $proof.source_journal_mode -cne 'wal' -or $proof.snapshot_scope -cne 'single_database_committed_read_view' -or $proof.cross_database_atomic -ne $false -or $proof.wal_resolution -cne 'sqlite_read_transaction_resolves_committed_wal_if_present'){throw 'Phase2 per-database WAL snapshot evidence is incomplete'}
+  $readers=@()
+  foreach($role in @('legacy','candidate')){
+   $path=Join-Path $Context.root ($Stage+'-'+$kind+'-'+$role+'-read.stdout.json')
+   $null=Assert-LifecycleStorageRegular $path 65536
+   $read=[IO.File]::ReadAllText($path)|ConvertFrom-Json
+   if($read.source_commit -cne $Context.tools.$role.source_commit -or $read.action -cne 'read' -or @($read.records).Count -ne $Context.generation*2){throw 'Phase2 storage reader evidence is incomplete'}
+   $readers+=@{role=$role;source_commit=$read.source_commit;receipt_sha256=(Get-FileHash $path).Hash.ToLowerInvariant();record_count=@($read.records).Count}
+  }
+  $databases+=@{kind=$kind;snapshot_sha256=$proof.sha256;snapshot_bytes=$proof.size;journal_mode=$proof.source_journal_mode;wal_before=$proof.wal_before;wal_after=$proof.wal_after;readers=$readers;source_readonly=$proof.source_readonly}
+ }
+ return @{stage=$Stage;generation=$Context.generation;databases=$databases;queue_retry_metadata_preservation_tested=$false;shared_owner_ref_tested=$false;protection_deadline_tested=$false;cross_database_atomic=$false;outbox_tested=$false;server_ack_tested=$false;wal_only_frozen_rows_proven=$false}
+}

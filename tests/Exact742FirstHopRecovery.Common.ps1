@@ -5,7 +5,7 @@ function Import-Exact742TestDefinitions {
  . (Join-Path $PSScriptRoot 'Invoke-LifecycleStorageCompatibility.ps1')
  . (Join-Path $repo 'scripts/Exact-Installed742Qualification.ps1')
  $sources=@(
-  @{path=(Join-Path $repo 'scripts/windows_setup_exe_lifecycle_smoke.ps1');names=@('Get-LifecycleAgentProcesses','Open-LifecycleAgentProcess','Get-LifecycleUpdaterIdentity','Get-LifecycleStoragePreflight','Get-LifecycleRuntimeProcess','Get-LifecycleTaskDefinition','Get-LifecycleRuntimeOwner','Get-LifecycleTrustedPublisher','Assert-LifecyclePublisherProtocol')},
+  @{path=(Join-Path $repo 'scripts/windows_setup_exe_lifecycle_smoke.ps1');names=@('Add-Evidence','Get-LifecycleAgentProcesses','Open-LifecycleAgentProcess','Get-LifecycleUpdaterIdentity','Get-LifecycleStoragePreflight','Get-LifecycleRuntimeProcess','Get-LifecycleTaskDefinition','Get-LifecycleRuntimeOwner','Get-LifecycleTrustedPublisher','Assert-LifecyclePublisherProtocol')},
   @{path=(Join-Path $PSScriptRoot 'Invoke-RealInstallerTimeoutRecovery.ps1');names=@('Read-RecoveryJournal','Assert-RecoveryFiles')}
  )
  foreach($source in $sources){

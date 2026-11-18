@@ -82,6 +82,13 @@ elif mode=='backup':
     regular(source,1073741824)
     for p in (destination.parent,*destination.parent.parents):
         if p.is_symlink() or getattr(p.lstat(),'st_file_attributes',0)&1024:raise ValueError('backup_reparse')
+    def wal_state():
+        wal=Path(str(source)+'-wal')
+        try:s=wal.lstat()
+        except FileNotFoundError:return {'exists':False,'bytes':0,'observation':'absent_at_stat'}
+        if not stat.S_ISREG(s.st_mode) or getattr(s,'st_file_attributes',0)&1024 or s.st_size>1073741824:raise ValueError('source_wal_bound_or_reparse')
+        return {'exists':True,'bytes':s.st_size,'observation':'sample_only_not_atomic_with_backup'}
+    wal_before=wal_state()
     deadline=time.monotonic()+8
     def progress(status,remaining,total):
         if time.monotonic()>deadline or total*65536>17179869184:raise TimeoutError('sqlite_backup_deadline_or_bound')
@@ -92,13 +99,14 @@ elif mode=='backup':
     try:
         src=sqlite3.connect(source.as_uri()+'?mode=ro',uri=True,timeout=.2)
         src.execute('PRAGMA query_only=ON');src.execute('BEGIN');src.execute('SELECT count(*) FROM sqlite_master').fetchone()
+        source_journal_mode=src.execute('PRAGMA journal_mode').fetchone()[0]
         dst=sqlite3.connect(destination,timeout=.2)
         src.backup(dst,pages=128,progress=progress,sleep=.01)
         dst.execute('PRAGMA journal_mode=DELETE').fetchone();dst.close();dst=None
         src.rollback();src.close();src=None
         regular(destination,1073741824)
         if time.monotonic()>deadline:raise TimeoutError('sqlite_backup_deadline')
-        print(json.dumps({'schema':'edr.test.storage-snapshot.v1','source':str(source),'config_sha256':expected,'sqlite_backup':True,'source_readonly':True,'sha256':hashlib.sha256(destination.read_bytes()).hexdigest(),'size':destination.stat().st_size},separators=(',',':')))
+        print(json.dumps({'schema':'edr.test.storage-snapshot.v1','source':str(source),'config_sha256':expected,'sqlite_backup':True,'source_readonly':True,'sha256':hashlib.sha256(destination.read_bytes()).hexdigest(),'size':destination.stat().st_size,'database_kind':kind,'source_journal_mode':source_journal_mode,'wal_before':wal_before,'wal_after':wal_state(),'snapshot_scope':'single_database_committed_read_view','wal_resolution':'sqlite_read_transaction_resolves_committed_wal_if_present','cross_database_atomic':False,'wal_only_frozen_rows_proven':False},separators=(',',':')))
     finally:
         if dst is not None:dst.close()
         if src is not None:src.close()
@@ -109,10 +117,14 @@ function Invoke-LifecycleStoragePython($Context,[string[]]$Arguments,[string]$La
   $encoded=[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes((Get-LifecycleStoragePython)))
   return Invoke-LifecycleStorageProcess $Context $Context.tools.python_path (@('-I','-B','-c',("import base64;exec(base64.b64decode('"+$encoded+"'))"))+$Arguments) $Label
 }
-function Import-LifecycleStorageTools([string]$InputPath,[string]$Architecture,[string]$PeVerifier) {
+function Import-LifecycleStorageTools([string]$InputPath,[string]$Architecture,[string]$PeVerifier,[ValidateSet('legacy-publisher','installed742-to747')][string]$Cohort='legacy-publisher') {
   $path=Assert-LifecycleStorageRegular $InputPath 65536;$tools=[IO.File]::ReadAllText($path)|ConvertFrom-Json
   if($tools.schema -cne 'edr.windows.storage-compat-tools.v1' -or $tools.architecture -cne $Architecture){throw 'storage tools identity mismatch'}
   $pins=@{legacy='b51bc3d825e6d5666535463b34eb708201e6fda7';candidate='d4e837790c53861c99d31ee127c55a5ef1f06f4a'}
+  if($Cohort -ceq 'installed742-to747') {
+    $pins=@{legacy='b307daa7a4e60a141d344fcb10bded19d97b436d';candidate='388d69438781d93cd36871354439585feb1ebc07'}
+    if($Architecture -cne 'arm64' -or $tools.cohort -cne $Cohort -or @($tools.source_commits.PSObject.Properties).Count -ne 2 -or $tools.source_commits.legacy -cne $pins.legacy -or $tools.source_commits.candidate -cne $pins.candidate){throw 'Exact maintenance storage cohort/source mismatch'}
+  } elseif($tools.PSObject.Properties['cohort'] -and $tools.cohort -cne 'legacy-publisher'){throw 'Storage cohort requires explicit installed-source consumer selection'}
   foreach($role in @('legacy','candidate')) {
     if($tools.$role.source_commit -cne $pins[$role]){throw 'storage consumer source differs from immutable product source'}
     foreach($kind in @('cache','queue')) {
