@@ -69,10 +69,10 @@ function Convert-Exact742NativeFloor([byte[]]$Bytes) {
  if($raw -cnotmatch '^(0|[1-9][0-9]*)$' -or ![UInt64]::TryParse($raw,[ref]$value) -or $value -gt 9007199254740991){throw 'Native storage floor is invalid'}
  return $value
 }
-function Read-Exact742NativeFloor([string]$Destination) {
+function Read-Exact742NativeFloor([string]$Destination,[ValidateSet('e6ea9736829d0c0be5284c570f198ec888bcaad1845a074ea8838ebf6b326dbe','c1ea2133d925ff688dd6f15419ecd5dd2065525466e78b8a44c51212a6464fd0')][string]$ExpectedAgentSha256='e6ea9736829d0c0be5284c570f198ec888bcaad1845a074ea8838ebf6b326dbe') {
  # Same original CLI and finite20s/5s contract as the verified native floor reader.
  $exe=Join-Path $InstallDir 'FDSensor.exe';$config=Join-Path $InstallDir 'agent.toml'
- Assert-Exact742ProgramHash $exe 'e6ea9736829d0c0be5284c570f198ec888bcaad1845a074ea8838ebf6b326dbe'
+ Assert-Exact742ProgramHash $exe $ExpectedAgentSha256
  $configHash=(Get-FileHash $config).Hash.ToLowerInvariant()
  $directory=Join-Path $InstallDir ('.storage-preflight-'+[Guid]::NewGuid().ToString('N'));New-Item -ItemType Directory $directory|Out-Null
  $output=Join-Path $directory 'floor';$process=$null;$first=$null;$record=$null;$cleanupFailure=$null
@@ -81,18 +81,18 @@ function Read-Exact742NativeFloor([string]$Destination) {
  try{
   $process=[Diagnostics.Process]::Start($start);$null=$process.Handle
   $stdout=$process.StandardOutput.ReadToEndAsync();$stderr=$process.StandardError.ReadToEndAsync()
-  if(!$process.WaitForExit(20000)){throw 'Native742 storage authority exceeded20s'}
+  if(!$process.WaitForExit(20000)){throw 'Native signed-Agent storage authority exceeded20s'}
   if(![Threading.Tasks.Task]::WaitAll([Threading.Tasks.Task[]]@($stdout,$stderr),5000)){throw 'Native storage preflight output drain exceeded5s'}
   if($stdout.Result.Length+$stderr.Result.Length -gt 65536){throw 'Native storage authority output exceeds64KiB'}
   [IO.File]::WriteAllText((Join-Path $Destination 'native-floor.stdout.log'),$stdout.Result,[Text.UTF8Encoding]::new($false))
   [IO.File]::WriteAllText((Join-Path $Destination 'native-floor.stderr.log'),$stderr.Result,[Text.UTF8Encoding]::new($false))
-  if($process.ExitCode -ne 0){throw ('Native742 storage authority rejected with exit '+$process.ExitCode)}
+  if($process.ExitCode -ne 0){throw ('Native signed-Agent storage authority rejected with exit '+$process.ExitCode)}
   $null=Assert-LifecycleStorageRegular $output 16
   $bytes=[IO.File]::ReadAllBytes($output);$floor=Convert-Exact742NativeFloor $bytes
   if((Get-FileHash $config).Hash.ToLowerInvariant() -cne $configHash){throw 'Configuration changed during native storage preflight'}
-  Assert-Exact742ProgramHash $exe 'e6ea9736829d0c0be5284c570f198ec888bcaad1845a074ea8838ebf6b326dbe'
+  Assert-Exact742ProgramHash $exe $ExpectedAgentSha256
   [IO.File]::WriteAllBytes((Join-Path $Destination 'native-floor.txt'),$bytes)
-  $record=@{floor_bytes=$floor;output_sha256=(Get-FileHash $output).Hash.ToLowerInvariant();exe_sha256='e6ea9736829d0c0be5284c570f198ec888bcaad1845a074ea8838ebf6b326dbe';config_sha256=$configHash;role='storage_space_preflight';pid=$process.Id;birth_filetime=$process.StartTime.ToFileTimeUtc();observation='directly started exact preflight arguments; retained Process handle confirmed exit';exit_code=$process.ExitCode;parent_pid=$PID;limit_ms=20000}
+  $record=@{floor_bytes=$floor;output_sha256=(Get-FileHash $output).Hash.ToLowerInvariant();exe_sha256=$ExpectedAgentSha256;config_sha256=$configHash;role='storage_space_preflight';pid=$process.Id;birth_filetime=$process.StartTime.ToFileTimeUtc();observation='directly started exact preflight arguments; retained Process handle confirmed exit';exit_code=$process.ExitCode;parent_pid=$PID;limit_ms=20000}
  }catch{$first=$_}
  finally{
   if($process){
