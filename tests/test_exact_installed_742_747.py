@@ -1,6 +1,5 @@
 """Fixed media/identity/routing boundaries; no setup, network or signing."""
 import copy
-import hashlib
 import importlib.util
 import json
 import os
@@ -69,17 +68,14 @@ class BoundaryTests(unittest.TestCase):
     def test_official_assets_are_not_changed_and_no_setup_can_run_on_rejection(self):
         with tempfile.TemporaryDirectory() as d,patch.object(exact.io_owner,'api') as api,patch.object(exact.io_owner,'fetch') as fetch:
             bad=request();bad['target_publisher_proof']['artifact_sha256']='0'*64
-            with self.assertRaises(ValueError):exact.stage(bad,Path(d),Path(d)/'inputs')
+            with self.assertRaises(ValueError):exact.stage(bad,Path(d)/'inputs')
             api.assert_not_called();fetch.assert_not_called();self.assertFalse((Path(d)/'inputs').exists())
 
-    def test_lf_export_uses_fixed_git_bytes_without_rewriting_release(self):
-        with tempfile.TemporaryDirectory() as d:
-            path=Path(d)/'lf.ps1';data=b'original\n';sha=hashlib.sha256(data).hexdigest()
-            with patch.object(exact.subprocess,'run',return_value=type('Result',(),{'stdout':data})()):
-                exact.export_source(Path(d),'scripts/original.ps1',path,sha)
-            self.assertEqual(path.read_bytes(),data)
-            with patch.object(exact.subprocess,'run',return_value=type('Result',(),{'stdout':b'original\r\n'})()):
-                with self.assertRaises(ValueError):exact.export_source(Path(d),'scripts/original.ps1',Path(d)/'wrong',sha)
+    def test_rejected_private_release_does_not_create_stage(self):
+        with tempfile.TemporaryDirectory() as d,patch.object(exact.io_owner,'api',return_value={}),patch.object(exact.io_owner,'fetch') as fetch:
+            with self.assertRaises(ValueError):exact.stage(request(),Path(d)/'inputs')
+            fetch.assert_not_called()
+            self.assertFalse((Path(d)/'inputs').exists())
 
 
 if __name__=='__main__':unittest.main()

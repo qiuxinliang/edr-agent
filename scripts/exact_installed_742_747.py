@@ -1,12 +1,8 @@
 """Fixed, disposable ARM task qualification; never published-baseline eligibility."""
 import argparse
-import hashlib
 import json
 import os
 from pathlib import Path
-import re
-import subprocess
-import zipfile
 
 import headless_repack_lifecycle as io_owner
 import windows_release_checkpoint as checkpoint
@@ -22,7 +18,6 @@ THUMBPRINT = '01BB4E940A8E9CD5C09DEE81F17B5FB016750C3F'
 DER_SHA = 'fb7a1b9fa95054b69d11e982bc77c6bb78f778b7e85943b3d1b198923d172a8a'
 COHORT = 'installed742-to747'
 # Exact existing official metadata, not caller-selectable release eligibility.
-TASK_OWNER_SHA = 'e8795f44ac8727dc99eebdaf3c696678340e1fe4b32ec8e9e0d5acfadd2bca9a'
 ASSETS = {'source': [{'digest': 'sha256:32b77e511853047a87f43c75d7c739f8f3be467fc57374cf2cce5fc65efa73be',
              'id': 722889728,
              'name': 'edr-agent-win_3.2.742-windows-arm64-artifact-manifest.json',
@@ -197,15 +192,6 @@ def validate_release(label, release):
     return actual
 
 
-def export_source(repo, relative, destination, expected):
-    data = subprocess.run(['git', '-C', str(repo), 'show', SOURCE_COMMIT + ':' + relative],
-                          check=True, capture_output=True, timeout=30).stdout
-    if hashlib.sha256(data).hexdigest() != expected or b'\r\n' in data:
-        raise ValueError('Original LF fixture owner differs from fixed source')
-    with destination.open('xb') as stream:
-        stream.write(data)
-
-
 def check_manifest(label, directory, assets, proof):
     version = '3.2.742' if label == 'source' else '3.2.747'
     prefix = 'edr-agent-win_' + version + '-windows-arm64-'
@@ -236,7 +222,7 @@ def check_manifest(label, directory, assets, proof):
     return manifest
 
 
-def stage(request, repo, root):
+def stage(request, root):
     validate_request(request)
     root = Path(root).resolve()
     if root.exists():
@@ -263,15 +249,12 @@ def stage(request, repo, root):
     source, target = root / 'source', root / 'target'
     if io_owner.digest(source / 'runtime/edr_agent_inplace_update.ps1') != PACKAGED_UPDATER_SHA:
         raise ValueError('Official source runtime updater changed')
-    export_source(repo, 'scripts/edr_agent_inplace_update.ps1', source / 'fixture-updater-LF.ps1', UPDATER_SHA)
-    export_source(repo, 'install/windows-inno/edr_windows_autorun.ps1', source / 'fixture-task-owner-LF.ps1', TASK_OWNER_SHA)
     result = dict(schema='edr.exact-installed-742-to-747.inputs.v1', architecture='arm64', runtime_mode='scheduled_task',
         source_version='3.2.742', target_version='3.2.747', source_setup_exe=str(source / 'edr-agent-win_3.2.742-windows-arm64-setup.exe'),
         target_setup_exe=str(target / 'edr-agent-win_3.2.747-windows-arm64-setup.exe'), source_runtime_directory=str(source / 'runtime'),
-        source_fixture_updater=str(source / 'fixture-updater-LF.ps1'), source_fixture_task_owner=str(source / 'fixture-task-owner-LF.ps1'),
         source_installed_agent_sha256=request['source_publisher_proof']['artifact_sha256'], source_installed_updater_sha256=UPDATER_SHA,
         source_installed_launcher_sha256=LAUNCHER_SHA, source_publisher_proof=str(source/'publisher-verification.json'),
-        target_publisher_proof=str(target/'publisher-verification.json'), source_fixture_task_owner_sha256=TASK_OWNER_SHA,
+        target_publisher_proof=str(target/'publisher-verification.json'),
         upgrade_input=None, upgrade_input_sha256=None, storage_tools_input=None, storage_tools_input_sha256=None,
         first_hop_inputs_staged=False, qualification_only=True, full_gate=False, full_gate_passed=False, deployment_authorized=False,
         old_full_setup_rollback_supported=False,
@@ -281,8 +264,6 @@ def stage(request, repo, root):
                     'harness': {k: os.environ.get(k, '') for k in ('GITHUB_SHA', 'GITHUB_RUN_ID', 'GITHUB_RUN_ATTEMPT')}})
     binding_paths={
         'source_setup':result['source_setup_exe'], 'target_setup':result['target_setup_exe'],
-        'source_fixture_updater':result['source_fixture_updater'],
-        'source_fixture_task_owner':result['source_fixture_task_owner'],
         'source_manifest':str(source/'edr-agent-win_3.2.742-windows-arm64-artifact-manifest.json'),
         'source_cms':str(source/'edr-agent-win_3.2.742-windows-arm64-artifact-manifest.json.p7s'),
         'source_proof':str(source/'publisher-verification.json'),
@@ -301,7 +282,6 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('mode', choices=('validate', 'stage'))
     parser.add_argument('--request', type=Path)
-    parser.add_argument('--repo', type=Path, default=Path.cwd())
     parser.add_argument('--root', type=Path)
     args = parser.parse_args()
     raw = args.request.read_text(encoding='utf-8-sig') if args.request else os.environ.get('EXACT_INSTALLED_TRANSITION_REQUEST', '')
@@ -313,7 +293,7 @@ def main():
         return
     if not args.root:
         parser.error('stage requires --root')
-    stage(request, args.repo, args.root)
+    stage(request, args.root)
     path=Path(args.root).resolve()/'lifecycle-inputs.json'
     print(json.dumps(dict(input_path=str(path),input_sha256=io_owner.digest(path),qualification_only=True,full_gate=False,deployment_authorized=False)))
 

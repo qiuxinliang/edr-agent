@@ -1175,7 +1175,6 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          fetch-depth: 0
           persist-credentials: false
       - uses: actions/setup-python@v6
         with:
@@ -1222,7 +1221,7 @@ jobs:
           if(!$env:USB_SIGNING_RELEASE_TOKEN){throw 'Existing USB_SIGNING_RELEASE_TOKEN private Contents read credential is required'}
           $request=Join-Path $PWD 'exact-installed-request.json'
           [IO.File]::WriteAllText($request,$env:EXACT_INSTALLED_TRANSITION_REQUEST,[Text.UTF8Encoding]::new($false))
-          $raw=python scripts/exact_installed_742_747.py stage --request $request --repo $PWD --root exact-installed-input
+          $raw=python scripts/exact_installed_742_747.py stage --request $request --root exact-installed-input
           if($LASTEXITCODE -ne 0){throw 'Exact signed media admission/staging failed; no Setup allowed'}
           $binding=$raw|ConvertFrom-Json
           "EXACT_INPUT_PATH=$($binding.input_path)"|Out-File $env:GITHUB_ENV -Append -Encoding UTF8
