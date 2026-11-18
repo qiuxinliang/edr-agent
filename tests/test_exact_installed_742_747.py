@@ -1,5 +1,6 @@
 """Fixed media/identity/routing boundaries; no setup, network or signing."""
 import copy
+import hashlib
 import importlib.util
 import json
 import os
@@ -7,6 +8,7 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+import zipfile
 from unittest.mock import patch
 
 sys.path.insert(0,str(Path(__file__).parents[1]/'scripts'))
@@ -76,6 +78,103 @@ class BoundaryTests(unittest.TestCase):
             with self.assertRaises(ValueError):exact.stage(request(),Path(d)/'inputs')
             fetch.assert_not_called()
             self.assertFalse((Path(d)/'inputs').exists())
+
+
+class FirstHopBoundaryTests(unittest.TestCase):
+    def fixture(self):
+        env=dict(GITHUB_ACTIONS='true',RUNNER_ENVIRONMENT='github-hosted',RUNNER_ARCH='ARM64',
+                 GITHUB_SHA='a'*40,GITHUB_RUN_ID='123',GITHUB_RUN_ATTEMPT='2',GITHUB_JOB='exact742')
+        source={a['name']:a for a in exact.ASSETS['source']}
+        identity=dict(install_dir=exact.INSTALL_DIR,runtime_mode='scheduled_task',
+            agent_sha256=source['edr-agent-win_3.2.742-windows-arm64-FDSensor.exe']['digest'][7:],
+            updater_sha256=exact.UPDATER_SHA,launcher_sha256=exact.LAUNCHER_SHA,native_integrity_sha256=exact.INTEGRITY_SHA)
+        receipt=dict(schema='edr.exact-installed742.qualification-result.v1',complete=True,qualification_only=True,
+            full_gate=False,full_gate_passed=False,deployment_authorized=False,source_version='3.2.742',target_version='3.2.747',
+            architecture='arm64',runner_environment='github-hosted',harness_commit=env['GITHUB_SHA'],run_id='123',run_attempt='2',job='exact742',
+            consumer_identity=identity,source_setup_sha256=source['edr-agent-win_3.2.742-windows-arm64-setup.exe']['digest'][7:],
+            setup_output={k:identity[k] for k in ('updater_sha256','launcher_sha256','native_integrity_sha256')},
+            config_sha256='b'*64,task_owner=dict(mode='scheduled_task',name='FDSecurityAgent',path='\\',xml='actual task XML',sddl='actual SDDL'),
+            uninstall=dict(version='3.2.742',location=exact.INSTALL_DIR,key='actual key'))
+        return receipt,env
+
+    def test_only_same_fresh_hosted_arm_actual_setup_receipt(self):
+        receipt,env=self.fixture();self.assertEqual(exact.qualification_consumer(receipt,env),receipt['consumer_identity'])
+        for key,value in [('harness_commit','c'*40),('run_id','999'),('run_attempt','1'),('job','old-job'),
+                ('runner_environment','self-hosted'),('architecture','amd64'),('target_version','3.2.748'),
+                ('complete',False),('full_gate',True),('deployment_authorized',True),('config_sha256',''),
+                ('source_setup_sha256','0'*64),('setup_output',{}),('task_owner',{}),('uninstall',{})]:
+            with self.subTest(field=key),self.assertRaises(ValueError):exact.qualification_consumer({**receipt,key:value},env)
+        for field in receipt['consumer_identity']:
+            bad=copy.deepcopy(receipt);bad['consumer_identity'][field]='wrong'
+            with self.subTest(identity=field),self.assertRaises(ValueError):exact.qualification_consumer(bad,env)
+        for key,value in [('GITHUB_ACTIONS','false'),('RUNNER_ENVIRONMENT','self-hosted'),('RUNNER_ARCH','X64'),('GITHUB_SHA','')]:
+            with self.subTest(environment=key),self.assertRaises(ValueError):exact.qualification_consumer(receipt,{**env,key:value})
+
+    def test_pinned_file_rejects_changed_empty_symlink_or_oversize(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory)/'input';path.write_bytes(b'fixed')
+            sha=hashlib.sha256(b'fixed').hexdigest();self.assertEqual(exact.pinned_file(path,sha),path)
+            with self.assertRaises(ValueError):exact.pinned_file(path,sha,4)
+            with self.assertRaises(ValueError):exact.pinned_file(path,'0'*64)
+            link=Path(directory)/'link';link.symlink_to(path)
+            with self.assertRaises(ValueError):exact.pinned_file(link,sha)
+            path.write_bytes(b'')
+            with self.assertRaises(ValueError):exact.pinned_file(path,hashlib.sha256(b'').hexdigest())
+
+    def test_updater_adapter_accepts_only_original_eol_equivalence(self):
+        actual=b'original source\n';packaged=b'original source\r\n'
+        with patch.object(exact,'UPDATER_SHA',hashlib.sha256(actual).hexdigest()),patch.object(exact,'PACKAGED_UPDATER_SHA',hashlib.sha256(packaged).hexdigest()):
+            exact.assert_updater_equivalence(packaged,actual)
+            for changed_archive,changed_actual in [(packaged,packaged),(packaged,b'candidate source\n'),(b'candidate source\r\n',actual),(packaged+b'\r\n',actual)]:
+                with self.assertRaises(ValueError):exact.assert_updater_equivalence(changed_archive,changed_actual)
+
+    def test_wrapper_preserves_packaged_transition_and_actual_recovery(self):
+        # File transport/crypto admission has separate real-media checks; exercise
+        # this adapter with a disposable, byte-pinned consumer and producer double.
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);source=root/'source';target=root/'target';source.mkdir();target.mkdir()
+            installed=root/'installed';installed.mkdir();actual=b'old updater\n';packaged=b'old updater\r\n'
+            sha=lambda data:hashlib.sha256(data).hexdigest()
+            receipt,env=self.fixture();receipt_path=root/'receipt.json';receipt_path.write_text(json.dumps(receipt))
+            roles={};inventories={};proofs={}
+            for label,version,folder in [('source','3.2.742',source),('target','3.2.747',target)]:
+                prefix='edr-agent-win_'+version+'-windows-arm64-';inventories[label]=[]
+                for role,suffix in [('setup','setup.exe'),('manifest','artifact-manifest.json'),('cms','artifact-manifest.json.p7s')]:
+                    path=folder/(prefix+suffix);path.write_bytes(b'fixture');roles[label+'_'+role]=path
+                archive=folder/(prefix+'exe.zip')
+                with zipfile.ZipFile(archive,'w') as z:z.writestr('edr_agent_inplace_update.ps1',packaged)
+                inventories[label].append(dict(name=archive.name,digest='sha256:'+exact.io_owner.digest(archive)))
+                proof=folder/'publisher-verification.json';proof.write_text(json.dumps(dict(artifact_sha256='target-hash')))
+                roles[label+'_proof']=proof;proofs[label]=str(proof)
+            roles['source_runtime_archive']=source/'edr-agent-win_3.2.742-windows-arm64-exe.zip'
+            for name,data in [('FDSensor.exe',b'agent'),('edr_agent_inplace_update.ps1',actual),('FDSensorTaskLaunch.ps1',b'launcher'),('native-package-integrity.json',b'integrity'),('agent.toml',b'config')]:
+                (installed/name).write_bytes(data)
+            consumer=dict(agent_sha256=sha(b'agent'),updater_sha256=sha(actual),launcher_sha256=sha(b'launcher'),native_integrity_sha256=sha(b'integrity'))
+            receipt['config_sha256']=sha(b'config');receipt_path.write_text(json.dumps(receipt))
+            staged=dict(schema='edr.exact-installed-742-to-747.inputs.v1',source_version='3.2.742',target_version='3.2.747',architecture='arm64',runtime_mode='scheduled_task',first_hop_inputs_staged=False,upgrade_input=None,storage_tools_input=None,
+                source_setup_exe=str(roles['source_setup']),target_setup_exe=str(roles['target_setup']),source_publisher_proof=proofs['source'],target_publisher_proof=proofs['target'],
+                file_bindings=[dict(role=k,path=str(v),sha256=exact.io_owner.digest(v),bytes=v.stat().st_size) for k,v in roles.items()])
+            input_path=root/'lifecycle-inputs.json';input_path.write_text(json.dumps(staged))
+            def producer(target,source,out,*args):
+                out.mkdir();transition=dict(baseline_updater_sha256=sha(packaged),upgrade_class='installer_required',binary_sha256='target-hash')
+                (out/'transition.json').write_text(json.dumps(transition));return transition
+            with patch.object(exact,'INSTALL_DIR',str(installed)),patch.object(exact,'UPDATER_SHA',sha(actual)),patch.object(exact,'PACKAGED_UPDATER_SHA',sha(packaged)),patch.object(exact,'LAUNCHER_SHA',sha(b'launcher')),patch.object(exact,'INTEGRITY_SHA',sha(b'integrity')),patch.object(exact,'ASSETS',inventories),patch.object(exact,'qualification_consumer',return_value=consumer),patch.object(exact,'validate_request'),patch.object(exact,'check_manifest'),patch.object(exact.checkpoint,'prepare_lifecycle_upgrade',side_effect=producer):
+                path=exact.prepare_first_hop(input_path,exact.io_owner.digest(input_path),receipt_path,exact.io_owner.digest(receipt_path),root/'out',env)
+            output=json.loads(path.read_text());transition=json.loads((root/'out/transition.json').read_text())
+            self.assertEqual(output['expected_recovery']['updater_sha256'],sha(actual))
+            self.assertEqual(transition['baseline_updater_sha256'],sha(packaged))
+            self.assertEqual(output['expected_recovery']['task_owner'],receipt['task_owner'])
+            self.assertEqual(output['target_release_binding_sha256'],exact.io_owner.digest(root/'out/transition.json'))
+            self.assertFalse(output['full_gate']);self.assertFalse(output['deployment_authorized'])
+
+    def test_stale_receipt_fails_before_producer_or_source_mutation(self):
+        receipt,env=self.fixture();receipt['run_attempt']='1'
+        with tempfile.TemporaryDirectory() as directory,patch.object(exact.checkpoint,'prepare_lifecycle_upgrade') as producer:
+            root=Path(directory);input_path=root/'inputs.json';input_path.write_text('{}')
+            receipt_path=root/'receipt.json';receipt_path.write_text(json.dumps(receipt))
+            with self.assertRaisesRegex(ValueError,'fresh harness'):
+                exact.prepare_first_hop(input_path,exact.io_owner.digest(input_path),receipt_path,exact.io_owner.digest(receipt_path),root/'out',env)
+            producer.assert_not_called();self.assertFalse((root/'out').exists())
 
 
 if __name__=='__main__':unittest.main()

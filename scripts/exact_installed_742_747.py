@@ -1,5 +1,9 @@
 """Fixed, disposable ARM task qualification; never published-baseline eligibility."""
 import argparse
+import hashlib
+import re
+import stat
+import zipfile
 import json
 import os
 from pathlib import Path
@@ -278,12 +282,160 @@ def stage(request, root):
     return result
 
 
+
+INSTALL_DIR = r'C:\Program Files\FDSecurity'
+INTEGRITY_SHA = '5399c68ef8860199c2efccc4ece6b8e489b01cd7e6f89cfe582df3332e4f37f9'
+FIRST_HOP_SCHEMA = 'edr.exact742-to747.first-hop.v1'
+BINDING_ROLES = {'source_setup', 'target_setup', 'source_manifest', 'source_cms', 'source_proof',
+                 'target_manifest', 'target_cms', 'target_proof', 'source_runtime_archive'}
+
+
+def pinned_file(path, expected, limit=32 * 1024 * 1024):
+    path = Path(path)
+    info = path.lstat()
+    if (not stat.S_ISREG(info.st_mode) or getattr(info, 'st_file_attributes', 0) & 0x400
+            or not 0 < info.st_size <= limit or not re.fullmatch('[a-f0-9]{64}', str(expected))
+            or io_owner.digest(path) != expected):
+        raise ValueError('Exact first-hop file identity changed: ' + path.name)
+    return path
+
+
+def qualification_consumer(receipt, environment):
+    """Only this clean hosted job's successful actual Setup receipt is eligible."""
+    identities = {'harness_commit': 'GITHUB_SHA', 'run_id': 'GITHUB_RUN_ID',
+                  'run_attempt': 'GITHUB_RUN_ATTEMPT', 'job': 'GITHUB_JOB'}
+    for field, variable in identities.items():
+        value = environment.get(variable, '')
+        pattern = '[a-f0-9]{40}' if field == 'harness_commit' else ('[1-9][0-9]*' if field in ('run_id', 'run_attempt') else '[A-Za-z0-9_-]+')
+        if not re.fullmatch(pattern, value) or receipt.get(field) != value:
+            raise ValueError('Qualification is not from this fresh harness job: ' + field)
+    if (environment.get('GITHUB_ACTIONS') != 'true' or environment.get('RUNNER_ENVIRONMENT') != 'github-hosted'
+            or environment.get('RUNNER_ARCH') != 'ARM64' or receipt.get('runner_environment') != 'github-hosted'
+            or receipt.get('architecture') != 'arm64' or receipt.get('target_version') != '3.2.747'
+            or receipt.get('schema') != 'edr.exact-installed742.qualification-result.v1'
+            or receipt.get('complete') is not True or receipt.get('qualification_only') is not True
+            or any(receipt.get(k) is not False for k in ('full_gate', 'full_gate_passed', 'deployment_authorized'))
+            or receipt.get('source_version') != '3.2.742'):
+        raise ValueError('First-hop requires actual hosted ARM qualification, never full-gate admission')
+    source_assets = {a['name']: a for a in ASSETS['source']}
+    agent = source_assets['edr-agent-win_3.2.742-windows-arm64-FDSensor.exe']['digest'][7:]
+    expected = dict(install_dir=INSTALL_DIR, runtime_mode='scheduled_task', agent_sha256=agent,
+                    updater_sha256=UPDATER_SHA, launcher_sha256=LAUNCHER_SHA, native_integrity_sha256=INTEGRITY_SHA)
+    if receipt.get('consumer_identity') != expected or receipt.get('source_setup_sha256') != source_assets['edr-agent-win_3.2.742-windows-arm64-setup.exe']['digest'][7:]:
+        raise ValueError('Actual signed Setup consumer identity mismatch')
+    if receipt.get('setup_output') != {k: expected[k] for k in ('updater_sha256', 'launcher_sha256', 'native_integrity_sha256')}:
+        raise ValueError('Qualification actual Setup output changed')
+    if not re.fullmatch('[a-f0-9]{64}', str(receipt.get('config_sha256', ''))):
+        raise ValueError('Qualification synthetic config digest missing')
+    task, uninstall = receipt.get('task_owner', {}), receipt.get('uninstall', {})
+    if (task.get('mode') != 'scheduled_task' or task.get('name') != 'FDSecurityAgent' or task.get('path') != '\\'
+            or not task.get('xml') or not task.get('sddl') or uninstall.get('version') != '3.2.742'
+            or uninstall.get('location', '').rstrip('\\') != INSTALL_DIR):
+        raise ValueError('Qualification source task or uninstall prestate missing')
+    return expected
+
+
+
+def assert_updater_equivalence(packaged, actual):
+    if (hashlib.sha256(packaged).hexdigest() != PACKAGED_UPDATER_SHA
+            or hashlib.sha256(actual).hexdigest() != UPDATER_SHA
+            or packaged.replace(b'\r\n', b'\n') != actual):
+        raise ValueError('Installed CAE is not the exact packaged updater CRLF-to-LF equivalent')
+
+def prepare_first_hop(input_path, input_sha256, receipt_path, receipt_sha256, destination, environment=None):
+    """Test-only adapter: original packaged baseline889 stays distinct from installed CAE."""
+    environment = os.environ if environment is None else environment
+    input_path = pinned_file(input_path, input_sha256, 1024 * 1024)
+    receipt_path = pinned_file(receipt_path, receipt_sha256, 1024 * 1024)
+    staged, receipt = io_owner.read(input_path), io_owner.read(receipt_path)
+    consumer = qualification_consumer(receipt, environment)
+    if (staged.get('schema') != 'edr.exact-installed-742-to-747.inputs.v1'
+            or staged.get('source_version') != '3.2.742' or staged.get('target_version') != '3.2.747'
+            or staged.get('architecture') != 'arm64' or staged.get('runtime_mode') != 'scheduled_task'
+            or staged.get('first_hop_inputs_staged') is not False or staged.get('upgrade_input') is not None
+            or staged.get('storage_tools_input') is not None):
+        raise ValueError('First-hop requires unchanged qualification-only staging')
+    root = input_path.parent
+    bindings = staged.get('file_bindings', [])
+    if len(bindings) != len(BINDING_ROLES) or {b['role'] for b in bindings} != BINDING_ROLES:
+        raise ValueError('Exact first-hop requires nine unique staged roles')
+    role_paths = {}
+    for label, version in (('source', '3.2.742'), ('target', '3.2.747')):
+        prefix = 'edr-agent-win_' + version + '-windows-arm64-'
+        role_paths.update({label + '_setup': root / label / (prefix + 'setup.exe'),
+                          label + '_manifest': root / label / (prefix + 'artifact-manifest.json'),
+                          label + '_cms': root / label / (prefix + 'artifact-manifest.json.p7s'),
+                          label + '_proof': root / label / 'publisher-verification.json'})
+    role_paths['source_runtime_archive'] = root / 'source/edr-agent-win_3.2.742-windows-arm64-exe.zip'
+    for field, role in [('source_setup_exe', 'source_setup'), ('target_setup_exe', 'target_setup'),
+                        ('source_publisher_proof', 'source_proof'), ('target_publisher_proof', 'target_proof')]:
+        if Path(staged.get(field, '')).resolve() != role_paths[role].resolve():
+            raise ValueError('Qualification role path changed: ' + field)
+    for binding in bindings:
+        if Path(binding['path']).resolve() != role_paths[binding['role']].resolve():
+            raise ValueError('Staged role does not identify its exact release member')
+        file = pinned_file(binding['path'], binding['sha256'])
+        if file.stat().st_size != binding['bytes']:
+            raise ValueError('Staged input length changed')
+    request = {'schema': SCHEMA, **{label + '_publisher_proof': io_owner.read(staged[label + '_publisher_proof']) for label in ('source', 'target')}}
+    validate_request(request)
+    for label in ('source', 'target'):
+        inventory = {a['name']: a for a in ASSETS[label]}
+        directory = root / label
+        check_manifest(label, directory, inventory, request[label + '_publisher_proof'])
+        archive = directory / ('edr-agent-win_' + ('3.2.742' if label == 'source' else '3.2.747') + '-windows-arm64-exe.zip')
+        pinned_file(archive, inventory[archive.name]['digest'][7:])
+    installed = Path(INSTALL_DIR)
+    for name, expected in [('FDSensor.exe', consumer['agent_sha256']), ('edr_agent_inplace_update.ps1', UPDATER_SHA),
+                           ('FDSensorTaskLaunch.ps1', LAUNCHER_SHA), ('native-package-integrity.json', INTEGRITY_SHA),
+                           ('agent.toml', receipt['config_sha256'])]:
+        pinned_file(installed / name, expected)
+    baseline = root / 'source/edr-agent-win_3.2.742-windows-arm64-exe.zip'
+    with zipfile.ZipFile(baseline) as archive:
+        packaged = archive.read('edr_agent_inplace_update.ps1')
+    actual = (installed / 'edr_agent_inplace_update.ps1').read_bytes()
+    assert_updater_equivalence(packaged, actual)
+    destination = Path(destination).resolve()
+    if destination.exists():
+        raise ValueError('Fresh first-hop output directory required')
+    transition = checkpoint.prepare_lifecycle_upgrade(root / 'target', root / 'source', destination,
+        'win_3.2.747', 'win_3.2.742', 'arm64', Path(staged['target_publisher_proof']))
+    if (transition['baseline_updater_sha256'] != PACKAGED_UPDATER_SHA or transition['upgrade_class'] != 'installer_required'
+            or transition['binary_sha256'] != request['target_publisher_proof']['artifact_sha256']):
+        raise ValueError('Standard target release binding differs from exact first-hop')
+    transition_path = destination / 'transition.json'
+    result = dict(schema=FIRST_HOP_SCHEMA, source_consumer_receipt_path=str(receipt_path.resolve()),
+        source_consumer_receipt_sha256=receipt_sha256, qualification_input_path=str(input_path.resolve()),
+        qualification_input_sha256=input_sha256, target_release_binding_path=str(transition_path),
+        target_release_binding_sha256=io_owner.digest(transition_path), packaged_source_runtime_sha256=io_owner.digest(baseline),
+        packaged_source_updater_sha256=PACKAGED_UPDATER_SHA, source_updater_path=str(installed / 'edr_agent_inplace_update.ps1'),
+        install_dir=INSTALL_DIR, architecture='arm64', runtime_mode='scheduled_task',
+        harness={key: receipt[key] for key in ('harness_commit', 'run_id', 'run_attempt', 'job')},
+        expected_recovery=dict(version=receipt['source_version'], agent_sha256=consumer['agent_sha256'], updater_sha256=consumer['updater_sha256'],
+            launcher_sha256=consumer['launcher_sha256'], native_integrity_sha256=consumer['native_integrity_sha256'],
+            config_sha256=receipt['config_sha256'], task_owner=receipt['task_owner'], uninstall=receipt['uninstall']),
+        target_agent_sha256=transition['binary_sha256'], full_gate=False, deployment_authorized=False,
+        old_full_setup_rollback_supported=False)
+    path = destination / 'first-hop-input.json'
+    path.write_text(json.dumps(result, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+    return path
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('mode', choices=('validate', 'stage'))
+    parser.add_argument('mode', choices=('validate', 'stage', 'first-hop'))
     parser.add_argument('--request', type=Path)
     parser.add_argument('--root', type=Path)
+    parser.add_argument('--input', type=Path)
+    parser.add_argument('--input-sha256')
+    parser.add_argument('--receipt', type=Path)
+    parser.add_argument('--receipt-sha256')
     args = parser.parse_args()
+    if args.mode == 'first-hop':
+        if not all((args.input, args.input_sha256, args.receipt, args.receipt_sha256, args.root)):
+            parser.error('first-hop requires pinned --input, --receipt and fresh --root')
+        path = prepare_first_hop(args.input, args.input_sha256, args.receipt, args.receipt_sha256, args.root)
+        print(json.dumps(dict(input_path=str(path), input_sha256=io_owner.digest(path), full_gate=False, deployment_authorized=False)))
+        return
     raw = args.request.read_text(encoding='utf-8-sig') if args.request else os.environ.get('EXACT_INSTALLED_TRANSITION_REQUEST', '')
     if len(raw.encode('utf-8')) > 32768:
         raise ValueError('Exact request exceeds 32 KiB')
