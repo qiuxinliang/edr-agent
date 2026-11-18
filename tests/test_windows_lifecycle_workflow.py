@@ -40,7 +40,7 @@ class WindowsLifecycleWorkflowTests(unittest.TestCase):
         routing=self.text.split('  validate-publisher-routing:',1)[1].split('  native-lifecycle:',1)[0]
         self.assertIn('    permissions:\n      contents: read',routing)
         self.assertNotIn('contents: write',routing)
-        self.assertEqual(self.text.count('    needs: validate-publisher-routing'),3)
+        self.assertEqual(self.text.count('    needs: validate-publisher-routing'),4)
         _,full,headless=download_branches(self.text)
         self.assertIn('if ($env:PUBLISHER_VERIFICATION_JSON)',full)
         self.assertIn('artifact-manifest.json.p7s" downloads\\target',full)
@@ -50,6 +50,29 @@ class WindowsLifecycleWorkflowTests(unittest.TestCase):
         self.assertIn("@('--publisher-verification-map', $mapPath)",bind)
         self.assertNotIn('${{ inputs.publisher_verification_json }}',bind)
         self.assertIn('@publisherArgs',bind)
+
+    def test_exact742_qualification_isolated_and_cannot_masquerade_full_gate(self):
+        body=self.text.split('  exact-installed742-qualification:',1)[1]
+        self.assertIn('runs-on: windows-11-vs2026-arm',body)
+        self.assertIn('    permissions:\n      contents: read',body)
+        self.assertIn('USB_SIGNING_RELEASE_TOKEN: ${{ secrets.USB_SIGNING_RELEASE_TOKEN }}',body)
+        self.assertNotIn('USB_SIGNING_TOKEN:',body)
+        self.assertNotIn('cmake --build',body)
+        self.assertNotIn('stage_native.py',body)
+        self.assertNotIn('windows-lifecycle-evidence-',body)
+        self.assertIn('exact742-qualification-only-',body)
+        self.assertIn('$result.full_gate -ne $false',body)
+        self.assertIn('$result.full_gate_passed -ne $false',body)
+        self.assertIn('$result.deployment_authorized -ne $false',body)
+        negatives=step(body,'Parse modified PowerShell and run fresh no-key negative consumers before any Setup')
+        actual=step(body,'Qualify actual installed742 consumer in a separate fresh native process')
+        self.assertIn('& $windowsPowerShell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File',negatives)
+        self.assertIn('test_exact_installed742_qualification.ps1',negatives)
+        self.assertNotIn('& ./tests/',negatives)
+        self.assertIn('& $windowsPowerShell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File scripts/windows_setup_exe_lifecycle_smoke.ps1',actual)
+        self.assertIn('-ExactInstalledTransitionInputSha256 $env:EXACT_INPUT_SHA256',actual)
+        self.assertLess(body.index('Parse modified PowerShell'),body.index('Qualify actual installed742'))
+        self.assertIn('!inputs.exact_installed_transition_request',self.text.split('  native-lifecycle:',1)[1].split('  recover-synthetic-owner:',1)[0])
 
     def setUp(self):
         self.text = WORKFLOW.read_text(encoding='utf-8')
