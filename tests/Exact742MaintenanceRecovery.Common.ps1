@@ -115,6 +115,18 @@ function Convert-ExactRegistrationPath([string]$Path) {
  if(!$Path){return ''}
  return [IO.Path]::GetFullPath(($Path -replace '\\+','\')).TrimEnd('\').ToLowerInvariant()
 }
+# Classify unrelated products without making their malformed paths our contract.
+# Named EDR keys always proceed to the strict value/path validator below.
+function Test-ExactMaintenanceRegistrationRelevant([string]$Name,[string]$Location) {
+ if($Name -ceq 'FDSecurityAgentHeadless' -or $Name -ceq '{A73C1E7F-8D94-4A2C-BF5D-1E2F3A4B5C6D}}_is1'){return $true}
+ $expected=Convert-ExactRegistrationPath $InstallDir
+ try{return (Convert-ExactRegistrationPath $Location) -ceq $expected}
+ catch{
+  $cause=$_.Exception.GetBaseException()
+  if($cause -is [ArgumentException] -or $cause -is [NotSupportedException] -or $cause -is [IO.PathTooLongException]){return $false}
+  throw
+ }
+}
 function Get-ExactRegistrationDigest($Entry) {
  $sha=[Security.Cryptography.SHA256]::Create()
  try{return ([BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes(($Entry|ConvertTo-Json -Depth 12 -Compress))))).Replace('-','').ToLowerInvariant()}finally{$sha.Dispose()}
@@ -132,7 +144,7 @@ function Get-ExactMaintenanceRegistrationInventory {
     try{
      $key=$parent.OpenSubKey($name,$false);if(!$key){throw 'Uninstall key disappeared during inventory'}
      $location=[string]$key.GetValue('InstallLocation','',[Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
-     if($name -cne 'FDSecurityAgentHeadless' -and $name -cne '{A73C1E7F-8D94-4A2C-BF5D-1E2F3A4B5C6D}}_is1' -and (Convert-ExactRegistrationPath $location) -cne (Convert-ExactRegistrationPath $InstallDir)){continue}
+     if(!(Test-ExactMaintenanceRegistrationRelevant $name $location)){continue}
      $values=@();$valueNames=@($key.GetValueNames()|Sort-Object);if($valueNames.Count -gt 64){throw 'Uninstall value inventory exceeds64 bound'}
      foreach($valueName in $valueNames){$value=$key.GetValue($valueName,$null,[Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames);if(($value|ConvertTo-Json -Compress).Length -gt 16384){throw 'Uninstall registry value exceeds16KiB bound'};$values+=[ordered]@{name=$valueName;kind=[string]$key.GetValueKind($valueName);value=$value}}
      $acl=$key.GetAccessControl();$rows+=[ordered]@{key=$name;view=[string]$view;values=$values;subkey_count=$key.SubKeyCount;acl_protected=$acl.AreAccessRulesProtected;parent_acl_protected=$parent.GetAccessControl().AreAccessRulesProtected;sddl=$acl.GetSecurityDescriptorSddlForm([Security.AccessControl.AccessControlSections]::All)}

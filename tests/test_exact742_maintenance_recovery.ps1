@@ -84,6 +84,19 @@ namespace FDSecurity {
  $bad=($canonical|ConvertTo-Json -Depth 12|ConvertFrom-Json);$bad.values[2].value='"C:\other\unins000.exe"'
  Reject {Assert-ExactMaintenanceRegistrationInventory @($bad,$legacy) '3.2.742' $legacy}
  $env:RUNNER_ENVIRONMENT='self-hosted';Reject {New-ExactHeadlessRegistrationFixture};$env:RUNNER_ENVIRONMENT='github-hosted'
+ # Only unrelated malformed paths are ignored; named/third EDR keys stay strict.
+ $malformed='C:\unrelated'+[char]0+'product'
+ Need (!(Test-ExactMaintenanceRegistrationRelevant 'OtherProduct' $malformed)) 'Unrelated malformed registration must not abort or enter EDR inventory'
+ Need (!(Test-ExactMaintenanceRegistrationRelevant 'OtherProduct' 'C:\OtherProduct')) 'Unrelated valid registration entered EDR inventory'
+ Need (Test-ExactMaintenanceRegistrationRelevant 'FDSecurityAgentHeadless' $malformed) 'Named legacy malformed registration escaped strict validation'
+ Need (Test-ExactMaintenanceRegistrationRelevant $canonical.key $malformed) 'Named canonical malformed registration escaped strict validation'
+ Need (Test-ExactMaintenanceRegistrationRelevant 'ThirdProduct' ($InstallDir+'\')) 'Third registration pointing at FDSecurity was ignored'
+ $third=($canonical|ConvertTo-Json -Depth 12|ConvertFrom-Json);$third.key='ThirdProduct'
+ Reject {Assert-ExactMaintenanceRegistrationInventory @($canonical,$legacy,$third) '3.2.742' $legacy}
+ $bad=($canonical|ConvertTo-Json -Depth 12|ConvertFrom-Json);$bad.values[1].value=$malformed
+ Reject {Assert-ExactMaintenanceRegistrationInventory @($bad,$legacy) '3.2.742' $legacy}
+ $bad=($legacy|ConvertTo-Json -Depth 12|ConvertFrom-Json);@($bad.values|Where-Object {$_.name -ceq 'InstallLocation'})[0].value=$malformed
+ Reject {Assert-ExactMaintenanceRegistrationInventory @($canonical,$bad) '3.2.742' $legacy}
  $completed=$true
  Write-Host "PASS: $count direct maintenance contract and bounded Job boundary assertions; no product execution"
 }finally{foreach($key in $old.Keys){[Environment]::SetEnvironmentVariable($key,$old[$key],'Process')};if($completed){Remove-Item -LiteralPath $root -Recurse -Force}else{Write-Warning "Retained failed pure fixture: $root"}}
