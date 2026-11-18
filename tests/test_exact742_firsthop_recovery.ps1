@@ -27,8 +27,10 @@ try{
  $bad=$ready.Clone();$bad.Journal=$journal.Clone();$bad.Journal.stage='full_installer_upgrade';Need (!(Test-Exact742LateHealthReady @bad)) 'Early installer boundary allowed injection'
  $bad=$ready.Clone();$bad.Registry=@(@{version='3.2.742'});Need (!(Test-Exact742LateHealthReady @bad)) 'Registry not yet747 allowed injection'
  $before=@([ordered]@{key='product';version='3.2.742';location='C:\Program Files\FDSecurity';uninstall='source-uninstaller';quiet_uninstall='source-quiet'})
- $after=@($before[0].Clone());Assert-Exact742RegistryRestored $before $after
- $after[0].version='3.2.747';$frozen=$after|ConvertTo-Json -Compress
+ $afterEntry=[ordered]@{}
+ foreach($key in $before[0].Keys){$afterEntry[$key]=$before[0][$key]}
+ $after=@($afterEntry);Assert-Exact742RegistryRestored $before $after
+ $after[0].version='3.2.747';Need ($before[0].version -ceq '3.2.742') 'Recovery prestate fixture was aliased';$frozen=$after|ConvertTo-Json -Compress
  Reject {Assert-Exact742RegistryRestored $before $after} 'registry_restoration_gap'
  Need (($after|ConvertTo-Json -Compress) -ceq $frozen) 'Registry validator repaired the failed state'
  Assert-Exact742RecoveredGeneration $true 100 200 'C:\Program Files\FDSecurity\FDSensor.exe' 'C:\Program Files\FDSecurity\FDSensor.exe'
