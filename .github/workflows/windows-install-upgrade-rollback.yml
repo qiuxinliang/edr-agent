@@ -105,6 +105,11 @@ on:
         required: false
         default: '0'
         type: string
+      exact742_late_health_recovery:
+        description: Explicit fixed742-to747 ARM task late-health recovery case only; not full gate or deployment authorization
+        required: false
+        default: false
+        type: boolean
       exact_installed_transition_request:
         description: Explicit fixed ARM task installed742-to747 source qualification only; not a full or deployment gate
         required: false
@@ -144,6 +149,9 @@ jobs:
           LIFECYCLE_BASELINE_TAG: ${{ inputs.baseline_tag }}
           LIFECYCLE_PACKAGE_SCOPE: ${{ inputs.package_scope }}
           EXACT_INSTALLED_TRANSITION_REQUEST: ${{ inputs.exact_installed_transition_request }}
+          EXACT742_LATE_HEALTH_RECOVERY: ${{ inputs.exact742_late_health_recovery }}
+          INSTALLER_TIMEOUT_RECOVERY: ${{ inputs.installer_timeout_recovery }}
+          NATIVE_REPEAT_COUNT: ${{ inputs.native_repeat_count }}
           LIFECYCLE_ARCHITECTURE: ${{ inputs.architecture }}
           EDR_RELEASE_PACKAGE_SCOPE: ${{ inputs.package_scope }}
           CACHE_RECOVERY_SUBSET: ${{ inputs.cache_recovery_subset }}
@@ -1163,7 +1171,7 @@ jobs:
           if($LASTEXITCODE -ne 0){throw 'Signed lifecycle evidence was not retained'}
 
   exact-installed742-qualification:
-    name: Exact installed742 source qualification only (ARM64 task; not full gate)
+    name: ${{ inputs.exact742_late_health_recovery && 'Exact742 late health recovery case only (ARM64 task; not full gate)' || 'Exact742 source qualification only (ARM64 task; not full gate)' }}
     needs: validate-publisher-routing
     if: github.event_name == 'workflow_dispatch' && inputs.exact_installed_transition_request && github.repository == 'qiuxinliang/edr-agent'
     runs-on: windows-11-vs2026-arm
@@ -1195,7 +1203,7 @@ jobs:
           $windowsPowerShell=Join-Path $env:SystemRoot 'System32/WindowsPowerShell/v1.0/powershell.exe'
           $parseCode=@'
           $ErrorActionPreference='Stop'
-          foreach($name in @('scripts/windows_setup_exe_lifecycle_smoke.ps1','scripts/Exact-Installed742Qualification.ps1','tests/Invoke-LifecycleStorageCompatibility.ps1','tests/test_exact_installed742_qualification.ps1')){
+          foreach($name in @('scripts/windows_setup_exe_lifecycle_smoke.ps1','scripts/Exact-Installed742Qualification.ps1','tests/Invoke-LifecycleStorageCompatibility.ps1','tests/test_exact_installed742_qualification.ps1','tests/Exact742FirstHopRecovery.Common.ps1','tests/Invoke-Exact742FirstHopHealthRecovery.ps1','tests/test_exact742_firsthop_recovery.ps1')){
             $tokens=$null;$errors=$null
             $null=[Management.Automation.Language.Parser]::ParseFile((Join-Path $PWD $name),[ref]$tokens,[ref]$errors)
             if(@($errors).Count){throw ('WindowsPS syntax failure: '+$name)}
@@ -1203,7 +1211,7 @@ jobs:
           '@
           & $windowsPowerShell -NoProfile -NonInteractive -Command $parseCode
           if($LASTEXITCODE -ne 0){throw 'WindowsPS5.1 qualification syntax failed'}
-          foreach($test in @('test_exact_installed742_qualification.ps1','test_windows_lifecycle_first_hop.ps1','test_windows_lifecycle_runtime_mode.ps1','test_windows_lifecycle_publisher.ps1')){
+          foreach($test in @('test_exact_installed742_qualification.ps1','test_exact742_firsthop_recovery.ps1','test_windows_lifecycle_first_hop.ps1','test_windows_lifecycle_runtime_mode.ps1','test_windows_lifecycle_publisher.ps1')){
             # The qualification negative fixture defines isolated doubles. Never
             # run it in the later real Setup process or share its loaded types.
             & $windowsPowerShell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Join-Path $PWD ('tests/'+$test)) -RepoRoot $PWD
@@ -1241,18 +1249,51 @@ jobs:
             -BaselineConfigTemplate (Join-Path $stage.source_runtime_directory 'agent_windows_production.example.toml') `
             -ExactInstalledTransitionInput $env:EXACT_INPUT_PATH -ExactInstalledTransitionInputSha256 $env:EXACT_INPUT_SHA256
           if($LASTEXITCODE -ne 0){throw 'Installed742 source qualification failed; no full gate or deployment authorization'}
+      - name: Bind actual qualified742 consumer to unchanged target747 envelope
+        if: inputs.exact742_late_health_recovery
+        timeout-minutes: 5
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          $receipt=Join-Path $PWD 'exact-qualification-evidence/exact742-qualification.json'
+          $receiptSha=(Get-FileHash -LiteralPath $receipt).Hash.ToLowerInvariant()
+          $raw=python scripts/exact_installed_742_747.py first-hop --input $env:EXACT_INPUT_PATH --input-sha256 $env:EXACT_INPUT_SHA256 --receipt $receipt --receipt-sha256 $receiptSha --root exact-first-hop-input
+          if($LASTEXITCODE -ne 0){throw 'Actual742 consumer/target747 binding failed; no first hop allowed'}
+          $binding=$raw|ConvertFrom-Json
+          "EXACT_FIRST_HOP_PATH=$($binding.input_path)"|Out-File $env:GITHUB_ENV -Append -Encoding UTF8
+          "EXACT_FIRST_HOP_SHA256=$($binding.input_sha256)"|Out-File $env:GITHUB_ENV -Append -Encoding UTF8
+      - name: Exercise one late-health failure and original742 automatic recovery in a fresh native process
+        if: inputs.exact742_late_health_recovery
+        timeout-minutes: 15
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          $windowsPowerShell=Join-Path $env:SystemRoot 'System32/WindowsPowerShell/v1.0/powershell.exe'
+          & $windowsPowerShell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File tests/Invoke-Exact742FirstHopHealthRecovery.ps1 `
+            -FirstHopInput $env:EXACT_FIRST_HOP_PATH -FirstHopInputSha256 $env:EXACT_FIRST_HOP_SHA256 -EvidenceDir exact-late-health-evidence
+          if($LASTEXITCODE -ne 0){throw 'Exact742 late-health recovery failed; no retry or deployment authorization'}
+      - name: Preserve late-health case scope without full-gate authorization
+        if: inputs.exact742_late_health_recovery
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          $result=Get-Content exact-late-health-evidence/result.json -Raw -Encoding UTF8|ConvertFrom-Json
+          if($result.schema -cne 'edr.exact742.late-health-recovery.v1' -or !$result.case_passed -or !$result.fault_injected -or !$result.installer_job_empty -or !$result.updater_exit_confirmed -or $result.first_failure -or $result.cleanup_failure -or $result.full_gate -ne $false -or $result.full_gate_passed -ne $false -or $result.deployment_authorized -ne $false){throw 'Late-health result is incomplete or claims unsupported scope'}
+          'Single ARM task case only: signed742 Setup consumer qualification, original CAE first hop to signed747 and late-health failure recovery. No full Setup downgrade, storage readback, global release gate or deployment authorization.'|Out-File $env:GITHUB_STEP_SUMMARY -Append
       - name: Preserve qualification-only result scope
         shell: pwsh
         run: |
           $result=Get-Content exact-qualification-evidence/exact742-qualification.json -Raw -Encoding UTF8|ConvertFrom-Json
           if(!$result.complete -or !$result.qualification_only -or $result.full_gate -ne $false -or $result.full_gate_passed -ne $false -or $result.deployment_authorized -ne $false){throw 'Qualification result must never masquerade as full acceptance'}
-          'Qualification only: first-hop upgrade, fault recovery, storage readback and deployment remain unverified.'|Out-File $env:GITHUB_STEP_SUMMARY -Append
+          'Signed742 Setup consumer qualified; this qualification result alone does not establish first-hop recovery, storage readback or deployment authorization.'|Out-File $env:GITHUB_STEP_SUMMARY -Append
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: exact742-qualification-only-${{ github.run_id }}-${{ github.run_attempt }}
+          name: ${{ inputs.exact742_late_health_recovery && 'exact742-late-health-recovery-case-only' || 'exact742-qualification-only' }}-${{ github.run_id }}-${{ github.run_attempt }}
           retention-days: 7
           if-no-files-found: error
           path: |
             exact-qualification-evidence
             exact-installed-input/lifecycle-inputs.json
+            exact-first-hop-input
+            exact-late-health-evidence

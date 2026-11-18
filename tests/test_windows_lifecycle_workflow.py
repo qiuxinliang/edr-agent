@@ -60,7 +60,7 @@ class WindowsLifecycleWorkflowTests(unittest.TestCase):
         self.assertNotIn('cmake --build',body)
         self.assertNotIn('stage_native.py',body)
         self.assertNotIn('windows-lifecycle-evidence-',body)
-        self.assertIn('exact742-qualification-only-',body)
+        self.assertIn("'exact742-qualification-only'",body)
         self.assertIn('$result.full_gate -ne $false',body)
         self.assertIn('$result.full_gate_passed -ne $false',body)
         self.assertIn('$result.deployment_authorized -ne $false',body)
@@ -68,11 +68,41 @@ class WindowsLifecycleWorkflowTests(unittest.TestCase):
         actual=step(body,'Qualify actual installed742 consumer in a separate fresh native process')
         self.assertIn('& $windowsPowerShell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File',negatives)
         self.assertIn('test_exact_installed742_qualification.ps1',negatives)
+        self.assertIn('test_exact742_firsthop_recovery.ps1',negatives)
+        self.assertIn('tests/Exact742FirstHopRecovery.Common.ps1',negatives)
+        self.assertIn('tests/Invoke-Exact742FirstHopHealthRecovery.ps1',negatives)
         self.assertNotIn('& ./tests/',negatives)
         self.assertIn('& $windowsPowerShell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File scripts/windows_setup_exe_lifecycle_smoke.ps1',actual)
         self.assertIn('-ExactInstalledTransitionInputSha256 $env:EXACT_INPUT_SHA256',actual)
         self.assertLess(body.index('Parse modified PowerShell'),body.index('Qualify actual installed742'))
         self.assertIn('!inputs.exact_installed_transition_request',self.text.split('  native-lifecycle:',1)[1].split('  recover-synthetic-owner:',1)[0])
+
+    def test_exact742_late_case_is_explicit_single_and_not_normal_gate(self):
+        dispatch=self.text.split('  workflow_dispatch:',1)[1].split('permissions:',1)[0]
+        option=dispatch.split('      exact742_late_health_recovery:',1)[1].split('      exact_installed_transition_request:',1)[0]
+        self.assertIn('default: false',option);self.assertIn('type: boolean',option)
+        routing=step(self.text,'Reject ambiguous publisher proof routing before native setup')
+        self.assertIn('EXACT742_LATE_HEALTH_RECOVERY: ${{ inputs.exact742_late_health_recovery }}',routing)
+        body=self.text.split('  exact-installed742-qualification:',1)[1]
+        for label in ('Exact742 late health recovery case only','Exact742 source qualification only','exact742-late-health-recovery-case-only',"'exact742-qualification-only'"):
+            self.assertIn(label,body)
+        bind=step(body,'Bind actual qualified742 consumer to unchanged target747 envelope')
+        case=step(body,'Exercise one late-health failure and original742 automatic recovery in a fresh native process')
+        summary=step(body,'Preserve late-health case scope without full-gate authorization')
+        for optional in (bind,case,summary):self.assertIn('if: inputs.exact742_late_health_recovery',optional)
+        self.assertIn('--receipt-sha256 $receiptSha',bind)
+        self.assertIn('--input-sha256 $env:EXACT_INPUT_SHA256',bind)
+        self.assertIn('& $windowsPowerShell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File tests/Invoke-Exact742FirstHopHealthRecovery.ps1',case)
+        self.assertIn('-FirstHopInputSha256 $env:EXACT_FIRST_HOP_SHA256',case)
+        self.assertNotIn('continue-on-error',case)
+        self.assertNotIn('IssuedAtUnixMs',case);self.assertNotIn('DeadlineUnixMs',case)
+        for required in ('!$result.case_passed','!$result.fault_injected','!$result.installer_job_empty','!$result.updater_exit_confirmed','$result.first_failure','$result.cleanup_failure','$result.full_gate -ne $false','$result.deployment_authorized -ne $false'):
+            self.assertIn(required,summary)
+        self.assertLess(body.index('Qualify actual installed742'),body.index('Bind actual qualified742'))
+        self.assertLess(body.index('Bind actual qualified742'),body.index('Exercise one late-health'))
+        native=self.text.split('  native-lifecycle:',1)[1].split('  recover-synthetic-owner:',1)[0]
+        self.assertNotIn('exact742_late_health_recovery',native)
+        self.assertNotIn('needs: exact-installed742-qualification',self.text)
 
     def setUp(self):
         self.text = WORKFLOW.read_text(encoding='utf-8')

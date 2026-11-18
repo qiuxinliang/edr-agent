@@ -1031,9 +1031,9 @@ def main():
         env["EDR_RELEASE_PACKAGE_SCOPE"] = args.package_scope
     scope = package_scope(env)
     if args.command == "validate-publisher-routing":
-        if os.environ.get("EXACT_INSTALLED_TRANSITION_REQUEST", ""):
+        if os.environ.get("EXACT_INSTALLED_TRANSITION_REQUEST", "") or os.environ.get("EXACT742_LATE_HEALTH_RECOVERY", "") not in ("", "false"):
             from exact_installed_742_747 import validate_routing
-            validate_routing(os.environ["EXACT_INSTALLED_TRANSITION_REQUEST"], os.environ)
+            validate_routing(os.environ.get("EXACT_INSTALLED_TRANSITION_REQUEST", ""), os.environ)
         publisher_verification_map(os.environ.get("PUBLISHER_VERIFICATION_JSON", ""), args.tag,
             os.environ.get("LIFECYCLE_ARCHITECTURE", "all"), scope,
             os.environ.get("CACHE_RECOVERY_SUBSET", "false") == "true",

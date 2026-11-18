@@ -166,6 +166,11 @@ def validate_request(request):
 
 
 def validate_routing(raw, environment):
+    late = environment.get('EXACT742_LATE_HEALTH_RECOVERY', '')
+    if late not in ('', 'false', 'true') or (late == 'true' and not raw):
+        raise ValueError('Late-health recovery requires the explicit exact installed transition request')
+    if late == 'true' and (environment.get('INSTALLER_TIMEOUT_RECOVERY') == 'true' or environment.get('NATIVE_REPEAT_COUNT', '1') != '1'):
+        raise ValueError('Exact late-health recovery is one case and cannot mix generic timeout or repeat modes')
     if not raw:
         return None
     if (len(raw.encode('utf-8')) > 32768 or environment.get('GITHUB_EVENT_NAME') != 'workflow_dispatch'
