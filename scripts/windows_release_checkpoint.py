@@ -1031,7 +1031,7 @@ def main():
         env["EDR_RELEASE_PACKAGE_SCOPE"] = args.package_scope
     scope = package_scope(env)
     if args.command == "validate-publisher-routing":
-        if os.environ.get("EXACT_INSTALLED_TRANSITION_REQUEST", "") or os.environ.get("EXACT742_LATE_HEALTH_RECOVERY", "") not in ("", "false") or os.environ.get("EXACT742_SETUP_MAINTENANCE_RECOVERY", "") not in ("", "false") or os.environ.get("EXACT742_STORAGE_READBACK", "") not in ("", "false"):
+        if os.environ.get("EXACT_INSTALLED_TRANSITION_REQUEST", "") or os.environ.get("EXACT742_LATE_HEALTH_RECOVERY", "") not in ("", "false") or os.environ.get("EXACT742_SETUP_MAINTENANCE_RECOVERY", "") not in ("", "false") or os.environ.get("EXACT742_STORAGE_READBACK", "") not in ("", "false") or os.environ.get("EXACT742_EXISTING_HEADLESS_REGISTRATION", "") not in ("", "false"):
             from exact_installed_742_747 import validate_routing
             validate_routing(os.environ.get("EXACT_INSTALLED_TRANSITION_REQUEST", ""), os.environ)
         publisher_verification_map(os.environ.get("PUBLISHER_VERIFICATION_JSON", ""), args.tag,

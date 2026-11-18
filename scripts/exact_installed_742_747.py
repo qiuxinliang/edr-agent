@@ -166,6 +166,11 @@ def validate_request(request):
 
 
 def validate_routing(raw, environment):
+    headless_registration = environment.get('EXACT742_EXISTING_HEADLESS_REGISTRATION', '')
+    if (headless_registration not in ('', 'false', 'true') or (headless_registration == 'true' and
+            (environment.get('EXACT742_SETUP_MAINTENANCE_RECOVERY') != 'true'
+             or environment.get('EXACT742_STORAGE_READBACK') == 'true' or environment.get('EXACT742_LATE_HEALTH_RECOVERY') == 'true'))):
+        raise ValueError('Existing Headless registration requires maintenance only, without storage or late-health cases')
     storage = environment.get('EXACT742_STORAGE_READBACK', '')
     if storage not in ('', 'false', 'true') or (storage == 'true' and environment.get('EXACT742_SETUP_MAINTENANCE_RECOVERY') != 'true'):
         raise ValueError('Exact storage readback requires the explicit Setup maintenance/recovery case')

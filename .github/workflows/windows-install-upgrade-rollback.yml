@@ -120,6 +120,11 @@ on:
         required: false
         default: false
         type: boolean
+      exact742_existing_headless_registration:
+        description: Existing same-root historical Headless3.2.530 entry through signed Setup maintenance/recovery only; no database or full-gate claim
+        required: false
+        default: false
+        type: boolean
       exact_installed_transition_request:
         description: Explicit fixed ARM task installed742-to747 source qualification only; not a full or deployment gate
         required: false
@@ -162,6 +167,7 @@ jobs:
           EXACT742_LATE_HEALTH_RECOVERY: ${{ inputs.exact742_late_health_recovery }}
           EXACT742_SETUP_MAINTENANCE_RECOVERY: ${{ inputs.exact742_setup_maintenance_recovery }}
           EXACT742_STORAGE_READBACK: ${{ inputs.exact742_storage_readback }}
+          EXACT742_EXISTING_HEADLESS_REGISTRATION: ${{ inputs.exact742_existing_headless_registration }}
           INSTALLER_TIMEOUT_RECOVERY: ${{ inputs.installer_timeout_recovery }}
           NATIVE_REPEAT_COUNT: ${{ inputs.native_repeat_count }}
           LIFECYCLE_ARCHITECTURE: ${{ inputs.architecture }}
@@ -1190,7 +1196,7 @@ jobs:
           if($LASTEXITCODE -ne 0){throw 'Signed lifecycle evidence was not retained'}
 
   exact-installed742-qualification:
-    name: ${{ inputs.exact742_storage_readback && 'Exact742 synthetic storage + Setup recovery case only (not full gate)' || inputs.exact742_setup_maintenance_recovery && 'Exact742 post-install acceptance-refusal recovery only (data pending; not full gate)' || inputs.exact742_late_health_recovery && 'Exact742 late health recovery case only (ARM64 task; not full gate)' || 'Exact742 source qualification only (ARM64 task; not full gate)' }}
+    name: ${{ inputs.exact742_existing_headless_registration && 'Exact742 historical Headless registration Setup case only (no DB/full gate)' || inputs.exact742_storage_readback && 'Exact742 synthetic storage + Setup recovery case only (not full gate)' || inputs.exact742_setup_maintenance_recovery && 'Exact742 post-install acceptance-refusal recovery only (data pending; not full gate)' || inputs.exact742_late_health_recovery && 'Exact742 late health recovery case only (ARM64 task; not full gate)' || 'Exact742 source qualification only (ARM64 task; not full gate)' }}
     needs: [validate-publisher-routing, storage-compat-native-tools]
     if: ${{ !cancelled() && needs.validate-publisher-routing.result == 'success' && (needs.storage-compat-native-tools.result == 'success' || needs.storage-compat-native-tools.result == 'skipped') && github.event_name == 'workflow_dispatch' && inputs.exact_installed_transition_request && github.repository == 'qiuxinliang/edr-agent' }}
     runs-on: windows-11-vs2026-arm
@@ -1200,6 +1206,7 @@ jobs:
     env:
       EXACT_INSTALLED_TRANSITION_REQUEST: ${{ inputs.exact_installed_transition_request }}
       EXACT742_STORAGE_READBACK: ${{ inputs.exact742_storage_readback }}
+      EXACT742_EXISTING_HEADLESS_REGISTRATION: ${{ inputs.exact742_existing_headless_registration }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -1328,11 +1335,12 @@ jobs:
           $receipt=Join-Path $PWD 'exact-qualification-evidence/exact742-qualification.json'
           $receiptSha=(Get-FileHash -LiteralPath $receipt).Hash.ToLowerInvariant()
           $windowsPowerShell=Join-Path $env:SystemRoot 'System32/WindowsPowerShell/v1.0/powershell.exe'
-          $storageArgs=@()
-          if($env:EXACT742_STORAGE_READBACK -ceq 'true'){$storageArgs=@('-StorageToolsInput',$env:EXACT_STORAGE_INPUT,'-StorageToolsInputSha256',$env:EXACT_STORAGE_INPUT_SHA256)}
+          $caseArgs=@()
+          if($env:EXACT742_STORAGE_READBACK -ceq 'true'){$caseArgs=@('-StorageToolsInput',$env:EXACT_STORAGE_INPUT,'-StorageToolsInputSha256',$env:EXACT_STORAGE_INPUT_SHA256)}
+          if($env:EXACT742_EXISTING_HEADLESS_REGISTRATION -ceq 'true'){$caseArgs+=@('-ExistingHeadlessRegistrationFixture')}
           & $windowsPowerShell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File tests/Invoke-Exact742MaintenanceRecovery.ps1 `
             -QualificationInput $env:EXACT_INPUT_PATH -QualificationInputSha256 $env:EXACT_INPUT_SHA256 `
-            -SourceConsumerReceipt $receipt -SourceConsumerReceiptSha256 $receiptSha -EvidenceDir exact-maintenance-evidence @storageArgs
+            -SourceConsumerReceipt $receipt -SourceConsumerReceiptSha256 $receiptSha -EvidenceDir exact-maintenance-evidence @caseArgs
           if($LASTEXITCODE -ne 0){throw 'Direct signed Setup maintenance/recovery failed; no retry or deployment authorization'}
       - name: Preserve maintenance scope with explicit optional storage result
         if: inputs.exact742_setup_maintenance_recovery
@@ -1349,6 +1357,11 @@ jobs:
             if($result.data_scope -ne $false){throw 'Program-only phase cannot claim storage acceptance'}
             'Data/WAL/queue readback is pending.'|Out-File $env:GITHUB_STEP_SUMMARY -Append
           }
+          if($env:EXACT742_EXISTING_HEADLESS_REGISTRATION -ceq 'true'){
+            $registration=$result.existing_headless_registration
+            if(!$registration.tested -or !$registration.preserved -or $registration.version -cne '3.2.530' -or $registration.before_sha256 -cnotmatch '^[a-f0-9]{64}$' -or $registration.at747_sha256 -cne $registration.before_sha256 -or $registration.after742_sha256 -cne $registration.before_sha256 -or $result.data_scope -ne $false){throw 'Historical Headless entry paths, values, types and ACL must remain unchanged at747 and restored742'}
+            'Synthetic same-root historical Headless3.2.530 registration preserved through signed747 maintenance and signed742 recovery, including paths, values, types and ACL. No database, full-gate, deployment or new-signing claim.'|Out-File $env:GITHUB_STEP_SUMMARY -Append
+          }
           foreach($setup in @($result.maintenance,$result.recovery)){
             if(!$setup -or $setup.exit_code -ne 0 -or !$setup.job_empty -or $setup.limit_ms -ne 300000 -or $setup.drain_limit_ms -ne 5000 -or $setup.first_failure -or $setup.cleanup_failure){throw 'Signed Setup success and complete process-tree exit are required for both stages'}
           }
@@ -1362,7 +1375,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: ${{ inputs.exact742_storage_readback && 'exact742-maintenance-synthetic-storage-case-only' || inputs.exact742_setup_maintenance_recovery && 'exact742-setup-maintenance-recovery-program-only' || inputs.exact742_late_health_recovery && 'exact742-late-health-recovery-case-only' || 'exact742-qualification-only' }}-${{ github.run_id }}-${{ github.run_attempt }}
+          name: ${{ inputs.exact742_existing_headless_registration && 'exact742-existing-headless-registration-case-only' || inputs.exact742_storage_readback && 'exact742-maintenance-synthetic-storage-case-only' || inputs.exact742_setup_maintenance_recovery && 'exact742-setup-maintenance-recovery-program-only' || inputs.exact742_late_health_recovery && 'exact742-late-health-recovery-case-only' || 'exact742-qualification-only' }}-${{ github.run_id }}-${{ github.run_attempt }}
           retention-days: 7
           if-no-files-found: error
           path: |

@@ -166,10 +166,27 @@ class WindowsLifecycleWorkflowTests(unittest.TestCase):
         self.assertIn('--run-id $env:GITHUB_RUN_ID --run-attempt $env:GITHUB_RUN_ATTEMPT',bind)
         case=step(body,'Exercise signed747 direct maintenance and signed742 Setup recovery in a fresh native process')
         self.assertIn("@('-StorageToolsInput',$env:EXACT_STORAGE_INPUT,'-StorageToolsInputSha256',$env:EXACT_STORAGE_INPUT_SHA256)",case)
-        self.assertIn('@storageArgs',case)
+        self.assertIn('@caseArgs',case)
         summary=step(body,'Preserve maintenance scope with explicit optional storage result')
         for text in ('$result.data_preservation_passed -ne $true','@($result.storage_stages).Count -ne 3','$result.cross_database_atomic -ne $false','$result.outbox_tested -ne $false','$result.server_ack_tested -ne $false'):
             self.assertIn(text,summary)
+
+    def test_existing_headless_fixture_uses_existing_case_without_native_build(self):
+        dispatch=self.text.split('  workflow_dispatch:',1)[1].split('permissions:',1)[0]
+        option=dispatch.split('      exact742_existing_headless_registration:',1)[1].split('      exact_installed_transition_request:',1)[0]
+        self.assertIn('default: false',option);self.assertIn('type: boolean',option)
+        self.assertEqual(self.text.count('EXACT742_EXISTING_HEADLESS_REGISTRATION: ${{ inputs.exact742_existing_headless_registration }}'),2)
+        body=self.text.split('  exact-installed742-qualification:',1)[1]
+        case=step(body,'Exercise signed747 direct maintenance and signed742 Setup recovery in a fresh native process')
+        self.assertIn("if($env:EXACT742_EXISTING_HEADLESS_REGISTRATION -ceq 'true'){$caseArgs+=@('-ExistingHeadlessRegistrationFixture')}",case)
+        self.assertIn('@caseArgs',case)
+        summary=step(body,'Preserve maintenance scope with explicit optional storage result')
+        for required in ('!$registration.tested','!$registration.preserved',"$registration.version -cne '3.2.530'","$registration.before_sha256 -cnotmatch '^[a-f0-9]{64}$'",'$registration.at747_sha256 -cne $registration.before_sha256','$registration.after742_sha256 -cne $registration.before_sha256','$result.data_scope -ne $false'):
+            self.assertIn(required,summary)
+        self.assertIn('paths, values, types and ACL',summary)
+        self.assertIn("'exact742-existing-headless-registration-case-only'",body)
+        self.assertNotIn('cmake --build',body)
+        self.assertNotIn('exact742_existing_headless_registration',self.text.split('  storage-compat-native-tools:',1)[1].split('  signed-publisher-lifecycle:',1)[0])
 
     def setUp(self):
         self.text = WORKFLOW.read_text(encoding='utf-8')
