@@ -35,6 +35,22 @@ def download_branches(text):
 
 
 class WindowsLifecycleWorkflowTests(unittest.TestCase):
+    def test_full_publisher_map_routes_without_shell_interpolation_or_weaker_downloads(self):
+        self.assertEqual(self.text.count('      publisher_verification_json:'),2)
+        routing=self.text.split('  validate-publisher-routing:',1)[1].split('  native-lifecycle:',1)[0]
+        self.assertIn('    permissions:\n      contents: read',routing)
+        self.assertNotIn('contents: write',routing)
+        self.assertEqual(self.text.count('    needs: validate-publisher-routing'),3)
+        _,full,headless=download_branches(self.text)
+        self.assertIn('if ($env:PUBLISHER_VERIFICATION_JSON)',full)
+        self.assertIn('artifact-manifest.json.p7s" downloads\\target',full)
+        self.assertNotIn('artifact-manifest.json.p7s',headless)
+        bind=step(self.text,'Bind old updater transition to the target release manifest')
+        self.assertIn('[IO.File]::WriteAllText',bind)
+        self.assertIn("@('--publisher-verification-map', $mapPath)",bind)
+        self.assertNotIn('${{ inputs.publisher_verification_json }}',bind)
+        self.assertIn('@publisherArgs',bind)
+
     def setUp(self):
         self.text = WORKFLOW.read_text(encoding='utf-8')
 
@@ -355,7 +371,7 @@ class WindowsLifecycleWorkflowTests(unittest.TestCase):
 
     def test_signed_storage_uses_same_run_native_tools_from_frozen_sources(self):
         tools, signed = self.text.split('  storage-compat-native-tools:\n', 1)[1].split('  signed-publisher-lifecycle:\n', 1)
-        self.assertIn('needs: storage-compat-native-tools', signed)
+        self.assertIn('needs: [validate-publisher-routing, storage-compat-native-tools]', signed)
         self.assertNotIn('${{ runner.', tools.split('    steps:\n', 1)[0])
         self.assertIn("github.event_name == 'workflow_dispatch' && inputs.publisher_validation_request", tools)
         self.assertIn('fetch-depth: 0', tools)

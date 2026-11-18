@@ -12,6 +12,11 @@ on:
         required: false
         default: ''
         type: string
+      publisher_verification_json:
+        description: Optional per-architecture backend publisher receipts for normal full lifecycle
+        required: false
+        default: ''
+        type: string
       package_scope:
         description: Release asset scope; headless uses its hash-bound embedded installer
         required: false
@@ -40,6 +45,11 @@ on:
         type: string
       baseline_tag:
         description: Published baseline; empty selects the newest older published release with complete assets for both architectures
+        required: false
+        default: ''
+        type: string
+      publisher_verification_json:
+        description: Optional per-architecture backend publisher receipts for normal full lifecycle
         required: false
         default: ''
         type: string
@@ -115,7 +125,24 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  validate-publisher-routing:
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+      - name: Reject ambiguous publisher proof routing before native setup
+        env:
+          PUBLISHER_VERIFICATION_JSON: ${{ inputs.publisher_verification_json }}
+          LIFECYCLE_TARGET_TAG: ${{ inputs.target_tag }}
+          LIFECYCLE_ARCHITECTURE: ${{ inputs.architecture }}
+          EDR_RELEASE_PACKAGE_SCOPE: ${{ inputs.package_scope }}
+          CACHE_RECOVERY_SUBSET: ${{ inputs.cache_recovery_subset }}
+          PUBLISHER_VALIDATION_REQUEST: ${{ inputs.publisher_validation_request }}
+        run: python3 scripts/windows_release_checkpoint.py validate-publisher-routing --tag "$LIFECYCLE_TARGET_TAG"
   native-lifecycle:
+    needs: validate-publisher-routing
     if: ${{ !inputs.cache_recovery_subset && !inputs.publisher_validation_request }}
     strategy:
       fail-fast: false
@@ -125,6 +152,7 @@ jobs:
     timeout-minutes: 90
     env:
       GH_TOKEN: ${{ github.token }}
+      PUBLISHER_VERIFICATION_JSON: ${{ inputs.publisher_verification_json }}
     steps:
       - uses: actions/checkout@v6
 
@@ -355,6 +383,9 @@ jobs:
             Download-ImmutableAsset $env:TARGET_TAG $targetSetup downloads\target
             Download-ImmutableAsset $env:BASELINE_TAG $baselineSetup downloads\baseline
             Download-ImmutableAsset $env:TARGET_TAG "edr-agent-$env:TARGET_TAG-windows-${{ matrix.arch }}-artifact-manifest.json" downloads\target
+            if ($env:PUBLISHER_VERIFICATION_JSON) {
+              Download-ImmutableAsset $env:TARGET_TAG "edr-agent-$env:TARGET_TAG-windows-${{ matrix.arch }}-artifact-manifest.json.p7s" downloads\target
+            }
             $targetZip = @(Get-ChildItem downloads\target -Filter *.zip -File)
             $baselineZip = @(Get-ChildItem downloads\baseline -Filter *.zip -File)
             if ($targetZip.Count -ne 1 -or $baselineZip.Count -ne 1) {
@@ -428,10 +459,16 @@ jobs:
       - name: Bind old updater transition to the target release manifest
         shell: pwsh
         run: |
+          $publisherArgs = @()
+          if ($env:PUBLISHER_VERIFICATION_JSON) {
+            $mapPath = Join-Path $PWD 'publisher-verification-map.json'
+            [IO.File]::WriteAllText($mapPath, $env:PUBLISHER_VERIFICATION_JSON, [Text.UTF8Encoding]::new($false))
+            $publisherArgs = @('--publisher-verification-map', $mapPath)
+          }
           python .\scripts\windows_release_checkpoint.py prepare-lifecycle-upgrade `
             --directory downloads\target --baseline-directory downloads\baseline `
             --tag $env:TARGET_TAG --baseline-tag $env:BASELINE_TAG --arch '${{ matrix.arch }}' `
-            --destination release-metadata\lifecycle-upgrade
+            --destination release-metadata\lifecycle-upgrade @publisherArgs
           if ($LASTEXITCODE -ne 0) { throw 'old updater lifecycle input binding failed' }
 
       - name: Execute real Setup EXE install, upgrade, rollback, and uninstall
@@ -635,6 +672,7 @@ jobs:
           retention-days: 7
 
   recover-synthetic-owner:
+    needs: validate-publisher-routing
     if: github.event_name == 'workflow_dispatch' && inputs.cache_recovery_subset == true && !inputs.publisher_validation_request && github.repository == 'qiuxinliang/edr-agent'
     permissions:
       contents: read
@@ -813,6 +851,7 @@ jobs:
 # platform API auth, migrate real data, or claim the immutable 695 clock fixed.
 
   storage-compat-native-tools:
+    needs: validate-publisher-routing
     name: Storage compatibility tools (${{ matrix.arch }})
     if: github.event_name == 'workflow_dispatch' && inputs.publisher_validation_request && github.repository == 'qiuxinliang/edr-agent'
     strategy:
@@ -958,7 +997,7 @@ jobs:
   signed-publisher-lifecycle:
     name: Signed publisher (${{ matrix.arch }}, ${{ matrix.runtime_mode }})
     if: github.event_name == 'workflow_dispatch' && inputs.publisher_validation_request && github.repository == 'qiuxinliang/edr-agent'
-    needs: storage-compat-native-tools
+    needs: [validate-publisher-routing, storage-compat-native-tools]
     strategy:
       fail-fast: false
       matrix:

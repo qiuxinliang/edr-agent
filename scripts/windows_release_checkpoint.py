@@ -791,6 +791,41 @@ def stage_headless(directory, destination, metadata, tag, arch, tag_commit, repo
     return result
 
 
+PUBLISHER_VERIFIER_COMMIT = "c59eda045e3e2b9c882d462b74533e2c4b6c45da"
+
+
+def publisher_verification_map(raw, tag, architecture="all", scope="full", subset=False, legacy_request=""):
+    """Route exact backend receipts; cryptographic verification remains its producer's job."""
+    if not raw:
+        return {}
+    if scope != "full" or subset or legacy_request:
+        raise ValueError("publisher_verification_json requires normal full lifecycle without subset or publisher_validation_request")
+    if len(raw.encode("utf-8")) > 1024 * 1024:
+        raise ValueError("Publisher verification map exceeds 1 MiB")
+    def unique(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("Duplicate publisher verification JSON key")
+            result[key] = value
+        return result
+    value = json.loads(raw, object_pairs_hook=unique)
+    required = {"amd64", "arm64"} if architecture == "all" else {architecture}
+    if (not isinstance(value, dict) or not required <= set(value)
+            or not set(value) <= {"amd64", "arm64"} or not required <= {"amd64", "arm64"}):
+        raise ValueError("Publisher verification map lacks requested architecture or has unknown keys")
+    version = ".".join(map(str, windows_release_version(tag)))
+    for arch, proof in value.items():
+        if (not isinstance(proof, dict) or proof.get("schema") != "edr.windows.publisher-verification.v1"
+                or proof.get("arch") != arch or proof.get("version") != version
+                or proof.get("verifier_source_commit") != PUBLISHER_VERIFIER_COMMIT):
+            raise ValueError("Publisher verification has wrong architecture, target version or fixed verifier commit")
+        for field in ("manifest_sha256", "signature_sha256", "artifact_sha256", "subject_der_sha256"):
+            if not re.fullmatch(r"[a-f0-9]{64}", str(proof.get(field, ""))):
+                raise ValueError("Publisher verification requires fixed SHA256 fields")
+    return value
+
+
 def prepare_lifecycle_upgrade(directory, baseline_directory, destination, tag, baseline_tag, arch,
                               publisher_verification=None):
     """Bind the existing native lifecycle to release bytes and the old updater.
@@ -965,7 +1000,7 @@ def prepare_lifecycle_upgrade(directory, baseline_directory, destination, tag, b
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("source", "validate-scope", "verify-assets", "stage-headless", "prepare-lifecycle-upgrade", "prepare", "verify-owner", "restore", "seal", "upload", "restore-input", "seal-input", "restore-usb-final", "select-baseline", "get-release", "cleanup-published", "verify-p0-inputs"))
+    parser.add_argument("command", choices=("source", "validate-scope", "verify-assets", "stage-headless", "prepare-lifecycle-upgrade", "validate-publisher-routing", "prepare", "verify-owner", "restore", "seal", "upload", "restore-input", "seal-input", "restore-usb-final", "select-baseline", "get-release", "cleanup-published", "verify-p0-inputs"))
     parser.add_argument("--arch", choices=("amd64", "arm64"))
     parser.add_argument("--directory", type=Path, default=Path("dist"))
     parser.add_argument("--target-tag")
@@ -980,6 +1015,7 @@ def main():
     parser.add_argument("--expected-run-id")
     parser.add_argument("--published-baseline", action="store_true")
     parser.add_argument("--publisher-verification", type=Path)
+    parser.add_argument("--publisher-verification-map", type=Path)
     args = parser.parse_args()
     if args.command == "get-release":
         if not args.tag:
@@ -994,11 +1030,30 @@ def main():
     if args.package_scope:
         env["EDR_RELEASE_PACKAGE_SCOPE"] = args.package_scope
     scope = package_scope(env)
+    if args.command == "validate-publisher-routing":
+        publisher_verification_map(os.environ.get("PUBLISHER_VERIFICATION_JSON", ""), args.tag,
+            os.environ.get("LIFECYCLE_ARCHITECTURE", "all"), scope,
+            os.environ.get("CACHE_RECOVERY_SUBSET", "false") == "true",
+            os.environ.get("PUBLISHER_VALIDATION_REQUEST", ""))
+        print("Publisher verification routing accepted")
+        return
     if args.command == "prepare-lifecycle-upgrade":
         if not all((args.tag, args.baseline_tag, args.arch, args.destination, args.baseline_directory)):
             parser.error("prepare-lifecycle-upgrade requires tag, baseline-tag, arch, destination and baseline-directory")
-        print(json.dumps(prepare_lifecycle_upgrade(args.directory, args.baseline_directory, args.destination,
-            args.tag, args.baseline_tag, args.arch, args.publisher_verification), sort_keys=True))
+        if args.publisher_verification_map and args.publisher_verification:
+            parser.error("publisher verification file and map cannot be combined")
+        with tempfile.TemporaryDirectory(prefix="edr-publisher-proof-") as temporary:
+            verification = args.publisher_verification
+            if args.publisher_verification_map:
+                proofs = publisher_verification_map(args.publisher_verification_map.read_text(encoding="utf-8-sig"),
+                                                    args.tag, args.arch, scope)
+                if not proofs:
+                    raise ValueError("Explicit publisher verification map file must be nonempty")
+                proof = proofs[args.arch]
+                verification = Path(temporary) / "publisher-verification.json"
+                verification.write_text(json.dumps(proof, ensure_ascii=False), encoding="utf-8")
+            print(json.dumps(prepare_lifecycle_upgrade(args.directory, args.baseline_directory, args.destination,
+                args.tag, args.baseline_tag, args.arch, verification), sort_keys=True))
         return
     if args.command == "validate-scope":
         print(validate_scope(env))

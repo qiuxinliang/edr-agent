@@ -1214,6 +1214,31 @@ class LifecycleUpgradeInputTests(unittest.TestCase):
         return cp.prepare_lifecycle_upgrade(self.target,self.baseline,self.destination,
             'win_'+self.version,'win_'+self.old_version,self.arch,verification_path)
 
+    def test_map_cli_routes_bound_receipt_and_rejects_rebound_hashes_before_staging(self):
+        self.signed_repack()
+        self.prepare(lambda proof: proof.update(verifier_source_commit=cp.PUBLISHER_VERIFIER_COMMIT))
+        proof=json.loads((self.root/'publisher.json').read_text())
+        for field in (None, 'manifest_sha256', 'signature_sha256', 'artifact_sha256'):
+            with self.subTest(field=field):
+                selected=dict(proof)
+                if field: selected[field]='0'*64
+                map_path=self.root/'map.json';map_path.write_text(json.dumps({self.arch:selected}))
+                destination=self.root/('map-'+str(field))
+                argv=['checkpoint','prepare-lifecycle-upgrade','--directory',str(self.target),
+                      '--baseline-directory',str(self.baseline),'--destination',str(destination),
+                      '--tag','win_'+self.version,'--baseline-tag','win_'+self.old_version,
+                      '--arch',self.arch,'--publisher-verification-map',str(map_path)]
+                with patch.object(sys,'argv',argv),patch.dict(os.environ,{'EDR_RELEASE_PACKAGE_SCOPE':'full'}):
+                    if field:
+                        with self.assertRaises(ValueError):cp.main()
+                        self.assertFalse(destination.exists())
+                    else:
+                        import contextlib
+                        with contextlib.redirect_stdout(io.StringIO()) as output:cp.main()
+                        value=json.loads(output.getvalue())
+                        self.assertEqual(value['publisher_subject_der_sha256'],proof['subject_der_sha256'])
+                        self.assertEqual(value['publisher_verification'],proof)
+
     def signed_repack(self):
         self.update['upgrade_class'] = 'installer_required'
         self.signature=dict(format='cms-detached-sha256',status='signed',signer_thumbprint='A'*40,signer_subject='CN='+('P'*375))
@@ -1322,6 +1347,35 @@ class LifecycleUpgradeInputTests(unittest.TestCase):
         self.full['setup_exe_signed']=False
         self.data['full-installer-manifest.p7s']=b'unexpected signature'
         with self.assertRaisesRegex(ValueError,'installer signature policy'):self.prepare()
+
+
+class PublisherVerificationMapTests(unittest.TestCase):
+    def setUp(self):
+        self.proofs={arch:dict(schema='edr.windows.publisher-verification.v1',arch=arch,version='3.2.747',
+            verifier_source_commit=cp.PUBLISHER_VERIFIER_COMMIT,manifest_sha256='a'*64,signature_sha256='b'*64,
+            artifact_sha256='c'*64,subject_der_sha256='d'*64) for arch in ('amd64','arm64')}
+    def parse(self,raw=None,**options):
+        return cp.publisher_verification_map(json.dumps(self.proofs) if raw is None else raw,'win_3.2.747',**options)
+    def test_empty_preserves_legacy_and_both_architectures_route(self):
+        self.assertEqual(self.parse('',scope='headless',subset=True,legacy_request='legacy'),{})
+        self.assertEqual(self.parse(),self.proofs)
+        self.assertEqual(self.parse(architecture='arm64')['arm64']['arch'],'arm64')
+    def test_unicode_subject_remains_data(self):
+        subject='CN=测试, O=Example $(must_not_run) `value` "quoted"'
+        self.proofs['arm64']['subject']=subject
+        self.assertEqual(self.parse()['arm64']['subject'],subject)
+
+    def test_mixed_routing_and_incomplete_map_fail(self):
+        for options in ({'scope':'headless'},{'subset':True},{'legacy_request':'legacy'}):
+            with self.subTest(options=options),self.assertRaises(ValueError):self.parse(**options)
+        for value in ({'arm64':self.proofs['arm64']},{},[],{'x64':self.proofs['amd64']}):
+            with self.subTest(value=value),self.assertRaises(ValueError):self.parse(json.dumps(value))
+    def test_duplicate_keys_and_wrong_verifier_version_hash_fail(self):
+        raw=json.dumps(self.proofs)
+        with self.assertRaisesRegex(ValueError,'Duplicate'):self.parse('{"amd64":{},'+raw[1:])
+        for field,value in [('verifier_source_commit','f'*40),('version','3.2.746'),('arch','amd64'),('manifest_sha256','bad')]:
+            proofs=copy.deepcopy(self.proofs);proofs['arm64'][field]=value
+            with self.subTest(field=field),self.assertRaises(ValueError):self.parse(json.dumps(proofs))
 
 
 if __name__ == "__main__":
