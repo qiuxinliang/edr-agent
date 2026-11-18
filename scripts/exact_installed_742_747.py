@@ -166,6 +166,9 @@ def validate_request(request):
 
 
 def validate_routing(raw, environment):
+    storage = environment.get('EXACT742_STORAGE_READBACK', '')
+    if storage not in ('', 'false', 'true') or (storage == 'true' and environment.get('EXACT742_SETUP_MAINTENANCE_RECOVERY') != 'true'):
+        raise ValueError('Exact storage readback requires the explicit Setup maintenance/recovery case')
     late = environment.get('EXACT742_LATE_HEALTH_RECOVERY', '')
     maintenance = environment.get('EXACT742_SETUP_MAINTENANCE_RECOVERY', '')
     if (late not in ('', 'false', 'true') or maintenance not in ('', 'false', 'true')

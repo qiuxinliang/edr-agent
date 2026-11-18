@@ -115,6 +115,11 @@ on:
         required: false
         default: false
         type: boolean
+      exact742_storage_readback:
+        description: Add fixed b307/388d ARM storage readers to the accepted Setup maintenance/recovery case; prior Phase1 evidence required
+        required: false
+        default: false
+        type: boolean
       exact_installed_transition_request:
         description: Explicit fixed ARM task installed742-to747 source qualification only; not a full or deployment gate
         required: false
@@ -156,6 +161,7 @@ jobs:
           EXACT_INSTALLED_TRANSITION_REQUEST: ${{ inputs.exact_installed_transition_request }}
           EXACT742_LATE_HEALTH_RECOVERY: ${{ inputs.exact742_late_health_recovery }}
           EXACT742_SETUP_MAINTENANCE_RECOVERY: ${{ inputs.exact742_setup_maintenance_recovery }}
+          EXACT742_STORAGE_READBACK: ${{ inputs.exact742_storage_readback }}
           INSTALLER_TIMEOUT_RECOVERY: ${{ inputs.installer_timeout_recovery }}
           NATIVE_REPEAT_COUNT: ${{ inputs.native_repeat_count }}
           LIFECYCLE_ARCHITECTURE: ${{ inputs.architecture }}
@@ -875,25 +881,17 @@ jobs:
   storage-compat-native-tools:
     needs: validate-publisher-routing
     name: Storage compatibility tools (${{ matrix.arch }})
-    if: github.event_name == 'workflow_dispatch' && inputs.publisher_validation_request && github.repository == 'qiuxinliang/edr-agent'
+    if: github.event_name == 'workflow_dispatch' && (inputs.publisher_validation_request || inputs.exact742_storage_readback) && github.repository == 'qiuxinliang/edr-agent'
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - arch: amd64
-            runner: windows-2022
-            msvc_arch: x64
-            triplet: x64-windows
-            processor: AMD64
-          - arch: arm64
-            runner: windows-11-vs2026-arm
-            msvc_arch: arm64
-            triplet: arm64-windows
-            processor: ARM64
+        include: ${{ fromJSON(inputs.exact742_storage_readback && '[{"arch":"arm64","runner":"windows-11-vs2026-arm","msvc_arch":"arm64","triplet":"arm64-windows","processor":"ARM64"}]' || '[{"arch":"amd64","runner":"windows-2022","msvc_arch":"x64","triplet":"x64-windows","processor":"AMD64"},{"arch":"arm64","runner":"windows-11-vs2026-arm","msvc_arch":"arm64","triplet":"arm64-windows","processor":"ARM64"}]') }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     env:
       NATIVE_ARCH: ${{ matrix.arch }}
+      STORAGE_COMPAT_COHORT: ${{ inputs.exact742_storage_readback && 'installed742-to747' || 'legacy-publisher' }}
+      EXACT_INSTALLED_TRANSITION_REQUEST: ${{ inputs.exact_installed_transition_request }}
       P0_TEST_INPUTS_REF: '1190a89c39c0fcf675626afe040ed11b93670f09'
       EDR_VCPKG_TRIPLET: ${{ matrix.triplet }}
       VCPKG_DEFAULT_TRIPLET: ${{ matrix.triplet }}
@@ -918,9 +916,15 @@ jobs:
           if($env:HOST_ENVIRONMENT -cne 'github-hosted'){throw 'Native storage tools require a disposable hosted machine'}
           $expected=if($env:NATIVE_ARCH -eq 'arm64'){'Arm64'}else{'X64'}
           if([Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString() -cne $expected){throw 'Native storage tool host architecture mismatch'}
-          $request=$env:REQUEST|ConvertFrom-Json
-          if($request.schema -cne 'edr.signed-publisher-validation.v1' -or $request.legacy_tag -cne 'win_3.2.723' -or
-             $request.source_commit -cne 'd4e837790c53861c99d31ee127c55a5ef1f06f4a'){throw 'Storage source pins differ from the signed candidates'}
+          if($env:STORAGE_COMPAT_COHORT -ceq 'installed742-to747'){
+            if($env:NATIVE_ARCH -cne 'arm64'){throw 'Exact installed storage cohort is ARM64 only'}
+            python scripts/exact_installed_742_747.py validate
+            if($LASTEXITCODE -ne 0){throw 'Exact installed storage request rejected'}
+          }else{
+            $request=$env:REQUEST|ConvertFrom-Json
+            if($request.schema -cne 'edr.signed-publisher-validation.v1' -or $request.legacy_tag -cne 'win_3.2.723' -or
+               $request.source_commit -cne 'd4e837790c53861c99d31ee127c55a5ef1f06f4a'){throw 'Storage source pins differ from the signed candidates'}
+          }
           python tests/test_storage_compat_transfer.py
           if($LASTEXITCODE -ne 0){throw 'Storage tool transport regression failed'}
           python tests/storage_compat/test_stage_native.py
@@ -986,7 +990,7 @@ jobs:
           foreach($role in @('legacy','candidate')) {
             $source=Join-Path $root ('source-'+$role)
             $build=Join-Path $root ('build-'+$role)
-            python tests/storage_compat/prepare.py --repo $PWD --output $source --role $role
+            python tests/storage_compat/prepare.py --cohort $env:STORAGE_COMPAT_COHORT --repo $PWD --output $source --role $role
             if($LASTEXITCODE -ne 0){throw 'Frozen storage source export failed'}
             cmake -S $source -B $build -G Ninja -DCMAKE_BUILD_TYPE:STRING=StorageCompat `
               '-DCMAKE_MAP_IMPORTED_CONFIG_STORAGECOMPAT:STRING=Release;' -DCMAKE_MSVC_RUNTIME_LIBRARY:STRING=MultiThreadedDLL `
@@ -1004,9 +1008,10 @@ jobs:
           }
           $compiler=(Get-Command cl.exe -ErrorAction Stop).Source
           $dumpbin=Join-Path (Split-Path $compiler) 'dumpbin.exe'
-          python tests/storage_compat/stage_native.py stage --repo $PWD --legacy-build "$root/build-legacy" --candidate-build "$root/build-candidate" --source-manifests $root --dependency-prefix $prefix --msvc-redist-root $env:VCToolsRedistDir --compiler $compiler --dumpbin $dumpbin --architecture $env:NATIVE_ARCH --harness-commit $env:GITHUB_SHA --run-id $env:GITHUB_RUN_ID --run-attempt $env:GITHUB_RUN_ATTEMPT --output "$root/bundle"
+          python tests/storage_compat/stage_native.py stage --cohort $env:STORAGE_COMPAT_COHORT --repo $PWD --legacy-build "$root/build-legacy" --candidate-build "$root/build-candidate" --source-manifests $root --dependency-prefix $prefix --msvc-redist-root $env:VCToolsRedistDir --compiler $compiler --dumpbin $dumpbin --architecture $env:NATIVE_ARCH --harness-commit $env:GITHUB_SHA --run-id $env:GITHUB_RUN_ID --run-attempt $env:GITHUB_RUN_ATTEMPT --output "$root/bundle"
           if($LASTEXITCODE -ne 0){throw 'Native cross-version storage readback or dependency closure failed'}
       - name: Retain exact native storage tools as private same-run evidence
+        if: ${{ !inputs.exact742_storage_readback }}
         timeout-minutes: 15
         shell: pwsh
         env:
@@ -1015,6 +1020,14 @@ jobs:
           if(-not $env:GH_TOKEN){throw 'Private evidence credential is required'}
           python tests/storage_compat/transfer.py upload --architecture $env:NATIVE_ARCH --bundle "$env:RUNNER_TEMP/storage-compat-native/bundle" --output "$env:RUNNER_TEMP/storage-compat-native/upload"
           if($LASTEXITCODE -ne 0){throw 'Native storage tools were not retained'}
+      - name: Retain exact742 native tools only as same-run Actions evidence
+        if: inputs.exact742_storage_readback
+        uses: actions/upload-artifact@v4
+        with:
+          name: exact742-storage-tools-${{ github.run_id }}-${{ github.run_attempt }}-arm64
+          path: ${{ runner.temp }}/storage-compat-native/bundle
+          retention-days: 7
+          if-no-files-found: error
 
   signed-publisher-lifecycle:
     name: Signed publisher (${{ matrix.arch }}, ${{ matrix.runtime_mode }})
@@ -1177,15 +1190,16 @@ jobs:
           if($LASTEXITCODE -ne 0){throw 'Signed lifecycle evidence was not retained'}
 
   exact-installed742-qualification:
-    name: ${{ inputs.exact742_setup_maintenance_recovery && 'Exact742 post-install acceptance-refusal recovery only (data pending; not full gate)' || inputs.exact742_late_health_recovery && 'Exact742 late health recovery case only (ARM64 task; not full gate)' || 'Exact742 source qualification only (ARM64 task; not full gate)' }}
-    needs: validate-publisher-routing
-    if: github.event_name == 'workflow_dispatch' && inputs.exact_installed_transition_request && github.repository == 'qiuxinliang/edr-agent'
+    name: ${{ inputs.exact742_storage_readback && 'Exact742 synthetic storage + Setup recovery case only (not full gate)' || inputs.exact742_setup_maintenance_recovery && 'Exact742 post-install acceptance-refusal recovery only (data pending; not full gate)' || inputs.exact742_late_health_recovery && 'Exact742 late health recovery case only (ARM64 task; not full gate)' || 'Exact742 source qualification only (ARM64 task; not full gate)' }}
+    needs: [validate-publisher-routing, storage-compat-native-tools]
+    if: ${{ !cancelled() && needs.validate-publisher-routing.result == 'success' && (needs.storage-compat-native-tools.result == 'success' || needs.storage-compat-native-tools.result == 'skipped') && github.event_name == 'workflow_dispatch' && inputs.exact_installed_transition_request && github.repository == 'qiuxinliang/edr-agent' }}
     runs-on: windows-11-vs2026-arm
     timeout-minutes: 90
     permissions:
       contents: read
     env:
       EXACT_INSTALLED_TRANSITION_REQUEST: ${{ inputs.exact_installed_transition_request }}
+      EXACT742_STORAGE_READBACK: ${{ inputs.exact742_storage_readback }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -1209,7 +1223,7 @@ jobs:
           $windowsPowerShell=Join-Path $env:SystemRoot 'System32/WindowsPowerShell/v1.0/powershell.exe'
           $parseCode=@'
           $ErrorActionPreference='Stop'
-          foreach($name in @('scripts/windows_setup_exe_lifecycle_smoke.ps1','scripts/Exact-Installed742Qualification.ps1','tests/Invoke-LifecycleStorageCompatibility.ps1','tests/test_exact_installed742_qualification.ps1','tests/Exact742FirstHopRecovery.Common.ps1','tests/Invoke-Exact742FirstHopHealthRecovery.ps1','tests/test_exact742_firsthop_recovery.ps1','tests/Exact742MaintenanceRecovery.Common.ps1','tests/Invoke-Exact742MaintenanceRecovery.ps1','tests/test_exact742_maintenance_recovery.ps1')){
+          foreach($name in @('scripts/windows_setup_exe_lifecycle_smoke.ps1','scripts/Exact-Installed742Qualification.ps1','tests/Invoke-LifecycleStorageCompatibility.ps1','tests/test_exact_installed742_qualification.ps1','tests/Exact742FirstHopRecovery.Common.ps1','tests/Invoke-Exact742FirstHopHealthRecovery.ps1','tests/test_exact742_firsthop_recovery.ps1','tests/Exact742MaintenanceRecovery.Common.ps1','tests/Invoke-Exact742MaintenanceRecovery.ps1','tests/test_exact742_maintenance_recovery.ps1','tests/test_exact742_phase2_storage.ps1')){
             $tokens=$null;$errors=$null
             $null=[Management.Automation.Language.Parser]::ParseFile((Join-Path $PWD $name),[ref]$tokens,[ref]$errors)
             if(@($errors).Count){throw ('WindowsPS syntax failure: '+$name)}
@@ -1217,7 +1231,7 @@ jobs:
           '@
           & $windowsPowerShell -NoProfile -NonInteractive -Command $parseCode
           if($LASTEXITCODE -ne 0){throw 'WindowsPS5.1 qualification syntax failed'}
-          foreach($test in @('test_exact_installed742_qualification.ps1','test_exact742_firsthop_recovery.ps1','test_exact742_maintenance_recovery.ps1','test_windows_lifecycle_first_hop.ps1','test_windows_lifecycle_runtime_mode.ps1','test_windows_lifecycle_publisher.ps1')){
+          foreach($test in @('test_exact_installed742_qualification.ps1','test_exact742_firsthop_recovery.ps1','test_exact742_maintenance_recovery.ps1','test_exact742_phase2_storage.ps1','test_windows_lifecycle_first_hop.ps1','test_windows_lifecycle_runtime_mode.ps1','test_windows_lifecycle_publisher.ps1')){
             # The qualification negative fixture defines isolated doubles. Never
             # run it in the later real Setup process or share its loaded types.
             & $windowsPowerShell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Join-Path $PWD ('tests/'+$test)) -RepoRoot $PWD
@@ -1240,6 +1254,25 @@ jobs:
           $binding=$raw|ConvertFrom-Json
           "EXACT_INPUT_PATH=$($binding.input_path)"|Out-File $env:GITHUB_ENV -Append -Encoding UTF8
           "EXACT_INPUT_SHA256=$($binding.input_sha256)"|Out-File $env:GITHUB_ENV -Append -Encoding UTF8
+      - name: Download exact742 tools from this same workflow run
+        if: inputs.exact742_storage_readback
+        uses: actions/download-artifact@v4
+        with:
+          name: exact742-storage-tools-${{ github.run_id }}-${{ github.run_attempt }}-arm64
+          path: ${{ runner.temp }}/exact-storage-tools/bundle
+      - name: Bind same-run exact b307 and388d ARM storage tools before Setup
+        if: inputs.exact742_storage_readback
+        timeout-minutes: 15
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          $directory=Join-Path $env:RUNNER_TEMP 'exact-storage-tools'
+          $python=(Get-Command python -ErrorAction Stop).Source
+          $output=Join-Path $PWD 'exact-storage-tools-input.json'
+          python tests/storage_compat/stage_native.py bind --cohort installed742-to747 --repo $PWD --bundle "$directory/bundle" --architecture arm64 --harness-commit $env:GITHUB_SHA --run-id $env:GITHUB_RUN_ID --run-attempt $env:GITHUB_RUN_ATTEMPT --python-path $python --output $output
+          if($LASTEXITCODE -ne 0){throw 'Exact storage tool identity/closure binding failed'}
+          "EXACT_STORAGE_INPUT=$output"|Out-File $env:GITHUB_ENV -Append -Encoding UTF8
+          "EXACT_STORAGE_INPUT_SHA256=$((Get-FileHash $output).Hash.ToLowerInvariant())"|Out-File $env:GITHUB_ENV -Append -Encoding UTF8
       - name: Qualify actual installed742 consumer in a separate fresh native process
         timeout-minutes: 30
         shell: pwsh
@@ -1295,22 +1328,31 @@ jobs:
           $receipt=Join-Path $PWD 'exact-qualification-evidence/exact742-qualification.json'
           $receiptSha=(Get-FileHash -LiteralPath $receipt).Hash.ToLowerInvariant()
           $windowsPowerShell=Join-Path $env:SystemRoot 'System32/WindowsPowerShell/v1.0/powershell.exe'
+          $storageArgs=@()
+          if($env:EXACT742_STORAGE_READBACK -ceq 'true'){$storageArgs=@('-StorageToolsInput',$env:EXACT_STORAGE_INPUT,'-StorageToolsInputSha256',$env:EXACT_STORAGE_INPUT_SHA256)}
           & $windowsPowerShell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File tests/Invoke-Exact742MaintenanceRecovery.ps1 `
             -QualificationInput $env:EXACT_INPUT_PATH -QualificationInputSha256 $env:EXACT_INPUT_SHA256 `
-            -SourceConsumerReceipt $receipt -SourceConsumerReceiptSha256 $receiptSha -EvidenceDir exact-maintenance-evidence
+            -SourceConsumerReceipt $receipt -SourceConsumerReceiptSha256 $receiptSha -EvidenceDir exact-maintenance-evidence @storageArgs
           if($LASTEXITCODE -ne 0){throw 'Direct signed Setup maintenance/recovery failed; no retry or deployment authorization'}
-      - name: Preserve maintenance program-only scope with data acceptance pending
+      - name: Preserve maintenance scope with explicit optional storage result
         if: inputs.exact742_setup_maintenance_recovery
         shell: pwsh
         run: |
           $ErrorActionPreference='Stop'
           $result=Get-Content exact-maintenance-evidence/result.json -Raw -Encoding UTF8|ConvertFrom-Json
-          if($result.schema -cne 'edr.exact742.direct-setup-maintenance-recovery.v1' -or !$result.case_passed -or !$result.maintenance_passed -or !$result.signed_setup_recovery_passed -or $result.first_failure -or $result.cleanup_failure -or $result.data_scope -ne $false -or $result.automatic_updater_recovery_tested -ne $false -or $result.full_gate -ne $false -or $result.full_gate_passed -ne $false -or $result.deployment_authorized -ne $false){throw 'Maintenance result is incomplete or claims unsupported data/full-gate scope'}
+          if($result.schema -cne 'edr.exact742.direct-setup-maintenance-recovery.v1' -or !$result.case_passed -or !$result.maintenance_passed -or !$result.signed_setup_recovery_passed -or $result.first_failure -or $result.cleanup_failure -or $result.automatic_updater_recovery_tested -ne $false -or $result.full_gate -ne $false -or $result.full_gate_passed -ne $false -or $result.deployment_authorized -ne $false){throw 'Maintenance result is incomplete or claims unsupported data/full-gate scope'}
           if(!$result.controlled_acceptance_refusal_injected -or $result.acceptance_error_code -cne 'TEST_POST_INSTALL_ACCEPTANCE_REFUSED' -or !$result.acceptance_first_failure -or $result.failure_recovery_tested -ne $true -or $result.failure_recovery_scope -cne 'controlled post-install acceptance refusal after real747 Setup exit0/Jobempty/30s healthy only' -or $result.setup_midflight_recovery_tested -ne $false -or $result.setup_timeout_recovery_tested -ne $false){throw 'Only the explicitly injected post-install acceptance refusal and its signed Setup recovery are tested'}
+          if($env:EXACT742_STORAGE_READBACK -ceq 'true'){
+            if($result.data_scope -ne $true -or $result.data_preservation_passed -ne $true -or @($result.storage_stages).Count -ne 3 -or $result.cross_database_atomic -ne $false -or $result.outbox_tested -ne $false -or $result.server_ack_tested -ne $false){throw 'Exact synthetic storage readback is incomplete or overclaims scope'}
+            'Synthetic b307/388d cache+queue records reopened at742,747,and742 recovery via per-database committed WAL-aware snapshots; Shared references, freeze deadlines, persisted retry metadata, cross-DB atomicity, outbox, ACK, real endpoint data and WAL-only residency remain unverified.'|Out-File $env:GITHUB_STEP_SUMMARY -Append
+          }else{
+            if($result.data_scope -ne $false){throw 'Program-only phase cannot claim storage acceptance'}
+            'Data/WAL/queue readback is pending.'|Out-File $env:GITHUB_STEP_SUMMARY -Append
+          }
           foreach($setup in @($result.maintenance,$result.recovery)){
             if(!$setup -or $setup.exit_code -ne 0 -or !$setup.job_empty -or $setup.limit_ms -ne 300000 -or $setup.drain_limit_ms -ne 5000 -or $setup.first_failure -or $setup.cleanup_failure){throw 'Signed Setup success and complete process-tree exit are required for both stages'}
           }
-          'Program-only case: after signed747 Setup maintenance publishes a healthy target, record one controlled post-install acceptance refusal and restore using signed742 Setup. No mid-install or timeout failure recovery is covered. Program, registration, task and config checks only; Data/WAL/queue readback is pending. Automatic embedded-updater recovery, full global gate and deployment authorization are not established.'|Out-File $env:GITHUB_STEP_SUMMARY -Append
+          'Limited maintenance/recovery case: after signed747 Setup maintenance publishes a healthy target, record one controlled post-install acceptance refusal and restore using signed742 Setup. No mid-install or timeout failure recovery is covered. The installed program, registration, task and config are checked. Synthetic cache/queue readback is separately reported when requested. Automatic embedded-updater recovery, full global gate and deployment authorization are not established.'|Out-File $env:GITHUB_STEP_SUMMARY -Append
       - name: Preserve qualification-only result scope
         shell: pwsh
         run: |
@@ -1320,7 +1362,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: ${{ inputs.exact742_setup_maintenance_recovery && 'exact742-setup-maintenance-recovery-program-only' || inputs.exact742_late_health_recovery && 'exact742-late-health-recovery-case-only' || 'exact742-qualification-only' }}-${{ github.run_id }}-${{ github.run_attempt }}
+          name: ${{ inputs.exact742_storage_readback && 'exact742-maintenance-synthetic-storage-case-only' || inputs.exact742_setup_maintenance_recovery && 'exact742-setup-maintenance-recovery-program-only' || inputs.exact742_late_health_recovery && 'exact742-late-health-recovery-case-only' || 'exact742-qualification-only' }}-${{ github.run_id }}-${{ github.run_attempt }}
           retention-days: 7
           if-no-files-found: error
           path: |
@@ -1329,3 +1371,4 @@ jobs:
             exact-first-hop-input
             exact-late-health-evidence
             exact-maintenance-evidence
+            exact-storage-tools-input.json

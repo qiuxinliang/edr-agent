@@ -71,6 +71,15 @@ class BoundaryTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError,'explicit exact'):exact.checkpoint.main()
         self.assertIsNone(exact.validate_routing('',{'EXACT742_SETUP_MAINTENANCE_RECOVERY':'false','EXACT742_LATE_HEALTH_RECOVERY':'false'}))
 
+    def test_storage_requires_explicit_exact_maintenance_case(self):
+        env=dict(GITHUB_EVENT_NAME='workflow_dispatch',LIFECYCLE_PACKAGE_SCOPE='full',LIFECYCLE_ARCHITECTURE='arm64',LIFECYCLE_TARGET_TAG='win_3.2.747',LIFECYCLE_BASELINE_TAG='win_3.2.742',EXACT742_SETUP_MAINTENANCE_RECOVERY='true',EXACT742_STORAGE_READBACK='true')
+        raw=json.dumps(request());exact.validate_routing(raw,env)
+        for key,value in [('EXACT742_STORAGE_READBACK','yes'),('EXACT742_SETUP_MAINTENANCE_RECOVERY','false'),('EXACT742_LATE_HEALTH_RECOVERY','true'),('LIFECYCLE_ARCHITECTURE','amd64'),('LIFECYCLE_TARGET_TAG','win_3.2.748'),('NATIVE_REPEAT_COUNT','2')]:
+            with self.subTest(key=key),self.assertRaises(ValueError):exact.validate_routing(raw,{**env,key:value})
+        with self.assertRaises(ValueError):exact.validate_routing('',env)
+        with patch.dict(os.environ,{'EXACT742_STORAGE_READBACK':'true','EDR_RELEASE_PACKAGE_SCOPE':'full'},clear=True),patch.object(sys,'argv',['checkpoint','validate-publisher-routing','--tag','win_3.2.747']):
+            with self.assertRaisesRegex(ValueError,'explicit Setup'):exact.checkpoint.main()
+
     def test_exact_historical_signers_and_asset_set(self):
         for label in ('source','target'):
             rid,tag=exact.RELEASES[label]

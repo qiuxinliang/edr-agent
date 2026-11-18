@@ -40,7 +40,8 @@ class WindowsLifecycleWorkflowTests(unittest.TestCase):
         routing=self.text.split('  validate-publisher-routing:',1)[1].split('  native-lifecycle:',1)[0]
         self.assertIn('    permissions:\n      contents: read',routing)
         self.assertNotIn('contents: write',routing)
-        self.assertEqual(self.text.count('    needs: validate-publisher-routing'),4)
+        self.assertEqual(self.text.count('    needs: validate-publisher-routing'),3)
+        self.assertEqual(self.text.count('    needs: [validate-publisher-routing, storage-compat-native-tools]'),2)
         _,full,headless=download_branches(self.text)
         self.assertIn('if ($env:PUBLISHER_VERIFICATION_JSON)',full)
         self.assertIn('artifact-manifest.json.p7s" downloads\\target',full)
@@ -58,7 +59,7 @@ class WindowsLifecycleWorkflowTests(unittest.TestCase):
         self.assertIn('USB_SIGNING_RELEASE_TOKEN: ${{ secrets.USB_SIGNING_RELEASE_TOKEN }}',body)
         self.assertNotIn('USB_SIGNING_TOKEN:',body)
         self.assertNotIn('cmake --build',body)
-        self.assertNotIn('stage_native.py',body)
+        self.assertNotIn('stage_native.py stage',body)
         self.assertNotIn('windows-lifecycle-evidence-',body)
         self.assertIn("'exact742-qualification-only'",body)
         self.assertIn('$result.full_gate -ne $false',body)
@@ -116,7 +117,7 @@ class WindowsLifecycleWorkflowTests(unittest.TestCase):
             self.assertIn(script,negatives)
         self.assertIn("'test_exact742_maintenance_recovery.ps1'",negatives)
         case=step(body,'Exercise signed747 direct maintenance and signed742 Setup recovery in a fresh native process')
-        summary=step(body,'Preserve maintenance program-only scope with data acceptance pending')
+        summary=step(body,'Preserve maintenance scope with explicit optional storage result')
         for optional in (case,summary):self.assertIn('if: inputs.exact742_setup_maintenance_recovery',optional)
         self.assertIn('& $windowsPowerShell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File tests/Invoke-Exact742MaintenanceRecovery.ps1',case)
         for argument in ('-QualificationInput $env:EXACT_INPUT_PATH','-QualificationInputSha256 $env:EXACT_INPUT_SHA256','-SourceConsumerReceipt $receipt','-SourceConsumerReceiptSha256 $receiptSha'):
@@ -130,10 +131,45 @@ class WindowsLifecycleWorkflowTests(unittest.TestCase):
         self.assertIn('post-install acceptance-refusal recovery only',body)
         self.assertIn("'exact742-setup-maintenance-recovery-program-only'",body)
         self.assertLess(body.index('Qualify actual installed742'),body.index('Exercise signed747 direct maintenance'))
-        self.assertNotIn('cmake --build',body);self.assertNotIn('stage_native.py',body)
+        self.assertNotIn('cmake --build',body);self.assertNotIn('stage_native.py stage',body)
         self.assertNotIn('continue-on-error',case)
         self.assertNotIn('Invoke-Exact742FirstHopHealthRecovery.ps1',case)
         self.assertNotIn('exact742_setup_maintenance_recovery',self.text.split('  native-lifecycle:',1)[1].split('  recover-synthetic-owner:',1)[0])
+
+    def test_exact_storage_reuses_one_producer_and_only_arm_cohort(self):
+        self.assertEqual(self.text.count('  storage-compat-native-tools:'),1)
+        tools=self.text.split('  storage-compat-native-tools:',1)[1].split('  signed-publisher-lifecycle:',1)[0]
+        matrix=tools.split('include: ${{ fromJSON(',1)[1].split(') }}',1)[0]
+        exact=matrix.split("&& '",1)[1].split("' ||",1)[0]
+        self.assertEqual([item['arch'] for item in __import__('json').loads(exact)],['arm64'])
+        self.assertIn("'installed742-to747' || 'legacy-publisher'",tools)
+        for command in ('prepare.py --cohort $env:STORAGE_COMPAT_COHORT','stage_native.py stage --cohort $env:STORAGE_COMPAT_COHORT','--target storage_compat_cache storage_compat_queue'):
+            self.assertIn(command,tools)
+        body=self.text.split('  exact-installed742-qualification:',1)[1]
+        self.assertIn('needs: [validate-publisher-routing, storage-compat-native-tools]',body)
+        self.assertIn("needs.storage-compat-native-tools.result == 'skipped'",body)
+        self.assertIn("needs.validate-publisher-routing.result == 'success'",body)
+        bind=step(body,'Bind same-run exact b307 and388d ARM storage tools before Setup')
+        self.assertNotIn('transfer.py',bind)
+        self.assertNotIn('GH_TOKEN',bind)
+        upload=step(tools,'Retain exact742 native tools only as same-run Actions evidence')
+        download=step(body,'Download exact742 tools from this same workflow run')
+        self.assertIn('actions/upload-artifact@v4',upload)
+        self.assertIn('actions/download-artifact@v4',download)
+        for transfer in (upload,download):
+            self.assertIn('exact742-storage-tools-${{ github.run_id }}-${{ github.run_attempt }}-arm64',transfer)
+            self.assertNotIn('token',transfer.lower())
+        old=step(tools,'Retain exact native storage tools as private same-run evidence')
+        self.assertIn('if: ${{ !inputs.exact742_storage_readback }}',old)
+        self.assertIn('storage_compat/transfer.py upload --architecture $env:NATIVE_ARCH',old)
+        self.assertIn('stage_native.py bind --cohort installed742-to747',bind)
+        self.assertIn('--run-id $env:GITHUB_RUN_ID --run-attempt $env:GITHUB_RUN_ATTEMPT',bind)
+        case=step(body,'Exercise signed747 direct maintenance and signed742 Setup recovery in a fresh native process')
+        self.assertIn("@('-StorageToolsInput',$env:EXACT_STORAGE_INPUT,'-StorageToolsInputSha256',$env:EXACT_STORAGE_INPUT_SHA256)",case)
+        self.assertIn('@storageArgs',case)
+        summary=step(body,'Preserve maintenance scope with explicit optional storage result')
+        for text in ('$result.data_preservation_passed -ne $true','@($result.storage_stages).Count -ne 3','$result.cross_database_atomic -ne $false','$result.outbox_tested -ne $false','$result.server_ack_tested -ne $false'):
+            self.assertIn(text,summary)
 
     def setUp(self):
         self.text = WORKFLOW.read_text(encoding='utf-8')
@@ -457,7 +493,7 @@ class WindowsLifecycleWorkflowTests(unittest.TestCase):
         tools, signed = self.text.split('  storage-compat-native-tools:\n', 1)[1].split('  signed-publisher-lifecycle:\n', 1)
         self.assertIn('needs: [validate-publisher-routing, storage-compat-native-tools]', signed)
         self.assertNotIn('${{ runner.', tools.split('    steps:\n', 1)[0])
-        self.assertIn("github.event_name == 'workflow_dispatch' && inputs.publisher_validation_request", tools)
+        self.assertIn("github.event_name == 'workflow_dispatch' && (inputs.publisher_validation_request || inputs.exact742_storage_readback)", tools)
         self.assertIn('fetch-depth: 0', tools)
         self.assertIn("P0_TEST_INPUTS_REF: '1190a89c39c0fcf675626afe040ed11b93670f09'", tools)
         inputs = step(tools, 'Read the existing frozen private P0 test inputs')
@@ -469,8 +505,8 @@ class WindowsLifecycleWorkflowTests(unittest.TestCase):
         self.assertLess(tools.index('- name: Verify the frozen P0 inputs'),
                         tools.index('- name: Compile the frozen original'))
         for arch, triplet in [('amd64', 'x64-windows'), ('arm64', 'arm64-windows')]:
-            self.assertIn('- arch: '+arch, tools)
-            self.assertIn('triplet: '+triplet, tools)
+            self.assertIn('\"arch\":\"'+arch+'\"', tools)
+            self.assertIn('\"triplet\":\"'+triplet+'\"', tools)
         compile_step = step(tools, 'Compile the frozen original and candidate storage consumers')
         for required in ("foreach($role in @('legacy','candidate'))", 'storage_compat/prepare.py',
                          '-DCMAKE_BUILD_TYPE:STRING=StorageCompat',
