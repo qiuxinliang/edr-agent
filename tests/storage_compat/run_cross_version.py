@@ -1,7 +1,7 @@
 """Run immutable old/new storage consumers in fresh processes on isolated copies."""
 import argparse, hashlib, json, platform, sqlite3, subprocess, time
 from pathlib import Path
-from prepare import PINS
+from prepare import PINS, COHORTS, pins_for
 
 def sha(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
@@ -11,7 +11,8 @@ def main():
     p.add_argument('--legacy-bin',type=Path,required=True)
     p.add_argument('--candidate-bin',type=Path,required=True)
     p.add_argument('--output',type=Path,required=True)
-    a=p.parse_args();a.output.mkdir(parents=True,exist_ok=False)
+    p.add_argument('--cohort',choices=COHORTS,default='legacy-publisher')
+    a=p.parse_args();pins=pins_for(a.cohort);a.output.mkdir(parents=True,exist_ok=False)
     deadline=time.monotonic()+120
     epoch=str(int(time.time()));tenant='synthetic-storage-tenant';endpoint='synthetic-storage-endpoint'
     receipts=[];negatives=[];identities={};native_machines=set();cache_scan_cases=[]
@@ -42,7 +43,7 @@ def main():
         if result.returncode:
             raise ValueError(label+' failed: '+result.stderr[-500:])
         receipt=json.loads(result.stdout)
-        if receipt['source_commit']!=PINS[role] or receipt['action']!=action or receipt['owner']!=('evidence_cache' if kind=='cache' else 'queue'):
+        if receipt['source_commit']!=pins[role] or receipt['action']!=action or receipt['owner']!=('evidence_cache' if kind=='cache' else 'queue'):
             raise ValueError('receipt owner/source mismatch')
         if receipt['tenant_id']!=tenant_arg or receipt['endpoint_id']!=endpoint_arg or receipt['epoch']!=int(epoch_arg):
             raise ValueError('receipt input identity changed')
@@ -143,7 +144,7 @@ def main():
                 boundary_negatives.append(negative)
     if len(cache_scan_cases)!=3:raise ValueError('missing old/new cache scan counterfactuals')
     summary={'schema':'edr.test.storage-cross-version.v1','passed':True,'platform':platform.system(),
-             'machine':platform.machine(),'source_commits':PINS,'tools':identities,'epoch':int(epoch),
+             'machine':platform.machine(),'cohort':a.cohort,'source_commits':pins,'tools':identities,'epoch':int(epoch),
              'native_windows':platform.system()=='Windows','installed_agent_lifecycle':False,
              'native_machine':next(iter(native_machines)) if native_machines else None,
              'input_origin':'synthetic_records_via_original_storage_owner_api',

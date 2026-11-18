@@ -72,6 +72,28 @@ class BundleBoundaryTests(unittest.TestCase):
 
     def test_exact_closed_bundle(self):self.assertEqual(self.verify()['source_commits'],PINS)
 
+    def test_exact_installed_cohort_is_arm64_and_cannot_use_old_consumer_bundle(self):
+        selected=stage_native._prepare.pins_for('installed742-to747')
+        self.assertEqual(selected['legacy'],'b307daa7a4e60a141d344fcb10bded19d97b436d')
+        self.assertEqual(selected['candidate'],'388d69438781d93cd36871354439585feb1ebc07')
+        self.manifest.update(cohort='installed742-to747',architecture='arm64',source_commits=selected)
+        for role,entry in self.manifest['roles'].items():entry['source_commit']=selected[role]
+        for item in self.manifest['files']:
+            path=self.root/item['path'];data=bytearray(path.read_bytes());struct.pack_into('<H',data,132,0xAA64);path.write_bytes(data)
+            item.update(machine=0xAA64,sha256=hashlib.sha256(data).hexdigest())
+            role,kind=item['path'].split('/');kind=kind.removeprefix('storage_compat_').removesuffix('.exe')
+            self.manifest['roles'][role][kind+'_sha256']=item['sha256']
+        (self.root/'manifest.json').write_text(json.dumps(self.manifest))
+        actual=stage_native.verify(self.repo,self.root,'arm64',self.sha,'123','1','installed742-to747')
+        self.assertEqual(actual['source_commits'],selected)
+        with self.assertRaisesRegex(ValueError,'bundle_cohort'):
+            stage_native.verify(self.repo,self.root,'arm64',self.sha,'123','1')
+        with self.assertRaisesRegex(ValueError,'arm64_only'):
+            stage_native.verify(self.repo,self.root,'amd64',self.sha,'123','1','installed742-to747')
+        self.manifest['source_commits']=dict(PINS);(self.root/'manifest.json').write_text(json.dumps(self.manifest))
+        with self.assertRaisesRegex(ValueError,'bundle_source_scope'):
+            stage_native.verify(self.repo,self.root,'arm64',self.sha,'123','1','installed742-to747')
+
     def test_file_mutation(self):
         with (self.root/self.manifest['files'][0]['path']).open('ab') as f:f.write(b'x')
         with self.assertRaisesRegex(ValueError,'bundle_file_size'):self.verify()

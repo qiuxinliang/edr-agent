@@ -7,13 +7,26 @@ PINS = {
     'candidate': 'd4e837790c53861c99d31ee127c55a5ef1f06f4a',
 }
 
+EXACT_INSTALLED_PINS = {
+    'legacy': 'b307daa7a4e60a141d344fcb10bded19d97b436d',
+    'candidate': '388d69438781d93cd36871354439585feb1ebc07',
+}
+COHORTS = {'legacy-publisher': PINS, 'installed742-to747': EXACT_INSTALLED_PINS}
+
+def pins_for(cohort='legacy-publisher'):
+    if cohort not in COHORTS:
+        raise ValueError('Unsupported fixed storage consumer cohort')
+    return dict(COHORTS[cohort])
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument('--repo', required=True, type=Path)
     p.add_argument('--output', required=True, type=Path)
     p.add_argument('--role', required=True, choices=PINS)
+    p.add_argument('--cohort', choices=COHORTS, default='legacy-publisher')
     a = p.parse_args()
-    commit = PINS[a.role]
+    commit = pins_for(a.cohort)[a.role]
     actual = subprocess.check_output(['git', '-C', str(a.repo), 'rev-parse', commit], text=True, timeout=30).strip()
     if actual != commit:
         raise ValueError('source commit mismatch')
@@ -44,7 +57,7 @@ def main():
     tools = Path(__file__).resolve().parent
     with (a.output / 'CMakeLists.txt').open('a') as f:
         f.write(f'\n# Isolated storage compatibility test adapter only.\nset(COMPAT_SOURCE_COMMIT "{commit}")\ninclude("{tools.as_posix()}/targets.cmake")\n')
-    record = {'schema': 'edr.test.storage-compat-source.v1', 'source_commit': commit,
+    record = {'schema': 'edr.test.storage-compat-source.v1', 'cohort': a.cohort, 'source_commit': commit,
               'git_archive_sha256': hashlib.sha256(archive).hexdigest(),
               'cmake_overlay_sha256': hashlib.sha256((a.output / 'CMakeLists.txt').read_bytes()).hexdigest(),
               'files_before_test_overlay': files,
