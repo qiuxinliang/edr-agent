@@ -48,7 +48,7 @@ function Invoke-ExactMaintenanceSetupJob([string]$Setup,[string]$Label,[UInt64]$
  if($first){throw $first}
  return $record
 }
-function Get-ExactMaintenanceHealthyRuntime([string]$Version,[string]$AgentHash,[string]$IntegrityHash,[long]$PreviousBirth,[IntPtr]$PreviousHandle) {
+function Get-ExactMaintenanceHealthyRuntime([string]$Version,[string]$AgentHash,[string]$IntegrityHash,[long]$PreviousBirth,[IntPtr]$PreviousHandle,$LegacyBaseline=$null) {
  Assert-Exact742ProgramHash (Join-Path $InstallDir 'FDSensor.exe') $AgentHash
  if(([IO.File]::ReadAllText((Join-Path $InstallDir 'VERSION'))).Trim() -cne $Version){throw 'Direct Setup installed wrong version'}
  Assert-Exact742Integrity $InstallDir $IntegrityHash
@@ -58,7 +58,7 @@ function Get-ExactMaintenanceHealthyRuntime([string]$Version,[string]$AgentHash,
  try{
   $birth=[LifecycleInstallerFault]::Created($handle)
   Assert-Exact742RecoveredGeneration ([LifecycleInstallerFault]::Exited($PreviousHandle)) $PreviousBirth $birth ([LifecycleInstallerFault]::Image($handle)) (Join-Path $InstallDir 'FDSensor.exe')
-  $registry=@(Get-Exact742RegistryState)
+  $registry=@(Get-ExactMaintenanceRegistryState $Version $LegacyBaseline)
   if($registry.Count -ne 1 -or $registry[0].version -cne $Version){throw 'Direct Setup registry version does not match running runtime'}
   $owner=Get-LifecycleRuntimeOwner
   $clock=[Diagnostics.Stopwatch]::StartNew()
@@ -104,4 +104,87 @@ function Get-ExactMaintenanceStorageStage($Context,[string]$Stage) {
   $databases+=@{kind=$kind;snapshot_sha256=$proof.sha256;snapshot_bytes=$proof.size;journal_mode=$proof.source_journal_mode;wal_before=$proof.wal_before;wal_after=$proof.wal_after;readers=$readers;source_readonly=$proof.source_readonly}
  }
  return @{stage=$Stage;generation=$Context.generation;databases=$databases;queue_retry_metadata_preservation_tested=$false;shared_owner_ref_tested=$false;protection_deadline_tested=$false;cross_database_atomic=$false;outbox_tested=$false;server_ack_tested=$false;wal_only_frozen_rows_proven=$false}
+}
+
+# Optional disposable hosted fixture. No original-machine ACL is transported.
+function Get-ExactHeadlessFixtureValues {
+ $root='C:\Program Files\FDSecurity';$exe=$root+'\uninstall.exe'
+ return [ordered]@{DisplayName='FDSecurity Endpoint Agent';DisplayVersion='3.2.530';Publisher='FDSecurity';InstallLocation=$root;DisplayIcon=$exe;UninstallString='"'+$exe+'"';QuietUninstallString='"'+$exe+'" /S';NoModify=1;NoRepair=1}
+}
+function Convert-ExactRegistrationPath([string]$Path) {
+ if(!$Path){return ''}
+ return [IO.Path]::GetFullPath(($Path -replace '\\+','\')).TrimEnd('\').ToLowerInvariant()
+}
+function Get-ExactRegistrationDigest($Entry) {
+ $sha=[Security.Cryptography.SHA256]::Create()
+ try{return ([BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes(($Entry|ConvertTo-Json -Depth 12 -Compress))))).Replace('-','').ToLowerInvariant()}finally{$sha.Dispose()}
+}
+function Get-ExactMaintenanceRegistrationInventory {
+ $rows=@();$parentPath='SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall'
+ foreach($view in @([Microsoft.Win32.RegistryView]::Registry64,[Microsoft.Win32.RegistryView]::Registry32)){
+  $base=$null;$parent=$null
+  try{
+   $base=[Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine,$view);$parent=$base.OpenSubKey($parentPath,$false)
+   if(!$parent){throw 'Uninstall registry view unavailable'}
+   $names=@($parent.GetSubKeyNames());if($names.Count -gt 4096){throw 'Uninstall inventory exceeds finite4096-key bound'}
+   foreach($name in $names){
+    $key=$null
+    try{
+     $key=$parent.OpenSubKey($name,$false);if(!$key){throw 'Uninstall key disappeared during inventory'}
+     $location=[string]$key.GetValue('InstallLocation','',[Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+     if($name -cne 'FDSecurityAgentHeadless' -and $name -cne '{A73C1E7F-8D94-4A2C-BF5D-1E2F3A4B5C6D}}_is1' -and (Convert-ExactRegistrationPath $location) -cne (Convert-ExactRegistrationPath $InstallDir)){continue}
+     $values=@();$valueNames=@($key.GetValueNames()|Sort-Object);if($valueNames.Count -gt 64){throw 'Uninstall value inventory exceeds64 bound'}
+     foreach($valueName in $valueNames){$value=$key.GetValue($valueName,$null,[Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames);if(($value|ConvertTo-Json -Compress).Length -gt 16384){throw 'Uninstall registry value exceeds16KiB bound'};$values+=[ordered]@{name=$valueName;kind=[string]$key.GetValueKind($valueName);value=$value}}
+     $acl=$key.GetAccessControl();$rows+=[ordered]@{key=$name;view=[string]$view;values=$values;subkey_count=$key.SubKeyCount;acl_protected=$acl.AreAccessRulesProtected;parent_acl_protected=$parent.GetAccessControl().AreAccessRulesProtected;sddl=$acl.GetSecurityDescriptorSddlForm([Security.AccessControl.AccessControlSections]::All)}
+    }finally{if($key){$key.Dispose()}}
+   }
+  }finally{if($parent){$parent.Dispose()};if($base){$base.Dispose()}}
+ }
+ return $rows
+}
+function Assert-ExactMaintenanceRegistrationInventory($Rows,[string]$Version,$LegacyBaseline) {
+ $canonical=@($Rows|Where-Object {$_.key -ceq '{A73C1E7F-8D94-4A2C-BF5D-1E2F3A4B5C6D}}_is1'})
+ $legacy=@($Rows|Where-Object {$_.key -ceq 'FDSecurityAgentHeadless'})
+ if(@($Rows).Count -ne 2 -or $canonical.Count -ne 1 -or $legacy.Count -ne 1 -or @($Rows|Where-Object {$_.view -cne 'Registry64'}).Count){throw 'Dual registration requires only the canonical AppId and one Registry64 headless entry'}
+ $expected=Get-ExactHeadlessFixtureValues;$entry=$legacy[0]
+ if(@($entry.values).Count -ne 9 -or $entry.subkey_count -ne 0 -or $entry.acl_protected -ne $false -or $entry.parent_acl_protected -ne $true -or !$entry.sddl){throw 'Legacy registration value/ACL inheritance shape differs'}
+ foreach($name in $expected.Keys){$value=@($entry.values|Where-Object {$_.name -ceq $name});$kind=if($name -cin @('NoModify','NoRepair')){'DWord'}else{'String'};if($value.Count -ne 1 -or $value[0].kind -cne $kind -or $value[0].value -cne $expected[$name]){throw ('Legacy registration value/type differs: '+$name)}}
+ if($LegacyBaseline -and (Get-ExactRegistrationDigest $entry) -cne (Get-ExactRegistrationDigest $LegacyBaseline)){throw 'Legacy registration values/types/ACL changed on this host'}
+ $values=@{};foreach($value in $canonical[0].values){$values[$value.name]=$value.value}
+ $exe=Join-Path $InstallDir 'unins000.exe'
+ $uninstall=[regex]::Match([string]$values.UninstallString,'^"([^"\r\n]+)"$')
+ $quiet=[regex]::Match([string]$values.QuietUninstallString,'^"([^"\r\n]+)" /SILENT$')
+ if($values.DisplayVersion -cne $Version -or (Convert-ExactRegistrationPath $values.InstallLocation) -cne (Convert-ExactRegistrationPath $InstallDir) -or !$uninstall.Success -or !$quiet.Success -or (Convert-ExactRegistrationPath $uninstall.Groups[1].Value) -cne (Convert-ExactRegistrationPath $exe) -or (Convert-ExactRegistrationPath $quiet.Groups[1].Value) -cne (Convert-ExactRegistrationPath $exe)){throw 'Canonical AppId registration identity differs'}
+ return [ordered]@{key=$canonical[0].key;version=$values.DisplayVersion;location=$values.InstallLocation;uninstall=$values.UninstallString;quiet_uninstall=$values.QuietUninstallString}
+}
+function New-ExactHeadlessRegistrationFixture {
+ if($env:GITHUB_ACTIONS -cne 'true' -or $env:RUNNER_ENVIRONMENT -cne 'github-hosted' -or $env:RUNNER_ARCH -cne 'ARM64' -or $InstallDir -cne 'C:\Program Files\FDSecurity'){throw 'Headless registry fixture is restricted to disposable hosted ARM standard-directory qualification'}
+ $rows=@(Get-ExactMaintenanceRegistrationInventory)
+ if($rows.Count -ne 1 -or $rows[0].key -cne '{A73C1E7F-8D94-4A2C-BF5D-1E2F3A4B5C6D}}_is1' -or $rows[0].view -cne 'Registry64'){throw 'Headless fixture requires exactly one clean canonical registration; existing keys are never overwritten'}
+ $base=$null;$parent=$null;$created=$null
+ try{
+  $base=[Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine,[Microsoft.Win32.RegistryView]::Registry64)
+  $parent=$base.OpenSubKey('SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall',$true)
+  if(!$parent -or !$parent.GetAccessControl().AreAccessRulesProtected){throw 'Cloud uninstall parent ACL inheritance model differs'}
+  $existing=$parent.OpenSubKey('FDSecurityAgentHeadless',$false);if($existing){$existing.Dispose();throw 'Headless key appeared before creation; never overwrite'}
+  $created=$parent.CreateSubKey('FDSecurityAgentHeadless');$expected=Get-ExactHeadlessFixtureValues
+  foreach($name in $expected.Keys){$kind=if($name -cin @('NoModify','NoRepair')){[Microsoft.Win32.RegistryValueKind]::DWord}else{[Microsoft.Win32.RegistryValueKind]::String};$created.SetValue($name,$expected[$name],$kind)}
+ }finally{if($created){$created.Dispose()};if($parent){$parent.Dispose()};if($base){$base.Dispose()}}
+ $rows=@(Get-ExactMaintenanceRegistrationInventory);$null=Assert-ExactMaintenanceRegistrationInventory $rows '3.2.742' $null
+ return @($rows|Where-Object {$_.key -ceq 'FDSecurityAgentHeadless'})[0]
+}
+function Get-ExactMaintenanceRegistryState([string]$Version,$LegacyBaseline) {
+ if(!$LegacyBaseline){return @(Get-Exact742RegistryState)}
+ return Assert-ExactMaintenanceRegistrationInventory @(Get-ExactMaintenanceRegistrationInventory) $Version $LegacyBaseline
+}
+function Get-ExactMaintenanceUninstallerIdentity {
+ $native=[IO.File]::ReadAllText((Join-Path $InstallDir 'native-package-integrity.json'))|ConvertFrom-Json
+ $member=@($native.files|Where-Object {$_.name -ceq 'uninstall.exe'})
+ if($member.Count -ne 1){throw 'Native uninstall.exe identity is not unique'}
+ Assert-Exact742ProgramHash (Join-Path $InstallDir 'uninstall.exe') $member[0].sha256
+ $inno=Join-Path $InstallDir 'unins000.exe';$null=Assert-LifecycleStorageRegular $inno 16777216
+ # unins000 is generated by the real signed Setup; do not invent a golden build hash.
+ $stream=[IO.File]::OpenRead($inno)
+ try{if($stream.ReadByte() -ne 77 -or $stream.ReadByte() -ne 90){throw 'Canonical uninstaller is not a PE'}}finally{$stream.Dispose()}
+ return @{native_uninstall_sha256=$member[0].sha256;canonical_uninstaller_sha256=(Get-FileHash $inno).Hash.ToLowerInvariant();canonical_identity_scope='Actual Inno AppId unins000.exe from the just-completed signed Setup; never executed'}
 }

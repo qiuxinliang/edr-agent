@@ -1,7 +1,7 @@
 #Requires -Version 5.1
 # Disposable cloud fixture only: direct signed Setup maintenance and formal recovery.
 [CmdletBinding()]
-param([Parameter(Mandatory=$true)][string]$QualificationInput,[Parameter(Mandatory=$true)][string]$QualificationInputSha256,[Parameter(Mandatory=$true)][string]$SourceConsumerReceipt,[Parameter(Mandatory=$true)][string]$SourceConsumerReceiptSha256,[Parameter(Mandatory=$true)][string]$EvidenceDir,[string]$StorageToolsInput='',[string]$StorageToolsInputSha256='')
+param([Parameter(Mandatory=$true)][string]$QualificationInput,[Parameter(Mandatory=$true)][string]$QualificationInputSha256,[Parameter(Mandatory=$true)][string]$SourceConsumerReceipt,[Parameter(Mandatory=$true)][string]$SourceConsumerReceiptSha256,[Parameter(Mandatory=$true)][string]$EvidenceDir,[string]$StorageToolsInput='',[string]$StorageToolsInputSha256='',[switch]$ExistingHeadlessRegistrationFixture)
 $ErrorActionPreference='Stop'
 . (Join-Path $PSScriptRoot 'Exact742FirstHopRecovery.Common.ps1')
 . Import-Exact742TestDefinitions
@@ -24,6 +24,8 @@ if(Test-Path $EvidenceDir){throw 'Fresh direct maintenance evidence directory re
 New-Item -ItemType Directory $EvidenceDir|Out-Null
 $principal=[Security.Principal.WindowsIdentity]::GetCurrent()
 if(-not ([Security.Principal.WindowsPrincipal]::new($principal)).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)){throw 'Direct signed Setup test must run elevated'}
+if($ExistingHeadlessRegistrationFixture -and ($StorageToolsInput -or $StorageToolsInputSha256)){throw 'Headless registration case does not rerun storage tools'}
+$legacyBaseline=$null
 $beforeOwner=Get-LifecycleRuntimeOwner
 $beforeRegistry=@(Get-Exact742RegistryState)
 Assert-Exact742RegistryRestored @($source.uninstall) $beforeRegistry
@@ -33,6 +35,7 @@ Assert-Exact742ProgramHash (Join-Path $InstallDir 'edr_agent_inplace_update.ps1'
 Assert-Exact742ProgramHash (Join-Path $InstallDir 'FDSensorTaskLaunch.ps1') $source.consumer_identity.launcher_sha256
 Assert-Exact742Integrity $InstallDir $source.consumer_identity.native_integrity_sha256
 if((Get-FileHash (Join-Path $InstallDir 'agent.toml')).Hash.ToLowerInvariant() -cne $source.config_sha256){throw 'Direct maintenance source configuration changed'}
+if($ExistingHeadlessRegistrationFixture){$legacyBaseline=New-ExactHeadlessRegistrationFixture;$null=Get-ExactMaintenanceRegistryState '3.2.742' $legacyBaseline;$sourceUninstallers=Get-ExactMaintenanceUninstallerIdentity;$canonicalBefore=@(Get-ExactMaintenanceRegistrationInventory|Where-Object {$_.key -cne 'FDSecurityAgentHeadless'})[0]}
 $roles=@{};foreach($binding in $inputBinding.file_bindings){$roles[$binding.role]=$binding}
 $proof=[IO.File]::ReadAllText($inputBinding.target_publisher_proof)|ConvertFrom-Json
 $manifest=[IO.File]::ReadAllText($roles.target_manifest.path)|ConvertFrom-Json
@@ -67,21 +70,22 @@ try{
  $null=Read-Exact742BoundJson $QualificationInput $QualificationInputSha256
  Assert-Exact742FileBindings $inputBinding
  $result.maintenance=Invoke-ExactMaintenanceSetupJob $inputBinding.target_setup_exe 'direct747-maintenance' $minimum $setup[0].sha256
- $targetRuntime=Get-ExactMaintenanceHealthyRuntime '3.2.747' $proof.artifact_sha256 $raw[0].update.runtime_identity_sha256 $oldBirth $oldHandle
+ $targetRuntime=Get-ExactMaintenanceHealthyRuntime '3.2.747' $proof.artifact_sha256 $raw[0].update.runtime_identity_sha256 $oldBirth $oldHandle $legacyBaseline
  if((Get-FileHash (Join-Path $InstallDir 'agent.toml')).Hash.ToLowerInvariant() -cne $source.config_sha256){throw 'Direct747 maintenance changed protected synthetic config'}
+ if($legacyBaseline){$legacy747=@(Get-ExactMaintenanceRegistrationInventory|Where-Object {$_.key -ceq 'FDSecurityAgentHeadless'})[0];$targetUninstallers=Get-ExactMaintenanceUninstallerIdentity}
  $result.target_generation=@{pid=$targetRuntime.pid;birth=$targetRuntime.birth};$result.registry_at747=$targetRuntime.registry;$result.maintenance_passed=$true
  if($storageContext){
   $previousTarget=$targetRuntime
   Write-LifecycleStorageFixture $storageContext 'append' 'target747-append'
   Test-LifecycleStorageReadback $storageContext 'target747-restarted'
   $storageStages+=Get-ExactMaintenanceStorageStage $storageContext 'target747-restarted'
-  $afterAppend=Get-ExactMaintenanceHealthyRuntime '3.2.747' $proof.artifact_sha256 $raw[0].update.runtime_identity_sha256 $previousTarget.birth $previousTarget.handle
+  $afterAppend=Get-ExactMaintenanceHealthyRuntime '3.2.747' $proof.artifact_sha256 $raw[0].update.runtime_identity_sha256 $previousTarget.birth $previousTarget.handle $legacyBaseline
   $storageRetiredHandles+=$previousTarget.handle;$targetRuntime=$afterAppend
   $result.target_generation=@{pid=$targetRuntime.pid;birth=$targetRuntime.birth}
  }
  # The only simulated failure is this late test-side acceptance refusal.
  # A genuine Setup/health/Job failure never reaches this boundary or a blind retry.
- $acceptanceObservation=@{version=$targetRuntime.version;agent_sha256=(Get-FileHash (Join-Path $InstallDir 'FDSensor.exe')).Hash.ToLowerInvariant();setup_exit_code=$result.maintenance.exit_code;setup_job_empty=$result.maintenance.job_empty;setup_cleanup_failure=$result.maintenance.cleanup_failure;health_observe_ms=$targetRuntime.health_observe_ms;target_generation_alive=(![LifecycleInstallerFault]::Exited($targetRuntime.handle));task_mode=(Get-LifecycleRuntimeOwner).mode;registry=@(Get-Exact742RegistryState)}
+ $acceptanceObservation=@{version=$targetRuntime.version;agent_sha256=(Get-FileHash (Join-Path $InstallDir 'FDSensor.exe')).Hash.ToLowerInvariant();setup_exit_code=$result.maintenance.exit_code;setup_job_empty=$result.maintenance.job_empty;setup_cleanup_failure=$result.maintenance.cleanup_failure;health_observe_ms=$targetRuntime.health_observe_ms;target_generation_alive=(![LifecycleInstallerFault]::Exited($targetRuntime.handle));task_mode=(Get-LifecycleRuntimeOwner).mode;registry=@(Get-ExactMaintenanceRegistryState '3.2.747' $legacyBaseline)}
  try{Invoke-ExactMaintenanceAcceptanceBoundary $acceptanceObservation}
  catch{
   $cause=$_.Exception
@@ -104,7 +108,7 @@ try{
  if([LifecycleInstallerFault]::Exited($targetRuntime.handle) -or (Get-FileHash (Join-Path $InstallDir 'FDSensor.exe')).Hash.ToLowerInvariant() -cne $proof.artifact_sha256){throw 'Uncontrolled runtime change after acceptance refusal; no blind recovery'}
  $null=Get-LifecycleRuntimeOwner
  $result.recovery=Invoke-ExactMaintenanceSetupJob $inputBinding.source_setup_exe 'signed742-setup-recovery' $recoveryMinimum $source.source_setup_sha256
- $recoveredRuntime=Get-ExactMaintenanceHealthyRuntime '3.2.742' $source.consumer_identity.agent_sha256 $source.consumer_identity.native_integrity_sha256 $targetRuntime.birth $targetRuntime.handle
+ $recoveredRuntime=Get-ExactMaintenanceHealthyRuntime '3.2.742' $source.consumer_identity.agent_sha256 $source.consumer_identity.native_integrity_sha256 $targetRuntime.birth $targetRuntime.handle $legacyBaseline
  Assert-Exact742ProgramHash (Join-Path $InstallDir 'edr_agent_inplace_update.ps1') $source.consumer_identity.updater_sha256
  Assert-Exact742ProgramHash (Join-Path $InstallDir 'FDSensorTaskLaunch.ps1') $source.consumer_identity.launcher_sha256
  if((Get-FileHash (Join-Path $InstallDir 'agent.toml')).Hash.ToLowerInvariant() -cne $source.config_sha256){throw 'Signed742 Setup recovery changed protected synthetic config'}
@@ -116,6 +120,15 @@ try{
   $storageStages+=Get-ExactMaintenanceStorageStage $storageContext 'source742-after-recovery'
   $result.data_scope=$true;$result.data_preservation_passed=$true;$result.storage_stages=$storageStages
   $result.data_note='Synthetic frozen writer records checked field-by-field by b307/388d consumers on separate committed SQLite snapshots per database; WAL resolved if present, no cross-database atomicity, outbox or ACK claim'
+ }
+ if($legacyBaseline){
+  $null=Get-ExactMaintenanceRegistryState '3.2.742' $legacyBaseline
+  $finalInventory=@(Get-ExactMaintenanceRegistrationInventory)
+  $legacy742=@($finalInventory|Where-Object {$_.key -ceq 'FDSecurityAgentHeadless'})[0]
+  $canonicalAfter=@($finalInventory|Where-Object {$_.key -cne 'FDSecurityAgentHeadless'})[0]
+  if((Get-ExactRegistrationDigest $canonicalBefore) -cne (Get-ExactRegistrationDigest $canonicalAfter)){throw 'Canonical AppId complete values/types/ACL were not restored by signed742 Setup'}
+  foreach($entry in @($legacy747,$legacy742)){if((Get-ExactRegistrationDigest $entry) -cne (Get-ExactRegistrationDigest $legacyBaseline)){throw 'Legacy complete entry preservation failed'}}
+  $result.existing_headless_registration=@{tested=$true;preserved=$true;version='3.2.530';before_sha256=(Get-ExactRegistrationDigest $legacyBaseline);at747_sha256=(Get-ExactRegistrationDigest $legacy747);after742_sha256=(Get-ExactRegistrationDigest $legacy742);before=$legacyBaseline;at747=$legacy747;after742=$legacy742;canonical_before=$canonicalBefore;canonical_after742=$canonicalAfter;source_uninstallers=$sourceUninstallers;target_uninstallers=$targetUninstallers;recovered_uninstallers=(Get-ExactMaintenanceUninstallerIdentity)}
  }
  $result.recovered_generation=@{pid=$recoveredRuntime.pid;birth=$recoveredRuntime.birth};$result.signed_setup_recovery_passed=$true;$result.failure_recovery_tested=$true;$result.case_passed=$true
 }catch{$first=$_;$result.first_failure=$_.Exception.Message}

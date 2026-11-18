@@ -55,6 +55,35 @@ namespace FDSecurity {
   Need ([Environment]::GetEnvironmentVariable('PSModulePath','Process') -ceq $modulePath) 'Parent module path was not restored'
  }
  Reject {Invoke-ExactMaintenanceSetupJob $fixture 'unknown-stage' 2147483648 $digest}
+
+ # Pure full-entry registry contract; no registry access or product operation.
+ $InstallDir='C:\Program Files\FDSecurity'
+ $legacyValues=Get-ExactHeadlessFixtureValues
+ $legacy=[ordered]@{key='FDSecurityAgentHeadless';view='Registry64';values=@();subkey_count=0;acl_protected=$false;parent_acl_protected=$true;sddl='fixture-same-host-inherited-acl'}
+ foreach($name in @($legacyValues.Keys|Sort-Object)){$kind=if($name -cin @('NoModify','NoRepair')){'DWord'}else{'String'};$legacy.values+=[ordered]@{name=$name;kind=$kind;value=$legacyValues[$name]}}
+ $canonical=[ordered]@{key='{A73C1E7F-8D94-4A2C-BF5D-1E2F3A4B5C6D}}_is1';view='Registry64';values=@(@{name='DisplayVersion';value='3.2.742'},@{name='InstallLocation';value=$InstallDir+'\'},@{name='UninstallString';value='"'+$InstallDir+'\unins000.exe"'},@{name='QuietUninstallString';value='"'+$InstallDir+'\unins000.exe" /SILENT'})}
+ $rows=@($canonical,$legacy)
+ $registration=Assert-ExactMaintenanceRegistrationInventory $rows '3.2.742' $legacy
+ Need ($registration.version -ceq '3.2.742') 'Dual-registration adapter did not return canonical singleton'
+ Need ((Get-ExactRegistrationDigest $legacy) -cmatch '^[a-f0-9]{64}$') 'Complete entry digest missing'
+ Reject {Assert-ExactMaintenanceRegistrationInventory @($canonical,$legacy,$legacy) '3.2.742' $legacy}
+ Reject {Assert-ExactMaintenanceRegistrationInventory @($canonical) '3.2.742' $legacy}
+ foreach($field in @('view','subkey_count','acl_protected','parent_acl_protected','sddl')){
+  $bad=($legacy|ConvertTo-Json -Depth 12|ConvertFrom-Json)
+  switch($field){view{$bad.view='Registry32'}subkey_count{$bad.subkey_count=1}acl_protected{$bad.acl_protected=$true}parent_acl_protected{$bad.parent_acl_protected=$false}sddl{$bad.sddl='changed-acl'}}
+  Reject {Assert-ExactMaintenanceRegistrationInventory @($canonical,$bad) '3.2.742' $legacy}
+ }
+ foreach($field in @('kind','value')){
+  $bad=($legacy|ConvertTo-Json -Depth 12|ConvertFrom-Json)
+  if($field -ceq 'kind'){$bad.values[0].kind='ExpandString'}else{$bad.values[0].value='changed'}
+  Reject {Assert-ExactMaintenanceRegistrationInventory @($canonical,$bad) '3.2.742' $legacy}
+ }
+ $bad=($canonical|ConvertTo-Json -Depth 12|ConvertFrom-Json);$bad.key='unknown-key'
+ Reject {Assert-ExactMaintenanceRegistrationInventory @($bad,$legacy) '3.2.742' $legacy}
+ Reject {Assert-ExactMaintenanceRegistrationInventory $rows '3.2.747' $legacy}
+ $bad=($canonical|ConvertTo-Json -Depth 12|ConvertFrom-Json);$bad.values[2].value='"C:\other\unins000.exe"'
+ Reject {Assert-ExactMaintenanceRegistrationInventory @($bad,$legacy) '3.2.742' $legacy}
+ $env:RUNNER_ENVIRONMENT='self-hosted';Reject {New-ExactHeadlessRegistrationFixture};$env:RUNNER_ENVIRONMENT='github-hosted'
  $completed=$true
  Write-Host "PASS: $count direct maintenance contract and bounded Job boundary assertions; no product execution"
 }finally{foreach($key in $old.Keys){[Environment]::SetEnvironmentVariable($key,$old[$key],'Process')};if($completed){Remove-Item -LiteralPath $root -Recurse -Force}else{Write-Warning "Retained failed pure fixture: $root"}}
