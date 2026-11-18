@@ -104,6 +104,37 @@ class WindowsLifecycleWorkflowTests(unittest.TestCase):
         self.assertNotIn('exact742_late_health_recovery',native)
         self.assertNotIn('needs: exact-installed742-qualification',self.text)
 
+    def test_exact742_maintenance_phase1_is_program_only_after_qualification(self):
+        dispatch=self.text.split('  workflow_dispatch:',1)[1].split('permissions:',1)[0]
+        option=dispatch.split('      exact742_setup_maintenance_recovery:',1)[1].split('      exact_installed_transition_request:',1)[0]
+        self.assertIn('default: false',option);self.assertIn('type: boolean',option)
+        routing=step(self.text,'Reject ambiguous publisher proof routing before native setup')
+        self.assertIn('EXACT742_SETUP_MAINTENANCE_RECOVERY: ${{ inputs.exact742_setup_maintenance_recovery }}',routing)
+        body=self.text.split('  exact-installed742-qualification:',1)[1]
+        negatives=step(body,'Parse modified PowerShell and run fresh no-key negative consumers before any Setup')
+        for script in ('Exact742MaintenanceRecovery.Common.ps1','Invoke-Exact742MaintenanceRecovery.ps1','test_exact742_maintenance_recovery.ps1'):
+            self.assertIn(script,negatives)
+        self.assertIn("'test_exact742_maintenance_recovery.ps1'",negatives)
+        case=step(body,'Exercise signed747 direct maintenance and signed742 Setup recovery in a fresh native process')
+        summary=step(body,'Preserve maintenance program-only scope with data acceptance pending')
+        for optional in (case,summary):self.assertIn('if: inputs.exact742_setup_maintenance_recovery',optional)
+        self.assertIn('& $windowsPowerShell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File tests/Invoke-Exact742MaintenanceRecovery.ps1',case)
+        for argument in ('-QualificationInput $env:EXACT_INPUT_PATH','-QualificationInputSha256 $env:EXACT_INPUT_SHA256','-SourceConsumerReceipt $receipt','-SourceConsumerReceiptSha256 $receiptSha'):
+            self.assertIn(argument,case)
+        for required in ('!$result.case_passed','!$result.maintenance_passed','!$result.signed_setup_recovery_passed','$result.data_scope -ne $false','$result.automatic_updater_recovery_tested -ne $false','$result.full_gate -ne $false','$result.deployment_authorized -ne $false','!$setup.job_empty','$setup.exit_code -ne 0','$setup.limit_ms -ne 300000','$setup.drain_limit_ms -ne 5000','$setup.first_failure','$setup.cleanup_failure'):
+            self.assertIn(required,summary)
+        self.assertIn('Data/WAL/queue readback is pending',summary)
+        for required in ('!$result.controlled_acceptance_refusal_injected',"$result.acceptance_error_code -cne 'TEST_POST_INSTALL_ACCEPTANCE_REFUSED'",'!$result.acceptance_first_failure','$result.failure_recovery_tested -ne $true',"$result.failure_recovery_scope -cne 'controlled post-install acceptance refusal after real747 Setup exit0/Jobempty/30s healthy only'",'$result.setup_midflight_recovery_tested -ne $false','$result.setup_timeout_recovery_tested -ne $false'):
+            self.assertIn(required,summary)
+        self.assertIn('No mid-install or timeout failure recovery is covered',summary)
+        self.assertIn('post-install acceptance-refusal recovery only',body)
+        self.assertIn("'exact742-setup-maintenance-recovery-program-only'",body)
+        self.assertLess(body.index('Qualify actual installed742'),body.index('Exercise signed747 direct maintenance'))
+        self.assertNotIn('cmake --build',body);self.assertNotIn('stage_native.py',body)
+        self.assertNotIn('continue-on-error',case)
+        self.assertNotIn('Invoke-Exact742FirstHopHealthRecovery.ps1',case)
+        self.assertNotIn('exact742_setup_maintenance_recovery',self.text.split('  native-lifecycle:',1)[1].split('  recover-synthetic-owner:',1)[0])
+
     def setUp(self):
         self.text = WORKFLOW.read_text(encoding='utf-8')
 

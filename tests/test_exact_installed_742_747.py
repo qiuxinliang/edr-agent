@@ -61,6 +61,16 @@ class BoundaryTests(unittest.TestCase):
         with patch.dict(os.environ,{'EXACT742_LATE_HEALTH_RECOVERY':'true','EDR_RELEASE_PACKAGE_SCOPE':'full'},clear=True),patch.object(sys,'argv',['checkpoint','validate-publisher-routing','--tag','win_3.2.747']):
             with self.assertRaisesRegex(ValueError,'explicit exact'):exact.checkpoint.main()
 
+    def test_maintenance_flag_is_fixed_exclusive_and_never_ignored(self):
+        env=dict(GITHUB_EVENT_NAME='workflow_dispatch',LIFECYCLE_PACKAGE_SCOPE='full',LIFECYCLE_ARCHITECTURE='arm64',LIFECYCLE_TARGET_TAG='win_3.2.747',LIFECYCLE_BASELINE_TAG='win_3.2.742',EXACT742_SETUP_MAINTENANCE_RECOVERY='true')
+        raw=json.dumps(request());exact.validate_routing(raw,env)
+        with self.assertRaises(ValueError):exact.validate_routing('',env)
+        for key,bad in [('EXACT742_SETUP_MAINTENANCE_RECOVERY','yes'),('EXACT742_LATE_HEALTH_RECOVERY','true'),('INSTALLER_TIMEOUT_RECOVERY','true'),('NATIVE_REPEAT_COUNT','2'),('GITHUB_EVENT_NAME','workflow_call'),('LIFECYCLE_ARCHITECTURE','amd64'),('LIFECYCLE_TARGET_TAG','win_3.2.748'),('LIFECYCLE_BASELINE_TAG','win_3.2.687'),('PUBLISHER_VALIDATION_REQUEST','legacy'),('CACHE_RECOVERY_SUBSET','true')]:
+            with self.subTest(field=key),self.assertRaises(ValueError):exact.validate_routing(raw,{**env,key:bad})
+        with patch.dict(os.environ,{'EXACT742_SETUP_MAINTENANCE_RECOVERY':'true','EDR_RELEASE_PACKAGE_SCOPE':'full'},clear=True),patch.object(sys,'argv',['checkpoint','validate-publisher-routing','--tag','win_3.2.747']):
+            with self.assertRaisesRegex(ValueError,'explicit exact'):exact.checkpoint.main()
+        self.assertIsNone(exact.validate_routing('',{'EXACT742_SETUP_MAINTENANCE_RECOVERY':'false','EXACT742_LATE_HEALTH_RECOVERY':'false'}))
+
     def test_exact_historical_signers_and_asset_set(self):
         for label in ('source','target'):
             rid,tag=exact.RELEASES[label]

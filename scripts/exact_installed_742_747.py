@@ -167,10 +167,14 @@ def validate_request(request):
 
 def validate_routing(raw, environment):
     late = environment.get('EXACT742_LATE_HEALTH_RECOVERY', '')
-    if late not in ('', 'false', 'true') or (late == 'true' and not raw):
-        raise ValueError('Late-health recovery requires the explicit exact installed transition request')
-    if late == 'true' and (environment.get('INSTALLER_TIMEOUT_RECOVERY') == 'true' or environment.get('NATIVE_REPEAT_COUNT', '1') != '1'):
-        raise ValueError('Exact late-health recovery is one case and cannot mix generic timeout or repeat modes')
+    maintenance = environment.get('EXACT742_SETUP_MAINTENANCE_RECOVERY', '')
+    if (late not in ('', 'false', 'true') or maintenance not in ('', 'false', 'true')
+            or ((late == 'true' or maintenance == 'true') and not raw)):
+        raise ValueError('Exact case requires the explicit exact installed transition request and boolean case flags')
+    if late == 'true' and maintenance == 'true':
+        raise ValueError('Late-health and direct Setup maintenance/recovery are mutually exclusive cases')
+    if (late == 'true' or maintenance == 'true') and (environment.get('INSTALLER_TIMEOUT_RECOVERY') == 'true' or environment.get('NATIVE_REPEAT_COUNT', '1') != '1'):
+        raise ValueError('Exact recovery is one case and cannot mix generic timeout or repeat modes')
     if not raw:
         return None
     if (len(raw.encode('utf-8')) > 32768 or environment.get('GITHUB_EVENT_NAME') != 'workflow_dispatch'
