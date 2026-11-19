@@ -7536,6 +7536,100 @@ static void compact_exec(sqlite3 *db, const char *sql) {
   assert(rc == SQLITE_OK);
 }
 
+static int check_rtq_candidate_scan(const char *payload, int scanned, int returned,
+                                      int partial, const char *process_name) {
+  char out[12000];
+  assert(edr_local_evidence_cache_query_json(payload, out, sizeof(out)) == 0);
+  cJSON *root = cJSON_Parse(out);
+  assert(root);
+  const cJSON *flag = cJSON_GetObjectItemCaseSensitive(root, "partial");
+  assert(cJSON_GetObjectItemCaseSensitive(root, "rows_scanned")->valueint == scanned);
+  assert(cJSON_GetObjectItemCaseSensitive(root, "rows_returned")->valueint == returned);
+  const cJSON *rows = cJSON_GetObjectItemCaseSensitive(root, "rows");
+  assert(cJSON_IsArray(rows) && cJSON_GetArraySize(rows) == returned);
+  if (process_name) assert(strstr(out, process_name));
+  printf("RTQ candidate coverage: scanned=%d returned=%d partial=%d (expected %d)\n",
+         scanned, returned, cJSON_IsTrue(flag), partial);
+  fflush(stdout);
+  int flag_matches = partial ? cJSON_IsTrue(flag) : cJSON_IsFalse(flag);
+  cJSON_Delete(root);
+  return flag_matches;
+}
+
+static void test_rtq_candidate_scan_coverage(void) {
+  const char *bounded = "{\"limit\":10,\"process_name\":\"scan-target.exe\"}";
+  char path[640];
+  assert(make_test_sqlite_path(path, sizeof(path)) == 0);
+  assert(edr_local_evidence_cache_open(path, 8u, 24u) == 0);
+  sqlite3 *db = NULL;
+  assert(sqlite3_open(path, &db) == SQLITE_OK);
+  struct timespec ts;
+  assert(timespec_get(&ts, TIME_UTC) == TIME_UTC);
+  int64_t now = (int64_t)ts.tv_sec * INT64_C(1000000000) + ts.tv_nsec;
+  char *sql = sqlite3_mprintf(
+      "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<320) "
+      "INSERT INTO p0_candidates(candidate_id,event_time_ns,process_name) "
+      "SELECT 'scan-'||x,%lld+x,'scan-noise.exe' FROM n WHERE x<300;", (long long)now);
+  assert(sql);
+  compact_exec(db, sql);
+  sqlite3_free(sql);
+  int coverage_ok = check_rtq_candidate_scan(bounded, 299, 0, 0, NULL);
+
+  sql = sqlite3_mprintf(
+      "INSERT INTO p0_candidates(candidate_id,event_time_ns,process_name) "
+      "VALUES('scan-300',%lld+300,'scan-noise.exe');", (long long)now);
+  assert(sql);
+  compact_exec(db, sql);
+  sqlite3_free(sql);
+  coverage_ok &= check_rtq_candidate_scan(bounded, 300, 0, 1, NULL);
+
+  sql = sqlite3_mprintf(
+      "WITH RECURSIVE n(x) AS (VALUES(301) UNION ALL SELECT x+1 FROM n WHERE x<320) "
+      "INSERT INTO p0_candidates(candidate_id,event_time_ns,process_name) "
+      "SELECT 'scan-'||x,%lld+x,'scan-noise.exe' FROM n "
+      "UNION ALL SELECT 'scan-target',%lld,'scan-target.exe';",
+      (long long)now, (long long)now);
+  assert(sql);
+  compact_exec(db, sql);
+  sqlite3_free(sql);
+  coverage_ok &= check_rtq_candidate_scan(bounded, 300, 0, 1, NULL);
+  coverage_ok &= check_rtq_candidate_scan("{\"limit\":12,\"process_name\":\"scan-target.exe\"}", 321, 1, 0, "scan-target.exe");
+
+  coverage_ok &= check_rtq_candidate_scan(
+      "{\"limit\":1,\"process_name\":\"scan-noise.exe\"}", 1, 1, 1, "scan-noise.exe");
+
+  compact_exec(db, "UPDATE p0_candidates SET event_time_ns=0 WHERE id > 299;");
+  EdrBehaviorRecord ring;
+  init_record(&ring, EDR_EVENT_NET_CONNECT);
+  ring.event_time_ns = now;
+  ring.priority = 3u;
+  ring.net_dport = 445;
+  set_record_generation(&ring, 4242u);
+  snprintf(ring.net_dst, sizeof(ring.net_dst), "192.0.2.71");
+  snprintf(ring.detection_context, sizeof(ring.detection_context),
+           "{\"engine\":\"p0\",\"severity\":\"P0\"}");
+  snprintf(ring.endpoint_id, sizeof(ring.endpoint_id), "scan-endpoint");
+  snprintf(ring.tenant_id, sizeof(ring.tenant_id), "scan-tenant");
+  snprintf(ring.event_id, sizeof(ring.event_id), "scan-ring");
+  snprintf(ring.process_name, sizeof(ring.process_name), "scan-ring.exe");
+  edr_local_evidence_cache_record_behavior(&ring);
+  compact_exec(db, "UPDATE p0_candidates SET event_time_ns=0 WHERE process_name='scan-ring.exe';");
+  coverage_ok &= check_rtq_candidate_scan(bounded, 300, 0, 0, NULL);
+
+  coverage_ok &= check_rtq_candidate_scan(
+      "{\"limit\":1,\"process_name\":\"scan-ring.exe\"}", 1, 1, 1, "scan-ring.exe");
+  compact_exec(db, "ALTER TABLE p0_candidates RENAME TO hidden_candidates;");
+  char failed[12000];
+  int query_rc = edr_local_evidence_cache_query_json(bounded, failed, sizeof(failed));
+  printf("RTQ candidate scan with missing table: rc=%d (expected nonzero)\n", query_rc);
+  fflush(stdout);
+  coverage_ok &= query_rc != 0 && failed[0] == '\0';
+  assert(coverage_ok);
+  assert(sqlite3_close(db) == SQLITE_OK);
+  edr_local_evidence_cache_close();
+  cleanup_test_sqlite_path(path);
+}
+
 static int64_t compact_scalar(sqlite3 *db, const char *sql) {
   sqlite3_stmt *st = NULL;
   assert(sqlite3_prepare_v2(db, sql, -1, &st, NULL) == SQLITE_OK);
@@ -15592,6 +15686,9 @@ int main(int argc, char **argv) {
   }
 #endif
 #if defined(EDR_HAVE_SQLITE)
+  if (argc == 2 && !strcmp(argv[1], "--rtq-candidate-scan-coverage")) {
+    test_rtq_candidate_scan_coverage(); return 0;
+  }
   if (argc == 2 && !strcmp(argv[1], "--registry-pre-window-contract")) {
     test_alert_window_recall_contract(1); test_registry_sidecar_wrap(); return 0;
   }
@@ -16053,6 +16150,9 @@ int main(int argc, char **argv) {
   RUN_CACHE_CASE("context", test_preprocess_parent_proof_survives_reentry_and_local_eviction());
   RUN_CACHE_CASE("context", test_parent_text_requires_proved_lifetime_and_survives_cache_eviction());
   RUN_CACHE_CASE("context", test_parent_edge_repairs_late_real_generation_at_child_birth());
+#if defined(EDR_HAVE_SQLITE)
+  RUN_CACHE_CASE("context", test_rtq_candidate_scan_coverage());
+#endif
   RUN_CACHE_CASE("context", test_rtq_signed_scope_and_legacy_aliases());
   RUN_CACHE_CASE("context", test_file_sha256_query_uses_file_evidence_cache());
   if (completed_cases == 0) {

@@ -11877,6 +11877,7 @@ int edr_local_evidence_cache_query_json(const char *payload_json, char *out, siz
   uint32_t returned = 0;
   uint32_t scanned = 0;
   appendf(out, cap, &off, "{\"source\":\"mixed\",\"partial\":false,\"rows\":[");
+  int partial = 0;
   int hash_query = f.file_sha256[0] != '\0';
   if (!hash_query) {
     uint32_t ring_pos = s_ring_pos;
@@ -11922,12 +11923,7 @@ int edr_local_evidence_cache_query_json(const char *payload_json, char *out, siz
       append_json_array_items(out, cap, &off, &first, rows);
       returned += cache_returned;
       scanned += cache_scanned;
-      if (cache_truncated) {
-        char *partial_flag = strstr(out, "\"partial\":false");
-        if (partial_flag) {
-          memcpy(partial_flag + 10, "true ", 5u);
-        }
-      }
+      partial = cache_truncated;
     }
     free(rows);
   }
@@ -11939,12 +11935,17 @@ int edr_local_evidence_cache_query_json(const char *payload_json, char *out, siz
         "source_completeness,source_truncated_fields "
         "FROM p0_candidates WHERE event_time_ns>=? AND local_retention_state='retained' ORDER BY event_time_ns DESC LIMIT ?;";
     sqlite3_stmt *st = NULL;
-    if (sqlite3_prepare_v2(s_db, sql, -1, &st, NULL) == SQLITE_OK) {
+    int step = sqlite3_prepare_v2(s_db, sql, -1, &st, NULL);
+    if (step == SQLITE_OK) {
       int64_t cutoff = now_unix_ns() - (int64_t)f.time_window_s * 1000000000LL;
       sqlite3_bind_int64(st, 1, (sqlite3_int64)cutoff);
-      sqlite3_bind_int64(st, 2, (sqlite3_int64)(f.limit * 20u + 100u));
-      while (sqlite3_step(st) == SQLITE_ROW && returned < f.limit) {
-        scanned++;
+      const uint32_t candidate_scan_limit = f.limit * 20u + 100u;
+      uint32_t candidates_scanned = 0;
+      sqlite3_bind_int64(st, 2, (sqlite3_int64)candidate_scan_limit);
+      step = SQLITE_DONE;
+      while (returned < f.limit && candidates_scanned < candidate_scan_limit &&
+             (step = sqlite3_step(st)) == SQLITE_ROW) {
+        candidates_scanned++;
         int64_t ts = sqlite3_column_int64(st, 0);
         uint32_t ty = (uint32_t)sqlite3_column_int64(st, 1);
         uint32_t pid = (uint32_t)sqlite3_column_int64(st, 2);
@@ -11978,10 +11979,25 @@ int edr_local_evidence_cache_query_json(const char *payload_json, char *out, siz
                           generation_source, source_completeness, source_truncated_fields);
         returned++;
       }
+      scanned += candidates_scanned;
+      /* At the scan limit the available budget cannot establish coverage.
+       * The count alone does not establish that more candidates exist. */
+      partial = candidates_scanned == candidate_scan_limit;
       sqlite3_finalize(st);
+    }
+    if (step != SQLITE_ROW && step != SQLITE_DONE) {
+      out[0] = '\0';
+      evidence_cache_unlock();
+      return -1;
     }
   }
 #endif
+  if (partial || (!hash_query && returned == f.limit)) {
+    char *partial_flag = strstr(out, "\"partial\":false");
+    if (partial_flag) {
+      memcpy(partial_flag + 10, "true ", 5u);
+    }
+  }
   appendf(out, cap, &off, "],\"rows_scanned\":%u,\"rows_returned\":%u}", scanned, returned);
   out[cap - 1u] = '\0';
   evidence_cache_unlock();
