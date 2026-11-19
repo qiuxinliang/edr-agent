@@ -1693,7 +1693,9 @@ if(SQLite3_FOUND)
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
   add_test(NAME registry_source_fidelity COMMAND test_local_evidence_cache_candidate --registry-source-fidelity
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
-  set_tests_properties(alert_window_recall registry_pre_window_contract registry_source_fidelity
+  add_test(NAME alert_window_contention COMMAND test_local_evidence_cache_candidate --alert-window-contention
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+  set_tests_properties(alert_window_recall alert_window_contention registry_pre_window_contract registry_source_fidelity
     PROPERTIES TIMEOUT 150 RESOURCE_LOCK local_evidence_cache_fixture)
   if(TEST owner_manifest_frame)
     set_tests_properties(owner_manifest_frame PROPERTIES TIMEOUT 150

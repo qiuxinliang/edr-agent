@@ -495,6 +495,10 @@ void edr_local_evidence_cache_test_reset_mutex_timing(void);
 void edr_local_evidence_cache_test_record_mutex_timing(uint64_t wait_ns,
                                                         uint64_t hold_ns);
 void edr_local_evidence_cache_test_hold_mutex(uint32_t hold_ms);
+void edr_local_evidence_cache_test_alert_window_steps(
+    void (*step)(int after_read, void *context), void *context);
+void edr_local_evidence_cache_test_hold_mutex_notify(uint32_t hold_ms,
+    void (*locked)(void *), void *ctx);
 #endif
 
 /** 追加 engine_health JSON 片段，形如 `"evidence_cache":{...}`。 */

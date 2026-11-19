@@ -8408,17 +8408,34 @@ void edr_local_evidence_cache_test_record_mutex_timing(uint64_t wait_ns,
   evidence_cache_unlock();
 }
 
-void edr_local_evidence_cache_test_hold_mutex(uint32_t hold_ms) {
+static void (*s_test_alert_window_step)(int after_read, void *context);
+static void *s_test_alert_window_context;
+
+void edr_local_evidence_cache_test_alert_window_steps(
+    void (*step)(int after_read, void *context), void *context) {
+  s_test_alert_window_step = step;
+  s_test_alert_window_context = context;
+}
+
+void edr_local_evidence_cache_test_hold_mutex_notify(uint32_t hold_ms,
+    void (*locked)(void *), void *ctx) {
   evidence_cache_lock();
+  if (locked) locked(ctx);
+  if (hold_ms) {
 #if defined(_WIN32)
-  Sleep((DWORD)hold_ms);
+    Sleep((DWORD)hold_ms);
 #else
-  struct timespec delay;
-  delay.tv_sec = (time_t)(hold_ms / 1000u);
-  delay.tv_nsec = (long)(hold_ms % 1000u) * 1000000L;
-  (void)nanosleep(&delay, NULL);
+    struct timespec delay;
+    delay.tv_sec = (time_t)(hold_ms / 1000u);
+    delay.tv_nsec = (long)(hold_ms % 1000u) * 1000000L;
+    (void)nanosleep(&delay, NULL);
 #endif
+  }
   evidence_cache_unlock();
+}
+
+void edr_local_evidence_cache_test_hold_mutex(uint32_t hold_ms) {
+  edr_local_evidence_cache_test_hold_mutex_notify(hold_ms, NULL, NULL);
 }
 #endif
 
@@ -11191,6 +11208,7 @@ static int parent_context_quality(const char *value) {
 typedef struct {
   const EdrAlertWindowQuery *query;
   EvidenceQueryDeadline deadline;
+  uint64_t started_mono_ns;
   char owner[160], start[32], birth[32];
   char snapshot[65];
   int64_t first_ns, last_ns;
@@ -11624,6 +11642,84 @@ static int window_encode(AlertWindowRead *r, cJSON *root, char *out, size_t cap)
   cJSON_free(json);
   return rc;
 }
+
+/* Alert-window authorization carries millisecond expiry. Cache retention uses
+ * a separate wall clock sampled in whole seconds. */
+static int64_t alert_window_now_ms(void) {
+#ifdef EDR_LOCAL_EVIDENCE_CACHE_TESTING
+  if (s_test_now_unix_ns > 0) return s_test_now_unix_ns / 1000000LL;
+#endif
+  struct timespec wall;
+  if (timespec_get(&wall, TIME_UTC) != TIME_UTC) return INT64_MAX;
+  return (int64_t)wall.tv_sec * 1000 + wall.tv_nsec / 1000000;
+}
+
+static uint64_t alert_window_clock_ns(void) {
+#ifdef EDR_LOCAL_EVIDENCE_CACHE_TESTING
+  if (s_test_alert_window_step) return edr_monotonic_ns();
+#endif
+  return evidence_cache_clock_ns();
+}
+
+static int alert_window_deadline_error(const AlertWindowRead *read) {
+  if (alert_window_now_ms() >= read->deadline.expires_ms) return EDR_PARENT_CONTEXT_ERROR_EXPIRED;
+  uint64_t mono = alert_window_clock_ns();
+  return mono < read->started_mono_ns || mono >= read->deadline.until_mono_ns
+      ? EDR_PARENT_CONTEXT_ERROR_BUDGET : 0;
+}
+
+static int alert_window_interrupted(void *arg) {
+  return alert_window_deadline_error(arg) != 0;
+}
+
+static void alert_window_retry_pause(void) {
+#ifdef EDR_LOCAL_EVIDENCE_CACHE_TESTING
+  if (s_test_alert_window_step) {
+    s_test_alert_window_step(0, s_test_alert_window_context);
+    return;
+  }
+#endif
+#if defined(_WIN32)
+  Sleep(5);
+#else
+  struct timespec delay = {0, 5000000};
+  (void)nanosleep(&delay, NULL);
+#endif
+}
+
+static int alert_window_acquire_lock(const AlertWindowRead *read) {
+  if (evidence_cache_try_query_lock()) return 0;
+  const uint64_t retry_until = read->started_mono_ns + 20000000ULL;
+  const uint64_t wait_started = evidence_cache_clock_ns();
+  /* Collection maintenance cooperates within a 20 ms elapsed-time budget
+   * measured on a monotonic clock. Bound retry count independently. */
+  for (unsigned retry = 0; retry < 2; ++retry) {
+    uint64_t now = alert_window_clock_ns();
+    if (alert_window_now_ms() >= read->deadline.expires_ms) return EDR_PARENT_CONTEXT_ERROR_EXPIRED;
+    if (now < read->started_mono_ns ||
+        now >= read->deadline.until_mono_ns || read->deadline.until_mono_ns - now < 5000000ULL ||
+        now >= retry_until || retry_until - now < 5000000ULL)
+      return EDR_PARENT_CONTEXT_ERROR_BUSY;
+    alert_window_retry_pause();
+    now = alert_window_clock_ns();
+    if (alert_window_now_ms() >= read->deadline.expires_ms) return EDR_PARENT_CONTEXT_ERROR_EXPIRED;
+    if (now < read->started_mono_ns || now >= read->deadline.until_mono_ns || now >= retry_until)
+      return EDR_PARENT_CONTEXT_ERROR_BUSY;
+    if (evidence_cache_try_query_lock()) {
+      s_evidence_cache_lock_tls.wait_ns =
+          evidence_cache_elapsed_ns(wait_started, s_evidence_cache_lock_tls.acquired_ns);
+      /* The scheduler may pause this thread between the check and try. */
+      now = alert_window_clock_ns();
+      if (now < read->started_mono_ns || now >= retry_until) {
+        evidence_cache_unlock();
+        return alert_window_now_ms() >= read->deadline.expires_ms
+            ? EDR_PARENT_CONTEXT_ERROR_EXPIRED : EDR_PARENT_CONTEXT_ERROR_BUSY;
+      }
+      return 0;
+    }
+  }
+  return EDR_PARENT_CONTEXT_ERROR_BUSY;
+}
 #endif
 
 int edr_local_evidence_cache_query_alert_window_json(const EdrAlertWindowQuery *q, char *out, size_t cap) {
@@ -11640,26 +11736,38 @@ int edr_local_evidence_cache_query_alert_window_json(const EdrAlertWindowQuery *
       q->max_bytes < 512 || q->max_bytes > 8192 || cap <= (size_t)q->max_bytes)
     return EDR_PARENT_CONTEXT_ERROR_INVALID;
 #if defined(EDR_HAVE_SQLITE)
-  int64_t now = now_unix_ns() / 1000000LL;
+  int64_t now = alert_window_now_ms();
   if (q->expires_unix_ms <= now) return EDR_PARENT_CONTEXT_ERROR_EXPIRED;
-  if (!evidence_cache_try_query_lock()) return EDR_PARENT_CONTEXT_ERROR_BUSY;
   int64_t ms = q->expires_unix_ms - now;
   AlertWindowRead read = {0};
   read.query = q;
   read.deadline.expires_ms = q->expires_unix_ms;
-  read.deadline.until_mono_ns = edr_monotonic_ns() + (uint64_t)(ms < 2000 ? ms : 2000) * 1000000ULL;
+  read.started_mono_ns = alert_window_clock_ns();
+  if (!read.started_mono_ns || read.started_mono_ns > UINT64_MAX - 2000000000ULL)
+    return EDR_PARENT_CONTEXT_ERROR_BUDGET;
+  read.deadline.until_mono_ns = read.started_mono_ns + (uint64_t)(ms < 2000 ? ms : 2000) * 1000000ULL;
+  int deadline_error = alert_window_acquire_lock(&read);
+  if (deadline_error) return deadline_error;
+  deadline_error = alert_window_deadline_error(&read);
+  if (deadline_error) {
+    evidence_cache_unlock();
+    return deadline_error;
+  }
   sqlite_u64_decimal(q->process_start_key, read.start);
   sqlite_u64_decimal(q->process_creation_filetime_100ns, read.birth);
   cJSON *root = cJSON_CreateObject();
   int transaction = 0, rc = EDR_PARENT_CONTEXT_ERROR_STORAGE;
   if (!s_db || !root || !(read.rows = cJSON_AddArrayToObject(root, "rows"))) goto done;
-  sqlite3_progress_handler(s_db, 1000, authorized_query_interrupted, &read.deadline);
+  sqlite3_progress_handler(s_db, 1000, alert_window_interrupted, &read);
   if (exec_sql("BEGIN;") != 0) goto done;
   transaction = 1;
   rc = window_read_owner(&read);
   if (!rc && read.owner[0]) rc = window_check_projection(&read);
   if (!rc && read.owner[0] && !q->pre_snapshot_sha256) rc = window_read_post(&read);
   if (!rc) rc = window_encode(&read, root, out, cap);
+#ifdef EDR_LOCAL_EVIDENCE_CACHE_TESTING
+  if (s_test_alert_window_step) s_test_alert_window_step(1, s_test_alert_window_context);
+#endif
   if (!rc && exec_sql("COMMIT;") == 0)
     transaction = 0;
   else if (!rc)
@@ -11667,9 +11775,8 @@ int edr_local_evidence_cache_query_alert_window_json(const EdrAlertWindowQuery *
 done:
   if (s_db) sqlite3_progress_handler(s_db, 0, NULL, NULL);
   if (transaction) sqlite_rollback_silent();
-  if (authorized_query_interrupted(&read.deadline))
-    rc = now_unix_ns() / 1000000LL >= q->expires_unix_ms ? EDR_PARENT_CONTEXT_ERROR_EXPIRED
-                                                         : EDR_PARENT_CONTEXT_ERROR_BUDGET;
+  deadline_error = alert_window_deadline_error(&read);
+  if (deadline_error) rc = deadline_error;
   if (rc) *out = 0;
   cJSON_Delete(root);
   evidence_cache_unlock();

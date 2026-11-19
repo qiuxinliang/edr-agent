@@ -27,6 +27,7 @@
 #include <string.h>
 #include <time.h>
 #include <errno.h>
+#include <stdatomic.h>
 
 #if defined(_WIN32)
 #include <windows.h>
@@ -15676,6 +15677,7 @@ static void test_window_entry_order_and_recovery(int enforce) {
 #include "retained_context_recall_cases.h"
 #include "window_recovery_budget_cases.h"
 #include "alert_window_recall_cases.h"
+#include "alert_window_contention_cases.h"
 #include "alert_window_pre_page_cases.h"
 #include "owner_manifest_frame_cases.h"
 
@@ -15694,6 +15696,9 @@ int main(int argc, char **argv) {
     test_alert_window_invalid_network_fields();
     test_registry_sidecar_wrap();
     return 0;
+  }
+  if (argc == 2 && !strcmp(argv[1], "--alert-window-contention")) {
+    test_alert_window_contention(); return 0;
   }
   if (argc == 2 && !strcmp(argv[1], "--alert-window-recall")) {
     test_alert_window_recall();
