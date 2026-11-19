@@ -11271,8 +11271,12 @@ static int window_project_event(AlertWindowRead *r, const cJSON *event, int64_t 
   const char *trunc = authorized_context_text(event, "source_truncated_fields");
   if (!trunc) return EDR_PARENT_CONTEXT_ERROR_INTEGRITY;
   if (net) {
-    if (!ip || !*ip || strlen(ip) >= sizeof(((EdrBehaviorRecord *)0)->net_dst) || !manifest_utf8_valid(ip) ||
-        !parent_context_number(event, "remote_port", &port) || !port || port > 65535)
+    if (!ip || !parent_context_number(event, "remote_port", &port) || port > 65535)
+      return EDR_PARENT_CONTEXT_ERROR_INTEGRITY;
+    /* The collector leaves both destination fields empty when neither is
+     * decoded. Do not emit a connection. Coverage stays unknown. */
+    if (!*ip && !port) return 0;
+    if (!*ip || !port || strlen(ip) >= sizeof(((EdrBehaviorRecord *)0)->net_dst) || !manifest_utf8_valid(ip))
       return EDR_PARENT_CONTEXT_ERROR_INTEGRITY;
     if (q->remote_port && port != q->remote_port) return 0;
   } else {

@@ -15690,7 +15690,10 @@ int main(int argc, char **argv) {
     test_rtq_candidate_scan_coverage(); return 0;
   }
   if (argc == 2 && !strcmp(argv[1], "--registry-pre-window-contract")) {
-    test_alert_window_recall_contract(1); test_registry_sidecar_wrap(); return 0;
+    test_alert_window_recall_contract(1);
+    test_alert_window_invalid_network_fields();
+    test_registry_sidecar_wrap();
+    return 0;
   }
   if (argc == 2 && !strcmp(argv[1], "--alert-window-recall")) {
     test_alert_window_recall();

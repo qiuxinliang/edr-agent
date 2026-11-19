@@ -1,12 +1,12 @@
 #if defined(EDR_HAVE_SQLITE)
-static void window_deliver(EdrBehaviorRecord *r, const char *id, int64_t base, int64_t offset, unsigned port,
-                           int wrong_actor) {
+static void window_deliver_fields(EdrBehaviorRecord *r, const char *id, int64_t base,
+                                  int64_t offset, const char *ip, unsigned port, int wrong_actor) {
   init_floor_parent(r, base - INT64_C(90000000000));
   r->event_time_ns = base + offset;
   edr_local_evidence_cache_test_set_now_unix_ns(r->event_time_ns);
   s_test_monotonic_ns = (uint64_t)(INT64_C(100000000000) + offset);
   snprintf(r->event_id, sizeof(r->event_id), "%s", id);
-  if (!port) {
+  if (!ip) {
     r->type = EDR_EVENT_FILE_WRITE;
     r->file_actor_generation_validated = 1;
     snprintf(r->file_path, sizeof(r->file_path), "C:/Data/%s.exe", id);
@@ -14,11 +14,16 @@ static void window_deliver(EdrBehaviorRecord *r, const char *id, int64_t base, i
   } else {
     r->type = EDR_EVENT_NET_CONNECT;
     r->net_dport = port;
-    strcpy(r->net_dst, "192.0.2.74");
+    strcpy(r->net_dst, ip);
     if (wrong_actor) ++r->process_creation_filetime_100ns;
   }
-  assert(!!edr_local_evidence_cache_is_candidate(r) == !port);
+  assert(!!edr_local_evidence_cache_is_candidate(r) == !ip);
   edr_local_evidence_cache_record_behavior(r);
+}
+
+static void window_deliver(EdrBehaviorRecord *r, const char *id, int64_t base, int64_t offset,
+                           unsigned port, int wrong_actor) {
+  window_deliver_fields(r, id, base, offset, port ? "192.0.2.74" : NULL, port, wrong_actor);
 }
 
 static void init_window_registry(EdrBehaviorRecord *r, const char *id, int64_t base, int64_t offset,
@@ -67,12 +72,18 @@ static void test_alert_window_recall_contract(int require_registry_pre) {
     edr_local_evidence_cache_test_set_now_unix_ns(base - 40 * sec);
     edr_local_evidence_cache_test_set_retention_monotonic_ms(1000000);
     assert((compact ? edr_local_evidence_cache_open(path, 16, 24) : test_open_legacy_context(path, 16, 24)) == 0);
+    window_deliver_fields(r, "unknown-pre", base, -36 * sec, "", 0, 0);
     window_deliver(r, "only-A", base, -35 * sec, 51741, 0);
     window_registry_input(r, "reg-pre", base, -30 * sec, "HKCU/Software/Pre", "pre", 0);
     window_registry_input(r, "reg-pre-default", base, -30 * sec + 1, "HKCU/Software/前窗", "", 0);
     window_registry_input(r, "reg-pre-wrong", base, -29 * sec, "HKCU/Software/WrongPre", "wrong", 1);
     window_deliver(r, "anchor-A", base, 0, 0, 0);
     window_deliver(r, "anchor-B", base, 20 * sec, 0, 0);
+    for (int i = 0; i < 8; ++i) {
+      char id[32];
+      snprintf(id, sizeof(id), "a-unknown-post-%d", i);
+      window_deliver_fields(r, id, base, 24 * sec + i, "", 0, 0);
+    }
     window_deliver(r, "shared", base, 25 * sec, 51742, 0);
     window_deliver(r, "shared-next-ns", base, 25 * sec + 1, 51745, 0);
     window_deliver(r, "recycled", base, 26 * sec, 51744, 1);
@@ -144,7 +155,14 @@ static void test_alert_window_recall_contract(int require_registry_pre) {
       if (!b) assert(!strcmp(cJSON_GetObjectItemCaseSensitive(rows->child, "phase")->valuestring, "pre"));
       cJSON_Delete(root);
       q.remote_port = 51744; /* Wrong generation stays absent. */
-      root = window_answer(&q); assert(!cJSON_GetArraySize(cJSON_GetObjectItemCaseSensitive(root, "rows"))); cJSON_Delete(root);
+      root = window_answer(&q);
+      assert(!cJSON_GetArraySize(cJSON_GetObjectItemCaseSensitive(root, "rows")));
+      const cJSON *gaps = cJSON_GetObjectItemCaseSensitive(root, "gap_reasons");
+      assert(cJSON_IsArray(gaps) && cJSON_GetArraySize(gaps) > 0);
+      assert(!strcmp(cJSON_GetArrayItem(gaps, cJSON_GetArraySize(gaps) - 1)->valuestring, "unknown"));
+      assert(cJSON_IsFalse(cJSON_GetObjectItemCaseSensitive(root, "scan_limited")));
+      assert(cJSON_IsFalse(cJSON_GetObjectItemCaseSensitive(root, "output_truncated")));
+      cJSON_Delete(root);
       char invalid[8193]; q.remote_port = 0;
       assert(edr_local_evidence_cache_query_alert_window_json(&q, invalid, sizeof(invalid)) == EDR_PARENT_CONTEXT_ERROR_INVALID);
       q.remote_port = 65536;
@@ -237,6 +255,60 @@ static void test_alert_window_recall_contract(int require_registry_pre) {
     sqlite3_finalize(st);
     sqlite3_close(db);
     char out[8193] = "must be cleared";
+    assert(edr_local_evidence_cache_query_alert_window_json(&q, out, sizeof(out)) ==
+               EDR_PARENT_CONTEXT_ERROR_INTEGRITY &&
+           !out[0]);
+    /* Simulate external corruption in this disposable test store. The normal
+     * retention owner blocks deletion while a fact has a live reference. */
+    db = NULL;
+    st = NULL;
+    assert(sqlite3_open(path, &db) == SQLITE_OK);
+    assert(sqlite3_exec(db, "PRAGMA foreign_keys=OFF; DROP TRIGGER context_fact_retention_delete;",
+                        NULL, NULL, NULL) == SQLITE_OK);
+    assert(sqlite3_prepare_v2(db, "DELETE FROM context_facts WHERE fact_id=?;", -1, &st, NULL) == SQLITE_OK);
+    assert(sqlite3_bind_text(st, 1, shared, -1, SQLITE_STATIC) == SQLITE_OK);
+    assert(sqlite3_step(st) == SQLITE_DONE && sqlite3_changes(db) == 1);
+    sqlite3_finalize(st);
+    sqlite3_close(db);
+    assert(edr_local_evidence_cache_query_alert_window_json(&q, out, sizeof(out)) ==
+               EDR_PARENT_CONTEXT_ERROR_INTEGRITY &&
+           !out[0]);
+    edr_local_evidence_cache_close();
+    cleanup_test_sqlite_path(path);
+    free(r);
+    test_unsetenv("EDR_EVIDENCE_CONTEXT_WINDOW_S");
+    edr_local_evidence_cache_test_set_now_unix_ns(0);
+    edr_local_evidence_cache_test_set_retention_monotonic_ms(-1);
+    s_test_monotonic_ns = 0;
+  }
+}
+static void test_alert_window_invalid_network_fields(void) {
+  const int64_t sec = INT64_C(1000000000), base = INT64_C(1750061200000000101);
+  const struct { const char *ip; unsigned port; } malformed[] = {
+    {"", 51742}, {"192.0.2.74", 0}, {"192.0.2.74", 65536}
+  };
+  for (size_t i = 0; i < sizeof(malformed) / sizeof(malformed[0]); ++i) {
+    char path[640], out[8193] = "must be cleared";
+    EdrBehaviorRecord *r = calloc(1, sizeof(*r));
+    assert(r && make_test_sqlite_path(path, sizeof(path)) == 0);
+    test_setenv("EDR_EVIDENCE_CONTEXT_WINDOW_S", "45");
+    edr_local_evidence_cache_test_set_now_unix_ns(base - 10 * sec);
+    edr_local_evidence_cache_test_set_retention_monotonic_ms(1000000);
+    assert(edr_local_evidence_cache_open(path, 16, 24) == 0);
+    window_deliver(r, "anchor", base, 0, 0, 0);
+    window_deliver_fields(r, "invalid", base, sec, malformed[i].ip, malformed[i].port, 0);
+    window_deliver(r, "valid", base, 2 * sec, 51742, 0);
+    edr_local_evidence_cache_close();
+    assert(edr_local_evidence_cache_open(path, 16, 24) == 0);
+    EdrAlertWindowQuery q = {
+      .tenant_id = r->tenant_id, .endpoint_id = r->endpoint_id,
+      .alert_id = "alert", .source_event_id = "anchor",
+      .pid = r->pid, .process_start_key = r->process_start_key,
+      .process_creation_filetime_100ns = r->process_creation_filetime_100ns,
+      .source_time_ns = base, .from_ns = base - sec, .until_ns = base + 3 * sec,
+      .expires_unix_ms = base / 1000000 + 30000,
+      .kind = "network_port", .remote_port = 51742, .limit = 50, .max_bytes = 8192,
+    };
     assert(edr_local_evidence_cache_query_alert_window_json(&q, out, sizeof(out)) ==
                EDR_PARENT_CONTEXT_ERROR_INTEGRITY &&
            !out[0]);
