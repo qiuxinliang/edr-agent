@@ -311,8 +311,23 @@ class WindowsReleaseWorkflowTests(unittest.TestCase):
         confirmation = publish.split('- name: Confirm validation candidate remains a draft\n', 1)[1]
         self.assertIn("if: env.EDR_RELEASE_VALIDATION_ONLY == 'true'", confirmation)
         self.assertIn('windows_release_checkpoint.py verify-owner', confirmation)
-        for name in ('prepare-release', 'windows-build', 'usb-finalize', 'windows-lifecycle'):
+        for name in ('prepare-release', 'usb-finalize', 'windows-lifecycle'):
             self.assertNotIn('EDR_RELEASE_VALIDATION_ONLY', self.jobs[name])
+        build = self.jobs['windows-build']
+        fixture_steps = (
+            'Bind ARM64 alert-window replay executable to validation run',
+            'Retain the same-run ARM64 alert-window replay executable',
+        )
+        artifact_gate = (
+            "if: steps.resume.outputs.restored != 'true' && matrix.arch == 'arm64'"
+            " && github.event.repository.private == true && env.EDR_RELEASE_VALIDATION_ONLY == 'true'"
+            " && env.EDR_AGENT_RELEASE_TAG == 'win_3.2.749' && github.ref_name == 'codex/utm-cache-recall-749'"
+        )
+        for name in fixture_steps:
+            step = build.split(f'- name: {name}\n', 1)[1].split('\n      - ', 1)[0]
+            self.assertIn(artifact_gate, step)
+            build = build.replace(step, '', 1)
+        self.assertNotIn('EDR_RELEASE_VALIDATION_ONLY', build)
 
     def test_headless_scope_is_explicit_and_validated_before_release_operations(self):
         scope = self.text.split('      package_scope:', 1)[1].split('      upgrade_class:', 1)[0]

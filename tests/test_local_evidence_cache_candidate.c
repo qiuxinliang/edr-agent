@@ -15678,6 +15678,7 @@ static void test_window_entry_order_and_recovery(int enforce) {
 #include "window_recovery_budget_cases.h"
 #include "alert_window_recall_cases.h"
 #include "alert_window_contention_cases.h"
+#include "alert_window_live_contention_cases.h"
 #include "alert_window_pre_page_cases.h"
 #include "owner_manifest_frame_cases.h"
 
@@ -15700,6 +15701,11 @@ int main(int argc, char **argv) {
   if (argc == 2 && !strcmp(argv[1], "--alert-window-contention")) {
     test_alert_window_contention(); return 0;
   }
+#if defined(_WIN32)
+  if (argc == 2 && !strcmp(argv[1], "--alert-window-live-contention")) {
+    test_alert_window_live_contention(); return 0;
+  }
+#endif
   if (argc == 2 && !strcmp(argv[1], "--alert-window-recall")) {
     test_alert_window_recall();
     test_alert_window_pre_page();

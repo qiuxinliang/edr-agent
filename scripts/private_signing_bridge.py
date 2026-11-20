@@ -56,7 +56,8 @@ def validate_source(run, attempt, commit, version, info):
     if not ((event == "push" and branch == "win_" + version)
             or (event == "workflow_dispatch" and (branch in RELEASE_BRANCHES
                 or (branch == "codex/cache-deploy-compat-registry" and version == "3.2.747")
-                or (branch == "codex/utm-cache-recall-748" and version == "3.2.748")))):
+                or (branch == "codex/utm-cache-recall-748" and version == "3.2.748")
+                or (branch == "codex/utm-cache-recall-749" and version == "3.2.749")))):
         raise ValueError("USB signing accepts release tags or a manual release from an explicitly trusted release branch only")
 
 

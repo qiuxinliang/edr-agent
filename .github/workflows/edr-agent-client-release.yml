@@ -768,6 +768,30 @@ jobs:
           & .\tests\run_telemetry_windows_native.ps1 @telemetryArgs
           if ($LASTEXITCODE -ne 0) { throw 'Native telemetry release gate failed' }
 
+      - name: Bind ARM64 alert-window replay executable to validation run
+        if: steps.resume.outputs.restored != 'true' && matrix.arch == 'arm64' && github.event.repository.private == true && env.EDR_RELEASE_VALIDATION_ONLY == 'true' && env.EDR_AGENT_RELEASE_TAG == 'win_3.2.749' && github.ref_name == 'codex/utm-cache-recall-749'
+        shell: pwsh
+        run: |
+          $probes = @(Get-ChildItem -LiteralPath build -Recurse -File -Filter test_local_evidence_cache_candidate.exe)
+          if ($probes.Count -ne 1) { throw 'Expected one ARM64 alert-window replay executable' }
+          & ./scripts/Assert-WindowsPeArchitecture.ps1 -Path $probes[0].FullName -Architecture arm64
+          $output = New-Item -Path build/utm-alert-window-fixture -ItemType Directory
+          Copy-Item -LiteralPath $probes[0].FullName -Destination $output.FullName
+          $hash = (Get-FileHash -LiteralPath $probes[0].FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          [ordered]@{ commit=$env:GITHUB_SHA; run=$env:GITHUB_RUN_ID; attempt=$env:GITHUB_RUN_ATTEMPT; sha256=$hash } |
+            ConvertTo-Json -Compress | Set-Content -LiteralPath (Join-Path $output.FullName 'provenance.json') -Encoding utf8
+          & dumpbin /dependents $probes[0].FullName | Set-Content -LiteralPath (Join-Path $output.FullName 'dependencies.txt') -Encoding utf8
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot record ARM64 replay executable dependencies' }
+
+      - name: Retain the same-run ARM64 alert-window replay executable
+        if: steps.resume.outputs.restored != 'true' && matrix.arch == 'arm64' && github.event.repository.private == true && env.EDR_RELEASE_VALIDATION_ONLY == 'true' && env.EDR_AGENT_RELEASE_TAG == 'win_3.2.749' && github.ref_name == 'codex/utm-cache-recall-749'
+        uses: actions/upload-artifact@v4
+        with:
+          name: alert-window-contention-utm-arm64
+          path: build/utm-alert-window-fixture/
+          if-no-files-found: error
+          retention-days: 3
+
       - name: Save native Windows rule validation evidence
         if: (always()) && steps.resume.outputs.restored != 'true'
         uses: actions/upload-artifact@v4
