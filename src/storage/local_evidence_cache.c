@@ -639,20 +639,31 @@ static int source_field_list_has(const char *list, const char *field) {
   return 0;
 }
 
-static void source_field_list_append(char *list, size_t cap, const char *field) {
+static int source_field_list_append(char *list, size_t cap, const char *field) {
   size_t used;
   size_t field_len;
-  if (!list || cap == 0u || !field || !field[0] ||
-      source_field_list_has(list, field)) {
-    return;
-  }
+  if (!list || cap == 0u || !field || !field[0]) return 0;
+  if (source_field_list_has(list, field)) return 1;
   used = strlen(list);
   field_len = strlen(field);
   if (used + (used ? 1u : 0u) + field_len >= cap) {
-    return;
+    return 0;
   }
   if (used) list[used++] = ',';
   memcpy(list + used, field, field_len + 1u);
+  return 1;
+}
+
+/* Preserve as many upstream omissions as fit with the new path omission.
+ * When any fields are displaced, keep the existing overflow signal. */
+static void mark_cached_file_path_omission(char fields[EDR_BR_SOURCE_TRUNCATED_FIELDS_LEN]) {
+  const size_t cap = EDR_BR_SOURCE_TRUNCATED_FIELDS_LEN;
+  if (source_field_list_append(fields, cap, "source.file_path")) return;
+  size_t end = cap - sizeof(",source.list_overflow,source.file_path");
+  while (end && fields[end] != ',') --end;
+  fields[end] = '\0';
+  source_field_list_append(fields, cap, "source.list_overflow");
+  source_field_list_append(fields, cap, "source.file_path");
 }
 
 static void capture_field_provenance(char *out, size_t cap,
@@ -1675,7 +1686,16 @@ static int ring_record_to(RingSlot *ring, uint32_t slots, uint32_t *pos,
   copy_s(s->source_truncated_fields, sizeof(s->source_truncated_fields),
          r->source_truncated_fields);
   copy_s(s->process_name, sizeof(s->process_name), r->process_name);
-  copy_s(s->file_path, sizeof(s->file_path), r->file_path);
+  int path_exact = copy_s(s->file_path, sizeof(s->file_path), r->file_path);
+  if (!path_exact && r->type == EDR_EVENT_FILE_WRITE) {
+    size_t end = sizeof(s->file_path) - 1u;
+    /* The first omitted byte may continue the last copied code point. */
+    while (end && ((unsigned char)r->file_path[end] & 0xc0u) == 0x80u) --end;
+    s->file_path[end] = '\0';
+    mark_cached_file_path_omission(s->source_truncated_fields);
+    if (!strcmp(s->source_completeness, "COMPLETE"))
+      copy_s(s->source_completeness, sizeof(s->source_completeness), "TRUNCATED");
+  }
   copy_s(s->net_dst, sizeof(s->net_dst), r->net_dst);
   return evicted;
 }
@@ -4805,6 +4825,11 @@ static int build_post_context_manifest_template_json(const EdrBehaviorRecord *r,
     manifest_rejected("post-context manifest missing source record");
     return -1;
   }
+  const char *path = r->file_path;
+  /* The writer's image identifies the actor, not the target of a write. */
+  if (!*path && r->type != EDR_EVENT_FILE_WRITE) path = r->exe_path;
+  const char *quality = !*path && r->type == EDR_EVENT_FILE_WRITE &&
+      !strcmp(r->source_completeness, "COMPLETE") ? "NOT_EVALUABLE" : r->source_completeness;
   generation_known = record_process_generation(r, &generation);
   parent_generation_known = record_parent_snapshot(r, &parent_snapshot);
   generation_source = generation_known ? record_process_generation_source(r) : "";
@@ -4837,10 +4862,10 @@ static int build_post_context_manifest_template_json(const EdrBehaviorRecord *r,
                           parent_generation_known ? record_parent_generation_source(r) : "") &&
        manifest_add_text(root, "parent_process_name", parent_generation_known ? parent_snapshot.process_name : "") &&
        manifest_add_text(root, "parent_exe_path", parent_generation_known ? parent_snapshot.exe_path : "") &&
-       manifest_add_text(root, "source_completeness", r->source_completeness) &&
+       manifest_add_text(root, "source_completeness", quality) &&
        manifest_add_text(root, "source_truncated_fields", r->source_truncated_fields) &&
        manifest_add_text(root, "process_name", r->process_name) &&
-       manifest_add_text(root, "path", r->file_path[0] ? r->file_path : r->exe_path) &&
+       manifest_add_text(root, "path", path) &&
        manifest_add_text(root, "dns_query", r->dns_query) &&
        manifest_add_text(root, "remote_ip", r->net_dst) &&
        manifest_add_u64(root, "remote_port", r->net_dport) &&

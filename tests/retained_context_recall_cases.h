@@ -38,6 +38,127 @@ static void retained_recall_contract(EdrSoarCommandMeta *meta, const EdrBehavior
       "{\"schema\":\"edr.command.result-purpose.v1\",\"kind\":\"cached_rtq\",\"max_bytes\":16383,\"max_rows\":%u,\"window_s\":600,\"issued_unix_ms\":%lld,\"event_type\":11,\"request\":%s}",
       rows,(long long)meta->issued_at_unix_ms,request);
 }
+
+static void test_file_target_fidelity(void) {
+  const int64_t trigger_time = INT64_C(1793100000000000000);
+  const char *image = "C:\\UserData\\fidelity-self.exe";
+  char shared_prefix[254];
+  memset(shared_prefix, 'q', sizeof(shared_prefix) - 1u);
+  memcpy(shared_prefix, "C:\\UserData\\", sizeof("C:\\UserData\\") - 1u);
+  shared_prefix[sizeof(shared_prefix) - 1u] = '\0';
+  char exact_boundary[256];
+  snprintf(exact_boundary, sizeof(exact_boundary), "%sAB", shared_prefix);
+  assert(strlen(exact_boundary) == 255u);
+
+  for (unsigned layout = 0; layout < 2u; ++layout) {
+    char path[640], queue_path[640], output[16384];
+    EdrBehaviorRecord owner, event;
+    assert(make_test_sqlite_path(path, sizeof(path)) == 0);
+    assert(make_test_sqlite_path(queue_path, sizeof(queue_path)) == 0);
+    edr_storage_queue_configure(16, 24);
+    assert(edr_storage_queue_open(queue_path) == EDR_OK);
+    edr_pt_cache_init();
+    edr_local_evidence_cache_test_set_now_unix_ns(trigger_time);
+    assert((layout ? edr_local_evidence_cache_open(path, 16, 24)
+                   : test_open_legacy_context(path, 16, 24)) == 0);
+    init_window_replacement_candidate(&owner, 0, trigger_time);
+    event = owner;
+    event.type = EDR_EVENT_FILE_WRITE;
+    event.net_dport = 0;
+    event.net_dst[0] = '\0';
+    event.detection_context[0] = '\0';
+    event.source_truncated_fields[0] = '\0';
+    snprintf(event.exe_path, sizeof(event.exe_path), "%s", image);
+
+    /* The two full paths share a prefix but are separate observations. The
+     * 255-byte boundary splits the UTF-8 character in both longer targets. */
+    const char *suffixes[] = {"\xe4\xb8\x80.bin", "\xe4\xb8\x81.bin", "AB"};
+    const char *qualities[] = {"COMPLETE", "NOT_EVALUABLE", "COMPLETE"};
+    for (unsigned index = 0; index < 3u; ++index) {
+      event.event_time_ns = trigger_time - 3 + (int64_t)index;
+      snprintf(event.event_id, sizeof(event.event_id), "fidelity-pre-%u", index);
+      snprintf(event.file_path, sizeof(event.file_path), "%s%s", shared_prefix, suffixes[index]);
+      snprintf(event.source_completeness, sizeof(event.source_completeness), "%s", qualities[index]);
+      assert(!edr_local_evidence_cache_is_candidate(&event));
+      edr_local_evidence_cache_record_behavior(&event);
+    }
+    edr_local_evidence_cache_record_behavior(&owner);
+
+    /* An empty target and a legitimate write to the image must not collide. */
+    const char *targets[] = {"", image};
+    snprintf(event.source_completeness, sizeof(event.source_completeness), "COMPLETE");
+    for (unsigned index = 0; index < 2u; ++index) {
+      event.event_time_ns = trigger_time + 1 + (int64_t)index;
+      snprintf(event.event_id, sizeof(event.event_id), "fidelity-post-%u", index);
+      snprintf(event.file_path, sizeof(event.file_path), "%s", targets[index]);
+      assert(!edr_local_evidence_cache_is_candidate(&event));
+      edr_local_evidence_cache_record_behavior(&event);
+    }
+    edr_local_evidence_cache_close();
+    edr_pt_cache_shutdown();
+    edr_local_evidence_cache_test_set_now_unix_ns(trigger_time + INT64_C(1000000000));
+    assert(edr_local_evidence_cache_open(path, 16, 24) == 0);
+
+    EdrSoarCommandMeta meta;
+    retained_recall_contract(&meta, &owner, trigger_time + INT64_C(1000000000),
+                             "{\"event_type\":\"file_write\"}", 50);
+    assert(edr_local_evidence_cache_query_authorized_json(meta.result_authorization.command_id,
+                                                         &meta, output, sizeof(output)) == 0);
+    assert(retained_recall_rows(output, "context_pre") == 3);
+    assert(retained_recall_rows(output, "context_post") == 2);
+    assert(retained_recall_rows(output, NULL) == 5);
+    /* Assert the exact serialized nanoseconds, not their cJSON double view. */
+    assert(strstr(output, "\"event_time_ns\":1793099999999999997"));
+    assert(strstr(output, "\"event_time_ns\":1793099999999999998"));
+    assert(strstr(output, "\"event_time_ns\":1793099999999999999"));
+    cJSON *response = cJSON_Parse(output);
+    assert(response);
+    const cJSON *row = NULL;
+    unsigned clipped_complete = 0, clipped_not_evaluable = 0, boundary = 0;
+    unsigned missing = 0, self_write = 0;
+    cJSON_ArrayForEach(row, cJSON_GetObjectItemCaseSensitive(response, "rows")) {
+      const char *target = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(row, "file_path"));
+      const char *quality = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(row, "source_completeness"));
+      const char *omissions = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(row, "source_truncated_fields"));
+      assert(target && quality && omissions);
+      if (!strcmp(target, shared_prefix)) {
+        assert(!strcmp(omissions, "source.file_path"));
+        if (!strcmp(quality, "TRUNCATED")) clipped_complete++;
+        if (!strcmp(quality, "NOT_EVALUABLE")) clipped_not_evaluable++;
+      } else if (!strcmp(target, exact_boundary)) {
+        assert(!strcmp(quality, "COMPLETE") && !*omissions);
+        boundary++;
+      } else if (!*target) {
+        assert(!strcmp(quality, "NOT_EVALUABLE") && !*omissions);
+        missing++;
+      } else {
+        assert(!strcmp(target, image) && !strcmp(quality, "COMPLETE") && !*omissions);
+        self_write++;
+      }
+    }
+    assert(clipped_complete == 1 && clipped_not_evaluable == 1 && boundary == 1);
+    assert(missing == 1 && self_write == 1);
+    cJSON_Delete(response);
+
+    /* A search for the common image name must return only the known target. */
+    retained_recall_contract(&meta, &owner, trigger_time + INT64_C(1000000000),
+                             "{\"event_type\":\"file_write\",\"file_path\":\"fidelity-self.exe\"}", 50);
+    assert(edr_local_evidence_cache_query_authorized_json(meta.result_authorization.command_id,
+                                                         &meta, output, sizeof(output)) == 0);
+    assert(retained_recall_rows(output, "context_post") == 1);
+    assert(retained_recall_rows(output, NULL) == 1);
+    assert(strstr(output, "\"event_time_ns\":1793100000000000002"));
+    printf("file_target_fidelity layout=%u clipped_utf8=2 exact_boundary=1 "
+           "missing=1 self_write=1 image_filter=1\n", layout);
+
+    edr_local_evidence_cache_close();
+    edr_storage_queue_close();
+    cleanup_test_sqlite_path(path);
+    cleanup_test_sqlite_path(queue_path);
+  }
+  edr_local_evidence_cache_test_set_now_unix_ns(0);
+}
+
 static void test_retained_context_recall(int enforce) {
   const int64_t base=INT64_C(1793100000000000000),now=base+INT64_C(2000000000);
   for (unsigned layout=0;layout<2u;++layout) {

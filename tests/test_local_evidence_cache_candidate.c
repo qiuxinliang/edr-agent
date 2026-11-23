@@ -5231,7 +5231,12 @@ static void test_context_manifest_discloses_32_item_truncation(void) {
       assert(cJSON_IsString(source_completeness) && source_completeness->valuestring &&
              strcmp(source_completeness->valuestring, "TRUNCATED") == 0);
       assert(cJSON_IsString(source_fields) && source_fields->valuestring &&
-             strcmp(source_fields->valuestring, pre.source_truncated_fields) == 0);
+             strstr(source_fields->valuestring, "source.file_path") &&
+             strstr(source_fields->valuestring, "source.list_overflow"));
+      const char *overflow = strstr(source_fields->valuestring, ",source.list_overflow");
+      assert(overflow && overflow > source_fields->valuestring);
+      assert(!memcmp(source_fields->valuestring, pre.source_truncated_fields,
+                     (size_t)(overflow - source_fields->valuestring)));
     }
     cJSON_Delete(root);
   }
@@ -15689,6 +15694,9 @@ int main(int argc, char **argv) {
   }
 #endif
 #if defined(EDR_HAVE_SQLITE)
+  if (argc == 2 && !strcmp(argv[1], "--file-target-fidelity")) {
+    test_file_target_fidelity(); return 0;
+  }
   if (argc == 2 && !strcmp(argv[1], "--rtq-candidate-scan-coverage")) {
     test_rtq_candidate_scan_coverage(); return 0;
   }
@@ -16033,6 +16041,7 @@ int main(int argc, char **argv) {
   RUN_CACHE_CASE("retention", test_selected_window_and_command_fact_dependencies());
   RUN_CACHE_CASE("retention", test_authorized_query_scope_and_absence());
   RUN_CACHE_CASE("retention", test_retained_context_recall(1));
+  RUN_CACHE_CASE("context", test_file_target_fidelity());
   RUN_CACHE_CASE("retention", test_retained_context_unknown_actor());
   RUN_CACHE_CASE("retention", test_retained_context_adjacent_ns(0));
   RUN_CACHE_CASE("retention", test_retained_context_adjacent_ns(1));
