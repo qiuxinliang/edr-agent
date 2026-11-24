@@ -1,4 +1,4 @@
-"""Run the pinned 749/751 Windows retention CTest on one MSVC ARM64 runner."""
+"""Compare pinned MSVC ARM64 retirement versions or replay 751's release prefix."""
 import argparse
 from contextlib import contextmanager
 import ctypes
@@ -25,6 +25,7 @@ REVISIONS = {
 TEST = 'local_evidence_cache_retention'
 DEADLINE = 150
 WATCHDOG = DEADLINE + 25
+PREFIX_WATCHDOG = 1200
 MAX_REPORT_INPUT_BYTES = 8 * 1024 * 1024
 ARM64 = 0xAA64
 EXPECTED_CASES = 59  # Both pinned trees contain 60 entries, one available only in --suite all.
@@ -41,6 +42,40 @@ CASE_EVENT = re.compile(
     r'^cache-case (begin|ok) suite=retention case=(test_[a-z0-9_]+\([0-9u]*\))'
     r'(?: elapsed_ms=([0-9]{1,12}))?\s*$', re.MULTILINE | re.ASCII)
 SUITE_OK = re.compile(r'^cache-suite ok suite=retention cases=([0-9]{1,3})\s*$', re.MULTILINE)
+# Signing job 3.2.751: retirement was result 95 of 125. The names also
+# validate the generated gate inventory before any prefix fixture runs.
+FORMAL_PREFIX = tuple("""
+evidence_startup_index_manifest tdh_property_alias_order_contract python_installer_config_contract
+openssl_tls_handshake command_signature_cross_language response_capability_manifest_contract
+command_inbox_persistence command_upload_outbox_recovery forensic_io_hard_timeout forensic_path_lifecycle
+response_forensic_path_contract forensic_tar_timeout windows_isolation_mock_behavior response_file_security_behavior
+shell_session_stream_completeness command_registry_and_payload_contract rtq_collector_behavior
+command_process_identity_and_receipts agent_update_command_contract agent_update_packaging_contract
+windows_updater_publisher windows_release_collector_pe_closure windows_inplace_collector_transaction
+windows_installer_log_redaction windows_update_physical_guard windows_inno_evidence_space
+windows_storage_space_preflight windows_updater_health_clock windows_updater_storage_start windows_updater_stop
+windows_updater_task_recovery windows_updater_atomic_json windows_updater_admission windows_updater_installer_job
+windows_autorun_acl windows_autorun_task windows_installer_acl_behavior windows_installer_health_behavior
+windows_agent_update_invocation request_signing http_retry_contract transport_v2_status_capacity
+transport_durable_owner process_evidence_pending telemetry_admission pid_history_pmfe_generation
+command_result_json_contract rtq_long_command_windows process_generation_same_handle_command_line
+kernel_file_io_identity etw_process_payload_identity_native collector_file_read_windows etw_network_decode_native
+wfas_provider_native security_event_time_native security_event_time_failures process_create_coalescer_state_machine
+security_event_xml_bounded_command_line cmd_actor_and_script_artifact http_telemetry_budget socket_connect_timeout_contract
+windows_headless_runtime_contract windows_install_compatibility_behavior windows_task_exit_behavior
+windows_task_trace_environment windows_native_manifest_behavior windows_native_uninstall_behavior event_bus_wait_and_mpmc
+behavior_record_alert_proto_contract behavior_record_alert_emit_contract ave_parent_integrity p0_source_only_durable_contract
+storage_queue_sqlite_contract detection_decision_combo detection_regression_scenarios detection_profile_and_trigger_modes
+webshell_semantic_rules detection_sensor_bridge windows_rule_semantic_audit p0_rule_ir_record_golden
+process_command_admission p0_rule_ir_exclusions p0_validation_matrix windows_event_policy p0_direct_emit_suppression
+p0_source_only_capacity_recovery p0_deferred_snapshot process_tree_cache owner_manifest_frame registry_pre_window_contract
+registry_source_fidelity alert_window_contention local_evidence_cache_candidate local_evidence_cache_migration
+""".split()) + (TEST,)
+GATE_LABEL = '^windows-release-gate$'
+CTEST_START = re.compile(r'^\s*Start\s+(\d+):\s+(\w+)\s*$', re.MULTILINE | re.ASCII)
+CTEST_RESULT = re.compile(
+    r'^ *([0-9]+)/([0-9]+) Test +# *([0-9]+): +(\w+) +\.{2,} *(.*?) +[0-9.]+ sec *$',
+    re.MULTILINE | re.ASCII)
 
 
 class PairError(RuntimeError):
@@ -180,8 +215,11 @@ def pe_machine(path):
 
 
 def sha256(path):
+    digest = hashlib.sha256()
     with path.open('rb') as source:
-        return hashlib.file_digest(source, 'sha256').hexdigest()
+        for block in iter(lambda: source.read(1024 * 1024), b''):
+            digest.update(block)
+    return digest.hexdigest()
 
 
 def command_output(command, env=None, cwd=None):
@@ -191,8 +229,12 @@ def command_output(command, env=None, cwd=None):
     return result.stdout
 
 
+def ctest_base(ctest, build):
+    return [str(ctest), '--test-dir', str(build), '-C', 'Release']
+
+
 def selection(ctest, build):
-    return [str(ctest), '--test-dir', str(build), '-C', 'Release', '-R', '^' + TEST + '$']
+    return ctest_base(ctest, build) + ['-R', '^' + TEST + '$']
 
 
 def inspect_build(build, revision, ctest, env):
@@ -232,11 +274,13 @@ def inspect_build(build, revision, ctest, env):
                      'FIXTURES_SETUP', 'FIXTURES_CLEANUP', 'PASS_REGULAR_EXPRESSION', 'SKIP_REGULAR_EXPRESSION')),
             'unexpected_ctest_runtime_overrides')
     require(pe_machine(binary) == ARM64, 'fixture_is_not_arm64')
-    return binary, {'commit': actual, 'binary_sha256': sha256(binary), 'msvc_version': version[1],
-                    'msvc_sha256': sha256(Path(compiler_path[1]))}
+    return source.resolve(strict=True), binary, {
+        'commit': actual, 'binary_sha256': sha256(binary), 'msvc_version': version[1],
+        'msvc_sha256': sha256(Path(compiler_path[1])),
+    }
 
 
-def bind_sqlite(dumpbin, binary, pinned, digest):
+def bind_sqlite(dumpbin, binary, pinned, digest, stage=True):
     imports = command_output([str(dumpbin), '/dependents', str(binary)]).decode('ascii', errors='replace')
     require(re.search(r'^\s*sqlite3\.dll\s*$', imports, re.IGNORECASE | re.MULTILINE),
             'fixture_does_not_import_sqlite3')
@@ -244,6 +288,15 @@ def bind_sqlite(dumpbin, binary, pinned, digest):
     local = binary.with_name('sqlite3.dll')
     # The app-local copy has precedence in the standard Windows DLL search
     # order. Both copies must come from the same verified Release installation.
+    if not local.exists() and not stage:
+        # CTest starts retirement in the build root. Look for the exact DLL,
+        # independent of PATHEXT and executable lookup semantics.
+        directories = [binary.parent.parent] + [
+            Path(directory) for directory in os.get_exec_path() if directory
+        ]
+        resolved = next((path / 'sqlite3.dll' for path in directories if (path / 'sqlite3.dll').is_file()), None)
+        require(resolved is not None and sha256(resolved) == digest, 'fixture_path_sqlite_mismatch')
+        return resolved.resolve()
     if not local.exists():
         with pinned.open('rb') as source, local.open('xb') as destination:
             shutil.copyfileobj(source, destination)
@@ -277,7 +330,7 @@ def clean_work(build, initial):
     return len(new_files)
 
 
-def run_owned(host, args, environment, console):
+def run_owned(host, args, environment, console, watchdog=None):
     # The worker blocks on its pipe until it belongs to the job. CTest and any
     # fixture grandchildren therefore cannot start outside the tracked tree.
     with host.job() as job, console.open('xb') as log:
@@ -289,7 +342,7 @@ def run_owned(host, args, environment, console):
             worker.stdin.write(b'1')
             worker.stdin.close()
             try:
-                code = worker.wait(timeout=WATCHDOG)
+                code = worker.wait(timeout=WATCHDOG if watchdog is None else watchdog)
             except subprocess.TimeoutExpired:
                 code = None
             total, active = host.job_counts(job)
@@ -422,6 +475,187 @@ def execute_leg(host, build, initial, ctest, binary, sqlite, binding, scratch_ro
     require(sha256(sqlite) == binding['sqlite_sha256'], 'fixture_app_local_sqlite_mismatch')
 
 
+def formal_selection(ctest, build, names):
+    return ctest_base(ctest, build) + ['-L', GATE_LABEL, '-R', '^(' + '|'.join(names) + ')$']
+
+
+def inspect_formal_gate(ctest, build, environment):
+    gate = ctest_base(ctest, build) + ['-L', GATE_LABEL]
+    inventory = json.loads(command_output(gate + ['--show-only=json-v1'], environment))
+    tests = inventory.get('tests', [])
+    require(len(tests) == 125 and tuple(test.get('name') for test in tests[:95]) == FORMAL_PREFIX,
+            'formal_gate_inventory_mismatch')
+    require(all(test.get('command') for test in tests[:95]), 'formal_prefix_command_missing')
+
+
+def tree_state(root):
+    # Capture both roots without traversing links or directory reparse points.
+    # Ignore directory timestamps, which change whenever test outputs are created.
+    state = {}
+    pending = [root]
+    while pending:
+        for entry in pending.pop().iterdir():
+            info = entry.lstat()
+            attributes = getattr(info, 'st_file_attributes', 0)
+            directory = stat.S_ISDIR(info.st_mode) and not attributes & 0x0400
+            content = () if directory else (info.st_size, info.st_mtime_ns, info.st_ino)
+            state[entry] = (info.st_mode, attributes, *content)
+            require(len(state) <= 100_000, 'fixture_tree_entry_limit_exceeded')
+            if directory:
+                pending.append(entry)
+    return state
+
+
+def check_inventory_work(build, after_discovery=False):
+    # CTest discovery can create LastTest.log, even when no test runs. Refuse
+    # existing results before discovery and remove only its known output after.
+    testing = build / 'Testing'
+    temporary = testing / 'Temporary'
+    log = temporary / 'LastTest.log'
+    for directory in (testing, temporary):
+        if not os.path.lexists(directory):
+            return
+        info = directory.lstat()
+        require(stat.S_ISDIR(info.st_mode) and not getattr(info, 'st_file_attributes', 0) & 0x0400,
+                'preexisting_ctest_work_state')
+        expected = {temporary} if directory == testing else ({log} if after_discovery else set())
+        require(set(directory.iterdir()) <= expected, 'preexisting_ctest_work_state')
+    if after_discovery and os.path.lexists(log):
+        info = log.lstat()
+        require(stat.S_ISREG(info.st_mode) and not getattr(info, 'st_file_attributes', 0) & 0x0400,
+                'unexpected_ctest_discovery_output')
+        log.unlink()
+
+
+def restore_trees(initial):
+    removed = 0
+    for root, prior in initial.items():
+        current = tree_state(root)
+        require(all(current.get(path) == info for path, info in prior.items()),
+                'preexisting_formal_fixture_state_changed')
+        added = set(current) - prior.keys()
+        require(all(not current[path][1] & 0x0400 and
+                    (stat.S_ISDIR(current[path][0]) or stat.S_ISREG(current[path][0]))
+                    for path in added), 'unsupported_formal_fixture_output_type')
+        for path in sorted(added, key=lambda path: len(path.parts), reverse=True):
+            if stat.S_ISDIR(current[path][0]):
+                path.rmdir()
+            else:
+                path.unlink()
+        require(tree_state(root) == prior, 'formal_fixture_state_not_restored')
+        removed += len(added)
+    return removed
+
+
+def formal_console(console, names, leg):
+    started = CTEST_START.findall(console)
+    results = CTEST_RESULT.findall(console)
+    require(tuple(name for _, name in started) == names[:len(started)], 'formal_start_order_mismatch')
+    require(len(results) <= len(started), 'formal_result_without_start')
+    for index, (position, total, number, name, _) in enumerate(results, 1):
+        require((index, len(names), started[index - 1]) == (int(position), int(total), (number, name)),
+                'formal_result_order_mismatch')
+    prefix = [result for result in results if result[3] != TEST]
+    leg.update(prefix_results=len(prefix), prefix_passed=sum(result[4] == 'Passed' for result in prefix),
+               retirement_started=len(started) == len(names))
+    if leg['retirement_started']:
+        leg['retirement_ctest_id'] = int(started[-1][0])
+    if prefix:
+        leg['prefix_last_result'] = prefix[-1][3]
+    if len(started) > len(results):
+        leg['last_started_without_result'] = started[-1][1]
+    failed = next((result for result in prefix if result[4] != 'Passed'), None)
+    if failed:
+        raw_status = failed[4]
+        status = 'timeout' if raw_status == '***Timeout' else 'not_run' if raw_status == 'Not Run' else 'failure'
+        leg['prefix_first_failure'] = {'position': int(failed[0]), 'test': failed[3], 'status': status}
+
+
+def retirement_log(path, test_id):
+    with path.open('rb') as source:
+        source.seek(max(0, path.stat().st_size - MAX_REPORT_INPUT_BYTES))
+        log = source.read(MAX_REPORT_INPUT_BYTES).decode('utf-8', errors='replace').replace('\r\n', '\n')
+    header = rf'^{test_id}/[0-9]+ Testing: {TEST}$'
+    matches = list(re.finditer(header, log, re.MULTILINE))
+    require(len(matches) == 1, 'retirement_log_section_missing_or_ambiguous')
+    section = log[matches[0].end():]
+    _, marker, section = section.partition('\nOutput:\n' + '-' * 58 + '\n')
+    require(bool(marker), 'retirement_output_start_missing')
+    output, marker, _ = section.partition('\n<end of output>\n')
+    require(bool(marker), 'retirement_output_end_missing')
+    return output
+
+
+def formal_result(code, junit, log, names, leg):
+    report = ET.fromstring(read_bounded(junit))
+    tests = report.findall('testcase')
+    require(report.tag == 'testsuite' and tuple(test.get('name') for test in tests) == names,
+            'unexpected_formal_junit_selection')
+    require(all(test.get('status') == 'run' and test.find('failure') is None and test.find('skipped') is None
+                for test in tests[:-1]), 'prefix_junit_failure')
+    retirement = ET.Element('testsuite')
+    retirement.append(tests[-1])
+    leg.update(classify(code, retirement, log, {'completed': leg['completed'], 'active_case': leg['active_case']}))
+
+
+def execute_formal_leg(host, build, initial, ctest, binary, sqlite, binding, scratch, condition, leg):
+    require(all(tree_state(root) == state for root, state in initial.items()), 'formal_fixture_state_differs')
+    require(sha256(binary) == binding['binary_sha256'], 'fixture_binary_changed')
+    require(sha256(sqlite) == binding['sqlite_sha256'], 'fixture_sqlite_mismatch')
+    scratch.mkdir()
+    environment = ctest_environment(os.environ, scratch)
+    names = FORMAL_PREFIX if condition == 'prefix' else (TEST,)
+    junit = scratch / 'ctest-results.xml'
+    console = scratch / 'ctest-console.log'
+    last_test = build / 'Testing' / 'Temporary' / 'LastTest.log'
+    args = formal_selection(ctest, build, names) + [
+        '--parallel', '1', '--stop-on-failure', '--output-on-failure', '--no-tests=error',
+        '--output-junit', str(junit),
+    ]
+    started = time.monotonic()
+    try:
+        code, exited, exited_without_cleanup, processes = run_owned(
+            host, args, environment, console, PREFIX_WATCHDOG if condition == 'prefix' else WATCHDOG)
+        leg.update(exit_code=code, wall_seconds=round(time.monotonic() - started, 3),
+                   processes_seen=processes, process_tree_exited=exited,
+                   process_tree_exited_without_cleanup=exited_without_cleanup)
+        formal_console(read_bounded(console).decode('utf-8', errors='replace').replace('\r\n', '\n'), names, leg)
+        if 'prefix_first_failure' in leg:
+            leg['outcome'] = 'prefix_failure'
+        log = None
+        if last_test.is_file() and leg['retirement_started']:
+            log = retirement_log(last_test, leg['retirement_ctest_id'])
+            leg.update(progress(log))
+        require(code is not None, 'ctest_harness_watchdog')
+        require(exited and exited_without_cleanup, 'fixture_process_survived_ctest')
+        if 'prefix_first_failure' not in leg:
+            require(leg['retirement_started'] and leg['prefix_passed'] == len(names) - 1 and
+                    junit.is_file() and log is not None, 'ctest_results_missing_or_stale')
+            formal_result(code, junit, log, names, leg)
+            require(processes >= len(names) + 2, 'ctest_fixture_process_unproven')
+    except EXPECTED_ERRORS as error:
+        leg['result_failure'] = safe_error(error)
+    try:
+        require(leg.get('process_tree_exited'), 'formal_fixture_cleanup_unsafe')
+        leg['work_outputs_removed'] = restore_trees(initial)
+        shutil.rmtree(scratch)
+        leg['clean_synthetic_state'] = True
+    except EXPECTED_ERRORS as error:
+        leg['cleanup_failure'] = safe_error(error)
+        raise
+    require('result_failure' not in leg, 'ctest_result_incomplete')
+    require(sha256(binary) == binding['binary_sha256'], 'fixture_binary_changed')
+    require(sha256(sqlite) == binding['sqlite_sha256'], 'fixture_sqlite_mismatch')
+
+
+def formal_decision(legs):
+    result = decision(legs)
+    return {'candidate_timeout_reproduced': 'prefix_timeout_reproduced',
+            'baseline_timeout_reproduced': 'clean_timeout_reproduced',
+            'both_versions_timeout': 'both_conditions_timeout',
+            'both_versions_complete': 'both_conditions_complete'}.get(result, result)
+
+
 def decision(legs):
     outcomes = [leg['outcome'] for leg in legs]
     if len(outcomes) != 4 or any(outcome not in ('pass', 'timeout') for outcome in outcomes):
@@ -446,7 +680,9 @@ def save_report(output, report):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--baseline-build', type=Path, required=True)
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument('--baseline-build', type=Path)
+    mode.add_argument('--formal-prefix', action='store_true')
     parser.add_argument('--candidate-build', type=Path, required=True)
     parser.add_argument('--scratch-root', type=Path, required=True)
     parser.add_argument('--sqlite-dll', type=Path, required=True)
@@ -457,6 +693,9 @@ def main():
     output.mkdir(parents=True, exist_ok=False)
     report = {'schema': 1, 'test': TEST, 'configuration': 'Release', 'deadline_seconds': DEADLINE,
               'harness_watchdog_seconds': WATCHDOG, 'bindings': {}, 'legs': []}
+    if args.formal_prefix:
+        report.update(mode='751_formal_prefix', formal_predecessors=len(FORMAL_PREFIX) - 1,
+                      prefix_watchdog_seconds=PREFIX_WATCHDOG)
     stage = 'host'
     leg = None
     try:
@@ -475,32 +714,64 @@ def main():
                        if os.environ.get('GITHUB_ACTIONS') == 'true' else host.temp_directory())
         require(scratch.is_dir() and host.volume(scratch) == host.volume(formal_temp),
                 'scratch_volume_differs_from_formal_gate')
-        builds = {'749': args.baseline_build.resolve(strict=True),
-                  '751': args.candidate_build.resolve(strict=True)}
-        baseline_volume = host.volume(builds['749'])
-        require(builds['749'] != builds['751'] and baseline_volume == host.volume(builds['751']),
-                'build_directories_do_not_share_one_volume')
+        candidate = args.candidate_build.resolve(strict=True)
+        builds = {'751': candidate} if args.formal_prefix else {
+            '749': args.baseline_build.resolve(strict=True), '751': candidate,
+        }
+        build_volume = host.volume(candidate)
+        if not args.formal_prefix:
+            require(builds['749'] != candidate and host.volume(builds['749']) == build_volume,
+                    'build_directories_do_not_share_one_volume')
         report.update(native_machine='arm64', same_build_volume=True, same_formal_temp_volume=True,
-                      build_and_temp_share_volume=(baseline_volume == host.volume(scratch)))
+                      build_and_temp_share_volume=(build_volume == host.volume(scratch)))
         binaries, dlls, initial = {}, {}, {}
+        if args.formal_prefix:
+            check_inventory_work(candidate)
         for version, build in builds.items():
             stage = 'inspect_' + version
-            binaries[version], report['bindings'][version] = inspect_build(
+            source, binaries[version], report['bindings'][version] = inspect_build(
                 build, REVISIONS[version], ctest, ctest_environment(os.environ, scratch))
-            dlls[version] = bind_sqlite(dumpbin, binaries[version], pinned, sqlite_digest)
-            report['bindings'][version].update(sqlite_sha256=sqlite_digest, sqlite_source='app_local_import')
+            dlls[version] = bind_sqlite(dumpbin, binaries[version], pinned, sqlite_digest, stage=not args.formal_prefix)
+            report['bindings'][version].update(
+                sqlite_sha256=sqlite_digest,
+                sqlite_source='app_local_import' if dlls[version].parent == binaries[version].parent else
+                'verified_release_search_path',
+            )
             initial[version] = work_state(build)
             require(not WORK_FILES.intersection(initial[version]), 'preexisting_fixture_work_files')
-        stage = 'compare_toolchain'
-        require(all(report['bindings']['749'][key] == report['bindings']['751'][key]
-                    for key in ('msvc_version', 'msvc_sha256')), 'compiler_identity_mismatch')
-        for index, version in enumerate(('749', '751', '751', '749'), 1):
+        if args.formal_prefix:
+            stage = 'inspect_formal_gate'
+            require(Path.cwd().resolve() == source, 'formal_invocation_directory_mismatch')
+            roots = {source, candidate}
+            require(not any(scratch.is_relative_to(root) or output.is_relative_to(root) for root in roots),
+                    'formal_scratch_overlaps_fixture_tree')
+            inspect_formal_gate(ctest, candidate, ctest_environment(os.environ, scratch))
+            check_inventory_work(candidate, after_discovery=True)
+            if candidate.is_relative_to(source):
+                roots.remove(candidate)
+            formal_initial = {root: tree_state(root) for root in roots}
+            # All four conditions use the same fresh TEMP path and build cwd.
+            formal_scratch = Path(tempfile.mkdtemp(prefix='ret-formal-', dir=scratch))
+            require(host.volume(formal_scratch) == host.volume(scratch), 'fixture_temp_volume_changed')
+            formal_scratch.rmdir()
+            order = ('clean', 'prefix', 'prefix', 'clean')
+        else:
+            stage = 'compare_toolchain'
+            require(all(report['bindings']['749'][key] == report['bindings']['751'][key]
+                        for key in ('msvc_version', 'msvc_sha256')), 'compiler_identity_mismatch')
+            order = ('749', '751', '751', '749')
+        for index, item in enumerate(order, 1):
             stage = 'execute_leg'
-            leg = {'position': index, 'version': version}
+            leg = {'position': index, 'version': '751' if args.formal_prefix else item}
             report['legs'].append(leg)
             require(sha256(ctest) == report['ctest_sha256'], 'ctest_executable_changed')
-            execute_leg(host, builds[version], initial[version], ctest, binaries[version], dlls[version],
-                        report['bindings'][version], scratch, output / f'{index}-{version}', leg)
+            if args.formal_prefix:
+                leg['condition'] = item
+                execute_formal_leg(host, candidate, formal_initial, ctest, binaries['751'], dlls['751'],
+                                   report['bindings']['751'], formal_scratch, item, leg)
+            else:
+                execute_leg(host, builds[item], initial[item], ctest, binaries[item], dlls[item],
+                            report['bindings'][item], scratch, output / f'{index}-{item}', leg)
             save_report(output, report)
             if leg['outcome'] not in ('pass', 'timeout'):
                 break
@@ -510,7 +781,7 @@ def main():
             if 'outcome' in leg:
                 leg['ctest_outcome_before_harness_failure'] = leg['outcome']
             leg['outcome'] = 'harness_or_integrity_failure'
-    report['decision'] = decision(report['legs'])
+    report['decision'] = formal_decision(report['legs']) if args.formal_prefix else decision(report['legs'])
     save_report(output, report)
     print(json.dumps(report, separators=(',', ':')))
     return 1 if report['decision'] == 'inconclusive' else 0
