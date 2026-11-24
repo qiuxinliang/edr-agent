@@ -1,0 +1,101 @@
+name: Fixed 749 and 751 retirement comparison
+on:
+  push:
+    branches: [codex/diagnose-749-751-arm64]
+
+permissions:
+  contents: read
+
+jobs:
+  compare:
+    if: github.event.created && github.run_attempt == '1' && github.repository == 'qiuxinliang/edr-agent' && github.ref == 'refs/heads/codex/diagnose-749-751-arm64'
+    runs-on: windows-11-vs2026-arm
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      VCPKG_ROOT: ${{ github.workspace }}/vcpkg
+      VCPKG_DEFAULT_TRIPLET: arm64-windows
+      VCPKG_DOWNLOADS: ${{ github.workspace }}/.cache/vcpkg-downloads
+      VCPKG_BINARY_SOURCES: clear;files,${{ github.workspace }}/.cache/vcpkg-bincache,readwrite
+      P0_TEST_INPUTS_REF: 1190a89c39c0fcf675626afe040ed11b93670f09
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Open the two frozen source trees
+        run: |
+          git worktree add --detach src-749 1ec49f21a50da2cccccdf50b1637298ac55bb673
+          if ($LASTEXITCODE) { throw '749 source checkout failed' }
+          git worktree add --detach src-751 ec7f14f5ee5c876269cb5562f0fe30e5a37f39ed
+          if ($LASTEXITCODE) { throw '751 source checkout failed' }
+      - name: Set up native ARM64 compiler
+        run: .\scripts\Initialize-VSEnvironment.ps1 -Architecture arm64
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12.10'
+          architecture: x64
+      - name: Read fixed P0 inputs
+        env:
+          P0_TEST_INPUTS_SSH_KEY: ${{ secrets.P0_TEST_INPUTS_SSH_KEY }}
+        run: .\scripts\checkout_private_p0_inputs.ps1 -Directory .p0-test-inputs -Ref $env:P0_TEST_INPUTS_REF
+      - name: Verify fixed P0 inputs and prepare build tools
+        run: |
+          python -m pip install --disable-pip-version-check --only-binary=:all: --requirement requirements-release.txt
+          if ($LASTEXITCODE) { throw 'Pinned P0 verification dependency unavailable' }
+          python -B scripts/windows_release_checkpoint.py verify-p0-inputs --directory .p0-test-inputs
+          if ($LASTEXITCODE) { throw 'P0 verification failed' }
+          .\scripts\Ensure-WindowsBuildTools.ps1 -NinjaOnly
+      - name: Resolve dependency cache key
+        id: deps
+        run: |
+          New-Item -ItemType Directory -Force .cache/vcpkg-downloads, .cache/vcpkg-bincache | Out-Null
+          python -B scripts/vcpkg_cache_key.py --triplet arm64-windows
+      - uses: actions/cache/restore@v5
+        with:
+          path: |
+            .cache/vcpkg-downloads
+            .cache/vcpkg-bincache
+          key: ${{ steps.deps.outputs.key }}
+          restore-keys: ${{ steps.deps.outputs.restore-prefix }}
+      - name: Materialize one pinned dependency installation
+        run: |
+          .\scripts\bootstrap_pinned_vcpkg.ps1
+          .\scripts\Invoke-VcpkgInstallWithRetry.ps1 -VcpkgExe "$env:VCPKG_ROOT/vcpkg.exe" -FeatureArgs @('--x-feature=sqlite','--x-feature=yara') -MaxAttempts 3 -InitialBackoffSeconds 30
+      - name: Build the two unmodified retirement suites
+        timeout-minutes: 25
+        run: |
+          $installed = "$env:GITHUB_WORKSPACE/vcpkg_installed"
+          foreach ($version in '749', '751') {
+            cmake -S "src-$version" -B "build-$version" -G Ninja -DCMAKE_BUILD_TYPE=Release `
+              "-DCMAKE_TOOLCHAIN_FILE=$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" `
+              "-DCMAKE_PREFIX_PATH=$installed/arm64-windows" "-DVCPKG_INSTALLED_DIR=$installed" `
+              -DCMAKE_SYSTEM_PROCESSOR=ARM64 -DEDR_WINDOWS_TARGET_ARCH=arm64 -DVCPKG_MANIFEST_FEATURES=yara `
+              "-DEDR_AGENT_VERSION_STRING=3.2.$version" -DEDR_PCRE2_PRODUCER_TARGET=windows/arm64 `
+              "-DEDR_PCRE2_VCPKG_ROOT=$env:VCPKG_ROOT" -DEDR_WITH_INGEST_HTTPS_OPENSSL=ON `
+              -DEDR_WITH_P0_RULES_OPENSSL=ON -DEDR_REQUIRE_SQLITE=ON -DEDR_WITH_YARA=ON `
+              -DEDR_REQUIRE_YARA=ON -DEDR_ENABLE_IPO=ON "-DEDR_P0_TEST_CONFIG_DIR=$env:EDR_BACKEND_CONFIG_DIR" `
+              -DEDR_BUILD_TESTS=ON
+            if ($LASTEXITCODE) { throw "Configure failed for $version" }
+            cmake --build "build-$version" --config Release --target test_local_evidence_cache_candidate
+            if ($LASTEXITCODE) { throw "Build failed for $version" }
+            .\scripts\Assert-WindowsPeArchitecture.ps1 -Path "build-$version/tests/test_local_evidence_cache_candidate.exe" -Architecture arm64
+          }
+      - name: Compare on the same runner and volumes
+        id: pair
+        timeout-minutes: 15
+        run: |
+          $prefix = "$env:GITHUB_WORKSPACE/vcpkg_installed/arm64-windows"
+          $env:PATH = "$prefix/bin;$prefix/tools/openssl;$env:PATH"
+          python -B tests/run_msvc_arm64_retention_pair.py --baseline-build build-749 --candidate-build build-751 --sqlite-dll "$prefix/bin/sqlite3.dll" --scratch-root "$env:RUNNER_TEMP" --output "$env:RUNNER_TEMP/retention-pair"
+          if ($LASTEXITCODE) { throw 'See the bounded diagnostic result for the first failure' }
+      - name: Preserve comparison statistics
+        if: always() && (steps.pair.outcome == 'success' || steps.pair.outcome == 'failure')
+        uses: actions/upload-artifact@v6
+        with:
+          name: fixed-retirement-pair-${{ github.sha }}
+          path: ${{ runner.temp }}/retention-pair/comparison.json
+          if-no-files-found: error
+          retention-days: 1
