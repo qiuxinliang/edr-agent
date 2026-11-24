@@ -51,7 +51,7 @@ WINDOWS_EXPECTED = {
     "windows_headless_log_stream_initialization",
 }
 RUNTIME_EXPECTED = {
-    "alert_window_signed_network_port", "alert_window_contention",
+    "alert_window_signed_network_port", "alert_window_signed_file_write", "alert_window_contention",
     "forensic_path_lifecycle", "forensic_io_hard_timeout", "forensic_tar_timeout", "forensic_baseline_staging",
     "storage_physical_guard", "storage_space_preflight", "shell_session_stream_completeness",
     "authorized_local_query_contract", "evidence_startup_index_manifest",
@@ -958,6 +958,10 @@ class WindowsReleaseGateTests(unittest.TestCase):
                 'BOOL WINAPI GetFileAttributesExA(const char *, GET_FILEEX_INFO_LEVELS, void *);\n'
                 'DWORD WINAPI GetLastError(void);\n'
                 'typedef struct { DWORD nLength; void *lpSecurityDescriptor; BOOL bInheritHandle; } SECURITY_ATTRIBUTES;\n'
+                '/* Compile the contention fixture against its declared Windows surface. */\n'
+                'HANDLE WINAPI CreateEventW(SECURITY_ATTRIBUTES *, BOOL, BOOL, const wchar_t *);\n'
+                'BOOL WINAPI SetEvent(HANDLE);\n'
+                'void YieldProcessor(void);\n'
                 'BOOL WINAPI CreateDirectoryA(const char *, SECURITY_ATTRIBUTES *);\n'
                 'DWORD GetTempPathA(DWORD, char *);\n'
                 'unsigned GetTempFileNameA(const char *, const char *, unsigned, char *);\n'

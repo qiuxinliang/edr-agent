@@ -56,6 +56,67 @@ static void assert_registry_page_projection(EdrCommandResultAuthorization a, con
   cJSON_Delete(r);
 }
 
+static void assert_file_window_projection(EdrCommandResultAuthorization a, const cJSON *network,
+                                          int64_t issued) {
+  cJSON *result = cJSON_Duplicate(network, 1);
+  CHECK(result);
+  cJSON *scope = cJSON_GetObjectItemCaseSensitive(result, "scope");
+  CHECK(cJSON_SetValuestring(cJSON_GetObjectItemCaseSensitive(scope, "kind"), "file_write"));
+  char *request = cJSON_PrintUnformatted(scope);
+  CHECK(request && edr_command_result_bind_contract(&a, (const uint8_t *)request, strlen(request), issued) == 0);
+  cJSON_free(request);
+
+  cJSON *row = cJSON_GetArrayItem(cJSON_GetObjectItemCaseSensitive(result, "rows"), 0);
+  cJSON_DeleteItemFromObjectCaseSensitive(row, "remote_ip");
+  cJSON_DeleteItemFromObjectCaseSensitive(row, "remote_port");
+  cJSON *path = cJSON_AddStringToObject(row, "file_path", "C:/synthetic/file.bin");
+  cJSON *quality = cJSON_AddStringToObject(row, "file_path_quality", "unconfirmed");
+  CHECK(path && quality);
+  CHECK(cJSON_SetValuestring(cJSON_GetObjectItemCaseSensitive(result, "gap_reason"), "activation_gap"));
+  cJSON *gaps = cJSON_GetObjectItemCaseSensitive(result, "gap_reasons");
+  CHECK(cJSON_InsertItemInArray(gaps, 0, cJSON_CreateString("activation_gap")));
+  assert_window_project(&a, result, 1);
+  CHECK(cJSON_SetValuestring(cJSON_GetObjectItemCaseSensitive(scope, "alert_id"), "other"));
+  assert_window_project(&a, result, 0);
+  CHECK(cJSON_SetValuestring(cJSON_GetObjectItemCaseSensitive(scope, "alert_id"), "a"));
+  CHECK(cJSON_SetValuestring(cJSON_GetObjectItemCaseSensitive(row, "process_start_key"), "3"));
+  assert_window_project(&a, result, 0);
+  CHECK(cJSON_SetValuestring(cJSON_GetObjectItemCaseSensitive(row, "process_start_key"), "18446744073709551615"));
+  CHECK(cJSON_SetValuestring(quality, "observed"));
+  assert_window_project(&a, result, 0); /* Old post path never proves the write target. */
+  CHECK(cJSON_SetValuestring(quality, "missing"));
+  assert_window_project(&a, result, 0);
+  CHECK(cJSON_SetValuestring(path, ""));
+  assert_window_project(&a, result, 1);
+
+  cJSON_DeleteItemFromObjectCaseSensitive(row, "fact_id");
+  CHECK(cJSON_AddNumberToObject(row, "slot", 0));
+  CHECK(cJSON_SetValuestring(cJSON_GetObjectItemCaseSensitive(row, "phase"), "pre"));
+  CHECK(cJSON_SetValuestring(cJSON_GetObjectItemCaseSensitive(row, "event_time_ns"), "1700000000000000000"));
+  char boundary[257];
+  memset(boundary, 'a', sizeof(boundary) - 1u);
+  boundary[sizeof(boundary) - 1u] = 0;
+  CHECK(cJSON_SetValuestring(path, boundary));
+  CHECK(cJSON_SetValuestring(quality, "unconfirmed"));
+  assert_window_project(&a, result, 0);
+  CHECK(cJSON_SetValuestring(quality, "truncated"));
+  assert_window_project(&a, result, 0);
+  boundary[255] = 0;
+  CHECK(cJSON_SetValuestring(path, boundary));
+  assert_window_project(&a, result, 1);
+  CHECK(cJSON_SetValuestring(quality, "observed"));
+  assert_window_project(&a, result, 0);
+  boundary[254] = 0;
+  CHECK(cJSON_SetValuestring(path, boundary));
+  assert_window_project(&a, result, 1);
+
+  char *raw = cJSON_PrintUnformatted(result), out[8197];
+  CHECK(raw && edr_command_result_project_detail(&a, "alert_window_query_v1", 1, 0, raw, out, sizeof(out)) != 0);
+  CHECK(edr_command_result_project_detail(&a, "rtq_query", 1, 0, raw, out, sizeof(out)) != 0);
+  cJSON_free(raw);
+  cJSON_Delete(result);
+}
+
 static int alert_window_command_results(void) {
   const char *type = "alert_window_query_v2", *id = "synthetic-window";
   char path[256];
@@ -89,6 +150,7 @@ static int alert_window_command_results(void) {
   CHECK(edr_command_result_bind_contract(&wrong, (const uint8_t *)window_request, strlen(window_request),
                                          m.issued_at_unix_ms) != 0);
   assert_window_project(a, r, 1);
+  assert_file_window_projection(*a, r, m.issued_at_unix_ms);
   cJSON *port_result = cJSON_Duplicate(r, 1);
   CHECK(port_result);
   cJSON *port_scope = cJSON_GetObjectItemCaseSensitive(port_result, "scope");

@@ -15266,6 +15266,27 @@ static void activation_gap_query(const EdrBehaviorRecord *candidate, int64_t now
   cJSON_Delete(result);
 }
 
+static void assert_file_scope_activation_gap(const EdrBehaviorRecord *candidate, int64_t base,
+                                             int activation, int interrupted) {
+  EdrAlertWindowQuery q = {
+      .tenant_id = candidate->tenant_id, .endpoint_id = candidate->endpoint_id,
+      .alert_id = "activation-file-alert", .source_event_id = candidate->event_id,
+      .pid = candidate->pid, .process_start_key = candidate->process_start_key,
+      .process_creation_filetime_100ns = candidate->process_creation_filetime_100ns,
+      .source_time_ns = base, .from_ns = base - INT64_C(120000000000),
+      .until_ns = base + INT64_C(120000000000),
+      .expires_unix_ms = base / 1000000 + 30000, .kind = "file_write", .limit = 50, .max_bytes = 8192,
+  };
+  char result[8193];
+  assert(edr_local_evidence_cache_query_alert_window_json(&q, result, sizeof(result)) == 0);
+  cJSON *root = cJSON_Parse(result);
+  assert(root && cJSON_GetArraySize(cJSON_GetObjectItemCaseSensitive(root, "rows")) == 1);
+  assert(!!strstr(result, "activation_gap") == activation);
+  assert(!!strstr(result, "window_interrupted") == interrupted);
+  printf("file_scope_gap rows=1 activation=%d interrupted=%d\n", activation, interrupted);
+  cJSON_Delete(root);
+}
+
 /* Force the actual unlocked command-preparation boundary: the alert writer
  * waits while another thread finishes ordinary ingestion. No timing race or
  * fabricated post-context manifest is used by this counterfactual. */
@@ -15345,10 +15366,12 @@ static void test_window_activation_gap(int enforce) {
     snprintf(event.file_path, sizeof(event.file_path), "C:\\UserData\\after-activation.bin");
     edr_local_evidence_cache_record_behavior(&event);
     assert(sqlite_post_artifact_count(path, id, event.event_id) == 1);
+    if (enforce) assert_file_scope_activation_gap(&candidate, base, mode < 2u, 0);
     edr_local_evidence_cache_close();
     edr_local_evidence_cache_test_set_window_recovery_identity(1);
     assert(edr_local_evidence_cache_open(path, 8u, 24u) == 0);
     activation_gap_query(&candidate, base, mode < 2u ? "activation_gap+service_restart_gap" : "service_restart_gap", enforce);
+    if (enforce) assert_file_scope_activation_gap(&candidate, base, mode < 2u, 1);
     if (mode < 2u) {
       EdrCommandFacts facts = {candidate.cmdline, NULL};
       assert(edr_local_evidence_cache_record_alert_context(&candidate, &facts) == 0);

@@ -140,6 +140,54 @@ static void test_file_target_fidelity(void) {
     assert(missing == 1 && self_write == 1);
     cJSON_Delete(response);
 
+    EdrAlertWindowQuery q = {
+        .tenant_id = owner.tenant_id, .endpoint_id = owner.endpoint_id,
+        .alert_id = "file-fidelity", .source_event_id = owner.event_id,
+        .pid = owner.pid, .process_start_key = owner.process_start_key,
+        .process_creation_filetime_100ns = owner.process_creation_filetime_100ns,
+        .source_time_ns = trigger_time, .from_ns = trigger_time - INT64_C(120000000000),
+        .until_ns = trigger_time + INT64_C(120000000000),
+        .expires_unix_ms = trigger_time / 1000000 + 30000,
+        .kind = "file_write", .limit = 50, .max_bytes = 8192,
+    };
+    int scoped_rc = edr_local_evidence_cache_query_alert_window_json(&q, output, sizeof(output));
+    printf("scoped file recall first query layout=%u rc=%d\n", layout, scoped_rc);
+    fflush(stdout);
+    assert(scoped_rc == 0);
+    response = cJSON_Parse(output);
+    assert(response);
+    assert(cJSON_GetArraySize(cJSON_GetObjectItemCaseSensitive(response, "rows")) == 5);
+    unsigned scoped_clipped = 0, scoped_missing = 0, scoped_boundary = 0, scoped_post = 0;
+    cJSON_ArrayForEach(row, cJSON_GetObjectItemCaseSensitive(response, "rows")) {
+      const char *target = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(row, "file_path"));
+      const char *quality = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(row, "file_path_quality"));
+      assert(target && quality && cJSON_GetArraySize(row) == 8);
+      if (!strcmp(target, shared_prefix)) {
+        assert(!strcmp(quality, "truncated")); ++scoped_clipped;
+      } else if (!*target) {
+        assert(!strcmp(quality, "missing")); ++scoped_missing;
+      } else if (!strcmp(target, exact_boundary)) {
+        assert(!strcmp(quality, "unconfirmed")); ++scoped_boundary;
+      } else {
+        assert(!strcmp(target, image) && !strcmp(quality, "unconfirmed")); ++scoped_post;
+      }
+    }
+    assert(scoped_clipped == 2 && scoped_missing == 1 && scoped_boundary == 1 && scoped_post == 1);
+    cJSON_Delete(response);
+    q.source_event_id = "wrong-file-source";
+    assert(edr_local_evidence_cache_query_alert_window_json(&q, output, sizeof(output)) == 0);
+    response = cJSON_Parse(output);
+    assert(response && !strcmp(cJSON_GetObjectItemCaseSensitive(response, "coverage")->valuestring, "owner_unavailable"));
+    assert(cJSON_GetArraySize(cJSON_GetObjectItemCaseSensitive(response, "rows")) == 0);
+    cJSON_Delete(response);
+    q.source_event_id = owner.event_id;
+    ++q.process_creation_filetime_100ns;
+    assert(edr_local_evidence_cache_query_alert_window_json(&q, output, sizeof(output)) == 0);
+    response = cJSON_Parse(output);
+    assert(response && !strcmp(cJSON_GetObjectItemCaseSensitive(response, "coverage")->valuestring, "owner_unavailable"));
+    assert(cJSON_GetArraySize(cJSON_GetObjectItemCaseSensitive(response, "rows")) == 0);
+    cJSON_Delete(response);
+
     /* A search for the common image name must return only the known target. */
     retained_recall_contract(&meta, &owner, trigger_time + INT64_C(1000000000),
                              "{\"event_type\":\"file_write\",\"file_path\":\"fidelity-self.exe\"}", 50);

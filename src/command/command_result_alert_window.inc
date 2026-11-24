@@ -42,6 +42,16 @@ static int window_result_row(const cJSON *row, const EdrAlertWindowQuery *q, uin
   if (!strcmp(q->kind, "network") || !strcmp(q->kind, "network_port"))
     return cJSON_GetArraySize(row) == 8 && window_literal_ip(window_string(row, "remote_ip")) &&
            window_uint(row, "remote_port", 1, 65535, &port) && (!q->remote_port || port == q->remote_port);
+  if (!strcmp(q->kind, "file_write")) {
+    const char *path = window_string(row, "file_path");
+    const char *quality = result_text(row, "file_path_quality");
+    if (cJSON_GetArraySize(row) != 8 || !path) return 0;
+    size_t len = strlen(path);
+    if (len >= (id ? EDR_BR_STR_LONG : 256u)) return 0;
+    if (!len) return !strcmp(quality, "missing");
+    if (!strcmp(quality, "observed")) return !id && len < 255u;
+    return result_member(quality, "truncated|unconfirmed");
+  }
   return cJSON_GetArraySize(row) == 9 && *result_text(row, "registry_key") && window_string(row, "registry_value") &&
          result_member(result_text(row, "registry_op"), "set_value|create_key|delete_key|delete_value");
 }
@@ -68,7 +78,8 @@ static cJSON *result_alert_window(const cJSON *root, const cJSON *contract,
     const char *reason = cJSON_GetStringValue(item);
     if (!reason ||
         !result_member(reason,
-                       "unknown|owner_unavailable|pre_window_truncated|window_interrupted|registry_fields_missing") ||
+                       "unknown|owner_unavailable|pre_window_truncated|window_interrupted|registry_fields_missing|activation_gap") ||
+        (!strcmp(reason, "activation_gap") && (strcmp(scope.kind, "file_write") || item != gaps->child)) ||
         (!strcmp(reason, "registry_fields_missing") && strcmp(scope.kind, "registry")) ||
         (item == gaps->child && strcmp(reason, result_text(root, "gap_reason"))))
       return NULL;

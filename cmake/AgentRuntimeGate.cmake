@@ -122,3 +122,7 @@ endif()
 if(TEST alert_window_signed_network_port)
   edr_agent_runtime_gate(alert_window_signed_network_port test_alert_window_signed_replay)
 endif()
+
+if(TEST alert_window_signed_file_write)
+  edr_agent_runtime_gate(alert_window_signed_file_write test_alert_window_signed_replay)
+endif()

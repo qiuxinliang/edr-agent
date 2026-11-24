@@ -90,7 +90,7 @@ static inline int window_scope(const cJSON *request, EdrAlertWindowQuery *q) {
   if (!window_identifier(q->tenant_id, sizeof(((EdrBehaviorRecord *)0)->tenant_id) - 1u) ||
       !window_identifier(q->endpoint_id, EDR_BR_ID_LEN - 1u) || !window_identifier(q->alert_id, 127) ||
       !window_identifier(q->source_event_id, EDR_BR_ID_LEN - 1u) || !q->kind ||
-      (strcmp(q->kind, "network") && strcmp(q->kind, "registry") && !port_query) ||
+      (strcmp(q->kind, "network") && strcmp(q->kind, "registry") && strcmp(q->kind, "file_write") && !port_query) ||
       !window_uint(request, "pid", 1, UINT32_MAX, &q->pid) || !window_uint(request, "limit", 1, 50, &q->limit) ||
       !window_uint(request, "max_bytes", 512, ALERT_WINDOW_MAX_BYTES, &q->max_bytes) ||
       !window_decimal(request, "process_start_key", UINT64_MAX, &q->process_start_key) ||

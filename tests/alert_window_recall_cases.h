@@ -391,7 +391,78 @@ static void test_registry_source_fidelity(void) {
   free(r);
 }
 
-static void test_alert_window_recall(void) { test_alert_window_recall_contract(1); }
+static void test_alert_window_file_actor(void) {
+  const int64_t base = INT64_C(1750061200000000101);
+  EdrBehaviorRecord *r = calloc(1, sizeof(*r));
+  assert(r);
+  for (int compact = 0; compact < 2; ++compact) {
+    char path[640], candidate[200];
+    assert(make_test_sqlite_path(path, sizeof(path)) == 0);
+    edr_local_evidence_cache_test_set_now_unix_ns(base);
+    edr_local_evidence_cache_test_set_retention_monotonic_ms(1000000);
+    assert((compact ? edr_local_evidence_cache_open(path, 16, 24)
+                    : test_open_legacy_context(path, 16, 24)) == 0);
+    window_deliver(r, "file-anchor", base, 0, 0, 0);
+    sqlite_candidate_id_for_source_event(path, r->event_id, candidate, sizeof(candidate));
+    EdrAlertWindowQuery q = {
+        .tenant_id = r->tenant_id, .endpoint_id = r->endpoint_id,
+        .alert_id = "file-alert", .source_event_id = "file-anchor",
+        .pid = r->pid, .process_start_key = r->process_start_key,
+        .process_creation_filetime_100ns = r->process_creation_filetime_100ns,
+        .source_time_ns = base, .from_ns = base - INT64_C(120000000000),
+        .until_ns = base + INT64_C(120000000000),
+        .expires_unix_ms = base / 1000000 + 30000, .kind = "file_write", .limit = 50, .max_bytes = 8192,
+    };
+    /* A, a sibling linked through the same parent, and a reused instance of
+     * A's PID all have a retained owner ref. Only A is the signed subject. */
+    init_floor_parent(r, base - INT64_C(90000000000));
+    r->type = EDR_EVENT_FILE_WRITE;
+    strcpy(r->event_id, "write-A");
+    strcpy(r->file_path, "C:/Lab/subject-A.bin");
+    r->event_time_ns = base + 1;
+    assert(!edr_local_evidence_cache_is_candidate(r));
+    edr_local_evidence_cache_record_behavior(r);
+    assert(sqlite_post_artifact_count(path, candidate, "write-A") == 1);
+    ++r->pid;
+    ++r->process_start_key;
+    ++r->process_creation_filetime_100ns;
+    edr_behavior_bind_parent_context(r);
+    r->event_time_ns = base + 2;
+    strcpy(r->event_id, "write-B");
+    strcpy(r->file_path, "C:/Lab/sibling-B.bin");
+    edr_local_evidence_cache_record_behavior(r);
+    assert(sqlite_post_artifact_count(path, candidate, "write-B") == 1);
+    r->pid = q.pid;
+    edr_behavior_bind_parent_context(r);
+    r->event_time_ns = base + 3;
+    strcpy(r->event_id, "write-reused");
+    strcpy(r->file_path, "C:/Lab/reused-PID.bin");
+    edr_local_evidence_cache_record_behavior(r);
+    assert(sqlite_post_artifact_count(path, candidate, "write-reused") == 1);
+
+    edr_local_evidence_cache_close();
+    assert(edr_local_evidence_cache_open(path, 16, 24) == 0);
+    cJSON *result = window_answer(&q);
+    const cJSON *rows = cJSON_GetObjectItemCaseSensitive(result, "rows");
+    assert(cJSON_GetArraySize(rows) == 1);
+    assert(!strcmp(cJSON_GetObjectItemCaseSensitive(rows->child, "file_path")->valuestring, "C:/Lab/subject-A.bin"));
+    assert(!strcmp(cJSON_GetObjectItemCaseSensitive(rows->child, "file_path_quality")->valuestring, "unconfirmed"));
+    cJSON_Delete(result);
+    assert(sqlite_post_artifact_count(path, candidate, "write-B") == 1);
+    printf("alert_window_file_actor layout=%d reopened=1 subject=1 sibling=0 reused=0\n", compact);
+    edr_local_evidence_cache_close();
+    cleanup_test_sqlite_path(path);
+  }
+  edr_local_evidence_cache_test_set_now_unix_ns(0);
+  edr_local_evidence_cache_test_set_retention_monotonic_ms(-1);
+  s_test_monotonic_ns = 0;
+  free(r);
+}
+
+static void test_alert_window_recall(void) {
+  test_alert_window_recall_contract(1);
+  test_alert_window_file_actor();
+}
 
 #if defined(EDR_HAVE_SQLITE)
 static void test_registry_sidecar_wrap(void) {

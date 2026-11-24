@@ -2315,6 +2315,11 @@ if(SQLite3_FOUND AND OpenSSL_FOUND)
     $<TARGET_FILE:test_alert_window_signed_replay>)
   set_tests_properties(alert_window_signed_registry_observation PROPERTIES TIMEOUT 30
     ENVIRONMENT "EDR_TEST_SIGNED_REGISTRY_OBSERVATION=1")
+  add_test(NAME alert_window_signed_file_write COMMAND ${Python3_EXECUTABLE} -c
+    "import subprocess,sys,tempfile; d=tempfile.TemporaryDirectory(); subprocess.run([sys.argv[1]],cwd=d.name,check=True)"
+    $<TARGET_FILE:test_alert_window_signed_replay>)
+  set_tests_properties(alert_window_signed_file_write PROPERTIES TIMEOUT 30
+    ENVIRONMENT "EDR_TEST_SIGNED_FILE_WRITE=1")
   add_test(NAME alert_window_private_transport COMMAND ${Python3_EXECUTABLE} -B
     ${CMAKE_SOURCE_DIR}/tests/test_alert_window_transport.py $<TARGET_FILE:test_alert_window_signed_replay>)
   set_tests_properties(alert_window_private_transport PROPERTIES TIMEOUT 45)
@@ -2405,6 +2410,7 @@ edr_minimization_test(command_result_egress test_command_result_egress)
 edr_minimization_test(alert_window_private_result_egress test_command_result_egress)
 edr_minimization_test(alert_window_signed_replay test_alert_window_signed_replay)
 edr_minimization_test(alert_window_signed_network_port test_alert_window_signed_replay)
+edr_minimization_test(alert_window_signed_file_write test_alert_window_signed_replay)
 edr_minimization_test(alert_window_private_transport test_alert_window_signed_replay)
 edr_minimization_test(command_result_compaction test_command_result_compaction)
 edr_minimization_test(authorized_local_query_contract test_egress_tls_client)

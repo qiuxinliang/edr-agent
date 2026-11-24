@@ -33,6 +33,7 @@ static char payload[640];
 static uint64_t replay_deadline_ns;
 static int registry_observation_mode;
 static int network_port_mode;
+static int file_write_mode;
 
 static void start_replay_executor(void) {
   replay_deadline_ns = edr_monotonic_ns() + UINT64_C(20000000000);
@@ -70,9 +71,10 @@ static void make_request(int64_t anchor) {
       payload, sizeof(payload),
       "{\"tenant_id\":\"t\",\"endpoint_id\":\"ep\",\"alert_id\":\"a\",\"source_event_id\":\"e\",\"pid\":42,"
       "\"process_start_key\":\"18446744073709551615\",\"process_creation_filetime_100ns\":\"133700000000000001\","
-      "\"source_time_ns\":\"%lld\",\"kind\":\"network\",\"from_ns\":\"%lld\","
+      "\"source_time_ns\":\"%lld\",\"kind\":\"%s\",\"from_ns\":\"%lld\","
       "\"until_ns\":\"%lld\",\"limit\":50,\"max_bytes\":8192}",
-      (long long)anchor, (long long)(anchor - INT64_C(120000000000)), (long long)(anchor + INT64_C(120000000000)));
+      (long long)anchor, file_write_mode ? "file_write" : "network",
+      (long long)(anchor - INT64_C(120000000000)), (long long)(anchor + INT64_C(120000000000)));
   assert(n > 0 && (size_t)n < sizeof(payload));
   if(network_port_mode) {
     cJSON *q=cJSON_Parse(payload); assert(q);
@@ -103,8 +105,8 @@ static void make_investigation_ids(int64_t issued_ms, char request_id[80], char 
 
 /* Materialize the owner, its actual edge and a recycled PID through the same
  * record writer as the Agent. The independent SQL witness joins the original
- * fact to that owner and checks its stored connection, before reading any result. */
-static void record_connection(int64_t anchor, char fact_id[65]) {
+ * fact to that owner before reading any result. */
+static void record_evidence(int64_t anchor, char fact_id[65]) {
   EdrBehaviorRecord *r = calloc(1, sizeof(*r));
   assert(r);
   edr_behavior_record_init(r);
@@ -128,6 +130,19 @@ static void record_connection(int64_t anchor, char fact_id[65]) {
     pre->registry_name_observation=EDR_REG_NAME_DEFAULT;
     edr_local_evidence_cache_record_behavior(pre); free(pre);
   }
+  if (file_write_mode) {
+    EdrBehaviorRecord *early = malloc(sizeof(*early));
+    assert(early);
+    *early = *r;
+    early->detection_context[0] = 0;
+    early->priority = 0;
+    early->event_time_ns = anchor + 1;
+    strcpy(early->event_id, "file-before-activation");
+    strcpy(early->file_path, "C:/synthetic/missing-file.bin");
+    assert(!edr_local_evidence_cache_is_candidate(early));
+    edr_local_evidence_cache_record_behavior(early);
+    free(early);
+  }
   assert(edr_local_evidence_cache_is_candidate(r));
   edr_local_evidence_cache_record_behavior(r);
   r->type = EDR_EVENT_NET_CONNECT;
@@ -143,6 +158,18 @@ static void record_connection(int64_t anchor, char fact_id[65]) {
   r->net_dport = 51744;
   strcpy(r->event_id, "synthetic-recycled");
   edr_local_evidence_cache_record_behavior(r);
+  if (file_write_mode) {
+    --r->process_creation_filetime_100ns;
+    r->type = EDR_EVENT_FILE_WRITE;
+    r->net_dport = 0;
+    r->net_dst[0] = 0;
+    r->priority = 0;
+    r->event_time_ns = anchor + 3;
+    strcpy(r->file_path, "C:/synthetic/retained-file.bin");
+    strcpy(r->event_id, "file-after-activation");
+    assert(!edr_local_evidence_cache_is_candidate(r));
+    edr_local_evidence_cache_record_behavior(r);
+  }
   if(registry_observation_mode) {
     r->process_creation_filetime_100ns--; r->type=EDR_EVENT_REG_SET_VALUE;
     r->net_dport=0; r->net_dst[0]=0; r->priority=0;
@@ -165,8 +192,10 @@ static void record_connection(int64_t anchor, char fact_id[65]) {
       "SELECT f.fact_id FROM context_facts f JOIN context_reference_projection r ON r.fact_id=f.fact_id "
       "JOIN artifacts a ON a.candidate_id=r.candidate_id AND a.artifact_type='p0_context_bundle' "
       "WHERE a.tenant_id='t' AND a.endpoint_id='ep' AND json_extract(a.manifest_json,'$.source_event_id')='e' "
-      "AND json_extract(f.manifest_template_json,'$.remote_port')=51742";
-  assert(sqlite3_prepare_v2(db, sql, -1, &st, NULL) == SQLITE_OK && sqlite3_step(st) == SQLITE_ROW);
+      "AND json_extract(f.manifest_template_json,'$.source_event_id')=?1";
+  assert(sqlite3_prepare_v2(db, sql, -1, &st, NULL) == SQLITE_OK);
+  assert(sqlite3_bind_text(st, 1, file_write_mode ? "file-after-activation" : "synthetic-related", -1, SQLITE_STATIC)
+         == SQLITE_OK && sqlite3_step(st) == SQLITE_ROW);
   assert(sqlite3_column_bytes(st, 0) == 64);
   memcpy(fact_id, sqlite3_column_text(st, 0), 64);
   fact_id[64] = 0;
@@ -311,7 +340,7 @@ static void ordered_go_receipt(const char *envelope_path, const char *transport_
   edr_ingest_http_configure_request_signing(&signing);
   assert(edr_local_evidence_cache_open_with_policy("synthetic-cache.db",16,1,4)==0);
   char fact_id[65];
-  record_connection(strtoll(fixture_string(request,"source_time_ns"),NULL,10),fact_id);
+  record_evidence(strtoll(fixture_string(request,"source_time_ns"),NULL,10),fact_id);
   EdrSoarCommandMeta m={0};
   assert(strlen(correlation)<sizeof(m.soar_correlation_id) && strlen(idem)<sizeof(m.idempotency_key));
   strcpy(m.soar_correlation_id,correlation);
@@ -347,7 +376,8 @@ int main(int argc, char **argv) {
   assert(argc == 1 || argc == 2 || (argc == 3 && !strcmp(argv[1],"--private-transport")));
   registry_observation_mode=getenv("EDR_TEST_SIGNED_REGISTRY_OBSERVATION")!=NULL;
   network_port_mode=getenv("EDR_TEST_SIGNED_NETWORK_PORT")!=NULL;
-  assert(!(network_port_mode && registry_observation_mode));
+  file_write_mode = getenv("EDR_TEST_SIGNED_FILE_WRITE") != NULL;
+  assert(network_port_mode + registry_observation_mode + file_write_mode <= 1);
   const char *id = "lcq-synthetic-window-signed";
   EdrConfig cfg = {0};
   strcpy(cfg.agent.tenant_id, "t");
@@ -398,7 +428,7 @@ int main(int argc, char **argv) {
   edr_command_result_json_free(http);
   cJSON_Delete(receipt);
   char fact_id[65];
-  record_connection(anchor, fact_id);
+  record_evidence(anchor, fact_id);
   char request_id[80], task_id[53];
   make_investigation_ids(meta.issued_at_unix_ms, request_id, task_id);
   long long key_time_ms = 0;
@@ -425,6 +455,14 @@ int main(int argc, char **argv) {
       assert(!cJSON_GetObjectItemCaseSensitive(row,"default_observed"));
       assert(cJSON_GetArraySize(row)==9);
     }
+  } else if (file_write_mode) {
+    assert(!strcmp(cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(receipt, "coverage")), "retained_window"));
+    assert(!strcmp(cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(receipt, "gap_reason")), "activation_gap"));
+    assert(cJSON_GetArraySize(rows) == 1);
+    const cJSON *row = cJSON_GetArrayItem(rows, 0);
+    assert(!strcmp(fixture_string(row, "fact_id"), fact_id));
+    assert(!strcmp(fixture_string(row, "file_path"), "C:/synthetic/retained-file.bin"));
+    assert(!strcmp(fixture_string(row, "file_path_quality"), "unconfirmed"));
   } else {
   assert(receipt &&
          !strcmp(cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(receipt, "coverage")), "retained_window"));
@@ -439,6 +477,8 @@ int main(int argc, char **argv) {
                                       r->soar_correlation_id, "", "");
   assert(http && edr_egress_request_validate_for_scope("POST", EDR_ALERT_WINDOW_RESULT_SUFFIX, "application/json",
                                                        http, strlen(http), "t", "ep", why, sizeof(why)) == 0);
+  assert(edr_egress_request_validate_for_scope("POST", "ingest/report-command-result", "application/json",
+                                              http, strlen(http), "t", "ep", why, sizeof(why)) != 0);
   printf("{\"request_id\":\"%s\",\"actor\":\"synthetic-analyst\",\"issued_at_unix_ms\":%lld,\"deadline_ms\":%u,"
          "\"request\":%s,\"http\":%s}\n", request_id, (long long)meta.issued_at_unix_ms, meta.deadline_ms, payload, http);
   if (argc == 2) {

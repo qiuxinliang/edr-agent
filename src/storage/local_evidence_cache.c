@@ -11239,7 +11239,7 @@ typedef struct {
   int64_t first_ns, last_ns;
   cJSON *rows;
   unsigned examined;
-  int pre_truncated, interrupted, registry_missing, scan_limited, output_truncated;
+  int pre_truncated, interrupted, activation_gap, registry_missing, scan_limited, output_truncated;
 } AlertWindowRead;
 
 static const char *window_column(sqlite3_stmt *st, int n, size_t max) {
@@ -11305,12 +11305,16 @@ static int window_project_event(AlertWindowRead *r, const cJSON *event, int64_t 
       !window_matches(event, "process_creation_filetime_100ns", r->birth))
     return 0;
   int net = !strcmp(q->kind, "network") || !strcmp(q->kind, "network_port");
-  if (net ? type != EDR_EVENT_NET_CONNECT : !is_registry_event_type(type)) return 0;
+  int file = !strcmp(q->kind, "file_write");
+  if (net && type != EDR_EVENT_NET_CONNECT) return 0;
+  if (file && type != EDR_EVENT_FILE_WRITE) return 0;
+  if (!net && !file && !is_registry_event_type(type)) return 0;
   uint32_t port = 0;
   const char *ip = parent_context_text(event, "remote_ip");
   const char *key = parent_context_text(event, "registry_key");
   const char *value = parent_context_text(event, "registry_value");
   const char *op = parent_context_text(event, "registry_op");
+  const char *path = NULL, *path_quality = NULL;
   const char *trunc = authorized_context_text(event, "source_truncated_fields");
   if (!trunc) return EDR_PARENT_CONTEXT_ERROR_INTEGRITY;
   if (net) {
@@ -11322,6 +11326,25 @@ static int window_project_event(AlertWindowRead *r, const cJSON *event, int64_t 
     if (!*ip || !port || strlen(ip) >= sizeof(((EdrBehaviorRecord *)0)->net_dst) || !manifest_utf8_valid(ip))
       return EDR_PARENT_CONTEXT_ERROR_INTEGRITY;
     if (q->remote_port && port != q->remote_port) return 0;
+  } else if (file) {
+    path = authorized_context_text(event, fact_id ? "path" : "file_path");
+    const char *quality = authorized_context_text(event, "source_completeness");
+    size_t cap = fact_id ? sizeof(((EdrBehaviorRecord *)0)->file_path) : sizeof(((RingSlot *)0)->file_path);
+    if (!path || !quality || strlen(path) >= cap || !manifest_utf8_valid(path))
+      return EDR_PARENT_CONTEXT_ERROR_INTEGRITY;
+    if (!*path)
+      path_quality = "missing";
+    else if (source_field_list_has(trunc, "source.file_path") || source_field_list_has(trunc, "file_path"))
+      path_quality = "truncated";
+    /* Old post manifests could store the writer image. Old ring slots could
+     * silently clip at the byte limit. Existing rows also lack a format tag
+     * that would let the reader prove the target of those writes. */
+    else if (fact_id || strlen(path) == cap - 1u || strcmp(quality, "COMPLETE") ||
+             source_field_list_has(trunc, "source.list_overflow") ||
+             source_field_list_has(trunc, "source.source_completeness"))
+      path_quality = "unconfirmed";
+    else
+      path_quality = "observed";
   } else {
     const char *quality = authorized_context_text(event, "source_completeness");
     if (!quality) return EDR_PARENT_CONTEXT_ERROR_INTEGRITY;
@@ -11351,8 +11374,10 @@ static int window_project_event(AlertWindowRead *r, const cJSON *event, int64_t 
       !manifest_add_text(row, "process_creation_filetime_100ns", r->birth) ||
       !(fact_id ? manifest_add_text(row, "fact_id", fact_id) : manifest_add_u64(row, "slot", slot)) ||
       !(net ? manifest_add_text(row, "remote_ip", ip) && manifest_add_u64(row, "remote_port", port)
-            : manifest_add_text(row, "registry_key", key) && manifest_add_text(row, "registry_value", value) &&
-                  manifest_add_text(row, "registry_op", op)) ||
+            : file ? manifest_add_text(row, "file_path", path) &&
+                     manifest_add_text(row, "file_path_quality", path_quality)
+                   : manifest_add_text(row, "registry_key", key) &&
+                     manifest_add_text(row, "registry_value", value) && manifest_add_text(row, "registry_op", op)) ||
       !cJSON_AddItemToArray(r->rows, row)) {
     cJSON_Delete(row);
     return EDR_PARENT_CONTEXT_ERROR_STORAGE;
@@ -11506,7 +11531,9 @@ static int window_read_owner(AlertWindowRead *r) {
   if (r->first_ns <= 0 || r->last_ns <= q->source_time_ns || r->last_ns - q->source_time_ns > 120000000000LL)
     goto done;
   copy_s(r->owner, sizeof(r->owner), canonical);
-  r->interrupted = !strcmp(state, "interrupted") || *gap;
+  r->activation_gap = !strcmp(q->kind, "file_write") &&
+      (!strcmp(gap, "activation_gap") || !strncmp(gap, "activation_gap+", sizeof("activation_gap+") - 1u));
+  r->interrupted = !strcmp(state, "interrupted") || (*gap && (!r->activation_gap || strcmp(gap, "activation_gap")));
   r->pre_truncated = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(bundle, "context_truncated"));
   rc = window_read_pre(r, raw, bundle, scratch != NULL);
   if (!rc) {
@@ -11623,6 +11650,7 @@ static int window_encode(AlertWindowRead *r, cJSON *root, char *out, size_t cap)
       !manifest_add_text(root, "coverage", found ? "retained_window" : "owner_unavailable") ||
       (found && (!manifest_add_u64_text(root, "window_from_ns", (uint64_t)r->first_ns) ||
                  !manifest_add_u64_text(root, "window_until_ns", (uint64_t)r->last_ns))) ||
+      (r->activation_gap && !window_gap(gaps, "activation_gap")) ||
       (r->interrupted && !window_gap(gaps, "window_interrupted")) ||
       (r->pre_truncated && !window_gap(gaps, "pre_window_truncated")) ||
       (r->registry_missing && !window_gap(gaps, "registry_fields_missing")) ||
@@ -11754,7 +11782,8 @@ int edr_local_evidence_cache_query_alert_window_json(const EdrAlertWindowQuery *
       !parent_context_scope_text(q->endpoint_id, sizeof(((EdrBehaviorRecord *)0)->endpoint_id)) ||
       !parent_context_scope_text(q->source_event_id, sizeof(((EdrBehaviorRecord *)0)->event_id)) ||
       !parent_context_scope_text(q->alert_id, 128) || !q->kind ||
-      (strcmp(q->kind, "network") && strcmp(q->kind, "registry") && strcmp(q->kind, "network_port")) ||
+      (strcmp(q->kind, "network") && strcmp(q->kind, "registry") &&
+       strcmp(q->kind, "network_port") && strcmp(q->kind, "file_write")) ||
       (!strcmp(q->kind, "network_port") ? !q->remote_port || q->remote_port > 65535 : q->remote_port != 0) || !q->pid || !q->process_start_key ||
       !q->process_creation_filetime_100ns || q->from_ns <= 0 || q->from_ns > q->source_time_ns ||
       q->source_time_ns > q->until_ns || q->until_ns - q->from_ns > 600000000000LL || !q->limit || q->limit > 50 ||
