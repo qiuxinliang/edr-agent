@@ -53,6 +53,18 @@ def validate_source(run, attempt, commit, version, info):
             or info.get("head_sha") != commit or info.get("status") != "in_progress"):
         raise ValueError("Source must be the active matching EDR release run, not a fork, stale attempt or other workflow")
     event, branch = info.get("event"), info.get("head_branch")
+    if branch == "codex/utm-cache-recall-751":
+        validation = {
+            "EDR_AGENT_RELEASE_TAG": "win_3.2.751",
+            "WINDOWS_RELEASE_MODE": "usb",
+            "EDR_RELEASE_PACKAGE_SCOPE": "full",
+            "EDR_RELEASE_CANDIDATE": "true",
+            "EDR_RELEASE_VALIDATION_ONLY": "true",
+        }
+        if (event != "workflow_dispatch" or version != "3.2.751"
+                or any(os.environ.get(key) != value for key, value in validation.items())):
+            raise ValueError("The 751 experimental branch requires a manual full USB validation-only candidate")
+        return
     if not ((event == "push" and branch == "win_" + version)
             or (event == "workflow_dispatch" and (branch in RELEASE_BRANCHES
                 or (branch == "codex/cache-deploy-compat-registry" and version == "3.2.747")
