@@ -9,7 +9,7 @@ import tempfile
 import unittest
 
 from owner_range_handoff import (
-    INSERT, PROJECTION_SQL, REFERENCE_ROWS, connect, pack_fixture, restore, version,
+    FILE_OVERHEAD, INSERT, MAX_PAGES, PROJECTION_SQL, REFERENCE_ROWS, connect, pack_fixture, restore, version,
 )
 
 
@@ -198,6 +198,26 @@ restore(Path(sys.argv[1]), Manifest(**json.loads(sys.argv[2])), _before_commit=l
             db.execute("UPDATE probe_owner_ranges SET member_count=1000000000")
         with self.assertRaisesRegex(ValueError, "invalid packed range member encoding"):
             restore(self.packed, manifest)
+
+    def test_budget_counts_large_main_file_with_smaller_committed_wal_snapshot(self):
+        manifest = self.pack()
+        with closing(connect(self.packed, "rw")) as writer:
+            writer.execute("PRAGMA wal_autocheckpoint=0")
+            writer.execute("CREATE TABLE scratch (payload BLOB)")
+            writer.execute("INSERT INTO scratch VALUES(zeroblob(2097152))")
+            writer.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+            writer.execute("DROP TABLE scratch")
+            writer.execute("PRAGMA incremental_vacuum").fetchall()
+            logical_pages, = writer.execute("PRAGMA page_count").fetchone()
+            page_size, = writer.execute("PRAGMA page_size").fetchone()
+            wal_size = Path(str(self.packed) + "-wal").stat().st_size
+            self.assertLess(logical_pages, MAX_PAGES)
+            self.assertGreater(self.packed.stat().st_size, MAX_PAGES * page_size)
+            shm_size = Path(str(self.packed) + "-shm").stat().st_size
+            omitted_main_cap = wal_size + shm_size + FILE_OVERHEAD + MAX_PAGES * (2 * page_size + 24)
+            with self.assertRaisesRegex(ValueError, "insufficient disk budget"):
+                restore(self.packed, manifest, max_db_bytes=omitted_main_cap)
+            self.assertEqual(version(writer), 6)
 
     def test_reject_preserves_committed_wal_with_last_writer_closed(self):
         manifest = self.pack()

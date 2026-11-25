@@ -175,12 +175,21 @@ def columns(db, table):
 
 def enforce_budget(db, path, page_budget, max_db_bytes, reserve_bytes):
     page_size, = db.execute("PRAGMA main.page_size").fetchone()
-    initial_wal = Path(str(path) + "-wal")
-    wal_bytes = initial_wal.stat().st_size if initial_wal.exists() else 0
+    def side_size(suffix):
+        try:
+            return Path(str(path) + suffix).stat().st_size
+        except FileNotFoundError:
+            return 0
+
+    if side_size("-journal"):
+        raise ValueError("unexpected rollback journal blocks evidence handoff")
+    main_bytes = max(path.stat().st_size, page_size * page_budget)
+    wal_bytes = side_size("-wal")
+    shm_bytes = side_size("-shm")
     # With cache spill and auto checkpoint disabled, bound the complete
     # address space plus the WAL written by this one transaction. Existing WAL
     # may stay pinned by a reader and is included independently.
-    peak = (2 * page_size + 24) * page_budget + wal_bytes + FILE_OVERHEAD
+    peak = main_bytes + wal_bytes + shm_bytes + (page_size + 24) * page_budget + FILE_OVERHEAD
     if page_budget < db.execute("PRAGMA main.page_count").fetchone()[0]:
         raise ValueError("evidence handoff exceeds the page budget")
     if peak > max_db_bytes or shutil.disk_usage(path.parent).free < reserve_bytes + peak:
