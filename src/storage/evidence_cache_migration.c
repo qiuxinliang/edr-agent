@@ -178,6 +178,7 @@ int edr_local_evidence_cache_migrate(const char *path, uint32_t max_db_mb,
   EdrContextStore store;
   MigrationBudget budget = {0};
   int rc = -1;
+  int owns_cache = 0;
   uint64_t start = migration_clock_ms();
   uint64_t cap = (uint64_t)max_db_mb * 1024u * 1024u;
   char *wal = NULL;
@@ -192,6 +193,10 @@ int edr_local_evidence_cache_migrate(const char *path, uint32_t max_db_mb,
     snprintf(result->error, sizeof(result->error), "migration needs at least 2 MiB free disk space"); goto done;
   }
   if (sqlite3_open_v2(path, &db, SQLITE_OPEN_READWRITE, NULL) != SQLITE_OK) goto sqlite_error;
+  if (sqlite3_db_config(db, SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, 1, NULL) != SQLITE_OK) {
+    snprintf(result->error, sizeof(result->error), "cannot disable migration close checkpoint");
+    sqlite3_close(db); db = NULL; goto done;
+  }
   sqlite3_busy_timeout(db, 200);
   MigrationDeadline deadline = { start + timeout_ms, cancelled, cancel_context };
   sqlite3_progress_handler(db, 1000, interrupted, &deadline);
@@ -207,9 +212,15 @@ int edr_local_evidence_cache_migrate(const char *path, uint32_t max_db_mb,
   sqlite3_finalize(journal);
   if (!wal_mode) { snprintf(result->error, sizeof(result->error), "migration requires the existing WAL cache format"); goto done; }
   /* Must acquire exclusive ownership before any schema or row changes. */
-  if (sqlite3_exec(db, "PRAGMA locking_mode=EXCLUSIVE;BEGIN EXCLUSIVE;COMMIT;", NULL, NULL, NULL) != SQLITE_OK) {
+  if (sqlite3_exec(db, "PRAGMA locking_mode=EXCLUSIVE;BEGIN EXCLUSIVE;", NULL, NULL, NULL) != SQLITE_OK) {
     snprintf(result->error, sizeof(result->error), "cache is busy; stop its Agent/readers before migration"); goto done;
   }
+  /* Another writer could have changed the format since the first read. */
+  if (scalar(db, "PRAGMA user_version", &v) != 0 || v < 0 || v > 2) {
+    snprintf(result->error, sizeof(result->error), "unsupported evidence cache format"); goto done;
+  }
+  if (sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL) != SQLITE_OK) goto sqlite_error;
+  owns_cache = 1;
   /* A near-full cache can have only 1 MiB of migration headroom. Keep clean
    * read pages below 128 KiB so the commit reserve reflects dirty work rather
    * than filling the runtime's 1 MiB read cache within each small batch.
@@ -297,7 +308,8 @@ done:
     sqlite3_int64 current = -1;
     if (scalar(db, "PRAGMA user_version", &current) == 0 && current >= 0) result->format = (uint32_t)current;
     /* Cleanup is best effort after failure; never replace the first cause. */
-    int checkpoint_rc = sqlite3_wal_checkpoint_v2(db, NULL, SQLITE_CHECKPOINT_TRUNCATE, NULL, NULL);
+    int checkpoint_rc = owns_cache
+        ? sqlite3_wal_checkpoint_v2(db, NULL, SQLITE_CHECKPOINT_TRUNCATE, NULL, NULL) : SQLITE_OK;
     if (rc == 0 && checkpoint_rc != SQLITE_OK) { rc = -1; result->complete = 0;
       snprintf(result->error, sizeof(result->error), "migration final checkpoint failed"); }
     /* max_page_count is a connection-local migration limit. */

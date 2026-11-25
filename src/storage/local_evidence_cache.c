@@ -8171,13 +8171,16 @@ int edr_local_evidence_cache_open_with_policy(const char *path, uint32_t max_db_
     set_error("cannot disable unguarded evidence close checkpoint");
     sqlite3_close(s_db); s_db=NULL; evidence_cache_unlock(); return -1;
   }
-  s_status.db_open = 1;
   if (edr_context_store_check_format(&s_context_store, s_db) != 0) {
     set_error(s_context_store.error);
-    evidence_cache_close_locked();
+    /* This cache was never admitted. Normal shutdown flushes metrics and
+     * checkpoints another format's committed WAL. */
+    sqlite3_close(s_db);
+    s_db = NULL;
     evidence_cache_unlock();
     return -1;
   }
+  s_status.db_open = 1;
   s_status.storage_format = (uint32_t)s_context_store.format;
   if (!sqlite_startup_schema_write_allow()) {
     sqlite3_close(s_db); s_db=NULL; s_status.db_open=0;

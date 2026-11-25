@@ -9395,6 +9395,69 @@ static void test_compact_full_busy_and_unknown_format(void) {
   assert(sqlite3_close(db) == SQLITE_OK); cleanup_test_sqlite_path(path);
 }
 
+static long rejected_format_file_digest(const char *path, uint8_t digest[32]) {
+  FILE *f = fopen(path, "rb");
+  if (!f && errno == ENOENT) return -1;
+  assert(f);
+  EdrSha256Ctx sha;
+  edr_sha256_init(&sha);
+  uint8_t buf[4096];
+  size_t n;
+  while ((n = fread(buf, 1, sizeof(buf), f)) != 0)
+    edr_sha256_update(&sha, buf, n);
+  assert(!ferror(f));
+  long size = ftell(f);
+  assert(size >= 0 && fclose(f) == 0);
+  edr_sha256_final(&sha, digest);
+  return size;
+}
+
+static void test_reject_committed_wal_format(const char *entry) {
+  char path[512], wal[520];
+  assert(make_test_sqlite_path(path, sizeof(path)) == 0);
+  snprintf(wal, sizeof(wal), "%s-wal", path);
+  sqlite3 *db = NULL;
+  assert(sqlite3_open(path, &db) == SQLITE_OK);
+  assert(sqlite3_db_config(db, SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, 1, NULL) == SQLITE_OK);
+  compact_exec(db, "PRAGMA journal_mode=WAL;PRAGMA wal_autocheckpoint=0;"
+                   "CREATE TABLE retained(id INTEGER PRIMARY KEY);PRAGMA user_version=1;");
+  assert(sqlite3_wal_checkpoint_v2(db, NULL, SQLITE_CHECKPOINT_TRUNCATE, NULL, NULL) == SQLITE_OK);
+  uint8_t main_before[32], wal_before[32], after[32];
+  long main_size = rejected_format_file_digest(path, main_before);
+  compact_exec(db, "BEGIN;INSERT INTO retained VALUES(42);PRAGMA user_version=6;COMMIT;");
+  assert(sqlite3_close(db) == SQLITE_OK);
+  assert(main_size > 0 && rejected_format_file_digest(path, after) == main_size);
+  assert(!memcmp(main_before, after, sizeof(after)));
+  long wal_size = rejected_format_file_digest(wal, wal_before);
+  assert(wal_size > 32);
+
+  if (!strcmp(entry, "preflight")) {
+    assert(edr_local_evidence_cache_startup_preflight(path, 32) == -1);
+  } else if (!strcmp(entry, "open")) {
+    EdrEvidenceCacheStatus status;
+    assert(edr_local_evidence_cache_open(path, 32, 24) == -1);
+    edr_local_evidence_cache_get_status(&status);
+    assert(!status.db_open && !strcmp(status.last_error, "unsupported evidence cache format 6"));
+  } else {
+    assert(!strcmp(entry, "migrate"));
+    EdrEvidenceMigrationResult result;
+    assert(edr_local_evidence_cache_migrate(path, 32, 2000, NULL, NULL, &result) == -1);
+    assert(!result.complete && !result.moved_refs && result.format == 6 && strstr(result.error, "unsupported"));
+  }
+  long wal_after = rejected_format_file_digest(wal, after);
+  int wal_equal = wal_after == wal_size && !memcmp(wal_before, after, sizeof(after));
+  long main_after = rejected_format_file_digest(path, after);
+  int main_equal = main_after == main_size && !memcmp(main_before, after, sizeof(after));
+  printf("rejected_format entry=%s main_bytes=%ld wal_before=%ld wal_after=%ld main_equal=%d wal_equal=%d\n",
+         entry, main_size, wal_size, wal_after, main_equal, wal_equal);
+  fflush(stdout);
+  assert(main_equal && wal_equal);
+  assert(sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK);
+  assert(compact_scalar(db, "PRAGMA user_version") == 6 && compact_scalar(db, "SELECT id FROM retained") == 42);
+  assert(sqlite3_close(db) == SQLITE_OK);
+  cleanup_test_sqlite_path(path);
+}
+
 static void test_compact_migration_budget_and_storage_types(void) {
   char path[512]; assert(make_test_sqlite_path(path, sizeof(path)) == 0);
   migration_fixture(path);
@@ -15716,6 +15779,10 @@ static void test_window_entry_order_and_recovery(int enforce) {
 
 int main(int argc, char **argv) {
 #if defined(EDR_HAVE_SQLITE)
+  if (argc == 3 && !strcmp(argv[1], "--reject-committed-wal-format")) {
+    test_reject_committed_wal_format(argv[2]);
+    return 0;
+  }
   if (argc == 3 && !strcmp(argv[1], "--dense-owner-range")) {
     run_dense_owner_range_witness(argv[2]);
     return 0;
@@ -16084,6 +16151,9 @@ int main(int argc, char **argv) {
   RUN_CACHE_CASE("retention", test_physical_floor_holds_maintenance_and_startup());
   RUN_CACHE_CASE("migration", test_compact_process_crash_recovery());
   RUN_CACHE_CASE("migration", test_compact_full_busy_and_unknown_format());
+  RUN_CACHE_CASE("migration", test_reject_committed_wal_format("preflight"));
+  RUN_CACHE_CASE("migration", test_reject_committed_wal_format("open"));
+  RUN_CACHE_CASE("migration", test_reject_committed_wal_format("migrate"));
   RUN_CACHE_CASE("migration", test_compact_migration_budget_and_storage_types());
   RUN_CACHE_CASE("migration", test_near_full_migration_resume_admission());
   RUN_CACHE_CASE("migration", test_compact_near_full_migration_releases_clean_pages());
