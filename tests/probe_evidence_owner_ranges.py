@@ -10,7 +10,9 @@ from contextlib import closing
 from itertools import groupby, zip_longest
 import json
 from pathlib import Path
+import shutil
 import sqlite3
+from tempfile import TemporaryDirectory
 
 
 REFERENCE_COLUMNS = (
@@ -86,23 +88,35 @@ def check_decoded(source, baseline, candidate):
     for expected, control, actual in zip_longest(
         source.execute(REFERENCE_ROWS), baseline.execute(REFERENCE_ROWS), decoded(candidate)
     ):
-        if control != expected or actual != expected:
+        if expected is None or not all(
+            row is not None and len(row) == len(expected)
+            and all(type(a) is type(b) and a == b for a, b in zip(expected, row))
+            for row in (control, actual)
+        ):
             # Never emit the source digest or an object key.
             raise ValueError(f"reference mismatch at ordered position {count + 1}")
         count += 1
     return count
 
 
-def read_only(path):
-    # immutable skips WAL processing, so reject a nonempty WAL or any
-    # rollback journal before accepting a closed copy.
+def file_identity(path):
+    stat = path.stat()
+    return stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns
+
+
+def closed_identity(path):
     if Path(f"{path}-journal").exists():
         raise ValueError("copy still has a rollback journal")
     wal = Path(f"{path}-wal")
     if wal.exists() and wal.stat().st_size:
         raise ValueError("copy still has a nonempty WAL")
-    db = sqlite3.connect(path.as_uri() + "?immutable=1&mode=ro", uri=True)
+    return file_identity(path)
+
+
+def read_snapshot(path, mode="ro"):
+    db = sqlite3.connect(path.as_uri() + f"?mode={mode}", uri=True)
     db.execute("PRAGMA query_only=ON")
+    db.execute("BEGIN")
     return db
 
 
@@ -158,24 +172,29 @@ def measure(path):
 
 def compare(path, output):
     path = path.resolve(strict=True)
-    after_close = path.stat()
+    after_close = closed_identity(path)
     output.mkdir(mode=0o700)
     baseline = output / "baseline.sqlite"
     candidate = output / "ranges.sqlite"
-    with closing(read_only(path)) as source:
-        ddl = checked_schema(source)
-        write_ledger(source, baseline, ddl, False)
-        write_ledger(source, candidate, ddl, True)
-        with closing(read_only(candidate)) as ranges, closing(read_only(baseline)) as original:
-            for ledger in (ranges, original):
-                if ledger.execute("PRAGMA quick_check").fetchall() != [("ok",)]:
-                    raise ValueError("probe ledger failed SQLite integrity check")
-            count = check_decoded(source, original, ranges)
-            range_count, = ranges.execute("SELECT count(*) FROM probe_owner_ranges").fetchone()
-            singleton_count, = ranges.execute("SELECT count(*) FROM compact_context_refs").fetchone()
-    stable = path.stat()
-    if (after_close.st_size, after_close.st_mtime_ns, after_close.st_ino, after_close.st_dev) != (
-            stable.st_size, stable.st_mtime_ns, stable.st_ino, stable.st_dev):
+    with TemporaryDirectory(dir=output) as directory:
+        # SQLite may create lock side files even on a read-only open of a WAL
+        # database. Only let it create them for a private copy of the input.
+        snapshot = Path(directory) / "closed.sqlite"
+        shutil.copyfile(path, snapshot)
+        if after_close != closed_identity(path):
+            raise ValueError("source copy identity changed")
+        with closing(read_snapshot(snapshot, "rw")) as source:
+            ddl = checked_schema(source)
+            write_ledger(source, baseline, ddl, False)
+            write_ledger(source, candidate, ddl, True)
+            with closing(read_snapshot(candidate)) as ranges, closing(read_snapshot(baseline)) as original:
+                for ledger in (ranges, original):
+                    if ledger.execute("PRAGMA quick_check").fetchall() != [("ok",)]:
+                        raise ValueError("probe ledger failed SQLite integrity check")
+                count = check_decoded(source, original, ranges)
+                range_count, = ranges.execute("SELECT count(*) FROM probe_owner_ranges").fetchone()
+                singleton_count, = ranges.execute("SELECT count(*) FROM compact_context_refs").fetchone()
+    if after_close != closed_identity(path):
         raise ValueError("source copy identity changed")
     return {"references": count, "ranges": range_count, "singletons": singleton_count,
             "existing_ledger": measure(baseline), "range_ledger": measure(candidate)}

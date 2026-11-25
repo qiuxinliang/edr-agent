@@ -1,9 +1,11 @@
+from contextlib import closing
 import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
-from probe_evidence_owner_ranges import compare
+from probe_evidence_owner_ranges import check_decoded, compare, write_ledger
 
 
 class ReferenceRangeProbeTests(unittest.TestCase):
@@ -22,7 +24,7 @@ class ReferenceRangeProbeTests(unittest.TestCase):
                 CREATE TABLE compact_context_refs (
                     id INTEGER PRIMARY KEY,candidate_key INTEGER,fact_key INTEGER,
                     source_identity BLOB,artifact_override TEXT,
-                    candidate_json_override TEXT,created_ns INTEGER,
+                    candidate_json_override TEXT,created_ns,
                     upload_status TEXT,minio_key TEXT
                 );
                 CREATE UNIQUE INDEX compact_context_ref_source
@@ -74,6 +76,37 @@ class ReferenceRangeProbeTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "nonempty WAL"):
             compare(self.closed, self.root / "output")
         self.assertFalse((self.root / "output" / "ranges.sqlite").exists())
+
+    def test_storage_class_difference_is_a_mismatch(self):
+        self.fixture([self.row(1, 1)])
+        output = self.root / "output"
+        compare(self.closed, output)
+        with closing(sqlite3.connect(output / "ranges.sqlite")) as candidate, closing(
+            sqlite3.connect(output / "baseline.sqlite")
+        ) as baseline:
+            candidate.execute("UPDATE compact_context_refs SET created_ns=cast(3 AS REAL)")
+            self.assertEqual(candidate.execute(
+                "SELECT typeof(created_ns) FROM compact_context_refs").fetchone(), ("real",))
+            with self.assertRaisesRegex(ValueError, "reference mismatch"):
+                check_decoded(baseline, baseline, candidate)
+
+    def test_external_wal_commit_is_rejected_even_when_main_file_stays_identical(self):
+        self.fixture([self.row(1, 1)])
+        with closing(sqlite3.connect(self.closed)) as writer:
+            self.assertEqual(writer.execute("PRAGMA journal_mode=wal").fetchone(), ("wal",))
+            writer.execute("SELECT count(*) FROM compact_context_refs").fetchone()
+            before = self.closed.read_bytes()
+
+            def inject_commit(source, path, ddl, candidate):
+                if candidate:
+                    writer.execute("UPDATE compact_context_refs SET created_ns=4")
+                    writer.commit()
+                    self.assertEqual(self.closed.read_bytes(), before)
+                write_ledger(source, path, ddl, candidate)
+
+            with patch("probe_evidence_owner_ranges.write_ledger", side_effect=inject_commit):
+                with self.assertRaisesRegex(ValueError, "nonempty WAL"):
+                    compare(self.closed, self.root / "output")
 
 
 if __name__ == "__main__":
