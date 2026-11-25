@@ -15710,7 +15710,17 @@ static void test_window_entry_order_and_recovery(int enforce) {
 #include "alert_window_pre_page_cases.h"
 #include "owner_manifest_frame_cases.h"
 
+#if defined(EDR_HAVE_SQLITE)
+#include "dense_owner_range_witness.h"
+#endif
+
 int main(int argc, char **argv) {
+#if defined(EDR_HAVE_SQLITE)
+  if (argc == 3 && !strcmp(argv[1], "--dense-owner-range")) {
+    run_dense_owner_range_witness(argv[2]);
+    return 0;
+  }
+#endif
 #if defined(EDR_HAVE_SQLITE) && defined(EDR_HAVE_ZSTD)
   if (argc == 2 && !strcmp(argv[1], "--owner-manifest-frame")) {
     test_owner_manifest_frame(); return 0;
