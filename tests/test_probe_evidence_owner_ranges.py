@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from probe_evidence_owner_ranges import check_decoded, compare, write_ledger
+from probe_evidence_owner_ranges import check_decoded, checked_schema, compare, read_snapshot, write_ledger
 
 
 class ReferenceRangeProbeTests(unittest.TestCase):
@@ -61,6 +61,50 @@ class ReferenceRangeProbeTests(unittest.TestCase):
         result = compare(self.closed, self.root / "output")
         self.assertEqual((result["references"], result["ranges"], result["singletons"]),
                          (258, 2, 0))
+
+    def test_range_ledger_has_its_own_format_even_when_all_rows_are_literal(self):
+        self.fixture([self.row(1, 1)])
+        output = self.root / "output"
+        compare(self.closed, output)
+        for name, expected in (("baseline.sqlite", 0), ("ranges.sqlite", 6)):
+            with closing(read_snapshot(output / name)) as db:
+                self.assertEqual(db.execute("PRAGMA user_version").fetchone(), (expected,))
+
+    def test_failed_write_rolls_back_layout_marker_and_first_range_together(self):
+        self.fixture([self.row(1, 1), self.row(2, 2)])
+        output = self.root / "range-failure.sqlite"
+        outside = []
+
+        def interrupt_after_first_range(rows):
+            first = next(iter(rows))
+            yield first, 2
+            with closing(sqlite3.connect(output, timeout=0)) as observer:
+                outside.append(observer.execute("PRAGMA user_version").fetchone())
+                outside.append(observer.execute("SELECT name FROM sqlite_schema").fetchall())
+            raise RuntimeError("injected interruption after first range")
+
+        with closing(read_snapshot(self.closed)) as source:
+            ddl = checked_schema(source)
+            with patch("probe_evidence_owner_ranges.runs", side_effect=interrupt_after_first_range):
+                with self.assertRaisesRegex(RuntimeError, "injected interruption"):
+                    write_ledger(source, output, ddl, True)
+
+        self.assertEqual(outside, [(0,), []])
+        with closing(read_snapshot(output)) as db:
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone(), (0,))
+            self.assertEqual(db.execute("SELECT name FROM sqlite_schema").fetchall(), [])
+
+    def test_compare_rejects_packaged_or_untagged_range_input(self):
+        self.fixture([self.row(1, 1)])
+        with closing(sqlite3.connect(self.closed)) as db, db:
+            db.execute("PRAGMA user_version=6")
+        with self.assertRaisesRegex(ValueError, "unsupported source evidence cache format 6"):
+            compare(self.closed, self.root / "versioned")
+        with closing(sqlite3.connect(self.closed)) as db, db:
+            db.execute("PRAGMA user_version=1")
+            db.execute("CREATE TABLE probe_owner_ranges(first_ref_id INTEGER PRIMARY KEY)")
+        with self.assertRaisesRegex(ValueError, "source contains an experimental owner-range layout"):
+            compare(self.closed, self.root / "untagged")
 
     def test_unresolved_owner_stops_projection(self):
         self.fixture([self.row(1, 1)])

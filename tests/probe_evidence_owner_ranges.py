@@ -22,6 +22,9 @@ REFERENCE_COLUMNS = (
 REFS = ",".join(REFERENCE_COLUMNS)
 REFERENCE_ROWS = f"SELECT {REFS} FROM compact_context_refs ORDER BY id"
 RANGE_SIZE = 256
+# The old reader uses versions 0–5 for standard layouts and retirement fences.
+# A packed ledger needs a distinct version so startup cannot replace its projection.
+PACKED_RANGE_USER_VERSION = 6
 
 RANGE_SCHEMA = """
 CREATE TABLE probe_owner_ranges (
@@ -121,6 +124,13 @@ def read_snapshot(path, mode="ro"):
 
 
 def checked_schema(source):
+    version, = source.execute("PRAGMA user_version").fetchone()
+    if not 0 <= version < PACKED_RANGE_USER_VERSION:
+        raise ValueError(f"unsupported source evidence cache format {version}")
+    if source.execute(
+        "SELECT 1 FROM sqlite_schema WHERE name='probe_owner_ranges' COLLATE NOCASE"
+    ).fetchone():
+        raise ValueError("source contains an experimental owner-range layout")
     columns = tuple(row[1] for row in source.execute("PRAGMA table_info(compact_context_refs)"))
     if columns != REFERENCE_COLUMNS:
         raise ValueError("unsupported compact reference columns")
@@ -146,10 +156,13 @@ def write_ledger(source, path, ddl, candidate):
     with closing(sqlite3.connect(path)) as db:
         page_size, = source.execute("PRAGMA page_size").fetchone()
         db.execute(f"PRAGMA page_size={page_size}")
-        db.execute(ddl[0])
         with db:
+            # executescript starts the transaction itself because it otherwise
+            # commits pending work before executing the script.
+            db.executescript("BEGIN IMMEDIATE;" + (RANGE_SCHEMA if candidate else ""))
+            db.execute(ddl[0])
             if candidate:
-                db.executescript(RANGE_SCHEMA)
+                db.execute(f"PRAGMA user_version={PACKED_RANGE_USER_VERSION}")
                 for row, count in runs(source.execute(REFERENCE_ROWS)):
                     if count == 1:
                         db.execute(insert, row)
