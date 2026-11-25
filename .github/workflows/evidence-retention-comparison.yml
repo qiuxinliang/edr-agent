@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
     inputs:
       p0_test_inputs_ref:
-        description: 'Fixed private P0 input commit (40 hex); defaults to P0_TEST_INPUTS_REF repository variable'
+        description: 'Fixed private P0 input commit (40 hex). Defaults to the snapshot pinned by this source revision.'
         type: string
         required: false
       diagnose_service_stop:
@@ -105,7 +105,8 @@ jobs:
     env:
       VCPKG_ROOT: ${{ github.workspace }}/vcpkg
       VCPKG_DEFAULT_TRIPLET: ${{ matrix.triplet }}
-      P0_TEST_INPUTS_REF: ${{ inputs.p0_test_inputs_ref || vars.P0_TEST_INPUTS_REF }}
+      # Advance this snapshot together with the source-owned P0 replay matrix.
+      P0_TEST_INPUTS_REF: ${{ inputs.p0_test_inputs_ref || '1190a89c39c0fcf675626afe040ed11b93670f09' }}
     steps:
       - uses: actions/checkout@v6
         with:
