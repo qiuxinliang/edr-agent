@@ -1,4 +1,5 @@
 """Exercise the shadow writer exclusively in synthetic temporary databases."""
+from contextlib import closing
 from pathlib import Path
 import sqlite3
 import tempfile
@@ -68,7 +69,7 @@ class LiveRangeTest(unittest.TestCase):
         self.assertEqual(list(logical_rows(self.db)),before[:3]+before[4:])
         self.db.execute(INSERT,standard(4,72,9))
         assert_matches_writer(self.db)
-        with sqlite3.connect(self.path) as reopened:
+        with closing(sqlite3.connect(self.path)) as reopened:
             self.assertEqual(list(logical_rows(reopened))[3][1],72)
 
     def test_exact_replay_does_not_split_or_rewrite(self):

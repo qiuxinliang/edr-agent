@@ -16,7 +16,7 @@ class ReferenceRangeProbeTests(unittest.TestCase):
         self.closed = self.root / "closed.sqlite"
 
     def fixture(self, rows):
-        with sqlite3.connect(self.closed) as db:
+        with closing(sqlite3.connect(self.closed)) as db, db:
             db.executescript("""
                 CREATE TABLE context_candidates(id INTEGER PRIMARY KEY);
                 CREATE TABLE context_facts(fact_id TEXT PRIMARY KEY);
@@ -108,7 +108,7 @@ class ReferenceRangeProbeTests(unittest.TestCase):
 
     def test_unresolved_owner_stops_projection(self):
         self.fixture([self.row(1, 1)])
-        with sqlite3.connect(self.closed) as db:
+        with closing(sqlite3.connect(self.closed)) as db, db:
             db.execute("DELETE FROM context_candidates")
         with self.assertRaisesRegex(ValueError, "unresolved compact candidate"):
             compare(self.closed, self.root / "output")
