@@ -1749,7 +1749,10 @@ add_test(NAME local_evidence_cache_context_layout COMMAND test_local_evidence_ca
 add_test(NAME local_evidence_cache_startup_budget COMMAND test_local_evidence_cache_candidate --startup-logical-budget WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 add_test(NAME local_evidence_cache_pressure_continuation COMMAND test_local_evidence_cache_candidate --pressure-continuation-empty WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 set_tests_properties(local_evidence_cache_candidate local_evidence_cache_migration
-  local_evidence_cache_retention local_evidence_cache_context_layout local_evidence_cache_startup_budget local_evidence_cache_pressure_continuation PROPERTIES TIMEOUT 150
+  local_evidence_cache_context_layout local_evidence_cache_startup_budget local_evidence_cache_pressure_continuation PROPERTIES TIMEOUT 150
+  RESOURCE_LOCK local_evidence_cache_fixture)
+# Override the telemetry runner's default timeout for this suite only.
+set_tests_properties(local_evidence_cache_retention PROPERTIES TIMEOUT 0
   RESOURCE_LOCK local_evidence_cache_fixture)
 if(WIN32)
   # This contract seeds 4200 durable rows before measuring bounded retention.
