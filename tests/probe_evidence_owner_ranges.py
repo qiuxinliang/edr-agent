@@ -161,16 +161,17 @@ def write_ledger(source, path, ddl, candidate):
             # commits pending work before executing the script.
             db.executescript("BEGIN IMMEDIATE;" + (RANGE_SCHEMA if candidate else ""))
             db.execute(ddl[0])
-            if candidate:
-                db.execute(f"PRAGMA user_version={PACKED_RANGE_USER_VERSION}")
-                for row, count in runs(source.execute(REFERENCE_ROWS)):
-                    if count == 1:
-                        db.execute(insert, row)
-                    else:
-                        db.execute("INSERT INTO probe_owner_ranges VALUES (?,?,?,?,?,?)",
-                                   (*row[:2], count, row[2], row[3], row[6]))
-            else:
-                db.executemany(insert, source.execute(REFERENCE_ROWS))
+            with closing(source.execute(REFERENCE_ROWS)) as references:
+                if candidate:
+                    db.execute(f"PRAGMA user_version={PACKED_RANGE_USER_VERSION}")
+                    for row, count in runs(references):
+                        if count == 1:
+                            db.execute(insert, row)
+                        else:
+                            db.execute("INSERT INTO probe_owner_ranges VALUES (?,?,?,?,?,?)",
+                                       (*row[:2], count, row[2], row[3], row[6]))
+                else:
+                    db.executemany(insert, references)
             for statement in ddl[1:]:
                 db.execute(statement)
         # Both shapes get the same deterministic compact-and-close treatment.

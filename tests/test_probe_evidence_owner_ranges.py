@@ -85,9 +85,14 @@ class ReferenceRangeProbeTests(unittest.TestCase):
 
         with closing(read_snapshot(self.closed)) as source:
             ddl = checked_schema(source)
-            with patch("probe_evidence_owner_ranges.runs", side_effect=interrupt_after_first_range):
+            with patch("probe_evidence_owner_ranges.runs", side_effect=interrupt_after_first_range) as packed:
                 with self.assertRaisesRegex(RuntimeError, "injected interruption"):
                     write_ledger(source, output, ddl, True)
+            # Keep the partly consumed cursor alive and check it before the
+            # connection closes. Windows cannot remove its database otherwise.
+            cursor, = packed.call_args.args
+            with self.assertRaisesRegex(sqlite3.ProgrammingError, "closed cursor"):
+                cursor.fetchone()
 
         self.assertEqual(outside, [(0,), []])
         with closing(read_snapshot(output)) as db:
