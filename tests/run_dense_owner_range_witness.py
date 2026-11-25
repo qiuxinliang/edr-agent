@@ -51,7 +51,9 @@ def restore_fixture(source, target, original):
 
 
 def state(work):
-    with closing(sqlite3.connect(work / "dense-range-synthetic.sqlite")) as db:
+    path = (work / "dense-range-synthetic.sqlite").resolve()
+    with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)) as db:
+        db.execute("BEGIN")
         floors = db.execute("""SELECT candidate_id,context_window_protect_until_active_ms,
             alert_context_protect_until_active_ms FROM p0_candidates ORDER BY candidate_id""").fetchall()
         pre = db.execute("""SELECT candidate_id,manifest_json FROM artifacts
@@ -61,23 +63,65 @@ def state(work):
         return floors, pre, facts, refs
 
 
+def native(binary, work, stage):
+    proc = subprocess.run([str(binary), "--dense-owner-range", stage], cwd=work,
+                          capture_output=True, text=True, timeout=150)
+    if proc.returncode:
+        raise RuntimeError(f"synthetic native {stage} exited {proc.returncode}: {proc.stderr[-1600:]}")
+    if stage == "query":
+        return [json.loads(line) for line in proc.stdout.splitlines()]
+
+
+def run_packed_handoff(binary):
+    from owner_range_handoff import pack_fixture, restore
+
+    dbname = "dense-range-synthetic.sqlite"
+    with tempfile.TemporaryDirectory(prefix="dense-owner-handoff-") as directory:
+        standard, restored = [Path(directory) / name for name in ("standard", "restored")]
+        standard.mkdir()
+        restored.mkdir()
+        native(binary, standard, "init")
+        native(binary, standard, "write")
+        receipt = pack_fixture(standard / dbname, restored / dbname)
+        before = state(standard)
+        assert restore(restored / dbname, receipt) == len(before[3]) == 585
+        # Let the old writer encounter the restored layout in the committed
+        # WAL. A read/write inspection connection could checkpoint it first.
+        restored_path = restored / dbname
+        with restored_path.open("rb") as main:
+            main.seek(60)
+            main_version = int.from_bytes(main.read(4), "big")
+        wal_bytes = Path(str(restored_path) + "-wal").stat().st_size
+        assert main_version == 6 and wal_bytes > 32
+        with closing(sqlite3.connect(restored_path.resolve().as_uri() + "?mode=ro", uri=True)) as db:
+            assert db.execute("PRAGMA user_version").fetchone() == (1,)
+        assert before == state(restored)
+        rows = native(binary, standard, "query")
+        assert rows == native(binary, restored, "query")
+        for work in (standard, restored):
+            native(binary, work, "continue")
+        after = state(standard)
+        assert after == state(restored)
+        assert len(after[0]) == len(before[0]) + 1 and len(after[3]) > len(before[3])
+        assert native(binary, standard, "query") == native(binary, restored, "query")
+        return {"references_before": len(before[3]), "references_after": len(after[3]),
+                "main_format_before_751": main_version, "wal_bytes_before_751": wal_bytes,
+                "owners_before": len(before[0]), "owners_after": len(after[0]),
+                "frozen_alerts": sum(deadline > 0 for _, _, deadline in before[0]),
+                "queried_ports": [[row["remote_port"] for row in q["rows"]] for q in rows]}
+
+
 def run(binary):
     with tempfile.TemporaryDirectory(prefix="dense-owner-windows-") as directory:
         base, shadow, restored = [Path(directory) / name for name in ("base","shadow","restored")]
         for d in (base, shadow, restored):
             d.mkdir()
-        def native(work, stage):
-            p = subprocess.run([str(binary), "--dense-owner-range", stage], cwd=work, check=False,
-                               capture_output=True, text=True, timeout=150)
-            if p.returncode:
-                raise RuntimeError(f"synthetic native {stage} exited {p.returncode}: {p.stderr[-1600:]}")
-            return [json.loads(line) for line in p.stdout.splitlines()] if stage == "query" else None
         for work in (base, shadow):
-            native(work, "init")
+            native(binary, work, "init")
             if work == shadow:
                 with closing(sqlite3.connect(work / "dense-range-synthetic.sqlite")) as db:
                     install(db)
-            native(work, "write")
+            native(binary, work, "write")
         dbname = "dense-range-synthetic.sqlite"
         with closing(sqlite3.connect(shadow / dbname)) as source, closing(sqlite3.connect(base / dbname)) as original:
             assert_matches_writer(source)
@@ -90,14 +134,14 @@ def run(binary):
         floors, bundles, _, refs = before
         assert len(floors) == len(bundles) == 32
         assert sum(alert_floor > 0 for _, _, alert_floor in floors) == 3
-        rows = native(base, "query")
-        assert rows == native(shadow, "query") == native(restored, "query")
+        rows = native(binary, base, "query")
+        assert rows == native(binary, shadow, "query") == native(binary, restored, "query")
         for work in (base, restored):
-            native(work, "continue")
+            native(binary, work, "continue")
         after = state(base)
         assert after == state(restored)
         assert len(after[0]) == 33 and len(after[2]) > len(before[2]) and len(after[3]) > len(refs)
-        assert native(base, "query") == native(restored, "query")
+        assert native(binary, base, "query") == native(binary, restored, "query")
         return {"candidates": len(floors), "frozen_alerts": sum(a > 0 for _,_,a in floors),
                 "logical_references":len(refs), "ranges":segments, "singletons":literals,
                 "queried_ports": [[row["remote_port"] for row in q["rows"]] for q in rows],
@@ -107,5 +151,8 @@ def run(binary):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("test_binary", type=Path)
+    parser.add_argument("--handoff", action="store_true",
+                        help="read and extend the atomically restored format-6 synthetic fixture")
     args = parser.parse_args()
-    print(json.dumps(run(args.test_binary.resolve(strict=True))))
+    scenario = run_packed_handoff if args.handoff else run
+    print(json.dumps(scenario(args.test_binary.resolve(strict=True))))
