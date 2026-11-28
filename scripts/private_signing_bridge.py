@@ -17,6 +17,7 @@ RELEASE_BRANCHES = {"main", "codex/release-workflow-convergence"}
 UTM_VALIDATION_BRANCHES = {
     "codex/utm-cache-recall-751": "3.2.751",
     "codex/utm-cache-recall-752": "3.2.752",
+    "codex/utm-cache-recall-753": "3.2.753",
 }
 
 

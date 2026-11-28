@@ -30,6 +30,11 @@ class Source747Tests(unittest.TestCase):
             ("codex/utm-cache-recall-752", "3.2.751", False),
             ("codex/utm-cache-recall-752", "3.2.752", True),
             ("other", "3.2.752", False),
+            ("codex/utm-cache-recall-752", "3.2.753", False),
+            ("codex/utm-cache-recall-753", "3.2.752", False),
+            ("codex/utm-cache-recall-753", "3.2.753", True),
+            ("codex/utm-cache-recall-753", "3.2.754", False),
+            ("other", "3.2.753", False),
             ("codex/utm-cache-recall-750", "3.2.751", False),
             ("other", "3.2.751", False),
             ("main", "3.2.748", True),
@@ -52,7 +57,7 @@ class Source747Tests(unittest.TestCase):
         return version, validation, info
 
     def test_candidate_requires_matching_release_run_identity(self):
-        for patch_version in (751, 752):
+        for patch_version in (751, 752, 753):
             version, validation, info = self.experimental_candidate(patch_version)
             with patch.dict(b.os.environ, validation, clear=True):
                 for change in (dict(path=".github/workflows/not-release.yml"), dict(id=124), dict(run_attempt=2),
@@ -65,7 +70,7 @@ class Source747Tests(unittest.TestCase):
         wrong_values = dict(EDR_AGENT_RELEASE_TAG="win_3.2.750", WINDOWS_RELEASE_MODE="signed",
                             EDR_RELEASE_PACKAGE_SCOPE="headless", EDR_RELEASE_CANDIDATE="false",
                             EDR_RELEASE_VALIDATION_ONLY="false")
-        for patch_version in (751, 752):
+        for patch_version in (751, 752, 753):
             version, validation, info = self.experimental_candidate(patch_version)
             for key, other in wrong_values.items():
                 with self.subTest(version=version, missing=key), patch.dict(b.os.environ, validation, clear=True):
