@@ -25,13 +25,36 @@ STAGES = (
     'rollback-formal-legacy',
     'rollback-formal-legacy-data',
     'uninstall-formal-recovered-source',
+    # These positions are public report IDs; append new stages.
+    'native-admission',
 )
+ADMISSION_STATUS_SCHEMA = 'edr.formal-maintenance-admission-status.v1'
 EXIT_CODE = re.compile(r'\b(?:exit code |exit=)(-?\d{1,10})\b')
 STORAGE_CAUSE = (
     'cache_owner_open', 'cache_owner_write', 'cache_query_target_not_found',
     'queue_owner_open', 'queue_owner_write', 'queue_readback_missing',
     'persisted_wire_changed', 'legacy_candidate_admission',
 )
+
+
+def admission_failure_code(path):
+    if path is None:
+        return 0
+    try:
+        if not path.is_file():
+            return 0
+        with path.open('rb') as stream:
+            raw = stream.read(1025)
+        if len(raw) > 1024:
+            return 0
+        status = json.loads(raw)
+    except (OSError, ValueError):
+        return 0
+    if (not isinstance(status, dict) or set(status) != {'schema', 'cause_code'}
+            or status['schema'] != ADMISSION_STATUS_SCHEMA):
+        return 0
+    code = status['cause_code']
+    return code if type(code) is int and 0 <= code <= 7 else 0
 
 
 def native_status(native, architecture, mode):
@@ -66,11 +89,14 @@ def native_status(native, architecture, mode):
                 if 'cause='+cause in detail:
                     storage_cause = index
                     break
-    passed = native.get('status') == 'succeeded' and all(statuses.get(stage) == 1 for stage in STAGES)
+    # Earlier native receipts did not emit the new admission milestone.
+    passed = (native.get('status') == 'succeeded'
+              and statuses.get('native-admission', 1) == 1
+              and all(statuses.get(stage) == 1 for stage in STAGES if stage != 'native-admission'))
     return statuses, passed, failure_line, exit_code, storage_cause
 
 
-def report(architecture, mode, layers, native):
+def report(architecture, mode, layers, native, admission_status=None):
     outcomes = {name: STATES.get(layers.get(name), 0) for name in LAYERS}
     stages, passed, line, exit_code, storage_cause = native_status(native, architecture, mode)
     passed = passed and all(state == 1 for state in outcomes.values())
@@ -84,6 +110,7 @@ def report(architecture, mode, layers, native):
         'layer_outcomes': outcomes,
         'stage_outcomes': {name.replace('-', '_'): stages.get(name, 0) for name in STAGES},
         'first_failed_layer': next((i for i, name in enumerate(LAYERS, 1) if outcomes[name] in (2, 3)), 0),
+        'admission_cause_code': admission_failure_code(admission_status) if outcomes['admission'] == 2 else 0,
         'first_native_failure_stage': next((i for i, name in enumerate(STAGES, 1) if stages.get(name) == 2), 0),
         'failure_line': line,
         'reported_exit_code': exit_code,
@@ -92,6 +119,7 @@ def report(architecture, mode, layers, native):
         'original_updater_execution_verified': stages.get('old-updater-upgrade') == 1,
         'platform_capability_receipt_observed': False,
         'platform_signed_command_delivery_observed': False,
+        'phase2_retirement_storage_exercised': False,
         'passed': passed,
     }
 
@@ -101,6 +129,7 @@ def main():
     parser.add_argument('--arch', choices=('amd64', 'arm64'), required=True)
     parser.add_argument('--mode', choices=('service', 'scheduled_task'), required=True)
     parser.add_argument('--native-summary', type=Path, required=True)
+    parser.add_argument('--admission-status', type=Path)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('outcomes', nargs=len(LAYERS))
     args = parser.parse_args()
@@ -109,7 +138,7 @@ def main():
         with args.native_summary.open(encoding='utf-8') as stream:
             native = json.load(stream)
     layers = dict(zip(LAYERS, args.outcomes))
-    result = report(args.arch, args.mode, layers, native)
+    result = report(args.arch, args.mode, layers, native, args.admission_status)
     text = json.dumps(result, indent=2)+'\n'
     args.output.write_text(text, encoding='utf-8')
     print(text, end='')

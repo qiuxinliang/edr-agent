@@ -17,6 +17,14 @@ from windows_release_checkpoint import (MARKER, asset_names, marker_scope, marke
 from windows_usb_bundle import unpack
 
 REQUEST_SCHEMA = "edr.formal-maintenance-validation.v1"
+STATUS_SCHEMA = "edr.formal-maintenance-admission-status.v1"
+SOURCE_READ = 1
+SOURCE_IDENTITY = 2
+ASSET = 3
+ARCHIVE = 4
+MANIFEST = 5
+UPDATE = 6
+REQUEST = 7
 # Canonical JSON binds both architectures' official asset IDs, sizes, hashes
 # and the redacted output of the original backend verifier.
 REQUEST_SHA256 = "9d7c9056b03eccf7bba100699cd05a2ef6e6b7f00f1afb8f82430f80e37c7d52"
@@ -26,6 +34,15 @@ SIGNED_ARTIFACT_PROOF = {
     "signature_sha256": "artifact-manifest.json.p7s",
     "artifact_sha256": "FDSensor.exe",
 }
+
+
+@dataclass
+class AdmissionStatus:
+    cause_code: int = 0
+
+    def write(self, path):
+        with path.open("x", encoding="utf-8") as report:
+            report.write(json.dumps(dict(schema=STATUS_SCHEMA, cause_code=self.cause_code)) + "\n")
 
 
 @dataclass(frozen=True)
@@ -97,8 +114,11 @@ def validate_request(request, arch):
     return assets
 
 
-def release_owner(source, assets):
+def release_owner(source, assets, status=None):
+    status = status if status is not None else AdmissionStatus()
+    status.cause_code = SOURCE_READ
     info = admission.api(admission.PUBLIC, f"releases/{source.release_id}")
+    status.cause_code = SOURCE_IDENTITY
     signed = source.mode != "unsigned"
     markers = MARKER.findall(info.get("body") or "")
     if (info.get("id") != source.release_id or info.get("tag_name") != source.tag
@@ -112,13 +132,17 @@ def release_owner(source, assets):
                     commit=source.commit, run_id=str(source.run))
     if not isinstance(owner, dict) or any(owner.get(key) != value for key, value in expected.items()):
         raise ValueError(f"{source.tag} Release provenance mismatch")
+    status.cause_code = ASSET
     if admission.checked_assets(info.get("assets")) != assets:
         raise ValueError(f"{source.tag} official Release asset ID, size or digest changed")
     return owner
 
 
-def assert_source_run(source):
+def assert_source_run(source, status=None):
+    status = status if status is not None else AdmissionStatus()
+    status.cause_code = SOURCE_READ
     run = admission.api(admission.PUBLIC, f"actions/runs/{source.run}/attempts/{source.attempt}")
+    status.cause_code = SOURCE_IDENTITY
     if (run.get("id") != source.run or run.get("run_attempt") != source.attempt
             or run.get("head_sha") != source.commit
             or run.get("repository", {}).get("full_name") != admission.PUBLIC
@@ -130,7 +154,9 @@ def assert_source_run(source):
         if run.get("conclusion") != "success":
             raise ValueError("The published legacy source attempt must have succeeded")
         return
+    status.cause_code = SOURCE_READ
     jobs = admission.jobs(admission.PUBLIC, source.run, source.attempt)
+    status.cause_code = SOURCE_IDENTITY
     # These are existing signed drafts. Their native build and sealing jobs
     # succeeded, even when the separate install/upgrade gate failed.
     job_names = [f"Build Windows {arch} (" for arch in admission.ARCHES]
@@ -180,9 +206,10 @@ def bind_publisher(manifest, proof, destination):
     return full_proof
 
 
-def stage_release(directory, arch, source, assets, proof):
-    owner = release_owner(source, assets)
-    assert_source_run(source)
+def stage_release(directory, arch, source, assets, proof, status):
+    owner = release_owner(source, assets, status)
+    assert_source_run(source, status)
+    status.cause_code = ASSET
     signed = source.mode != "unsigned"
     payload = directory / "target" if signed else directory
     prefix = asset_prefix(source, arch)
@@ -193,9 +220,13 @@ def stage_release(directory, arch, source, assets, proof):
         name = prefix + suffix
         admission.fetch(admission.PUBLIC, assets[name], payload / name)
     runtime = payload / "runtime"
+    status.cause_code = ARCHIVE
     unpack_runtime(payload / (prefix + "exe.zip"), runtime)
+    status.cause_code = MANIFEST
     admission.runtime_contract(runtime, assets, source.tag, arch, signed)
+    status.cause_code = UPDATE
     assert_original_protocol(runtime / "edr_agent_inplace_update.ps1", source)
+    status.cause_code = MANIFEST
     manifest = admission.read(payload / (prefix + "artifact-manifest.json"))
     if (manifest.get("schema_version") != 1 or manifest.get("version") != source.tag[4:]
             or manifest.get("build_provenance") != owner or "repack_provenance" in manifest):
@@ -220,12 +251,16 @@ def stage_release(directory, arch, source, assets, proof):
           or admission.pe((payload / (prefix + "setup.exe")).read_bytes(), arch, installer=True)[2] != (0, 0)
           or admission.pe((runtime / "FDSensor.exe").read_bytes(), arch)[2] != (0, 0)):
         raise ValueError("The published original 687 input requires its original unsigned policy")
-    if release_owner(source, assets) != owner:
+    current_owner = release_owner(source, assets, status)
+    status.cause_code = SOURCE_IDENTITY
+    if current_owner != owner:
         raise ValueError(f"{source.tag} Release provenance changed during admission")
     return payload
 
 
-def stage_pair(request, arch, root):
+def stage_pair(request, arch, root, status=None):
+    status = status if status is not None else AdmissionStatus()
+    status.cause_code = REQUEST
     assets = validate_request(request, arch)
     root = Path(root).resolve()
     root.mkdir(parents=True, exist_ok=False)
@@ -234,7 +269,7 @@ def stage_pair(request, arch, root):
     packages = {}
     for label, source in SOURCES.items():
         proof = request[label].get("publisher_verification", {}).get(arch)
-        payload = stage_release(root / label, arch, source, assets[label], proof)
+        payload = stage_release(root / label, arch, source, assets[label], proof, status)
         prefix = asset_prefix(source, arch)
         packages[label] = payload
         result.update({
@@ -245,6 +280,7 @@ def stage_pair(request, arch, root):
             f"{label}_signature_status": "unsigned" if source.mode == "unsigned" else "signed",
             f"{label}_updater_protocol": source.updater_protocol,
         })
+    status.cause_code = UPDATE
     migration = prepare_lifecycle_upgrade(packages["baseline"], packages["legacy"], root / "migration",
         SOURCES["baseline"].tag, SOURCES["legacy"].tag, arch, root / "baseline" / "publisher-verification.json")
     upgrade = prepare_lifecycle_upgrade(packages["target"], packages["baseline"], root / "upgrade",
@@ -262,18 +298,35 @@ def stage_pair(request, arch, root):
     result.update(migration_input=str(root / "migration" / "transition.json"),
                   upgrade_input=str(root / "upgrade" / "transition.json"), legacy_config_template=str(template))
     (root / "stage.json").write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
+    status.cause_code = 0
     return result
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--request", type=Path, required=True)
     parser.add_argument("--arch", choices=tuple(admission.ARCHES), required=True)
     parser.add_argument("--root", type=Path, required=True)
-    args = parser.parse_args()
-    if not 0 < args.request.stat().st_size <= 32768:
-        raise ValueError("Maintenance request exceeds bounded input size")
-    stage_pair(admission.read(args.request), args.arch, args.root)
+    parser.add_argument("--status", type=Path, help="Fresh redacted cause file outside the staging directory")
+    args = parser.parse_args(argv)
+    status_file = args.status.resolve() if args.status is not None else None
+    if status_file is not None and (status_file.is_relative_to(args.root.resolve())
+                                    or status_file == args.request.resolve() or status_file.exists()):
+        raise ValueError("Admission status requires a separate fresh file outside the staging directory")
+    status = AdmissionStatus(REQUEST)
+    try:
+        if not 0 < args.request.stat().st_size <= 32768:
+            raise ValueError("Maintenance request exceeds bounded input size")
+        stage_pair(admission.read(args.request), args.arch, args.root, status)
+    except BaseException:
+        if status_file is not None:
+            try:
+                status.write(status_file)
+            except OSError:
+                print("Unable to retain admission status file", file=sys.stderr)
+        raise
+    if status_file is not None:
+        status.write(status_file)
     print("Three pinned Full Setup inputs and both transitions verified")
 
 

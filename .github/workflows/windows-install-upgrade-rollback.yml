@@ -1192,7 +1192,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          python -B tests/stage_formal_maintenance_lifecycle.py --request "$env:RUNNER_TEMP/formal-maintenance-request.json" --arch $env:NATIVE_ARCH --root "$env:RUNNER_TEMP/formal-maintenance-input" *> "$env:RUNNER_TEMP/formal-maintenance-admission.log"
+          python -B tests/stage_formal_maintenance_lifecycle.py --request "$env:RUNNER_TEMP/formal-maintenance-request.json" --arch $env:NATIVE_ARCH --root "$env:RUNNER_TEMP/formal-maintenance-input" --status "$env:RUNNER_TEMP/formal-maintenance-admission-status.json" *> "$env:RUNNER_TEMP/formal-maintenance-admission.log"
           if ($LASTEXITCODE -ne 0) { throw 'Pinned Full Release/source, package, publisher receipt or transition admission failed' }
       - name: Verify signed packages with native Authenticode and CMS
         id: published_signature
@@ -1252,6 +1252,7 @@ jobs:
         run: |
           python -B scripts/vcpkg_release_cache.py restore --key '${{ steps.dependency_key.outputs.key }}' --actions-cache-hit '${{ steps.dependency_cache.outputs.cache-hit }}'
           if ($LASTEXITCODE -ne 0) { throw 'Existing shared dependency cache restore failed' }
+          Remove-Item Env:GH_TOKEN -ErrorAction Stop
           & ./scripts/bootstrap_pinned_vcpkg.ps1
           $vcpkg = Join-Path $PWD 'vcpkg/vcpkg.exe'
           & ./scripts/Invoke-VcpkgInstallWithRetry.ps1 -VcpkgExe $vcpkg -FeatureArgs @('--x-feature=sqlite','--x-feature=yara') -MaxAttempts 6 -InitialBackoffSeconds 30
@@ -1306,7 +1307,7 @@ jobs:
           P0_CLEANUP_RESULT: ${{ steps.p0_cleanup.outcome }}
           INSTALLED_RESULT: ${{ steps.installed_chain.outcome }}
         run: |
-          python -B tests/report_formal_maintenance.py --arch $env:NATIVE_ARCH --mode $env:LIFECYCLE_RUNTIME_MODE --native-summary "$env:RUNNER_TEMP/formal-maintenance-native/summary.json" --output "$env:RUNNER_TEMP/formal-maintenance-report.json" "$env:HOST_RESULT" "$env:ADMISSION_RESULT" "$env:PUBLISHER_RESULT" "$env:COMPILER_RESULT" "$env:P0_INPUT_RESULT" "$env:P0_VERIFY_RESULT" "$env:CACHE_KEY_RESULT" "$env:CACHE_RESTORE_RESULT" "$env:DEPENDENCY_RESULT" "$env:STORAGE_RESULT" "$env:P0_CLEANUP_RESULT" "$env:INSTALLED_RESULT"
+          python -B tests/report_formal_maintenance.py --arch $env:NATIVE_ARCH --mode $env:LIFECYCLE_RUNTIME_MODE --native-summary "$env:RUNNER_TEMP/formal-maintenance-native/summary.json" --admission-status "$env:RUNNER_TEMP/formal-maintenance-admission-status.json" --output "$env:RUNNER_TEMP/formal-maintenance-report.json" "$env:HOST_RESULT" "$env:ADMISSION_RESULT" "$env:PUBLISHER_RESULT" "$env:COMPILER_RESULT" "$env:P0_INPUT_RESULT" "$env:P0_VERIFY_RESULT" "$env:CACHE_KEY_RESULT" "$env:CACHE_RESTORE_RESULT" "$env:DEPENDENCY_RESULT" "$env:STORAGE_RESULT" "$env:P0_CLEANUP_RESULT" "$env:INSTALLED_RESULT"
           if (Test-Path -LiteralPath "$env:RUNNER_TEMP/formal-maintenance-report.json") {
             Get-Content -LiteralPath "$env:RUNNER_TEMP/formal-maintenance-report.json" | Out-File $env:GITHUB_STEP_SUMMARY -Append
           }

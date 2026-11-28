@@ -875,12 +875,14 @@ function Assert-LifecyclePreservationSnapshot($Snapshot, [string] $Stage) {
       throw "$Stage changed the original queue/evidence marker bytes"
     }
   }
-  Add-Evidence $Stage 'preserved' "original_config=true mode=$RuntimeMode runtime_owner_identity=true synthetic_queue_evidence_markers=$([bool]$Snapshot.markers)"
+  $detail = "original_config=true mode=$RuntimeMode runtime_owner_identity=true"
+  if ($Snapshot.markers) { $detail += ' synthetic_queue_evidence_markers=true business_database_readback=false' }
+  Add-Evidence $Stage 'preserved' $detail
 }
 
 $status = "failed"
 $failureLine = 0
-$script:LastLifecycleStage = "lifecycle"
+$script:LastLifecycleStage = if ($formalMaintenance) { 'native-admission' } else { 'lifecycle' }
 $script:LastSetupLog = ""
 try {
   $upgradeBinding = Get-Content -LiteralPath $UpgradeInput -Raw | ConvertFrom-Json
@@ -902,6 +904,9 @@ try {
         (Get-FileHash -LiteralPath $LegacySetupExe -Algorithm SHA256).Hash.ToLowerInvariant() -cne $migrationBinding.baseline_setup_sha256) {
       throw 'signed publisher migration and upgrade inputs do not form one immutable version chain'
     }
+  }
+  if ($formalMaintenance) {
+    Add-Evidence 'native-admission' 'verified' 'both signed full-installer inputs and original historical Setup bound to the installed chain'
   }
   # Validate the target independently first. A broken historical baseline must
   # not hide whether the candidate can install and uninstall on a clean host.

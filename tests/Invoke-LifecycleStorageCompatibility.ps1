@@ -271,6 +271,12 @@ function Write-LifecycleStorageFixture($Context,[ValidateSet('seed','append')][s
 function Test-LifecycleStorageReadback($Context,[string]$Stage,[string[]]$ReaderRoles=@('legacy','candidate')) {
   Assert-LifecycleStorageBinding $Context
   if($Stage -cnotmatch '^[a-z0-9-]+$' -or $Context.generation -notin @(1,2)){throw 'invalid storage readback stage'}
+  if($ReaderRoles.Count -eq 0 -or @($ReaderRoles|Select-Object -Unique).Count -ne $ReaderRoles.Count){throw 'invalid storage reader selection'}
+  foreach($role in $ReaderRoles) {
+    if($role -cnotin @('legacy','baseline','candidate') -or -not $Context.tools.PSObject.Properties[$role]){
+      throw 'storage reader role has not been admitted'
+    }
+  }
   $directory=Join-Path $Context.root $Stage
   if(Test-Path -LiteralPath $directory){throw 'storage readback stage already exists'}
   [IO.Directory]::CreateDirectory($directory)|Out-Null
@@ -282,9 +288,6 @@ function Test-LifecycleStorageReadback($Context,[string]$Stage,[string[]]$Reader
         $proof.source -ine $Context.binding.$kind.path -or $proof.config_sha256 -cne $Context.binding.config_sha256 -or
         $proof.sha256 -cne (Get-FileHash -LiteralPath $snapshot -Algorithm SHA256).Hash.ToLowerInvariant()){throw 'actual storage snapshot binding failed'}
     foreach($role in $ReaderRoles) {
-      if($role -cnotin @('legacy','baseline','candidate') -or -not $Context.tools.PSObject.Properties[$role]){
-        throw 'storage reader role has not been admitted'
-      }
       $copy=Join-Path $directory ($kind+'.'+$role+'.db')
       Copy-Item -LiteralPath $snapshot -Destination $copy -ErrorAction Stop
       if((Get-FileHash -LiteralPath $copy -Algorithm SHA256).Hash.ToLowerInvariant() -cne $proof.sha256){throw 'consumer copy differs from sealed snapshot'}

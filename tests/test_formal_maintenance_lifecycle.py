@@ -3,6 +3,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -115,6 +116,82 @@ class OfficialSourceTests(unittest.TestCase):
                 jobs[-1]["conclusion"] = "skipped"
                 with self.assertRaisesRegex(ValueError, "USB finalize"):
                     stage.assert_source_run(source)
+
+
+class AdmissionStatusTests(unittest.TestCase):
+    def setUp(self):
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        self.root = Path(folder.name) / "stage"
+        self.request_path = self.root.parent / "request.json"
+        self.status_path = self.root.parent / "admission-status.json"
+        self.request = request_fixture()
+        self.request_path.write_text(json.dumps(self.request), encoding="utf-8")
+        identity = patch.object(stage, "REQUEST_SHA256", stage.request_digest(self.request))
+        identity.start()
+        self.addCleanup(identity.stop)
+
+    def invoke(self, status_path=None):
+        stage.main(["--request", str(self.request_path), "--arch", "amd64", "--root", str(self.root),
+                    "--status", str(self.status_path if status_path is None else status_path)])
+
+    def assert_status(self, code):
+        report = stage.admission.read(self.status_path)
+        self.assertEqual(report, {"schema": "edr.formal-maintenance-admission-status.v1", "cause_code": code})
+        self.assertIs(type(report["cause_code"]), int)
+
+    def test_release_api_failure_retains_read_cause(self):
+        failed = subprocess.CompletedProcess(["gh"], 1, "", "transport error")
+        with patch.object(subprocess, "run", return_value=failed), patch.object(stage.admission.time, "sleep"):
+            with self.assertRaisesRegex(RuntimeError, "GitHub read failed"):
+                self.invoke()
+        self.assert_status(1)
+
+    def test_changed_asset_bytes_retain_asset_cause(self):
+        source = stage.SOURCES["legacy"]
+        owner = dict(repository=stage.admission.PUBLIC, tag=source.tag, mode=source.mode,
+                     commit=source.commit, run_id=str(source.run))
+        release = dict(id=source.release_id, tag_name=source.tag, target_commitish=source.commit,
+                       draft=False, prerelease=True, assets=self.request["legacy"]["assets"],
+                       body="<!-- edr-release-source:" + json.dumps(owner) + " -->")
+        run = dict(id=source.run, run_attempt=source.attempt, head_sha=source.commit,
+                   repository={"full_name": stage.admission.PUBLIC},
+                   head_repository={"full_name": stage.admission.PUBLIC},
+                   path=".github/workflows/edr-agent-client-release.yml", status="completed", conclusion="success")
+        changed_asset = next(row for row in release["assets"] if row["name"].endswith("amd64-exe.zip"))
+        api = f"repos/{stage.admission.PUBLIC}"
+
+        def gh(args, **kwargs):
+            endpoint = args[2]
+            if endpoint == f"{api}/releases/assets/{changed_asset['id']}":
+                kwargs["stdout"].write(b"x" * changed_asset["size"])
+                return subprocess.CompletedProcess(args, 0)
+            metadata = {
+                f"{api}/releases/{source.release_id}": release,
+                f"{api}/actions/runs/{source.run}/attempts/{source.attempt}": run,
+            }
+            return subprocess.CompletedProcess(args, 0, json.dumps(metadata[endpoint]))
+
+        with patch.object(subprocess, "run", side_effect=gh):
+            with self.assertRaisesRegex(ValueError, "Downloaded official asset size/digest mismatch"):
+                self.invoke()
+        self.assert_status(3)
+        self.assertFalse((self.root / "stage.json").exists())
+
+    def test_invalid_request_retains_request_cause_before_reads(self):
+        self.request_path.write_text("{}", encoding="utf-8")
+        with patch.object(subprocess, "run") as network:
+            with self.assertRaisesRegex(ValueError, "exact redacted"):
+                self.invoke()
+            network.assert_not_called()
+        self.assert_status(7)
+
+    def test_status_path_cannot_create_a_file_inside_package_staging(self):
+        with patch.object(subprocess, "run") as network:
+            with self.assertRaisesRegex(ValueError, "outside the staging directory"):
+                self.invoke(self.root / "legacy" / "runtime" / "status.json")
+            network.assert_not_called()
+        self.assertFalse(self.root.exists())
 
 
 class RuntimeAdmissionTests(unittest.TestCase):
