@@ -406,6 +406,38 @@ class WindowsLifecycleWorkflowTests(unittest.TestCase):
         self.assertLess(formal.index('- name: Verify the frozen P0 inputs'),
                         formal.index('- name: Compile and verify all three'))
 
+    def test_preseed_is_an_explicit_service_only_dispatch_on_the_formal_branch(self):
+        call, dispatch = self.text.split('  workflow_dispatch:\n', 1)
+        inputs = dispatch.split('\npermissions:\n', 1)[0]
+        self.assertNotIn('formal_preseed:', call)
+        self.assertRegex(inputs, r'(?m)^      formal_preseed:\n +description: .+\n +required: false\n +default: false\n +type: boolean$')
+        regular, formal = self.text.split('  formal-maintenance-lifecycle:\n', 1)
+        self.assertEqual(sum('!inputs.formal_preseed' in line for line in regular.splitlines()), 4)
+        self.assertIn("github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/codex/verify-687-752-753-maintenance' && github.repository == 'qiuxinliang/edr-agent'", formal)
+        self.assertIn('arch: [amd64, arm64]', formal)
+        self.assertIn("""fromJSON(inputs.formal_preseed && '["service"]' || '["service","scheduled_task"]')""", formal)
+        host = step(formal, 'Validate the exact dispatch and disposable native host')
+        self.assertIn("($preseed -and $env:LIFECYCLE_RUNTIME_MODE -cne 'service')", host)
+        self.assertIn('$dispatch.publisher_validation_request', host)
+        self.assertIn("if ($preseed) {\n            & ./tests/test_windows_lifecycle_storage.ps1 -RepoRoot $PWD", host)
+        self.assertIn('python -B tests/test_windows_lifecycle_storage.py', host)
+
+    def test_preseed_uses_separate_evidence_and_the_exact_existing_admission(self):
+        formal = self.text.split('  formal-maintenance-lifecycle:\n', 1)[1]
+        admit = step(formal, 'Admit the exact three original Full Setup inputs')
+        self.assertIn('tests/stage_formal_maintenance_lifecycle.py', admit)
+        self.assertNotIn('formal_preseed', admit)
+        self.assertIn("FORMAL_EVIDENCE_PREFIX: ${{ inputs.formal_preseed && 'formal-preseed' || 'formal-maintenance' }}", formal)
+        chain = step(formal, 'Exercise the original installed maintenance and recovery chain')
+        self.assertIn("if ($env:FORMAL_PRESEED -ceq 'true') { $parameters.FormalPreseed = $true }", chain)
+        self.assertIn("($env:FORMAL_EVIDENCE_PREFIX+'-native')", chain)
+        evidence = step(formal, 'Export only numeric and boolean maintenance evidence')
+        self.assertIn("($env:FORMAL_EVIDENCE_PREFIX+'-native')", evidence)
+        self.assertIn("if ($env:FORMAL_PRESEED -ceq 'true') { $caseArgs += '--formal-preseed' }", evidence)
+        upload = formal.rsplit('      - uses: actions/upload-artifact@v4\n', 1)[1]
+        self.assertIn('path: ${{ runner.temp }}/${{ env.FORMAL_EVIDENCE_PREFIX }}-report.json', upload)
+        self.assertIn('name: ${{ env.FORMAL_EVIDENCE_PREFIX }}-${{ matrix.arch }}-${{ matrix.runtime_mode }}', upload)
+        self.assertIn('retention-days: 1', upload)
 
 if __name__ == '__main__':
     unittest.main()

@@ -31,6 +31,7 @@ STAGES = (
     # These positions are public report IDs; append new stages.
     'native-admission',
 )
+PRESEED_STAGES = (*STAGES, 'legacy-preseed')
 ADMISSION_STATUS_SCHEMA = 'edr.formal-maintenance-admission-status.v1'
 EXIT_CODE = re.compile(r'\b(?:exit code |exit=)(-?\d{1,10})\b')
 STORAGE_CAUSE = (
@@ -44,6 +45,12 @@ SEED_TIMEOUT_STEPS = (
     ('legacy-seed-cache-seed', 20),
     ('legacy-seed-queue-seed', 20),
     ('legacy-seed-restart', 35),
+)
+PRESEED_APPEND_TIMEOUT_STEPS = (
+    ('updater-target-append-stop', 35),
+    ('updater-target-append-cache-append', 20),
+    ('updater-target-append-queue-append', 20),
+    ('updater-target-append-restart', 35),
 )
 RUNTIME_ACTION_PHASES = (
     'engine_enter', 'get_owner_begin', 'get_owner_returned',
@@ -72,7 +79,7 @@ def admission_failure_code(path):
     return code if type(code) is int and 0 <= code <= 7 else 0
 
 
-def native_status(native, architecture, mode):
+def native_status(native, architecture, mode, formal_preseed):
     if native is None:
         return {}, False, 0, 0, 0, ''
     if (native.get('schema') != 'edr.agent.setup-exe.lifecycle.v1'
@@ -83,16 +90,23 @@ def native_status(native, architecture, mode):
             or native.get('baseline_version') != '3.2.752'
             or native.get('target_version') != '3.2.753'):
         raise ValueError('native summary does not bind the requested maintenance chain')
+    if native.get('formal_preseed', False) is not formal_preseed:
+        raise ValueError('native summary does not bind the requested maintenance case')
+    stage_ids = PRESEED_STAGES if formal_preseed else STAGES
+    other_case_stage = 'legacy-seed' if formal_preseed else 'legacy-preseed'
     statuses = {}
     exit_code = failure_line = storage_cause = 0
     detail = ''
+    mixed = False
     for event in native['events']:
         name, status = event.get('stage'), event.get('status')
-        if name in STAGES and status == 'verified':
+        if name == other_case_stage:
+            mixed = True
+        elif name in stage_ids and status == 'verified':
             statuses[name] = 1
         if name == 'lifecycle' and status == 'failed':
             last = native.get('last_stage')
-            if last in STAGES:
+            if last in stage_ids and last != other_case_stage:
                 statuses[last] = 2
             line = native.get('failure_line')
             if type(line) is int and 0 < line <= 100000:
@@ -108,10 +122,12 @@ def native_status(native, architecture, mode):
                     storage_cause = index
                     break
             break
-    # Earlier native receipts did not emit the new admission milestone.
-    passed = (native.get('status') == 'succeeded'
+    # Earlier default receipts could omit native-admission; the new case
+    # always requires it and verifies legacy-preseed in place of legacy-seed.
+    optional_stage = 'legacy-seed' if formal_preseed else 'native-admission'
+    passed = (native.get('status') == 'succeeded' and not mixed
               and statuses.get('native-admission', 1) == 1
-              and all(statuses.get(stage) == 1 for stage in STAGES if stage != 'native-admission'))
+              and all(statuses.get(stage) == 1 for stage in stage_ids if stage != optional_stage))
     return statuses, passed, failure_line, exit_code, storage_cause, detail
 
 
@@ -119,13 +135,14 @@ def has_reparse_attribute(info):
     return bool(getattr(info, 'st_file_attributes', 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT)
 
 
-def runtime_action_phase(native_summary, mode, label):
+def runtime_action_phase(native_summary, mode, label, formal_preseed):
     if native_summary is None:
         return 0
     summary = native_summary.absolute()
     if summary.name != 'summary.json' or '..' in summary.parts:
         return 0
-    trace = summary.parent / 'storage-compat-legacy-updater' / (label+'.stderr.log')
+    storage = 'storage-compat-legacy-preseed' if formal_preseed else 'storage-compat-legacy-updater'
+    trace = summary.parent / storage / (label+'.stderr.log')
     try:
         for parent in trace.parents:
             info = parent.lstat()
@@ -156,20 +173,22 @@ def runtime_action_phase(native_summary, mode, label):
     return RUNTIME_ACTION_PHASES.index(phases[len(lines)-1])+1 if lines == expected else 0
 
 
-def seed_timeout(native, mode, outcome, detail, native_summary):
+def storage_timeout(native, mode, outcome, detail, native_summary, formal_preseed):
+    expected_stage = 'updater-target-append' if formal_preseed else 'legacy-seed'
     if (native is None or outcome != STATES['failure'] or native.get('status') != 'failed'
-            or native.get('last_stage') != 'legacy-seed' or mode not in ('service', 'scheduled_task')):
+            or native.get('last_stage') != expected_stage or mode not in ('service', 'scheduled_task')):
         return 0, 0, 0
-    for step, (label, budget) in enumerate(SEED_TIMEOUT_STEPS, 1):
+    steps = enumerate(PRESEED_APPEND_TIMEOUT_STEPS, 2) if formal_preseed else enumerate(SEED_TIMEOUT_STEPS, 1)
+    for step, (label, budget) in steps:
         if detail == f'storage child exceeded its finite deadline: label={label} budget_seconds={budget}':
-            phase = runtime_action_phase(native_summary, mode, label) if step in (2, 5) else 0
+            phase = runtime_action_phase(native_summary, mode, label, formal_preseed) if step in (2, 5) else 0
             return step, budget, phase
     return 0, 0, 0
 
 
 def service_state_after_timeout(native_summary, evidence):
     outcomes = evidence['layer_outcomes']
-    if (not WINDOWS_HOST or evidence['scheduled_task'] or evidence['timeout_step'] != 2
+    if (not WINDOWS_HOST or evidence.get('formal_preseed') or evidence['scheduled_task'] or evidence['timeout_step'] != 2
             or evidence['runtime_action_phase'] < 4 or outcomes['runner'] != STATES['success']
             or outcomes['installed_chain'] != STATES['failure']):
         return 0
@@ -198,12 +217,15 @@ def service_state_after_timeout(native_summary, evidence):
     return int(states[0]) if len(states) == 1 else 0
 
 
-def report(architecture, mode, layers, native, admission_status=None, native_summary=None):
+def report(architecture, mode, layers, native, admission_status=None, native_summary=None, *, formal_preseed=False):
+    if formal_preseed and mode != 'service':
+        raise ValueError('formal preseed evidence requires native service mode')
     outcomes = {name: STATES.get(layers.get(name), 0) for name in LAYERS}
-    stages, passed, line, exit_code, storage_cause, detail = native_status(native, architecture, mode)
-    step, budget, phase = seed_timeout(native, mode, outcomes['installed_chain'], detail, native_summary)
+    stages, passed, line, exit_code, storage_cause, detail = native_status(native, architecture, mode, formal_preseed)
+    step, budget, phase = storage_timeout(native, mode, outcomes['installed_chain'], detail, native_summary, formal_preseed)
+    stage_ids = PRESEED_STAGES if formal_preseed else STAGES
     passed = passed and all(state == 1 for state in outcomes.values())
-    return {
+    result = {
         'report_version': 1,
         'native_architecture': {'amd64': 0x8664, 'arm64': 0xaa64}[architecture],
         'scheduled_task': mode == 'scheduled_task',
@@ -211,10 +233,10 @@ def report(architecture, mode, layers, native, admission_status=None, native_sum
         'baseline_build': 752,
         'target_build': 753,
         'layer_outcomes': outcomes,
-        'stage_outcomes': {name.replace('-', '_'): stages.get(name, 0) for name in STAGES},
+        'stage_outcomes': {name.replace('-', '_'): stages.get(name, 0) for name in stage_ids},
         'first_failed_layer': next((i for i, name in enumerate(LAYERS, 1) if outcomes[name] in (2, 3)), 0),
         'admission_cause_code': admission_failure_code(admission_status) if outcomes['admission'] == 2 else 0,
-        'first_native_failure_stage': next((i for i, name in enumerate(STAGES, 1) if stages.get(name) == 2), 0),
+        'first_native_failure_stage': next((i for i, name in enumerate(stage_ids, 1) if stages.get(name) == 2), 0),
         'failure_line': line,
         'reported_exit_code': exit_code,
         'storage_cause_code': storage_cause,
@@ -229,6 +251,9 @@ def report(architecture, mode, layers, native, admission_status=None, native_sum
         'phase2_retirement_storage_exercised': False,
         'passed': passed,
     }
+    if formal_preseed:
+        result['formal_preseed'] = True
+    return result
 
 
 def main():
@@ -237,6 +262,7 @@ def main():
     parser.add_argument('--mode', choices=('service', 'scheduled_task'), required=True)
     parser.add_argument('--native-summary', type=Path, required=True)
     parser.add_argument('--admission-status', type=Path)
+    parser.add_argument('--formal-preseed', action='store_true')
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('outcomes', nargs=len(LAYERS))
     args = parser.parse_args()
@@ -245,14 +271,16 @@ def main():
         with args.native_summary.open(encoding='utf-8') as stream:
             native = json.load(stream)
     layers = dict(zip(LAYERS, args.outcomes))
-    result = report(args.arch, args.mode, layers, native, args.admission_status, args.native_summary)
+    result = report(args.arch, args.mode, layers, native, args.admission_status, args.native_summary,
+                    formal_preseed=args.formal_preseed)
     result['service_state_after_timeout'] = service_state_after_timeout(args.native_summary, result)
     text = json.dumps(result, indent=2)+'\n'
     args.output.write_text(text, encoding='utf-8')
     print(text, end='')
     fail = result['first_native_failure_stage']
     if fail:
-        print('Native maintenance failed at '+STAGES[fail-1])
+        stage_ids = PRESEED_STAGES if args.formal_preseed else STAGES
+        print('Native maintenance failed at '+stage_ids[fail-1])
     code = result['storage_cause_code']
     if code:
         print('Storage owner failure '+STORAGE_CAUSE[code-1])

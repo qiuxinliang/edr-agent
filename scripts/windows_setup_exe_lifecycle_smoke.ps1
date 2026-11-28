@@ -21,11 +21,15 @@ param(
   [string] $LegacyVersion = '',
   [string] $MigrationInput = '',
   [string] $StorageToolsInput = '',
-  [string] $FormalMaintenanceInput = ''
+  [string] $FormalMaintenanceInput = '',
+  [switch] $FormalPreseed
 )
 
 $ErrorActionPreference = "Stop"
 $formalMaintenance = -not [string]::IsNullOrWhiteSpace($FormalMaintenanceInput)
+if ($FormalPreseed -and (-not $formalMaintenance -or $RuntimeMode -cne 'service')) {
+  throw 'Original storage preseed requires the fixed formal maintenance service case'
+}
 $signedChain = $SignedPublisherValidation -or $formalMaintenance
 $repoRoot = Split-Path -Parent $PSScriptRoot
 . (Join-Path $PSScriptRoot 'Start-LifecycleWindowsPowerShell.ps1')
@@ -141,7 +145,7 @@ function Copy-InstallerDiagnostics([string] $Stage, [string] $SetupLog) {
     Write-Warning ("Unable to collect diagnostics for {0}: {1}" -f $Stage, $_.Exception.Message)
   }
 }
-function Invoke-Installer([string] $Path, [string] $Stage, [bool] $UpgradeExisting) {
+function Invoke-Installer([string] $Path, [string] $Stage, [bool] $UpgradeExisting, [switch] $KeepStorage) {
   $log = Join-Path $EvidenceDir ($Stage + ".setup.log")
   $script:LastLifecycleStage = $Stage
   $script:LastSetupLog = $log
@@ -154,6 +158,7 @@ function Invoke-Installer([string] $Path, [string] $Stage, [bool] $UpgradeExisti
     ('/LOG="{0}"' -f $log)
   )
   if ($UpgradeExisting) { $arguments += "/EDR_UPGRADE_EXISTING=1" }
+  if ($KeepStorage) { $arguments += '/EDR_KEEP_OFFLINE_QUEUE=1', '/EDR_KEEP_EVIDENCE_CACHE=1' }
   Add-Evidence $Stage "started" $Path
   $process = Start-LifecycleWindowsProcess -ProcessParameters @{
     FilePath=$Path;ArgumentList=$arguments;Wait=$true;PassThru=$true
@@ -920,17 +925,26 @@ try {
   # actual old Agent. Keep the separate direct-Setup path below unchanged.
   $offlineConfigHash = Initialize-LifecycleOfflineConfig $BaselineConfigTemplate
   if ($signedChain) {
-    Invoke-Installer $LegacySetupExe 'install-legacy-migration-baseline' $false
+    if ($FormalPreseed) {
+      $script:LastLifecycleStage = 'legacy-preseed'
+      Assert-LifecycleStorageBeforeInstall
+      $chainStorage=New-LifecycleStorageChain $storageTools 'legacy-preseed' -Preseed
+      Initialize-LifecycleStorageBeforeInstall $chainStorage
+      Add-Evidence 'legacy-preseed' 'verified' 'the original 687 storage owners created both configured databases before first Setup'
+    }
+    Invoke-Installer $LegacySetupExe 'install-legacy-migration-baseline' $false -KeepStorage:$FormalPreseed
     Assert-InstalledRuntime $LegacyVersion 'install-legacy-migration-baseline' $true
     $null=Wait-LifecycleEmbeddedUpdater $LegacyVersion $migrationBinding.baseline_updater_sha256
-    if ($formalMaintenance) {
-      Assert-FormalMaintenanceBinary $formalInput.legacy_binary_sha256
-      $script:LastLifecycleStage = 'legacy-seed'
+    if ($formalMaintenance) { Assert-FormalMaintenanceBinary $formalInput.legacy_binary_sha256 }
+    if (-not $FormalPreseed) {
+      if ($formalMaintenance) { $script:LastLifecycleStage = 'legacy-seed' }
+      $chainStorage=New-LifecycleStorageChain $storageTools 'legacy-updater'
+      Write-LifecycleStorageFixture $chainStorage 'seed' 'legacy-seed'
+      if ($formalMaintenance) {
+        Add-Evidence 'legacy-seed' 'verified' 'legacy storage owner wrote both fixture records to the configured cache and queue; original runtime restarted'
+      }
     }
-    $chainStorage=New-LifecycleStorageChain $storageTools 'legacy-updater'
-    Write-LifecycleStorageFixture $chainStorage 'seed' 'legacy-seed'
     if ($formalMaintenance) {
-      Add-Evidence 'legacy-seed' 'verified' 'legacy storage owner wrote both fixture records to the configured cache and queue; original runtime restarted'
       $script:LastLifecycleStage = 'legacy-installed'
       Test-LifecycleStorageReadback $chainStorage 'legacy-installed' @('legacy')
     } else { Test-LifecycleStorageReadback $chainStorage 'legacy-installed' }
@@ -1100,6 +1114,7 @@ try {
     install_dir = $InstallDir
     events = $eventArray
   }
+  if ($FormalPreseed) { $summary['formal_preseed'] = $true }
   [IO.File]::WriteAllText(
     (Join-Path $EvidenceDir "summary.json"),
     ($summary | ConvertTo-Json -Depth 8),

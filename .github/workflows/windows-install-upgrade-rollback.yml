@@ -100,6 +100,11 @@ on:
         required: false
         default: ''
         type: string
+      formal_preseed:
+        description: Exercise prefilled original 687 databases in the two hosted service cells of the fixed formal maintenance request
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   # GitHub hides draft releases from tokens without push-level contents access.
@@ -116,7 +121,7 @@ concurrency:
 
 jobs:
   native-lifecycle:
-    if: ${{ github.ref != 'refs/heads/codex/verify-687-752-753-maintenance' && !inputs.cache_recovery_subset && !inputs.publisher_validation_request }}
+    if: ${{ github.ref != 'refs/heads/codex/verify-687-752-753-maintenance' && !inputs.cache_recovery_subset && !inputs.publisher_validation_request && !inputs.formal_preseed }}
     strategy:
       fail-fast: false
       matrix:
@@ -635,7 +640,7 @@ jobs:
           retention-days: 7
 
   recover-synthetic-owner:
-    if: github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/codex/verify-687-752-753-maintenance' && inputs.cache_recovery_subset == true && !inputs.publisher_validation_request && github.repository == 'qiuxinliang/edr-agent'
+    if: github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/codex/verify-687-752-753-maintenance' && inputs.cache_recovery_subset == true && !inputs.publisher_validation_request && github.repository == 'qiuxinliang/edr-agent' && !inputs.formal_preseed
     permissions:
       contents: read
       actions: read
@@ -814,7 +819,7 @@ jobs:
 
   storage-compat-native-tools:
     name: Storage compatibility tools (${{ matrix.arch }})
-    if: github.event_name == 'workflow_dispatch' && inputs.publisher_validation_request && github.repository == 'qiuxinliang/edr-agent' && github.ref != 'refs/heads/codex/verify-687-752-753-maintenance'
+    if: github.event_name == 'workflow_dispatch' && inputs.publisher_validation_request && github.repository == 'qiuxinliang/edr-agent' && github.ref != 'refs/heads/codex/verify-687-752-753-maintenance' && !inputs.formal_preseed
     strategy:
       fail-fast: false
       matrix:
@@ -957,7 +962,7 @@ jobs:
 
   signed-publisher-lifecycle:
     name: Signed publisher (${{ matrix.arch }}, ${{ matrix.runtime_mode }})
-    if: github.event_name == 'workflow_dispatch' && inputs.publisher_validation_request && github.repository == 'qiuxinliang/edr-agent' && github.ref != 'refs/heads/codex/verify-687-752-753-maintenance'
+    if: github.event_name == 'workflow_dispatch' && inputs.publisher_validation_request && github.repository == 'qiuxinliang/edr-agent' && github.ref != 'refs/heads/codex/verify-687-752-753-maintenance' && !inputs.formal_preseed
     needs: storage-compat-native-tools
     strategy:
       fail-fast: false
@@ -1116,7 +1121,7 @@ jobs:
           if($LASTEXITCODE -ne 0){throw 'Signed lifecycle evidence was not retained'}
 
   formal-maintenance-lifecycle:
-    name: Formal maintenance (${{ matrix.arch }}, ${{ matrix.runtime_mode }})
+    name: ${{ inputs.formal_preseed && 'Formal preseed' || 'Formal maintenance' }} (${{ matrix.arch }}, ${{ matrix.runtime_mode }})
     if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/codex/verify-687-752-753-maintenance' && github.repository == 'qiuxinliang/edr-agent'
     permissions:
       actions: read
@@ -1125,11 +1130,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        arch: [amd64, arm64]
+        runtime_mode: ${{ fromJSON(inputs.formal_preseed && '["service"]' || '["service","scheduled_task"]') }}
         include:
-          - {arch: amd64, runtime_mode: service, runner: windows-2022, msvc: x64, triplet: x64-windows}
-          - {arch: arm64, runtime_mode: service, runner: windows-11-vs2026-arm, msvc: arm64, triplet: arm64-windows}
-          - {arch: amd64, runtime_mode: scheduled_task, runner: windows-2022, msvc: x64, triplet: x64-windows}
-          - {arch: arm64, runtime_mode: scheduled_task, runner: windows-11-vs2026-arm, msvc: arm64, triplet: arm64-windows}
+          - {arch: amd64, runner: windows-2022, msvc: x64, triplet: x64-windows}
+          - {arch: arm64, runner: windows-11-vs2026-arm, msvc: arm64, triplet: arm64-windows}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 105
     defaults:
@@ -1138,6 +1143,8 @@ jobs:
     env:
       NATIVE_ARCH: ${{ matrix.arch }}
       LIFECYCLE_RUNTIME_MODE: ${{ matrix.runtime_mode }}
+      FORMAL_PRESEED: ${{ inputs.formal_preseed && 'true' || 'false' }}
+      FORMAL_EVIDENCE_PREFIX: ${{ inputs.formal_preseed && 'formal-preseed' || 'formal-maintenance' }}
       EDR_VCPKG_TRIPLET: ${{ matrix.triplet }}
       VCPKG_DEFAULT_TRIPLET: ${{ matrix.triplet }}
       P0_TEST_INPUTS_REF: '1190a89c39c0fcf675626afe040ed11b93670f09'
@@ -1173,6 +1180,10 @@ jobs:
           $version = & "$env:WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -NonInteractive -Command '$PSVersionTable.PSVersion.ToString()'
           if ($LASTEXITCODE -ne 0 -or $version -notmatch '^5\.1\.') { throw 'Original installed updater requires Windows PowerShell 5.1' }
           $dispatch = (Get-Content -LiteralPath $env:GITHUB_EVENT_PATH -Raw | ConvertFrom-Json).inputs
+          $preseed = $env:FORMAL_PRESEED -ceq 'true'
+          if ($preseed -ne ("$($dispatch.formal_preseed)" -ieq 'true') -or ($preseed -and $env:LIFECYCLE_RUNTIME_MODE -cne 'service')) {
+            throw 'Formal preseed requires explicit manual service validation'
+          }
           if ($dispatch.baseline_tag -cne 'win_3.2.752' -or $dispatch.target_tag -cne 'win_3.2.753' -or
               $dispatch.package_scope -cne 'full' -or $dispatch.architecture -cne 'all' -or [string]$dispatch.native_repeat_count -cne '1' -or
               "$($dispatch.cache_recovery_subset)" -eq 'true' -or "$($dispatch.installer_timeout_recovery)" -eq 'true' -or
@@ -1186,6 +1197,11 @@ jobs:
           python -B tests/test_report_formal_maintenance.py
           if ($LASTEXITCODE -ne 0) { throw 'Formal evidence reporting regression failed' }
           & ./tests/test_windows_lifecycle_first_hop.ps1
+          if ($preseed) {
+            & ./tests/test_windows_lifecycle_storage.ps1 -RepoRoot $PWD
+            python -B tests/test_windows_lifecycle_storage.py
+            if ($LASTEXITCODE -ne 0) { throw 'Formal preseed storage regression failed' }
+          }
       - name: Admit the exact three original Full Setup inputs
         id: admitted
         timeout-minutes: 20
@@ -1274,6 +1290,7 @@ jobs:
           $root = Join-Path $env:RUNNER_TEMP 'formal-maintenance-input'
           $stagePath = Join-Path $root 'stage.json'
           $stage = Get-Content -LiteralPath $stagePath -Raw | ConvertFrom-Json
+          $nativeEvidence = Join-Path $env:RUNNER_TEMP ($env:FORMAL_EVIDENCE_PREFIX+'-native')
           $parameters = @{
             FormalMaintenanceInput = $stagePath
             LegacySetupExe = $stage.legacy_setup_exe; LegacyVersion = $stage.legacy_version
@@ -1283,10 +1300,11 @@ jobs:
             BaselineConfigTemplate = $stage.legacy_config_template
             StorageToolsInput = "$env:RUNNER_TEMP/formal-storage/input.json"
             Architecture = $env:NATIVE_ARCH; RuntimeMode = $env:LIFECYCLE_RUNTIME_MODE
-            EvidenceDir = "$env:RUNNER_TEMP/formal-maintenance-native"
+            EvidenceDir = $nativeEvidence
           }
+          if ($env:FORMAL_PRESEED -ceq 'true') { $parameters.FormalPreseed = $true }
           try {
-            & ./scripts/windows_setup_exe_lifecycle_smoke.ps1 @parameters *> "$env:RUNNER_TEMP/formal-maintenance-native.log"
+            & ./scripts/windows_setup_exe_lifecycle_smoke.ps1 @parameters *> ($nativeEvidence+'.log')
           } catch {
             throw 'Installed maintenance chain failed; see the sanitized stage and exit code in the report'
           }
@@ -1307,15 +1325,19 @@ jobs:
           P0_CLEANUP_RESULT: ${{ steps.p0_cleanup.outcome }}
           INSTALLED_RESULT: ${{ steps.installed_chain.outcome }}
         run: |
-          python -B tests/report_formal_maintenance.py --arch $env:NATIVE_ARCH --mode $env:LIFECYCLE_RUNTIME_MODE --native-summary "$env:RUNNER_TEMP/formal-maintenance-native/summary.json" --admission-status "$env:RUNNER_TEMP/formal-maintenance-admission-status.json" --output "$env:RUNNER_TEMP/formal-maintenance-report.json" "$env:HOST_RESULT" "$env:ADMISSION_RESULT" "$env:PUBLISHER_RESULT" "$env:COMPILER_RESULT" "$env:P0_INPUT_RESULT" "$env:P0_VERIFY_RESULT" "$env:CACHE_KEY_RESULT" "$env:CACHE_RESTORE_RESULT" "$env:DEPENDENCY_RESULT" "$env:STORAGE_RESULT" "$env:P0_CLEANUP_RESULT" "$env:INSTALLED_RESULT"
-          if (Test-Path -LiteralPath "$env:RUNNER_TEMP/formal-maintenance-report.json") {
-            Get-Content -LiteralPath "$env:RUNNER_TEMP/formal-maintenance-report.json" | Out-File $env:GITHUB_STEP_SUMMARY -Append
+          $nativeEvidence = Join-Path $env:RUNNER_TEMP ($env:FORMAL_EVIDENCE_PREFIX+'-native')
+          $report = Join-Path $env:RUNNER_TEMP ($env:FORMAL_EVIDENCE_PREFIX+'-report.json')
+          $caseArgs = @()
+          if ($env:FORMAL_PRESEED -ceq 'true') { $caseArgs += '--formal-preseed' }
+          python -B tests/report_formal_maintenance.py --arch $env:NATIVE_ARCH --mode $env:LIFECYCLE_RUNTIME_MODE --native-summary (Join-Path $nativeEvidence 'summary.json') --admission-status "$env:RUNNER_TEMP/formal-maintenance-admission-status.json" --output $report @caseArgs "$env:HOST_RESULT" "$env:ADMISSION_RESULT" "$env:PUBLISHER_RESULT" "$env:COMPILER_RESULT" "$env:P0_INPUT_RESULT" "$env:P0_VERIFY_RESULT" "$env:CACHE_KEY_RESULT" "$env:CACHE_RESTORE_RESULT" "$env:DEPENDENCY_RESULT" "$env:STORAGE_RESULT" "$env:P0_CLEANUP_RESULT" "$env:INSTALLED_RESULT"
+          if (Test-Path -LiteralPath $report) {
+            Get-Content -LiteralPath $report | Out-File $env:GITHUB_STEP_SUMMARY -Append
           }
           exit $LASTEXITCODE
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: formal-maintenance-${{ matrix.arch }}-${{ matrix.runtime_mode }}
-          path: ${{ runner.temp }}/formal-maintenance-report.json
+          name: ${{ env.FORMAL_EVIDENCE_PREFIX }}-${{ matrix.arch }}-${{ matrix.runtime_mode }}
+          path: ${{ runner.temp }}/${{ env.FORMAL_EVIDENCE_PREFIX }}-report.json
           if-no-files-found: error
           retention-days: 1

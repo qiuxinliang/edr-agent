@@ -43,15 +43,21 @@ function Get-LifecycleStoragePython {
 import hashlib,json,os,re,sqlite3,stat,sys,time,tomllib
 from pathlib import Path
 
-def regular(path,cap):
+def check_unaliased(path,allow_missing=False):
     for p in (path,*path.parents):
-        s=p.lstat()
+        try:s=p.lstat()
+        except FileNotFoundError:
+            if not allow_missing:raise
+            continue
         if stat.S_ISLNK(s.st_mode) or getattr(s,'st_file_attributes',0)&1024:raise ValueError('storage_reparse')
+
+def regular(path,cap):
+    check_unaliased(path)
     s=path.stat()
     if not stat.S_ISREG(s.st_mode) or not 0<s.st_size<=cap:raise ValueError('storage_file_bound')
     return s
 
-def config(path,install):
+def config(path,install,preseed=False):
     before=regular(path,131072);raw=path.read_bytes();after=regular(path,131072)
     if len(raw)!=before.st_size or (before.st_size,before.st_mtime_ns)!=(after.st_size,after.st_mtime_ns):raise ValueError('config_changed')
     value=tomllib.loads(raw.decode('utf-8-sig'));offline=value['offline'];agent=value['agent'];install=install.resolve()
@@ -61,7 +67,12 @@ def config(path,install):
     for kind,key,budget,retention in (('queue','queue_db_path','max_queue_size_mb','retention_hours'),('cache','evidence_cache_path','evidence_cache_max_size_mb','evidence_cache_retention_hours')):
         target=Path(offline[key])
         if not target.is_absolute():raise ValueError('database_path_not_absolute')
-        regular(target,1073741824)
+        if preseed:
+            for suffix in ('','-wal','-shm','-journal','.lock'):
+                entry=Path(str(target)+suffix)
+                check_unaliased(entry,allow_missing=True)
+                if entry.exists():raise ValueError('preseed_storage_already_exists')
+        else:regular(target,1073741824)
         target=target.resolve();target.relative_to(install)
         if target==install:raise ValueError('database_path_not_file')
         mb=offline[budget];hours=offline[retention]
@@ -73,8 +84,11 @@ def config(path,install):
     if os.path.normcase(result['cache']['path'])==os.path.normcase(result['queue']['path']):raise ValueError('database_alias')
     return result
 
-mode,config_path,install=sys.argv[1:4];cfg=config(Path(config_path),Path(install))
-if mode=='config':print(json.dumps(cfg,separators=(',',':')))
+mode,config_path,install=sys.argv[1:4];cfg=config(Path(config_path),Path(install),preseed=mode=='preseed-config')
+if mode in ('config','preseed-config'):
+    if mode=='preseed-config':
+        for kind in ('cache','queue'):Path(cfg[kind]['path']).parent.mkdir(parents=True,exist_ok=True)
+    print(json.dumps(cfg,separators=(',',':')))
 elif mode=='backup':
     expected,kind,destination=sys.argv[4:7]
     if cfg['config_sha256']!=expected or kind not in ('cache','queue'):raise ValueError('backup_binding')
@@ -144,14 +158,15 @@ function Assert-LifecycleStorageEnvironment {
     if($values -and @($values.Value|Where-Object{$_ -match '^(?i:EDR_QUEUE_PATH|EDR_EVIDENCE_CACHE_PATH)='}).Count -gt 0){throw 'service storage path override present'}
   }
 }
-function New-LifecycleStorageChain($Tools,[string]$Name) {
+function New-LifecycleStorageChain($Tools,[string]$Name,[switch]$Preseed) {
   if($Name -cnotmatch '^[a-z0-9-]+$'){throw 'invalid storage chain name'}
   $root=Join-Path $EvidenceDir ('storage-compat-'+$Name)
   if(Test-Path -LiteralPath $root){throw 'storage chain already exists'}
   [IO.Directory]::CreateDirectory($root)|Out-Null
   $context=@{tools=$Tools;root=$root;config=(Join-Path $InstallDir 'agent.toml');install=$InstallDir;epoch=[DateTimeOffset]::UtcNow.ToUnixTimeSeconds();generation=0;expected=@{cache=@();queue=@()};writer_uncertain=$false}
   Assert-LifecycleStorageEnvironment
-  $context.binding=Invoke-LifecycleStoragePython $context @('config',$context.config,$context.install) 'initial-config'
+  $mode=if($Preseed){'preseed-config'}else{'config'}
+  $context.binding=Invoke-LifecycleStoragePython $context @($mode,$context.config,$context.install) 'initial-config'
   return $context
 }
 function Assert-LifecycleStorageBinding($Context) {
@@ -240,6 +255,27 @@ function Invoke-LifecycleStorageOwner($Context,[string]$Role,[string]$Kind,[stri
   Assert-LifecycleStorageReceipt $Context $result $Role $Kind $Action $Generation
   return $result
 }
+function Assert-LifecycleStorageBeforeInstall {
+  if ($RuntimeMode -cne 'service' -or (Test-Path -LiteralPath (Join-Path $InstallDir 'FDSensor.exe')) -or
+      (Get-CimInstance Win32_Service -Filter "Name='FDSecurityAgent' OR Name='EdrAgent'" -ErrorAction Stop) -or
+      (Get-CimInstance Win32_Process -Filter "Name='FDSensor.exe' OR Name='edr_agent.exe' OR Name='FDSecurityInstallerWorker.exe'" -ErrorAction Stop) -or
+      (Get-CimInstance -Namespace 'root/Microsoft/Windows/TaskScheduler' -ClassName MSFT_ScheduledTask `
+        -Filter "TaskName='FDSecurityAgent' OR TaskName='EdrAgent'" -ErrorAction Stop)) {
+    throw 'Storage preseed requires a fresh installation with no Agent writer or runtime owner'
+  }
+}
+
+function Initialize-LifecycleStorageBeforeInstall($Context) {
+  if($Context.generation -ne 0){throw 'Storage preseed requires the original frozen generation'}
+  foreach($kind in @('cache','queue')) {
+    Assert-LifecycleStorageBeforeInstall
+    $result=Invoke-LifecycleStorageOwner $Context 'legacy' $kind 'create' $Context.binding.$kind.path 1 ('legacy-preseed-'+$kind)
+    $Context.expected[$kind]=@($result.records)
+  }
+  Assert-LifecycleStorageBeforeInstall
+  $Context.generation=1
+}
+
 function Write-LifecycleStorageFixture($Context,[ValidateSet('seed','append')][string]$Action,[string]$Stage) {
   Assert-LifecycleStorageBinding $Context
   $generation=if($Action -ceq 'seed'){1}else{2};$role=if($Action -ceq 'seed'){'legacy'}else{'candidate'}

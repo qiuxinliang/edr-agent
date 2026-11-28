@@ -234,6 +234,49 @@ public sealed class EdrLifecycleRuntimePhaseWriter : System.IO.StringWriter {
   $script:writerRemains=$false;$script:writeFails=$true;$script:restartFails=$true;$script:sequence.Clear();$script:fake.HasExited=$false
   Reject 'first_write_failure_survives_restart_failure' '*write_primary*' {Write-LifecycleStorageFixture $context 'seed' 'fixture' 3>$null}
   if($script:sequence -cnotcontains 'Start' -or $context.generation -ne 0){throw 'failed fixture projection changed'}
+  & {
+    $expectedEpoch=$context.epoch
+    $preseedContext=@{binding=$context.binding;epoch=$expectedEpoch;generation=0;expected=@{cache=@();queue=@()}}
+    $script:preseedOwnerExists=$false
+    $script:preseedTaskExists=$false
+    $script:preseedTaskQueryFails=$false
+    function Get-CimInstance {
+      [CmdletBinding()]param($ClassName,$Filter,$Namespace)
+      if($ClassName -ceq 'MSFT_ScheduledTask'){
+        if($Namespace -cne 'root/Microsoft/Windows/TaskScheduler' -or
+            $Filter -cne "TaskName='FDSecurityAgent' OR TaskName='EdrAgent'" -or
+            $PSBoundParameters['ErrorAction'] -ne 'Stop'){throw 'preseed task ownership query lost scope or failure handling'}
+        if($script:preseedTaskQueryFails){Write-Error 'fixture_task_query_failed';return}
+        if($script:preseedTaskExists){return [pscustomobject]@{TaskName='FDSecurityAgent'}}
+        return
+      }
+      if($script:preseedOwnerExists){return [pscustomobject]@{Name='FDSecurityAgent'}}
+    }
+    function Invoke-LifecycleStorageOwner {
+      param($Context,$Role,$Kind,$Action,$Database,$Generation,$Label)
+      if($Role -cne 'legacy' -or $Action -cne 'create' -or $Generation -ne 1 -or
+          $Context.epoch -ne $expectedEpoch -or $Database -cne $Context.binding.$Kind.path){throw 'wrong preseed owner binding'}
+      $script:sequence.Add('create-'+$Kind)
+      return [pscustomobject]@{records=@([pscustomobject]@{pid=1},[pscustomobject]@{pid=2})}
+    }
+    $script:sequence.Clear()
+    $script:preseedOwnerExists=$true
+    Reject 'preseed_never_writes_with_an_existing_owner' '*no Agent writer or runtime owner*' {Initialize-LifecycleStorageBeforeInstall $preseedContext}
+    if($script:sequence.Count -ne 0 -or $preseedContext.generation -ne 0){throw 'preseed ran while a writer might exist'}
+    $script:preseedOwnerExists=$false
+    $script:preseedTaskQueryFails=$true
+    Reject 'preseed_task_query_failure_blocks_both_writes' '*fixture_task_query_failed*' {Initialize-LifecycleStorageBeforeInstall $preseedContext}
+    $script:preseedTaskQueryFails=$false
+    $script:preseedTaskExists=$true
+    Reject 'preseed_existing_task_blocks_both_writes' '*no Agent writer or runtime owner*' {Initialize-LifecycleStorageBeforeInstall $preseedContext}
+    if($script:sequence.Count -ne 0 -or $preseedContext.generation -ne 0){throw 'preseed wrote with absent task-owner proof'}
+    $script:preseedTaskExists=$false
+    Pass 'preseed_creates_both_databases_with_one_frozen_epoch' {
+      Initialize-LifecycleStorageBeforeInstall $preseedContext
+      if(($script:sequence -join ',') -cne 'create-cache,create-queue' -or $preseedContext.generation -ne 1 -or
+          @($preseedContext.expected.cache).Count -ne 2 -or @($preseedContext.expected.queue).Count -ne 2){throw 'preseed did not retain its two original owner receipts'}
+    }
+  }
   $context.generation=1;$context.expected=$readbackExpected;$script:fake.HasExited=$false;$script:copies=New-Object 'System.Collections.Generic.List[string]'
   # Retain actual owner admission and receipt validation; isolate only external
   # process I/O. Cleanup must not run merely because a child returned exit zero.

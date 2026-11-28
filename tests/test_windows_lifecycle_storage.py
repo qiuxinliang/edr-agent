@@ -17,7 +17,7 @@ OWNER = ROOT / 'tests/Invoke-LifecycleStorageCompatibility.ps1'
 class SnapshotTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix='edr-storage-snapshot-')
-        self.root = Path(self.temp.name)
+        self.root = Path(self.temp.name).resolve()
         self.install = self.root / 'installed'
         self.install.mkdir()
         self.config = self.install / 'agent.toml'
@@ -84,6 +84,53 @@ class SnapshotTests(unittest.TestCase):
         self.assertEqual(Path(binding['cache']['path']), self.cache.resolve())
         self.assertEqual(binding['cache']['selected_retention_hours'], 72)
         self.assertEqual(binding['queue']['max_mb'], 512)
+
+    def configure_fresh_storage(self):
+        cache = self.install/'evidence'/'evidence_cache.db'
+        queue = self.install/'queue'/'edr_queue.db'
+        self.config.write_text(self.body.replace(json.dumps(str(self.cache)), json.dumps(str(cache)))
+                               .replace(json.dumps(str(self.queue)), json.dumps(str(queue))))
+        return cache, queue
+
+    def test_preseed_binds_fresh_paths_and_original_policy_without_creating_db(self):
+        database_paths = self.configure_fresh_storage()
+        before = self.config.read_bytes()
+        self.assertNotEqual(self.run_owner('config').returncode, 0)
+        result = self.run_owner('preseed-config')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        binding = json.loads(result.stdout)
+        self.assertEqual(binding['config_sha256'], hashlib.sha256(before).hexdigest())
+        self.assertEqual(binding['endpoint_id'], 'ci-fixture-endpoint')
+        for kind, path in zip(('cache', 'queue'), database_paths):
+            self.assertEqual(binding[kind], {'path': str(path.resolve()), 'max_mb': 512,
+                                            'retention_hours': 72, 'selected_retention_hours': 72})
+            self.assertTrue(path.parent.is_dir())
+            self.assertFalse(path.exists())
+        self.assertEqual(self.config.read_bytes(), before)
+
+    def test_preseed_refuses_existing_sidecar_before_creating_other_directories(self):
+        cache, queue = self.configure_fresh_storage()
+        cache.parent.mkdir()
+        sidecar = cache.with_name(cache.name+'-wal')
+        sidecar.write_bytes(b'prior owner WAL')
+        self.assertNotEqual(self.run_owner('preseed-config').returncode, 0)
+        self.assertEqual(sidecar.read_bytes(), b'prior owner WAL')
+        self.assertFalse(queue.parent.exists())
+
+    def test_preseed_refuses_outside_or_redirected_paths(self):
+        cache, queue = self.configure_fresh_storage()
+        before = self.config.read_text()
+        outside = self.root/'other'
+        self.config.write_text(before.replace(json.dumps(str(cache)), json.dumps(str(outside/'cache.db'))))
+        self.assertNotEqual(self.run_owner('preseed-config').returncode, 0)
+        self.assertFalse(outside.exists())
+        self.assertFalse(queue.parent.exists())
+        self.config.write_text(before)
+        outside.mkdir()
+        cache.parent.symlink_to(outside, target_is_directory=True)
+        self.assertNotEqual(self.run_owner('preseed-config').returncode, 0)
+        self.assertFalse((outside/'evidence_cache.db').exists())
+        self.assertFalse(queue.parent.exists())
 
     def test_database_outside_install_root_rejected(self):
         outside = self.root/'outside.db'

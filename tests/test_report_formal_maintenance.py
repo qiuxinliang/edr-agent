@@ -55,6 +55,14 @@ def legacy_seed_failure(detail, mode='service'):
     return native
 
 
+def preseed_summary():
+    native = raw_summary()
+    native.update(architecture='amd64', runtime_mode='service', formal_preseed=True)
+    native['events'] = [event for event in native['events'] if event['stage'] != 'legacy-seed']
+    native['events'].insert(1, {'stage': 'legacy-preseed', 'status': 'verified'})
+    return native
+
+
 def timeout_detail(label, seconds):
     return f'storage child exceeded its finite deadline: label={label} budget_seconds={seconds}'
 
@@ -70,7 +78,7 @@ class ReportTests(unittest.TestCase):
     def report(self, native):
         return report('arm64', 'scheduled_task', self.layers, native)
 
-    def report_cli(self, directory, status=None, native=None):
+    def report_cli(self, directory, status=None, native=None, formal_preseed=False):
         output = directory / 'public-report.json'
         summary = directory / 'summary.json'
         if native:
@@ -82,6 +90,8 @@ class ReportTests(unittest.TestCase):
                 '--output', str(output)]
         if status is not None:
             args += ['--admission-status', str(status)]
+        if formal_preseed:
+            args += ['--formal-preseed']
         args += [self.layers[name] for name in LAYERS]
         completed = subprocess.run(args, check=True, text=True, capture_output=True, timeout=10)
         return json.loads(output.read_text(encoding='utf-8')), completed.stdout
@@ -143,6 +153,93 @@ class ReportTests(unittest.TestCase):
         evidence = self.report(rejected)
         self.assertEqual(evidence['first_native_failure_stage'], 16)
         self.assertEqual(evidence['stage_outcomes']['install_legacy_migration_baseline'], 0)
+
+    def test_preseed_success_cannot_attest_running_legacy_seed(self):
+        native = preseed_summary()
+        with tempfile.TemporaryDirectory() as temporary:
+            evidence, _ = self.report_cli(Path(temporary), native=native, formal_preseed=True)
+        self.assertTrue(evidence['formal_preseed'])
+        self.assertTrue(evidence['passed'])
+        self.assertEqual(evidence['stage_outcomes']['legacy_preseed'], 1)
+        self.assertEqual(evidence['stage_outcomes']['legacy_seed'], 0)
+        self.assertEqual(evidence['stage_outcomes']['updater_target_append'], 1)
+        self.assertEqual(timeout_fields(evidence), (0, 0, 0))
+        self.assertEqual(evidence['service_state_after_timeout'], 0)
+
+        native['events'].insert(3, {'stage': 'legacy-seed', 'status': 'verified'})
+        mixed = report('amd64', 'service', self.layers, native, formal_preseed=True)
+        self.assertFalse(mixed['passed'])
+        self.assertEqual(mixed['stage_outcomes']['legacy_seed'], 0)
+
+    def test_preseed_failure_and_unexecuted_case_keep_separate_stage_state(self):
+        self.layers['installed_chain'] = 'failure'
+        native = preseed_summary()
+        native.update(status='failed', last_stage='legacy-preseed', failure_line=932)
+        native['events'][1:] = [{'stage': 'lifecycle', 'status': 'failed',
+                                 'detail': timeout_detail('legacy-seed-stop', 35)}]
+        evidence = report('amd64', 'service', self.layers, native, formal_preseed=True)
+        self.assertFalse(evidence['passed'])
+        self.assertEqual(evidence['first_native_failure_stage'], 17)
+        self.assertEqual(evidence['stage_outcomes']['legacy_preseed'], 2)
+        self.assertEqual(evidence['stage_outcomes']['legacy_seed'], 0)
+        self.assertEqual(evidence['stage_outcomes']['install_legacy_migration_baseline'], 0)
+        self.assertEqual(timeout_fields(evidence), (0, 0, 0))
+
+        self.layers.update(admission='failure', installed_chain='skipped')
+        skipped = report('amd64', 'service', self.layers, None, formal_preseed=True)
+        self.assertTrue(skipped['formal_preseed'])
+        self.assertEqual(skipped['first_failed_layer'], 2)
+        self.assertFalse(skipped['passed'])
+        self.assertTrue(all(value == 0 for value in skipped['stage_outcomes'].values()))
+        old = report('amd64', 'service', self.layers, None)
+        self.assertNotIn('formal_preseed', old)
+        self.assertNotIn('legacy_preseed', old['stage_outcomes'])
+
+    def test_report_rejects_preseed_source_and_mode_mismatch(self):
+        native = preseed_summary()
+        with self.assertRaisesRegex(ValueError, 'case'):
+            report('amd64', 'service', self.layers, native)
+        native.pop('formal_preseed')
+        with self.assertRaisesRegex(ValueError, 'case'):
+            report('amd64', 'service', self.layers, native, formal_preseed=True)
+        with self.assertRaisesRegex(ValueError, 'service'):
+            report('arm64', 'scheduled_task', self.layers, None, formal_preseed=True)
+
+    def test_preseed_retains_only_actual_append_timeouts_with_original_budgets(self):
+        self.layers['installed_chain'] = 'failure'
+        native = preseed_summary()
+        native.update(status='failed', last_stage='updater-target-append', failure_line=23)
+        stop = next(i for i, event in enumerate(native['events']) if event['stage'] == native['last_stage'])
+        native['events'][stop:] = [{'stage': 'lifecycle', 'status': 'failed'}]
+        labels = (('stop', 35), ('cache-append', 20), ('queue-append', 20), ('restart', 35))
+        for step, (label, seconds) in enumerate(labels, 2):
+            with self.subTest(label=label):
+                native['events'][-1]['detail'] = timeout_detail('updater-target-append-'+label, seconds)
+                evidence = report('amd64', 'service', self.layers, native, formal_preseed=True)
+                self.assertEqual(evidence['first_native_failure_stage'], 9)
+                self.assertEqual(evidence['stage_outcomes']['legacy_preseed'], 1)
+                self.assertEqual(evidence['stage_outcomes']['legacy_seed'], 0)
+                self.assertEqual(evidence['stage_outcomes']['updater_target_append'], 2)
+                self.assertEqual(timeout_fields(evidence), (step, seconds, 0))
+                self.assertFalse(evidence['passed'])
+
+        for detail in (timeout_detail('updater-target-append-stop', 20),
+                       timeout_detail('legacy-seed-stop', 35)):
+            native['events'][-1]['detail'] = detail
+            evidence = report('amd64', 'service', self.layers, native, formal_preseed=True)
+            self.assertEqual(timeout_fields(evidence), (0, 0, 0))
+
+        native['events'][-1]['detail'] = timeout_detail('updater-target-append-stop', 35)
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary).resolve()
+            for name in ('storage-compat-legacy-updater', 'storage-compat-legacy-preseed'):
+                traces = directory / name
+                traces.mkdir()
+                (traces / 'updater-target-append-stop.stderr.log').write_text(
+                    'lifecycle_runtime_action phase=engine_enter\n', encoding='ascii')
+                evidence, _ = self.report_cli(directory, native=native, formal_preseed=True)
+                self.assertEqual(timeout_fields(evidence), (2, 35, int(name.endswith('preseed'))))
+                self.assertEqual(evidence['service_state_after_timeout'], 0)
 
     def test_admission_status_reports_two_distinct_rejection_boundaries(self):
         self.layers = dict.fromkeys(LAYERS, 'skipped')
