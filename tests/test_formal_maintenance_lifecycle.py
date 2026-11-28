@@ -1,6 +1,7 @@
 import copy
 import hashlib
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -8,6 +9,16 @@ from unittest.mock import patch
 import zipfile
 
 import stage_formal_maintenance_lifecycle as stage
+
+
+def write_runtime_archive(path, members):
+    with zipfile.ZipFile(path, "x") as package:
+        for name, content in members:
+            member = zipfile.ZipInfo(name)
+            # Restore the raw name after ZipInfo's platform-dependent projection.
+            member.filename = name
+            member.create_system = 0
+            package.writestr(member, content)
 
 
 def request_fixture():
@@ -124,23 +135,27 @@ class RuntimeAdmissionTests(unittest.TestCase):
     def test_full_signed_archive_uses_windows_separators_without_repacking(self):
         with tempfile.TemporaryDirectory() as folder:
             archive = Path(folder) / "runtime.zip"
-            with zipfile.ZipFile(archive, "x") as package:
-                package.writestr("collector\\worker.exe", b"original native bytes")
+            name = "collector\\worker.exe"
+            content = b"original native bytes"
+            write_runtime_archive(archive, [(name, content)])
+            with zipfile.ZipFile(archive) as package:
+                member, = package.infolist()
+                self.assertEqual(member.orig_filename, name)
+                self.assertEqual(member.filename, name.replace(os.sep, "/"))
+                self.assertEqual(package.read(member), content)
             archive_sha = stage.admission.digest(archive)
             with self.assertRaisesRegex(ValueError, "Unsafe package path"):
                 stage.admission.extract(archive, Path(folder) / "old")
             destination = Path(folder) / "runtime"
             stage.unpack_runtime(archive, destination)
-            self.assertEqual((destination / "collector/worker.exe").read_bytes(), b"original native bytes")
+            self.assertEqual((destination / "collector/worker.exe").read_bytes(), content)
             self.assertEqual(stage.admission.digest(archive), archive_sha)
 
     def test_windows_separator_does_not_admit_traversal_or_case_collisions(self):
         for names in (("collector\\..\\escape",), ("collector\\file", "COLLECTOR/File")):
             with self.subTest(names=names), tempfile.TemporaryDirectory() as folder:
                 archive = Path(folder) / "runtime.zip"
-                with zipfile.ZipFile(archive, "x") as package:
-                    for name in names:
-                        package.writestr(name, b"data")
+                write_runtime_archive(archive, [(name, b"data") for name in names])
                 destination = Path(folder) / "runtime"
                 with self.assertRaises(ValueError):
                     stage.unpack_runtime(archive, destination)
