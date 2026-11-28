@@ -16135,7 +16135,11 @@ int main(int argc, char **argv) {
     test_startup_logical_budget_legacy(1,0,512u); return 0;
   }
   if (argc == 2 && strcmp(argv[1], "--startup-logical-budget") == 0) {
+#ifdef _WIN32
+    test_cache_page_size_contract(1);
+#else
     test_cache_page_size_contract(0);
+#endif
     test_startup_logical_budget(); return 0;
   }
   if (argc == 2 && strcmp(argv[1], "--capacity-health-snapshot") == 0) {
