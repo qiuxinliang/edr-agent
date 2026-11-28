@@ -15777,8 +15777,197 @@ static void test_window_entry_order_and_recovery(int enforce) {
 #include "dense_owner_range_witness.h"
 #endif
 
+#if defined(EDR_HAVE_SQLITE)
+/* Simulate an SQLite build whose fresh connection chooses 2 KiB. This runs
+ * during sqlite3_open, before the cache owner or the fixture creates tables. */
+static int s_test_page_size_initialize_during_open;
+static const char *s_test_page_size_race_sql;
+static int s_test_page_size_check_header;
+static sqlite3 *s_test_page_size_race_reader;
+static uint8_t s_test_page_size_race_db_digest[32];
+
+static void finish_page_size_race(int commit) {
+  if (!s_test_page_size_race_reader) return;
+  compact_exec(s_test_page_size_race_reader, commit ? "COMMIT;" : "ROLLBACK;");
+  assert(sqlite3_close(s_test_page_size_race_reader) == SQLITE_OK);
+  s_test_page_size_race_reader = NULL;
+}
+
+static int test_page_size_race(unsigned event, void *arg, void *statement, void *details) {
+  (void)details;
+  assert(event == SQLITE_TRACE_STMT);
+  sqlite3 *owner = arg;
+  const char *sql = sqlite3_sql(statement);
+  if (s_test_page_size_race_sql && sql && !strcmp(sql, s_test_page_size_race_sql)) {
+    s_test_page_size_race_sql = NULL;
+    const char *path = sqlite3_db_filename(owner, "main");
+    assert(sqlite3_open_v2(path, &s_test_page_size_race_reader, SQLITE_OPEN_READWRITE, NULL) == SQLITE_OK);
+    compact_exec(s_test_page_size_race_reader, "PRAGMA auto_vacuum=NONE;");
+    const int lock_only = !strcmp(sql, "PRAGMA main.user_version=0;");
+    if (lock_only) compact_exec(s_test_page_size_race_reader, "BEGIN IMMEDIATE;");
+    compact_exec(s_test_page_size_race_reader, "CREATE TABLE page_size_probe(value INTEGER);"
+        "INSERT INTO page_size_probe VALUES(42);");
+    if (!lock_only) {
+      compact_exec(s_test_page_size_race_reader, "BEGIN;SELECT value FROM page_size_probe;");
+      assert(rejected_format_file_digest(path, s_test_page_size_race_db_digest) == 4096);
+    }
+  } else if (s_test_page_size_check_header && sql && !strcmp(sql, "PRAGMA journal_mode=WAL;")) {
+    s_test_page_size_check_header = 0;
+    const char *path = sqlite3_db_filename(owner, "main");
+    uint8_t page[16 + 2], digest[32];
+    assert(rejected_format_file_digest(path, digest) == 4096);
+    FILE *file = fopen(path, "rb"); assert(file);
+    assert(fread(page, 1, sizeof(page), file) == sizeof(page) && fclose(file) == 0);
+    assert(!memcmp(page, "SQLite format 3", 16) && page[16] == 16 && page[17] == 0);
+  }
+  return 0;
+}
+
+static int test_nondefault_page_size(sqlite3 *db, char **error, const struct sqlite3_api_routines *api) {
+  (void)api;
+  int rc = sqlite3_exec(db, "PRAGMA main.page_size=2048;", NULL, NULL, error);
+  if (rc == SQLITE_OK && (s_test_page_size_race_sql || s_test_page_size_check_header))
+    rc = sqlite3_trace_v2(db, SQLITE_TRACE_STMT, test_page_size_race, db);
+  if (rc == SQLITE_OK && s_test_page_size_initialize_during_open) {
+    s_test_page_size_initialize_during_open = 0;
+    sqlite3 *other = NULL;
+    rc = sqlite3_open_v2(sqlite3_db_filename(db, "main"), &other, SQLITE_OPEN_READWRITE, NULL);
+    if (rc == SQLITE_OK)
+      rc = sqlite3_exec(other, "CREATE TABLE page_size_probe(value INTEGER);"
+                              "INSERT INTO page_size_probe VALUES(42);", NULL, NULL, error);
+    if (other) sqlite3_close(other);
+  }
+  return rc;
+}
+
+static void test_cache_page_size_contract(int emulate_default) {
+  char path[512];
+  sqlite3 *db = NULL;
+  assert(make_test_sqlite_path(path, sizeof(path)) == 0);
+  if (emulate_default) {
+    assert(sqlite3_auto_extension((void (*)(void))test_nondefault_page_size) == SQLITE_OK);
+    assert(sqlite3_open(path, &db) == SQLITE_OK);
+    assert(compact_scalar(db, "PRAGMA page_size") == 2048 && compact_scalar(db, "PRAGMA page_count") == 0);
+    assert(sqlite3_close(db) == SQLITE_OK);
+  }
+  s_test_page_size_check_header = emulate_default;
+  assert(edr_local_evidence_cache_open(path, 8, 24) == 0);
+  assert(s_test_page_size_check_header == 0);
+  edr_local_evidence_cache_close();
+  assert(sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK);
+  assert(compact_scalar(db, "PRAGMA page_size") == 4096);
+  assert(sqlite3_close(db) == SQLITE_OK);
+  cleanup_test_sqlite_path(path);
+
+  if (emulate_default) {
+    /* The file-length sample precedes this real competing connection's first
+     * DDL. The owner must recognize the initialized 2 KiB database on open. */
+    assert(make_test_sqlite_path(path, sizeof(path)) == 0);
+    s_test_page_size_initialize_during_open = 1;
+    assert(edr_local_evidence_cache_open(path, 8, 24) == 0);
+    assert(s_test_page_size_initialize_during_open == 0);
+    assert(sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK);
+    assert(compact_scalar(db, "PRAGMA page_size") == 2048);
+    assert(compact_scalar(db, "SELECT value FROM page_size_probe") == 42);
+    assert(sqlite3_close(db) == SQLITE_OK);
+    edr_local_evidence_cache_close();
+    cleanup_test_sqlite_path(path);
+    const char *const before[] = {"BEGIN;", "PRAGMA main.user_version=0;"};
+    for (unsigned i = 0; i < sizeof(before) / sizeof(before[0]); ++i) {
+      assert(make_test_sqlite_path(path, sizeof(path)) == 0);
+      s_test_page_size_race_sql = before[i];
+      int opened = edr_local_evidence_cache_open(path, 8, 24);
+      assert(s_test_page_size_race_sql == NULL);
+      assert(opened == -1);
+      if (i) {
+        EdrEvidenceCacheStatus status;
+        edr_local_evidence_cache_get_status(&status);
+        assert(!status.db_open && strstr(status.last_error, "locked"));
+        uint8_t uncommitted[32];
+        assert(rejected_format_file_digest(path, uncommitted) == 0);
+      }
+      finish_page_size_race(i != 0);
+      uint8_t after[32];
+      assert(rejected_format_file_digest(path, after) == 4096);
+      if (!i) assert(!memcmp(s_test_page_size_race_db_digest, after, sizeof(after)));
+      assert(sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK);
+      assert(compact_scalar(db, "PRAGMA page_size") == 2048);
+      assert(compact_scalar(db, "SELECT value FROM page_size_probe") == 42);
+      assert(sqlite3_close(db) == SQLITE_OK);
+      printf("cache_page_size_race stage=%s winning_2k_value_preserved=1\n",
+          i ? "write_lock_after_empty_snapshot" : "created_before_transaction");
+      cleanup_test_sqlite_path(path);
+    }
+    assert(sqlite3_cancel_auto_extension((void (*)(void))test_nondefault_page_size) == 1);
+  }
+
+  for (int size = 2048; size <= 8192; size *= 4) {
+    char sql[80], wal[528], before[65], after[65];
+    assert(make_test_sqlite_path(path, sizeof(path)) == 0);
+    snprintf(sql, sizeof(sql), "PRAGMA page_size=%d;PRAGMA auto_vacuum=INCREMENTAL;PRAGMA journal_mode=WAL;", size);
+    assert(sqlite3_open(path, &db) == SQLITE_OK);
+    compact_exec(db, sql);
+    compact_exec(db, "CREATE TABLE page_size_probe(value INTEGER);");
+    assert(sqlite3_close(db) == SQLITE_OK);
+    const int64_t now = INT64_C(1750061200000000101);
+    EdrBehaviorRecord *record = calloc(1, sizeof(*record)); assert(record);
+    init_floor_parent(record, now);
+    edr_local_evidence_cache_test_set_now_unix_ns(now);
+    edr_local_evidence_cache_test_set_retention_monotonic_ms(1000);
+    assert(edr_local_evidence_cache_open(path, 8, 24) == 0);
+    EdrCommandFacts facts = {record->cmdline, record->parent_cmdline};
+    assert(edr_local_evidence_cache_record_alert_context(record, &facts) == 0);
+    edr_local_evidence_cache_close();
+    assert(sqlite3_open(path, &db) == SQLITE_OK);
+    assert(sqlite3_db_config(db, SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, 1, NULL) == SQLITE_OK);
+    assert(sqlite3_wal_checkpoint_v2(db, NULL, SQLITE_CHECKPOINT_TRUNCATE, NULL, NULL) == SQLITE_OK);
+    parent_fixture_owner_hash(db, record->pid, before);
+    uint8_t main_before[32], main_after[32];
+    long main_bytes = rejected_format_file_digest(path, main_before);
+    compact_exec(db, "INSERT INTO page_size_probe VALUES(77);");
+    assert(sqlite3_close(db) == SQLITE_OK);
+    assert(rejected_format_file_digest(path, main_after) == main_bytes);
+    assert(!memcmp(main_before, main_after, sizeof(main_before)));
+    snprintf(wal, sizeof(wal), "%s-wal", path);
+    assert(rejected_format_file_digest(wal, main_after) > 32);
+    assert(edr_local_evidence_cache_open(path, 8, 24) == 0);
+    assert(sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK);
+    assert(compact_scalar(db, "PRAGMA page_size") == size);
+    assert(compact_scalar(db, "SELECT value FROM page_size_probe") == 77);
+    parent_fixture_owner_hash(db, record->pid, after);
+    assert(!strcmp(before, after));
+    EdrParentContextQuery q = floor_query(record, now);
+    parent_pressure_query(&q, "preexisting_page_size", 1);
+    assert(sqlite3_close(db) == SQLITE_OK);
+    edr_local_evidence_cache_close();
+    assert(rejected_format_file_digest(path, main_after) == main_bytes);
+    printf("cache_page_size existing=%d main_eof=%ld wal_committed=1 historical_owner_preserved=1\n", size, main_bytes);
+    cleanup_test_sqlite_path(path);
+    free(record);
+  }
+  edr_local_evidence_cache_test_set_now_unix_ns(0);
+  edr_local_evidence_cache_test_set_retention_monotonic_ms(-1);
+}
+#endif
+
 int main(int argc, char **argv) {
 #if defined(EDR_HAVE_SQLITE)
+  if (argc == 2 && strcmp(argv[1], "--startup-page-size-contract") == 0) {
+    test_cache_page_size_contract(1); return 0;
+  }
+  if (argc == 2 && strcmp(argv[1], "--reclaim-nondefault-page-size") == 0) {
+    assert(sqlite3_auto_extension((void (*)(void))test_nondefault_page_size) == SQLITE_OK);
+    char path[512]; sqlite3 *db = NULL;
+    assert(make_test_sqlite_path(path, sizeof(path)) == 0);
+    assert(edr_local_evidence_cache_open(path, 8, 24) == 0);
+    assert(sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK);
+    fprintf(stderr, "reclaim_nondefault_owner_page_size=%lld\n", (long long)compact_scalar(db, "PRAGMA page_size"));
+    assert(sqlite3_close(db) == SQLITE_OK);
+    edr_local_evidence_cache_close();cleanup_test_sqlite_path(path);
+    test_incremental_reclaim_is_bounded_and_preserves_evidence();
+    assert(sqlite3_cancel_auto_extension((void (*)(void))test_nondefault_page_size) == 1);
+    return 0;
+  }
   if (argc == 3 && !strcmp(argv[1], "--reject-committed-wal-format")) {
     test_reject_committed_wal_format(argv[2]);
     return 0;
@@ -15946,6 +16135,7 @@ int main(int argc, char **argv) {
     test_startup_logical_budget_legacy(1,0,512u); return 0;
   }
   if (argc == 2 && strcmp(argv[1], "--startup-logical-budget") == 0) {
+    test_cache_page_size_contract(0);
     test_startup_logical_budget(); return 0;
   }
   if (argc == 2 && strcmp(argv[1], "--capacity-health-snapshot") == 0) {

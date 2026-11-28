@@ -3408,6 +3408,32 @@ static int sqlite_database_page_bytes(uint64_t *bytes, uint64_t *page_size) {
   return 1;
 }
 
+static void sqlite_rollback_silent(void);
+
+/* A requested page size on an already created database can be applied by a
+ * later VACUUM. Finalize the size only inside a transaction whose SQLite
+ * snapshot is still empty, before startup can reach any VACUUM. */
+static int sqlite_initialize_page_size(uint64_t *logical, uint64_t *page_size) {
+  if (exec_sql("PRAGMA main.page_size=4096;") != 0 || exec_sql("BEGIN;") != 0) return -1;
+  if (!sqlite_database_page_bytes(logical, page_size)) goto failed;
+  if (*logical || *page_size != 4096u) {
+    set_error("evidence cache changed while selecting new SQLite page size");
+    goto failed;
+  }
+  /* Persist only SQLite's existing default header value. A competing writer
+   * that wins after the empty read can prevent the upgrade to a write lock. */
+  if (exec_sql("PRAGMA main.user_version=0;") != 0 ||
+      !sqlite_database_page_bytes(logical, page_size)) goto failed;
+  if (*logical != 4096u || *page_size != 4096u) {
+    set_error("new evidence cache requires a 4096-byte SQLite page");
+    goto failed;
+  }
+  if (exec_sql("COMMIT;") == 0) return 0;
+failed:
+  sqlite_rollback_silent();
+  return -1;
+}
+
 static int sqlite_database_write_allow(uint64_t work_bytes) {
   uint64_t current=0;
   if(!sqlite_database_page_bytes(&current,NULL)) return 0;
@@ -5170,7 +5196,6 @@ fail:
 /* Preserve all-or-none post-context attribution when one event belongs to
  * multiple live candidate windows.  A failed row cannot leave an arbitrary
  * prefix of candidates looking complete. */
-static void sqlite_rollback_silent(void);
 static int sqlite_commit_candidate_transaction(void);
 
 static int sqlite_record_context_artifacts(const EdrBehaviorRecord *r,
@@ -8188,6 +8213,14 @@ int edr_local_evidence_cache_open_with_policy(const char *path, uint32_t max_db_
   }
   uint64_t startup_logical=0,startup_page_size=0;
   if (!sqlite_database_page_bytes(&startup_logical,&startup_page_size)) {
+    sqlite3_close(s_db); s_db=NULL; s_status.db_open=0;
+    evidence_cache_unlock(); return -1;
+  }
+  /* The fixed reclaim page quotas assume 4 KiB for newly created caches.
+   * Check the opened connection as well as the earlier file samples: another
+   * connection may already have initialized the file or committed to WAL. */
+  if (!startup_bytes && !startup_wal_bytes && !startup_logical && startup_page_size != 4096u &&
+      sqlite_initialize_page_size(&startup_logical, &startup_page_size) != 0) {
     sqlite3_close(s_db); s_db=NULL; s_status.db_open=0;
     evidence_cache_unlock(); return -1;
   }
