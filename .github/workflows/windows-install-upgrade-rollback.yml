@@ -116,7 +116,7 @@ concurrency:
 
 jobs:
   native-lifecycle:
-    if: ${{ !inputs.cache_recovery_subset && !inputs.publisher_validation_request }}
+    if: ${{ github.ref != 'refs/heads/codex/verify-687-752-753-maintenance' && !inputs.cache_recovery_subset && !inputs.publisher_validation_request }}
     strategy:
       fail-fast: false
       matrix:
@@ -635,7 +635,7 @@ jobs:
           retention-days: 7
 
   recover-synthetic-owner:
-    if: github.event_name == 'workflow_dispatch' && inputs.cache_recovery_subset == true && !inputs.publisher_validation_request && github.repository == 'qiuxinliang/edr-agent'
+    if: github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/codex/verify-687-752-753-maintenance' && inputs.cache_recovery_subset == true && !inputs.publisher_validation_request && github.repository == 'qiuxinliang/edr-agent'
     permissions:
       contents: read
       actions: read
@@ -814,7 +814,7 @@ jobs:
 
   storage-compat-native-tools:
     name: Storage compatibility tools (${{ matrix.arch }})
-    if: github.event_name == 'workflow_dispatch' && inputs.publisher_validation_request && github.repository == 'qiuxinliang/edr-agent'
+    if: github.event_name == 'workflow_dispatch' && inputs.publisher_validation_request && github.repository == 'qiuxinliang/edr-agent' && github.ref != 'refs/heads/codex/verify-687-752-753-maintenance'
     strategy:
       fail-fast: false
       matrix:
@@ -957,7 +957,7 @@ jobs:
 
   signed-publisher-lifecycle:
     name: Signed publisher (${{ matrix.arch }}, ${{ matrix.runtime_mode }})
-    if: github.event_name == 'workflow_dispatch' && inputs.publisher_validation_request && github.repository == 'qiuxinliang/edr-agent'
+    if: github.event_name == 'workflow_dispatch' && inputs.publisher_validation_request && github.repository == 'qiuxinliang/edr-agent' && github.ref != 'refs/heads/codex/verify-687-752-753-maintenance'
     needs: storage-compat-native-tools
     strategy:
       fail-fast: false
@@ -1114,3 +1114,207 @@ jobs:
         run: |
           python scripts/upload_windows_lifecycle_evidence.py --target-tag $env:VALIDATION_TARGET_TAG --arch $env:NATIVE_ARCH --runtime-mode $env:LIFECYCLE_RUNTIME_MODE --job-status $env:SIGNED_LIFECYCLE_STATUS --workspace $env:GITHUB_WORKSPACE --output-dir "$env:RUNNER_TEMP/signed-lifecycle-evidence-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT-$env:NATIVE_ARCH-$env:LIFECYCLE_RUNTIME_MODE"
           if($LASTEXITCODE -ne 0){throw 'Signed lifecycle evidence was not retained'}
+
+  formal-maintenance-lifecycle:
+    name: Formal maintenance (${{ matrix.arch }}, ${{ matrix.runtime_mode }})
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/codex/verify-687-752-753-maintenance' && github.repository == 'qiuxinliang/edr-agent'
+    permissions:
+      actions: read
+      # GitHub requires push-level contents access for GETs against draft Releases.
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {arch: amd64, runtime_mode: service, runner: windows-2022, msvc: x64, triplet: x64-windows}
+          - {arch: arm64, runtime_mode: service, runner: windows-11-vs2026-arm, msvc: arm64, triplet: arm64-windows}
+          - {arch: amd64, runtime_mode: scheduled_task, runner: windows-2022, msvc: x64, triplet: x64-windows}
+          - {arch: arm64, runtime_mode: scheduled_task, runner: windows-11-vs2026-arm, msvc: arm64, triplet: arm64-windows}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 105
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      NATIVE_ARCH: ${{ matrix.arch }}
+      LIFECYCLE_RUNTIME_MODE: ${{ matrix.runtime_mode }}
+      EDR_VCPKG_TRIPLET: ${{ matrix.triplet }}
+      VCPKG_DEFAULT_TRIPLET: ${{ matrix.triplet }}
+      P0_TEST_INPUTS_REF: '1190a89c39c0fcf675626afe040ed11b93670f09'
+      VCPKG_DOWNLOADS: ${{ github.workspace }}/.cache/vcpkg-downloads
+      VCPKG_BINARY_SOURCES: clear;files,${{ github.workspace }}/.cache/vcpkg-bincache,readwrite
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12.10'
+          architecture: x64
+      - name: Validate the exact dispatch and disposable native host
+        id: native_host
+        env:
+          HOST_ENVIRONMENT: ${{ runner.environment }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $expected = if ($env:NATIVE_ARCH -ceq 'arm64') { 'Arm64' } else { 'X64' }
+          if ($env:HOST_ENVIRONMENT -cne 'github-hosted' -or [Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString() -cne $expected) {
+            throw 'Formal maintenance requires the requested native GitHub-hosted machine'
+          }
+          $admin = [Security.Principal.WindowsPrincipal]::new([Security.Principal.WindowsIdentity]::GetCurrent())
+          if (-not $admin.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'Elevated native host required' }
+          if (Get-Service -Name FDSecurityAgent,EdrAgent,FDSecurityAgentCISmoke -ErrorAction SilentlyContinue) { throw 'Existing Agent service on runner' }
+          if (Get-ScheduledTask -TaskName FDSecurityAgent,EdrAgent -ErrorAction SilentlyContinue) { throw 'Existing Agent task on runner' }
+          if (Get-Process -Name FDSensor,EDRAgent,FDSecurityInstallerWorker -ErrorAction SilentlyContinue) { throw 'Existing Agent process on runner' }
+          foreach ($path in @('C:\Program Files\FDSecurity','C:\ProgramData\FDSecurity','C:\edr-agent-setup-lifecycle-smoke')) {
+            if (Test-Path -LiteralPath $path) { throw 'Existing Agent state on runner' }
+          }
+          $version = & "$env:WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -NonInteractive -Command '$PSVersionTable.PSVersion.ToString()'
+          if ($LASTEXITCODE -ne 0 -or $version -notmatch '^5\.1\.') { throw 'Original installed updater requires Windows PowerShell 5.1' }
+          $dispatch = (Get-Content -LiteralPath $env:GITHUB_EVENT_PATH -Raw | ConvertFrom-Json).inputs
+          if ($dispatch.baseline_tag -cne 'win_3.2.752' -or $dispatch.target_tag -cne 'win_3.2.753' -or
+              $dispatch.package_scope -cne 'full' -or $dispatch.architecture -cne 'all' -or [string]$dispatch.native_repeat_count -cne '1' -or
+              "$($dispatch.cache_recovery_subset)" -eq 'true' -or "$($dispatch.installer_timeout_recovery)" -eq 'true' -or
+              [string]::IsNullOrWhiteSpace($dispatch.publisher_validation_request) -or
+              [Text.Encoding]::UTF8.GetByteCount($dispatch.publisher_validation_request) -gt 32768) {
+            throw 'Exact 752/753 full manual maintenance dispatch with an admitted 687 input is required'
+          }
+          [IO.File]::WriteAllText((Join-Path $env:RUNNER_TEMP 'formal-maintenance-request.json'), $dispatch.publisher_validation_request)
+          python -B tests/test_formal_maintenance_lifecycle.py
+          if ($LASTEXITCODE -ne 0) { throw 'Formal release admission regression failed' }
+          python -B tests/test_report_formal_maintenance.py
+          if ($LASTEXITCODE -ne 0) { throw 'Formal evidence reporting regression failed' }
+          & ./tests/test_windows_lifecycle_first_hop.ps1
+      - name: Admit the exact three original Full Setup inputs
+        id: admitted
+        timeout-minutes: 20
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python -B tests/stage_formal_maintenance_lifecycle.py --request "$env:RUNNER_TEMP/formal-maintenance-request.json" --arch $env:NATIVE_ARCH --root "$env:RUNNER_TEMP/formal-maintenance-input" *> "$env:RUNNER_TEMP/formal-maintenance-admission.log"
+          if ($LASTEXITCODE -ne 0) { throw 'Pinned Full Release/source, package, publisher receipt or transition admission failed' }
+      - name: Verify signed packages with native Authenticode and CMS
+        id: published_signature
+        timeout-minutes: 5
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = Join-Path $env:RUNNER_TEMP 'formal-maintenance-input'
+          foreach ($label in @('baseline','target')) {
+            $path = Join-Path $root $label
+            $proof = Get-Content (Join-Path $path 'publisher-verification.json') -Raw | ConvertFrom-Json
+            & ./scripts/Verify-HeadlessRepackLifecycle.ps1 -Root $path -Architecture $env:NATIVE_ARCH -Thumbprint $proof.thumbprint -Subject $proof.subject
+          }
+          $stage = Get-Content (Join-Path $root 'stage.json') -Raw | ConvertFrom-Json
+          $legacy = Get-AuthenticodeSignature -LiteralPath $stage.legacy_setup_exe -ErrorAction Stop
+          if ([string]$legacy.Status -cne 'NotSigned' -or $legacy.SignerCertificate) { throw 'Original 687 Setup must retain its published unsigned identity' }
+      - name: Initialize the existing pinned native compiler
+        id: compiler
+        run: |
+          & ./scripts/Initialize-VSEnvironment.ps1 -Architecture '${{ matrix.msvc }}'
+          & ./scripts/Ensure-WindowsBuildTools.ps1 -NinjaOnly
+      - name: Read the existing frozen private P0 checkout
+        id: p0_inputs
+        timeout-minutes: 5
+        env:
+          P0_TEST_INPUTS_SSH_KEY: ${{ secrets.P0_TEST_INPUTS_SSH_KEY }}
+        run: |
+          & ./scripts/checkout_private_p0_inputs.ps1 -Directory .p0-formal-inputs -Ref $env:P0_TEST_INPUTS_REF
+      - name: Verify the frozen P0 inputs and identity
+        id: p0_verification
+        timeout-minutes: 5
+        run: |
+          python -m pip install --disable-pip-version-check --only-binary=:all: --requirement ./requirements-release.txt
+          if ($LASTEXITCODE -ne 0) { throw 'Pinned P0 verification dependencies unavailable' }
+          python -B scripts/windows_release_checkpoint.py verify-p0-inputs --directory .p0-formal-inputs
+          if ($LASTEXITCODE -ne 0) { throw 'Frozen native test configuration identity verification failed' }
+      - name: Identify the locked dependency cache
+        id: dependency_key
+        run: |
+          New-Item -ItemType Directory -Force .cache/vcpkg-downloads,.cache/vcpkg-bincache | Out-Null
+          python -B scripts/vcpkg_cache_key.py --triplet '${{ matrix.triplet }}'
+          if ($LASTEXITCODE -ne 0) { throw 'Dependency cache identity failed' }
+      - uses: actions/cache/restore@v5
+        id: dependency_cache
+        with:
+          path: |
+            .cache/vcpkg-downloads
+            .cache/vcpkg-bincache
+          key: ${{ steps.dependency_key.outputs.key }}
+          restore-keys: |
+            ${{ steps.dependency_key.outputs.restore-prefix }}
+            vcpkg-${{ matrix.triplet }}-release-yara-fast-nogrpc-
+      - name: Materialize existing locked dependencies
+        id: dependencies
+        timeout-minutes: 35
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python -B scripts/vcpkg_release_cache.py restore --key '${{ steps.dependency_key.outputs.key }}' --actions-cache-hit '${{ steps.dependency_cache.outputs.cache-hit }}'
+          if ($LASTEXITCODE -ne 0) { throw 'Existing shared dependency cache restore failed' }
+          & ./scripts/bootstrap_pinned_vcpkg.ps1
+          $vcpkg = Join-Path $PWD 'vcpkg/vcpkg.exe'
+          & ./scripts/Invoke-VcpkgInstallWithRetry.ps1 -VcpkgExe $vcpkg -FeatureArgs @('--x-feature=sqlite','--x-feature=yara') -MaxAttempts 6 -InitialBackoffSeconds 30
+      - name: Compile and verify all three original storage owners in the same job
+        id: storage_tools
+        timeout-minutes: 30
+        run: |
+          & ./tests/Build-FormalMaintenanceStorageTools.ps1 -Architecture $env:NATIVE_ARCH -Root "$env:RUNNER_TEMP/formal-storage"
+      - name: Remove private fixture checkout before running the Agent
+        id: p0_cleanup
+        if: always() && steps.p0_inputs.outcome == 'success'
+        run: |
+          Remove-Item -LiteralPath (Join-Path $PWD '.p0-formal-inputs') -Recurse -Force -ErrorAction Stop
+      - name: Exercise the original installed maintenance and recovery chain
+        id: installed_chain
+        timeout-minutes: 35
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = Join-Path $env:RUNNER_TEMP 'formal-maintenance-input'
+          $stagePath = Join-Path $root 'stage.json'
+          $stage = Get-Content -LiteralPath $stagePath -Raw | ConvertFrom-Json
+          $parameters = @{
+            FormalMaintenanceInput = $stagePath
+            LegacySetupExe = $stage.legacy_setup_exe; LegacyVersion = $stage.legacy_version
+            BaselineSetupExe = $stage.baseline_setup_exe; BaselineVersion = $stage.baseline_version
+            TargetSetupExe = $stage.target_setup_exe; TargetVersion = $stage.target_version
+            MigrationInput = $stage.migration_input; UpgradeInput = $stage.upgrade_input
+            BaselineConfigTemplate = $stage.legacy_config_template
+            StorageToolsInput = "$env:RUNNER_TEMP/formal-storage/input.json"
+            Architecture = $env:NATIVE_ARCH; RuntimeMode = $env:LIFECYCLE_RUNTIME_MODE
+            EvidenceDir = "$env:RUNNER_TEMP/formal-maintenance-native"
+          }
+          try {
+            & ./scripts/windows_setup_exe_lifecycle_smoke.ps1 @parameters *> "$env:RUNNER_TEMP/formal-maintenance-native.log"
+          } catch {
+            throw 'Installed maintenance chain failed; see the sanitized stage and exit code in the report'
+          }
+          exit 0
+      - name: Export only numeric and boolean maintenance evidence
+        if: always()
+        env:
+          HOST_RESULT: ${{ steps.native_host.outcome }}
+          ADMISSION_RESULT: ${{ steps.admitted.outcome }}
+          PUBLISHER_RESULT: ${{ steps.published_signature.outcome }}
+          COMPILER_RESULT: ${{ steps.compiler.outcome }}
+          P0_INPUT_RESULT: ${{ steps.p0_inputs.outcome }}
+          P0_VERIFY_RESULT: ${{ steps.p0_verification.outcome }}
+          CACHE_KEY_RESULT: ${{ steps.dependency_key.outcome }}
+          CACHE_RESTORE_RESULT: ${{ steps.dependency_cache.outcome }}
+          DEPENDENCY_RESULT: ${{ steps.dependencies.outcome }}
+          STORAGE_RESULT: ${{ steps.storage_tools.outcome }}
+          P0_CLEANUP_RESULT: ${{ steps.p0_cleanup.outcome }}
+          INSTALLED_RESULT: ${{ steps.installed_chain.outcome }}
+        run: |
+          python -B tests/report_formal_maintenance.py --arch $env:NATIVE_ARCH --mode $env:LIFECYCLE_RUNTIME_MODE --native-summary "$env:RUNNER_TEMP/formal-maintenance-native/summary.json" --output "$env:RUNNER_TEMP/formal-maintenance-report.json" "$env:HOST_RESULT" "$env:ADMISSION_RESULT" "$env:PUBLISHER_RESULT" "$env:COMPILER_RESULT" "$env:P0_INPUT_RESULT" "$env:P0_VERIFY_RESULT" "$env:CACHE_KEY_RESULT" "$env:CACHE_RESTORE_RESULT" "$env:DEPENDENCY_RESULT" "$env:STORAGE_RESULT" "$env:P0_CLEANUP_RESULT" "$env:INSTALLED_RESULT"
+          if (Test-Path -LiteralPath "$env:RUNNER_TEMP/formal-maintenance-report.json") {
+            Get-Content -LiteralPath "$env:RUNNER_TEMP/formal-maintenance-report.json" | Out-File $env:GITHUB_STEP_SUMMARY -Append
+          }
+          exit $LASTEXITCODE
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: formal-maintenance-${{ matrix.arch }}-${{ matrix.runtime_mode }}
+          path: ${{ runner.temp }}/formal-maintenance-report.json
+          if-no-files-found: error
+          retention-days: 1

@@ -1,7 +1,7 @@
 """Run immutable old/new storage consumers in fresh processes on isolated copies."""
 import argparse, hashlib, json, platform, sqlite3, subprocess, time
 from pathlib import Path
-from prepare import PINS
+from prepare import FORMAL_MAINTENANCE_PINS, PINS
 
 def sha(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
@@ -9,6 +9,7 @@ def sha(path):
 def main():
     p=argparse.ArgumentParser()
     p.add_argument('--legacy-bin',type=Path,required=True)
+    p.add_argument('--baseline-bin',type=Path)
     p.add_argument('--candidate-bin',type=Path,required=True)
     p.add_argument('--output',type=Path,required=True)
     a=p.parse_args();a.output.mkdir(parents=True,exist_ok=False)
@@ -16,8 +17,12 @@ def main():
     epoch=str(int(time.time()));tenant='synthetic-storage-tenant';endpoint='synthetic-storage-endpoint'
     receipts=[];negatives=[];identities={};native_machines=set();cache_scan_cases=[]
     suffix='.exe' if platform.system()=='Windows' else ''
+    folders={'legacy':a.legacy_bin,'candidate':a.candidate_bin}
+    pins=FORMAL_MAINTENANCE_PINS if a.baseline_bin else PINS
+    if a.baseline_bin:
+        folders['baseline']=a.baseline_bin
     tools={role:{kind:folder/('storage_compat_'+kind+suffix) for kind in ('cache','queue')}
-           for role,folder in [('legacy',a.legacy_bin),('candidate',a.candidate_bin)]}
+           for role,folder in folders.items()}
     for role,pair in tools.items():
         identities[role]={kind:{'path':str(exe.resolve()),'sha256':sha(exe)} for kind,exe in pair.items()}
 
@@ -42,7 +47,7 @@ def main():
         if result.returncode:
             raise ValueError(label+' failed: '+result.stderr[-500:])
         receipt=json.loads(result.stdout)
-        if receipt['source_commit']!=PINS[role] or receipt['action']!=action or receipt['owner']!=('evidence_cache' if kind=='cache' else 'queue'):
+        if receipt['source_commit']!=pins[role] or receipt['action']!=action or receipt['owner']!=('evidence_cache' if kind=='cache' else 'queue'):
             raise ValueError('receipt owner/source mismatch')
         if receipt['tenant_id']!=tenant_arg or receipt['endpoint_id']!=endpoint_arg or receipt['epoch']!=int(epoch_arg):
             raise ValueError('receipt input identity changed')
@@ -90,6 +95,29 @@ def main():
 
     def comparable(records):
         return sorted(records,key=lambda x:json.dumps(x,sort_keys=True))
+
+    if a.baseline_bin:
+        for kind in ('cache','queue'):
+            original=a.output/(kind+'-legacy.db')
+            old=invoke('legacy',kind,'create',original,1,kind+'-legacy-write')
+            for role in pins:
+                label=kind+'-'+role+'-read-old'
+                actual=invoke(role,kind,'read',clone(original,label+'-copy'),1,label)
+                if comparable(actual)!=comparable(old):raise ValueError('legacy data readback changed: '+label)
+            updated=clone(original,kind+'-candidate-write')
+            new=invoke('candidate',kind,'append',updated,2,kind+'-candidate-append')
+            for role in pins:
+                label=kind+'-'+role+'-read-new'
+                actual=invoke(role,kind,'read',clone(updated,label+'-copy'),2,label)
+                if comparable(actual)!=comparable(old+new):raise ValueError('new data readback changed: '+label)
+        summary={'schema':'edr.test.storage-cross-version.v1','passed':True,'source_commits':pins,
+                 'native_windows':platform.system()=='Windows','installed_agent_lifecycle':False,
+                 'native_machine':next(iter(native_machines)) if native_machines else None,
+                 'reads':12,'write_phases':4,'queue_reader_delivery_clock_advance_s':301,
+                 'receipts':receipts}
+        (a.output/'summary.json').write_text(json.dumps(summary,indent=2,sort_keys=True)+'\n')
+        print(json.dumps({'passed':True,'reads':12,'write_phases':4,'native_windows':summary['native_windows']}))
+        return
 
     for kind in ('cache','queue'):
         original=a.output/(kind+'-legacy.db')

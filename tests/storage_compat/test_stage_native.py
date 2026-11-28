@@ -6,7 +6,7 @@ import struct
 import tempfile
 import unittest
 import stage_native
-from prepare import PINS
+from prepare import FORMAL_MAINTENANCE_PINS, PINS
 
 
 class TestConfigurationTests(unittest.TestCase):
@@ -66,11 +66,32 @@ class BundleBoundaryTests(unittest.TestCase):
 
     def tearDown(self):self.temp.cleanup()
 
-    def verify(self):
+    def verify(self, formal_maintenance=False):
         (self.root/'manifest.json').write_text(json.dumps(self.manifest))
-        return stage_native.verify(self.repo,self.root,'amd64',self.sha,'123','1')
+        return stage_native.verify(self.repo,self.root,'amd64',self.sha,'123','1',formal_maintenance)
 
     def test_exact_closed_bundle(self):self.assertEqual(self.verify()['source_commits'],PINS)
+
+    def test_exact_formal_bundle_requires_all_three_pinned_consumers(self):
+        self.manifest['source_commits']=FORMAL_MAINTENANCE_PINS
+        roles=self.manifest['roles']
+        for role in ('legacy','candidate'):
+            roles[role]['source_commit']=FORMAL_MAINTENANCE_PINS[role]
+        baseline=self.root/'baseline';baseline.mkdir()
+        roles['baseline']={'source_commit':FORMAL_MAINTENANCE_PINS['baseline']}
+        for kind in ('cache','queue'):
+            name='storage_compat_'+kind+'.exe'
+            relative='baseline/'+name
+            original=next(item for item in self.manifest['files'] if item['path']=='legacy/'+name)
+            (baseline/name).write_bytes((self.root/'legacy'/name).read_bytes())
+            self.manifest['files'].append(dict(original,path=relative))
+            roles['baseline'].update({kind+'_path':relative,kind+'_sha256':original['sha256']})
+        self.assertEqual(self.verify(formal_maintenance=True)['roles'], roles)
+        with self.assertRaisesRegex(ValueError,'bundle_source_scope'):
+            self.verify()
+        roles['baseline']['source_commit']=PINS['legacy']
+        with self.assertRaisesRegex(ValueError,'role_source'):
+            self.verify(formal_maintenance=True)
 
     def test_file_mutation(self):
         with (self.root/self.manifest['files'][0]['path']).open('ab') as f:f.write(b'x')

@@ -7,13 +7,23 @@ PINS = {
     'candidate': 'd4e837790c53861c99d31ee127c55a5ef1f06f4a',
 }
 
+FORMAL_MAINTENANCE_PINS = {
+    'legacy': '97064865522c6aebd050fab9675c7eb34697ece6',
+    'baseline': '408f5c5f2a325d08e3eb09d6b50eac87bf6694e3',
+    'candidate': 'a175b978f98fce2936bda44636ab48a7d40da547',
+}
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument('--repo', required=True, type=Path)
     p.add_argument('--output', required=True, type=Path)
-    p.add_argument('--role', required=True, choices=PINS)
+    p.add_argument('--role', required=True, choices=FORMAL_MAINTENANCE_PINS)
+    p.add_argument('--formal-maintenance', action='store_true')
     a = p.parse_args()
-    commit = PINS[a.role]
+    pins = FORMAL_MAINTENANCE_PINS if a.formal_maintenance else PINS
+    if a.role not in pins:
+        p.error('role is not part of the selected source cohort')
+    commit = pins[a.role]
     actual = subprocess.check_output(['git', '-C', str(a.repo), 'rev-parse', commit], text=True, timeout=30).strip()
     if actual != commit:
         raise ValueError('source commit mismatch')
@@ -43,7 +53,10 @@ def main():
             files[file.relative_to(a.output).as_posix()] = hashlib.sha256(file.read_bytes()).hexdigest()
     tools = Path(__file__).resolve().parent
     with (a.output / 'CMakeLists.txt').open('a') as f:
-        f.write(f'\n# Isolated storage compatibility test adapter only.\nset(COMPAT_SOURCE_COMMIT "{commit}")\ninclude("{tools.as_posix()}/targets.cmake")\n')
+        f.write(f'\n# Isolated storage compatibility test adapter only.\nset(COMPAT_SOURCE_COMMIT "{commit}")\n')
+        if a.formal_maintenance and a.role == 'legacy':
+            f.write('set(COMPAT_ORIGINAL_687 ON)\n')
+        f.write(f'include("{tools.as_posix()}/targets.cmake")\n')
     record = {'schema': 'edr.test.storage-compat-source.v1', 'source_commit': commit,
               'git_archive_sha256': hashlib.sha256(archive).hexdigest(),
               'cmake_overlay_sha256': hashlib.sha256((a.output / 'CMakeLists.txt').read_bytes()).hexdigest(),

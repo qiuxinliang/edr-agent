@@ -1,8 +1,11 @@
 #ifndef COMPAT_COMMON_H
 #define COMPAT_COMMON_H
+#include "edr/behavior_record.h"
+#include "edr/sha256.h"
 #include <errno.h>
 #include <limits.h>
 #include <sys/stat.h>
+#include <time.h>
 #ifndef COMPAT_SOURCE_COMMIT
 #error immutable source identity required
 #endif

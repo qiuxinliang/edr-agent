@@ -1,4 +1,4 @@
-"""Stage four source-pinned test executables using the existing native DLL owner.
+"""Stage source-pinned test executables using the existing native DLL owner.
 
 `stage` proves the closed PE/DLL bundle then runs native cross-version readback.
 `bind` rechecks the downloaded bundle and creates the local driver input paths.
@@ -18,6 +18,7 @@ import time
 _prepare_spec=importlib.util.spec_from_file_location('edr_storage_compat_prepare',Path(__file__).with_name('prepare.py'))
 _prepare=importlib.util.module_from_spec(_prepare_spec);_prepare_spec.loader.exec_module(_prepare)
 PINS=_prepare.PINS
+FORMAL_MAINTENANCE_PINS=_prepare.FORMAL_MAINTENANCE_PINS
 TEST_CONFIGURATION={'CMAKE_BUILD_TYPE':'StorageCompat',
                     'CMAKE_MAP_IMPORTED_CONFIG_STORAGECOMPAT':'Release;',
                     'CMAKE_MSVC_RUNTIME_LIBRARY':'MultiThreadedDLL'}
@@ -50,6 +51,8 @@ def test_configuration(cache_text):
 
 def stage(args):
     own=owner(args.repo);deadline=time.monotonic()+180
+    pins=FORMAL_MAINTENANCE_PINS if args.formal_maintenance else PINS
+    need(bool(args.baseline_build)==args.formal_maintenance,'formal_baseline_build_required')
     need(not args.output.exists(),'output_must_be_new')
     own.real_path(args.output.parent,directory=True)
     need(re.fullmatch('[0-9a-f]{40}',args.harness_commit) is not None,'harness_commit')
@@ -66,7 +69,8 @@ def stage(args):
         for name,path in own.dll_index(own.real_path(directory,directory=True)).items():
             need(name not in dlls,'ambiguous_dll');dlls[name]=(path,label+'/'+path.name)
     args.output.mkdir();files=[];roles={}
-    for role,build in [('legacy',args.legacy_build),('candidate',args.candidate_build)]:
+    for role in pins:
+        build=getattr(args,role+'_build')
         build=own.real_path(build,directory=True);cache=own.real_path(build/'CMakeCache.txt')
         text=cache.read_text(encoding='utf-8')
         configuration=test_configuration(text)
@@ -74,7 +78,7 @@ def stage(args):
         need(len(compilers)==1 and own.real_path(compilers[0])==compiler,'cmake_compiler_owner')
         source_manifest=args.source_manifests/(role+'-source.json')
         source=json.loads(source_manifest.read_text(encoding='utf-8'))
-        need(source.get('schema')=='edr.test.storage-compat-source.v1' and source.get('source_commit')==PINS[role],'source_manifest_identity')
+        need(source.get('schema')=='edr.test.storage-compat-source.v1' and source.get('source_commit')==pins[role],'source_manifest_identity')
         source_dirs=re.findall(r'(?m)^CMAKE_HOME_DIRECTORY:INTERNAL=(.+)$',text)
         need(len(source_dirs)==1,'cmake_source_owner');source_dir=own.real_path(source_dirs[0],directory=True)
         for relative,expected in source['files_before_test_overlay'].items():
@@ -101,7 +105,7 @@ def stage(args):
             for dependency in imports:
                 if dependency not in own.OS_DLLS:
                     need(dependency in dlls,'unresolved_dependency_'+dependency);pending.append(dlls[dependency])
-        roles[role]={'source_commit':PINS[role]}
+        roles[role]={'source_commit':pins[role]}
         for kind in ('cache','queue'):
             path=role+'/storage_compat_'+kind+'.exe'
             roles[role][kind+'_path']=path
@@ -112,12 +116,14 @@ def stage(args):
         files.append({'path':role+'/source.json','bytes':(directory/'source.json').stat().st_size,'sha256':own.digest(directory/'source.json')})
     result_dir=args.output.parent/(args.output.name+'-native-readback')
     runner=Path(__file__).resolve().with_name('run_cross_version.py')
-    result=subprocess.run([sys.executable,str(runner),'--legacy-bin',str(args.output/'legacy'),
-                           '--candidate-bin',str(args.output/'candidate'),'--output',str(result_dir)],
-                          capture_output=True,text=True,timeout=240)
+    command=[sys.executable,'-B',str(runner),'--legacy-bin',str(args.output/'legacy'),
+             '--candidate-bin',str(args.output/'candidate'),'--output',str(result_dir)]
+    if args.formal_maintenance:
+        command+=['--baseline-bin',str(args.output/'baseline')]
+    result=subprocess.run(command,capture_output=True,text=True,timeout=240)
     need(result.returncode==0,'native_cross_version_failed_'+result.stderr[-500:])
     result_json=json.loads((result_dir/'summary.json').read_text(encoding='utf-8'))
-    need(result_json.get('passed') is True and result_json.get('native_windows') is True and result_json.get('source_commits')==PINS,'native_receipt_identity')
+    need(result_json.get('passed') is True and result_json.get('native_windows') is True and result_json.get('source_commits')==pins,'native_receipt_identity')
     need(result_json.get('native_machine')==own.MACHINES[args.architecture],'native_execution_architecture')
     evidence=args.output/'evidence';evidence.mkdir()
     for path in sorted(result_dir.iterdir()):
@@ -127,7 +133,7 @@ def stage(args):
             files.append({'path':'evidence/'+path.name,'bytes':destination.stat().st_size,'sha256':hashlib.sha256(destination.read_bytes()).hexdigest()})
     manifest={'schema':'edr.windows.storage-compat-bundle.v1','architecture':args.architecture,
               'harness_commit':args.harness_commit,'run_id':args.run_id,'run_attempt':args.run_attempt,
-              'source_commits':PINS,'roles':roles,'files':files,'native_cross_version_passed':True,
+              'source_commits':pins,'roles':roles,'files':files,'native_cross_version_passed':True,
               'installed_agent_lifecycle':False,'product_payload':False,
               'test_configuration':configuration,
               'provenance':{'compiler_sha256':own.digest(compiler),'dumpbin_sha256':own.digest(dumpbin),
@@ -135,33 +141,35 @@ def stage(args):
                             'dependencies_lock_sha256':own.digest(args.repo/'dependencies.lock.json'),
                             'vcpkg_status_sha256':own.digest(prefix.parent/'vcpkg/status')}}
     dump_json(args.output/'manifest.json',manifest)
-    verify(args.repo,args.output,args.architecture,args.harness_commit,args.run_id,args.run_attempt)
+    verify(args.repo,args.output,args.architecture,args.harness_commit,args.run_id,args.run_attempt,args.formal_maintenance)
     print(json.dumps({'staged':True,'native_cross_version_passed':True,'manifest':str(args.output/'manifest.json'),
                       'manifest_sha256':hashlib.sha256((args.output/'manifest.json').read_bytes()).hexdigest()}))
 
 
-def verify(repo,bundle,architecture,harness_commit,run_id,run_attempt):
+def verify(repo,bundle,architecture,harness_commit,run_id,run_attempt,formal_maintenance=False):
     own=owner(repo);bundle=own.real_path(bundle,directory=True);manifest_path=own.real_path(bundle/'manifest.json')
+    pins=FORMAL_MAINTENANCE_PINS if formal_maintenance else PINS
     need(manifest_path.stat().st_size<=1024**2,'manifest_size');m=json.loads(manifest_path.read_text(encoding='utf-8'))
     need(m.get('schema')=='edr.windows.storage-compat-bundle.v1' and m.get('architecture')==architecture,'bundle_architecture_schema')
     need(m.get('harness_commit')==harness_commit and m.get('run_id')==run_id and m.get('run_attempt')==run_attempt,'bundle_owner_identity')
-    need(m.get('source_commits')==PINS and m.get('native_cross_version_passed') is True and m.get('product_payload') is False,'bundle_source_scope')
+    need(m.get('source_commits')==pins and m.get('native_cross_version_passed') is True and m.get('product_payload') is False,'bundle_source_scope')
+    need(isinstance(m.get('roles'),dict) and set(m['roles'])==set(pins),'bundle_roles')
     need(m.get('test_configuration')==TEST_CONFIGURATION,'bundle_test_configuration')
     need(isinstance(m.get('files'),list) and 4<=len(m['files'])<=160,'file_count')
     seen={};total=0
     for item in m['files']:
-        relative=item.get('path','');need(re.fullmatch(r'(legacy|candidate|evidence)/[A-Za-z0-9_.-]+',relative) is not None and relative not in seen,'bundle_path')
+        relative=item.get('path','')
+        need(re.fullmatch(r'(?:'+'|'.join((*pins,'evidence'))+r')/[A-Za-z0-9_.-]+',relative) is not None and relative not in seen,'bundle_path')
         path=own.real_path(bundle/relative);need(path.stat().st_size==item['bytes'] and 0<=item['bytes']<=own.MAX_FILE,'bundle_file_size')
-        total+=item['bytes'];need(total<=own.MAX_TOTAL*2,'bundle_total_size')
+        total+=item['bytes'];need(total<=own.MAX_TOTAL*len(pins),'bundle_total_size')
         need(hashlib.sha256(path.read_bytes()).hexdigest()==item['sha256'],'bundle_file_hash');seen[relative]=item
         if 'machine' in item:
             need(own.pe_machine(path)==own.MACHINES[architecture]==item['machine'],'bundle_pe_machine')
             imports=item.get('imports');need(isinstance(imports,list) and imports and len(imports)==len(set(imports)) and all(own.DLL_NAME.fullmatch(x) for x in imports),'bundle_imports')
-    need(total<=own.MAX_TOTAL*2,'bundle_total_size')
     actual={p.relative_to(bundle).as_posix() for p in bundle.rglob('*') if p.is_file()}
     need(actual==set(seen)|{'manifest.json'},'bundle_extra_or_missing_file')
-    for role in PINS:
-        entry=m['roles'][role];need(entry['source_commit']==PINS[role],'role_source')
+    for role in pins:
+        entry=m['roles'][role];need(entry['source_commit']==pins[role],'role_source')
         for kind in ('cache','queue'):
             relative=role+'/storage_compat_'+kind+'.exe'
             need(entry[kind+'_path']==relative and relative in seen and entry[kind+'_sha256']==seen[relative]['sha256'],'role_tool_binding')
@@ -176,23 +184,25 @@ def main():
     p=argparse.ArgumentParser();sub=p.add_subparsers(dest='action',required=True)
     for action in ('stage','bind'):
         q=sub.add_parser(action)
+        q.add_argument('--formal-maintenance',action='store_true')
         for name in ('repo','output'):q.add_argument('--'+name,type=Path,required=True)
         q.add_argument('--architecture',choices=('amd64','arm64'),required=True)
         for name in ('harness-commit','run-id','run-attempt'):q.add_argument('--'+name,required=True)
         if action=='stage':
             for name in ('legacy-build','candidate-build','source-manifests','dependency-prefix','msvc-redist-root','compiler','dumpbin'):
                 q.add_argument('--'+name,type=Path,required=True)
+            q.add_argument('--baseline-build',type=Path)
         else:
             q.add_argument('--bundle',type=Path,required=True);q.add_argument('--python-path',type=Path,required=True)
     args=p.parse_args()
     if args.action=='stage':stage(args)
     else:
-        m=verify(args.repo,args.bundle,args.architecture,args.harness_commit,args.run_id,args.run_attempt)
+        m=verify(args.repo,args.bundle,args.architecture,args.harness_commit,args.run_id,args.run_attempt,args.formal_maintenance)
         own=owner(args.repo);python=own.real_path(args.python_path)
         probe=subprocess.run([str(python),'-I','-c','import sqlite3,tomllib; print("storage-reader-runtime-v1")'],capture_output=True,text=True,timeout=15)
         need(probe.returncode==0 and probe.stdout.strip()=='storage-reader-runtime-v1','python_snapshot_runtime')
         bound={'schema':'edr.windows.storage-compat-tools.v1','architecture':args.architecture,'python_path':str(python)}
-        for role in PINS:
+        for role in m['source_commits']:
             bound[role]=dict(m['roles'][role])
             for kind in ('cache','queue'):bound[role][kind+'_path']=str((args.bundle/bound[role][kind+'_path']).resolve())
         dump_json(args.output,bound);print(json.dumps({'bound':True,'output':str(args.output)}))

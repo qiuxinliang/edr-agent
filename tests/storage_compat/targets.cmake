@@ -25,6 +25,10 @@ foreach(kind IN ITEMS cache queue)
     $<TARGET_PROPERTY:${owner},COMPILE_DEFINITIONS>
     "COMPAT_TEST_SOURCE=\"${owner_dir}/${owner}.c\""
     "COMPAT_SOURCE_COMMIT=\"${COMPAT_SOURCE_COMMIT}\"")
+  if(COMPAT_ORIGINAL_687 AND kind STREQUAL "cache")
+    target_compile_definitions(storage_compat_cache PRIVATE COMPAT_ORIGINAL_687=1)
+    target_sources(storage_compat_cache PRIVATE "${CMAKE_SOURCE_DIR}/src/core/time_util.c")
+  endif()
   target_compile_options(storage_compat_${kind} PRIVATE $<TARGET_PROPERTY:${owner},COMPILE_OPTIONS>)
   target_link_libraries(storage_compat_${kind} PRIVATE $<TARGET_PROPERTY:${owner},LINK_LIBRARIES>)
 endforeach()

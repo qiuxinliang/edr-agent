@@ -20,10 +20,13 @@ param(
   [string] $LegacySetupExe = '',
   [string] $LegacyVersion = '',
   [string] $MigrationInput = '',
-  [string] $StorageToolsInput = ''
+  [string] $StorageToolsInput = '',
+  [string] $FormalMaintenanceInput = ''
 )
 
 $ErrorActionPreference = "Stop"
+$formalMaintenance = -not [string]::IsNullOrWhiteSpace($FormalMaintenanceInput)
+$signedChain = $SignedPublisherValidation -or $formalMaintenance
 $repoRoot = Split-Path -Parent $PSScriptRoot
 . (Join-Path $PSScriptRoot 'Start-LifecycleWindowsPowerShell.ps1')
 . (Join-Path $repoRoot 'tests\Invoke-LifecycleStorageCompatibility.ps1')
@@ -49,19 +52,37 @@ if (Test-Path -LiteralPath $InstallDir) {
 
 & $bootstrapVerifier -Path $BaselineSetupExe -PayloadArchitecture $Architecture
 & $bootstrapVerifier -Path $TargetSetupExe -PayloadArchitecture $Architecture
-if ($SignedPublisherValidation) {
+if ($formalMaintenance) {
+  if ($SignedPublisherValidation -or $env:GITHUB_ACTIONS -cne 'true' -or
+      $env:GITHUB_REF -cne 'refs/heads/codex/verify-687-752-753-maintenance' -or
+      $LegacyVersion -cne '3.2.687' -or $BaselineVersion -cne '3.2.752' -or $TargetVersion -cne '3.2.753' -or
+      $SkipSetupRollback -or $ExerciseInstallerTimeout -or -not $LegacySetupExe -or -not $MigrationInput -or -not $StorageToolsInput) {
+    throw 'formal maintenance requires the exact 687, 752 and 753 chain on its disposable validation branch'
+  }
+  $formalInputPath = Assert-LifecycleStorageRegular $FormalMaintenanceInput 65536
+  $formalInput = [IO.File]::ReadAllText($formalInputPath) | ConvertFrom-Json
+  if ($formalInput.schema -cne 'edr.formal-maintenance-stage.v1' -or $formalInput.cohort -cne '687-752-753-maintenance' -or
+      $formalInput.architecture -cne $Architecture -or $formalInput.legacy_binary_sha256 -cnotmatch '^[a-f0-9]{64}$' -or
+      $formalInput.legacy_signature_status -cne 'unsigned' -or $formalInput.baseline_signature_status -cne 'signed' -or
+      $formalInput.target_signature_status -cne 'signed' -or $formalInput.legacy_updater_protocol -ne 5 -or
+      $formalInput.baseline_updater_protocol -ne 6 -or $formalInput.target_updater_protocol -ne 6) {
+    throw 'formal maintenance package identity or publisher protocol declaration mismatch'
+  }
+} elseif ($SignedPublisherValidation) {
   if ($env:GITHUB_ACTIONS -cne 'true' -or -not $LegacySetupExe -or -not $MigrationInput -or
       $LegacyVersion -cne '3.2.723' -or [version]$BaselineVersion -ge [version]$TargetVersion -or
       [version]$LegacyVersion -ge [version]$BaselineVersion -or $SkipSetupRollback -or -not $StorageToolsInput) {
     throw 'signed publisher validation requires disposable CI, original 3.2.723, two increasing candidates, storage consumer tools and full rollback'
   }
-  $LegacySetupExe = (Resolve-Path -LiteralPath $LegacySetupExe).Path
-  & $bootstrapVerifier -Path $LegacySetupExe -PayloadArchitecture $Architecture
-  $storageTools=Import-LifecycleStorageTools $StorageToolsInput $Architecture $archVerifier
 } elseif ($LegacySetupExe -or $LegacyVersion -or $MigrationInput -or $StorageToolsInput) {
   throw 'legacy migration inputs require signed publisher validation'
 }
-if ($RuntimeMode -ceq 'scheduled_task' -and -not $SignedPublisherValidation) {
+if ($signedChain) {
+  $LegacySetupExe = (Resolve-Path -LiteralPath $LegacySetupExe).Path
+  & $bootstrapVerifier -Path $LegacySetupExe -PayloadArchitecture $Architecture
+  $storageTools=Import-LifecycleStorageTools $StorageToolsInput $Architecture $archVerifier -FormalMaintenance:$formalMaintenance
+}
+if ($RuntimeMode -ceq 'scheduled_task' -and -not $signedChain) {
   throw 'scheduled-task lifecycle requires the explicitly bound signed validation path'
 }
 
@@ -73,6 +94,12 @@ function Add-Evidence([string] $Stage, [string] $Status, [string] $Detail) {
     status = $Status
     detail = $Detail
   }) | Out-Null
+}
+function Assert-FormalMaintenanceBinary([string]$ExpectedSha256) {
+  $binary = Assert-LifecycleStorageRegular (Join-Path $InstallDir 'FDSensor.exe')
+  if ((Get-FileHash -LiteralPath $binary -Algorithm SHA256).Hash.ToLowerInvariant() -cne $ExpectedSha256) {
+    throw 'installed runtime binary differs from its admitted release'
+  }
 }
 function Copy-InstallerDiagnostics([string] $Stage, [string] $SetupLog) {
   # Evidence collection must never hide the original installer failure.
@@ -814,10 +841,11 @@ function Get-LifecycleRuntimeOwner {
   return [ordered]@{mode='service';path=$service.PathName;account=$service.StartName;start_mode=$service.StartMode}
 }
 
-function New-LifecyclePreservationSnapshot([string] $Stage) {
+function New-LifecyclePreservationSnapshot([string] $Stage, [switch] $OwnerOnly) {
   $owner=Get-LifecycleRuntimeOwner
   $files=@()
-  foreach ($name in @('edr_queue.db.signed-lifecycle-preserve','local_evidence_cache.db.signed-lifecycle-preserve')) {
+  $markerNames = if (-not $OwnerOnly) { @('edr_queue.db.signed-lifecycle-preserve','local_evidence_cache.db.signed-lifecycle-preserve') }
+  foreach ($name in $markerNames) {
     $path=Join-Path $InstallDir $name
     if (Test-Path -LiteralPath $path) { throw 'preservation marker already exists' }
     [IO.File]::WriteAllText($path,('isolated preservation marker '+[Guid]::NewGuid().ToString('N')),[Text.UTF8Encoding]::new($false))
@@ -826,7 +854,8 @@ function New-LifecyclePreservationSnapshot([string] $Stage) {
   $snapshot=[pscustomobject]@{
     config_sha256=(Get-FileHash -LiteralPath (Join-Path $InstallDir 'agent.toml') -Algorithm SHA256).Hash.ToLowerInvariant()
     deployment_mode=$RuntimeMode;runtime_owner=$owner
-    markers=$files;scope='Actual configuration and runtime owner identity; synthetic queue/evidence marker bytes, not business database readback'
+    markers=$files
+    scope=$(if($OwnerOnly){'Actual configuration and runtime owner identity'}else{'Actual configuration and runtime owner identity; synthetic queue/evidence marker bytes, not business database readback'})
   }
   [IO.File]::WriteAllText((Join-Path $EvidenceDir ($Stage+'-preservation.json')),($snapshot|ConvertTo-Json -Depth 5),[Text.UTF8Encoding]::new($false))
   return $snapshot
@@ -846,15 +875,16 @@ function Assert-LifecyclePreservationSnapshot($Snapshot, [string] $Stage) {
       throw "$Stage changed the original queue/evidence marker bytes"
     }
   }
-  Add-Evidence $Stage 'preserved' "original_config=true mode=$RuntimeMode runtime_owner_identity=true synthetic_queue_evidence_markers=true business_database_readback=false"
+  Add-Evidence $Stage 'preserved' "original_config=true mode=$RuntimeMode runtime_owner_identity=true synthetic_queue_evidence_markers=$([bool]$Snapshot.markers)"
 }
 
 $status = "failed"
+$failureLine = 0
 $script:LastLifecycleStage = "lifecycle"
 $script:LastSetupLog = ""
 try {
   $upgradeBinding = Get-Content -LiteralPath $UpgradeInput -Raw | ConvertFrom-Json
-  if ($SignedPublisherValidation) {
+  if ($signedChain) {
     $migrationBinding=Get-Content -LiteralPath $MigrationInput -Raw | ConvertFrom-Json
     foreach ($binding in @($migrationBinding,$upgradeBinding)) {
       if ($binding.signature_status -cne 'signed' -or -not $binding.publisher_subject_der_sha256 -or
@@ -875,30 +905,48 @@ try {
   }
   # Validate the target independently first. A broken historical baseline must
   # not hide whether the candidate can install and uninstall on a clean host.
-  Invoke-Installer $TargetSetupExe "install-target-fresh" $false
-  Assert-InstalledRuntime $TargetVersion "install-target-fresh" $true $true
-  Invoke-UninstallerAndAssertCleanup "uninstall-target-fresh"
+  if (-not $formalMaintenance) {
+    Invoke-Installer $TargetSetupExe "install-target-fresh" $false
+    Assert-InstalledRuntime $TargetVersion "install-target-fresh" $true $true
+    Invoke-UninstallerAndAssertCleanup "uninstall-target-fresh"
+  }
 
   # Start with the immutable old Setup and the updater materialized by that
   # actual old Agent. Keep the separate direct-Setup path below unchanged.
   $offlineConfigHash = Initialize-LifecycleOfflineConfig $BaselineConfigTemplate
-  if ($SignedPublisherValidation) {
+  if ($signedChain) {
     Invoke-Installer $LegacySetupExe 'install-legacy-migration-baseline' $false
     Assert-InstalledRuntime $LegacyVersion 'install-legacy-migration-baseline' $true
     $null=Wait-LifecycleEmbeddedUpdater $LegacyVersion $migrationBinding.baseline_updater_sha256
+    if ($formalMaintenance) {
+      Assert-FormalMaintenanceBinary $formalInput.legacy_binary_sha256
+      $script:LastLifecycleStage = 'legacy-seed'
+    }
     $chainStorage=New-LifecycleStorageChain $storageTools 'legacy-updater'
     Write-LifecycleStorageFixture $chainStorage 'seed' 'legacy-seed'
-    Test-LifecycleStorageReadback $chainStorage 'legacy-installed'
-    $chainSnapshot=New-LifecyclePreservationSnapshot 'legacy-migration'
+    if ($formalMaintenance) {
+      Add-Evidence 'legacy-seed' 'verified' 'legacy storage owner wrote both fixture records to the configured cache and queue; original runtime restarted'
+      $script:LastLifecycleStage = 'legacy-installed'
+      Test-LifecycleStorageReadback $chainStorage 'legacy-installed' @('legacy')
+    } else { Test-LifecycleStorageReadback $chainStorage 'legacy-installed' }
+    $chainSnapshot=New-LifecyclePreservationSnapshot 'legacy-migration' -OwnerOnly:$formalMaintenance
     # This is the supported full-Setup migration. The old command contract
     # rejects this publisher before PS starts; do not bypass it with a patched
     # old updater, new fields, or a direct PS invocation counted as that hop.
     Invoke-Installer $BaselineSetupExe 'migrate-legacy-full-setup' $true
     Assert-InstalledRuntime $BaselineVersion 'migrate-legacy-full-setup' $true $true
     Assert-LifecyclePreservationSnapshot $chainSnapshot 'migrate-legacy-full-setup'
-    Test-LifecycleStorageReadback $chainStorage 'migrated-baseline'
+    if ($formalMaintenance) {
+      Assert-FormalMaintenanceBinary $migrationBinding.binary_sha256
+      $script:LastLifecycleStage = 'migrated-baseline'
+      Test-LifecycleStorageReadback $chainStorage 'migrated-baseline' @('baseline')
+    } else { Test-LifecycleStorageReadback $chainStorage 'migrated-baseline' }
+    if ($formalMaintenance) { $script:LastLifecycleStage = 'baseline-local-updater' }
     $migratedUpdater=Wait-LifecycleEmbeddedUpdater $BaselineVersion $upgradeBinding.baseline_updater_sha256
     Assert-LifecyclePublisherProtocol $migratedUpdater $upgradeBinding.baseline_updater_sha256 (Get-LifecycleTrustedPublisher $migrationBinding)
+    if ($formalMaintenance) {
+      Add-Evidence 'baseline-local-updater' 'verified' 'original installed updater materialized; publisher identity protocol 6 and DER argument verified locally'
+    }
   } else {
     Invoke-Installer $BaselineSetupExe 'install-old-updater-baseline' $false
   }
@@ -908,6 +956,41 @@ try {
   }
   Invoke-BaselineUpdaterUpgrade $upgradeBinding
   Assert-InstalledRuntime $TargetVersion 'old-updater-upgrade' $true $true
+  if ($formalMaintenance) {
+    $script:LastLifecycleStage = 'updater-target'
+    Assert-LifecyclePreservationSnapshot $chainSnapshot 'signed-updater-upgrade'
+    Test-LifecycleStorageReadback $chainStorage 'updater-target' @('candidate')
+    $script:LastLifecycleStage = 'updater-target-append'
+    Write-LifecycleStorageFixture $chainStorage 'append' 'updater-target-append'
+    Add-Evidence 'updater-target-append' 'verified' 'candidate storage owner wrote both fixture records to the configured cache and queue; original runtime restarted'
+    # Both intended recovery readers must first consume both generations on
+    # independent read-only snapshots of the same installed database.
+    $script:LastLifecycleStage = 'updater-target-new-data'
+    Test-LifecycleStorageReadback $chainStorage 'updater-target-new-data' @('candidate','baseline','legacy')
+
+    $null = Get-LifecycleTrustedPublisher $migrationBinding
+    Invoke-Installer $BaselineSetupExe 'rollback-formal-baseline' $true
+    Assert-InstalledRuntime $BaselineVersion 'rollback-formal-baseline' $true $true
+    Assert-FormalMaintenanceBinary $migrationBinding.binary_sha256
+    Assert-LifecyclePreservationSnapshot $chainSnapshot 'rollback-formal-baseline'
+    $null = Wait-LifecycleEmbeddedUpdater $BaselineVersion $migrationBinding.target_updater_sha256
+    $script:LastLifecycleStage = 'rollback-formal-baseline-data'
+    Test-LifecycleStorageReadback $chainStorage 'rollback-formal-baseline-data' @('baseline','legacy')
+
+    if ((Get-FileHash -LiteralPath $LegacySetupExe -Algorithm SHA256).Hash.ToLowerInvariant() -cne $migrationBinding.baseline_setup_sha256) {
+      throw 'original legacy recovery Setup no longer matches the admitted release'
+    }
+    Invoke-Installer $LegacySetupExe 'rollback-formal-legacy' $true
+    Assert-InstalledRuntime $LegacyVersion 'rollback-formal-legacy' $true
+    Assert-FormalMaintenanceBinary $formalInput.legacy_binary_sha256
+    Assert-LifecyclePreservationSnapshot $chainSnapshot 'rollback-formal-legacy'
+    $null = Wait-LifecycleEmbeddedUpdater $LegacyVersion $migrationBinding.baseline_updater_sha256
+    $script:LastLifecycleStage = 'rollback-formal-legacy-data'
+    Test-LifecycleStorageReadback $chainStorage 'rollback-formal-legacy-data' @('legacy')
+    Invoke-UninstallerAndAssertCleanup 'uninstall-formal-recovered-source'
+    $status = 'succeeded'
+    return
+  }
   if ($SignedPublisherValidation) {
     Assert-LifecyclePreservationSnapshot $chainSnapshot 'signed-updater-upgrade'
     Test-LifecycleStorageReadback $chainStorage 'updater-target'
@@ -965,6 +1048,7 @@ try {
   $status = "succeeded"
 } catch {
   $lifecycleFailure = $_
+  $failureLine = $lifecycleFailure.InvocationInfo.ScriptLineNumber
   try {
     foreach($entry in @(
         @{key='lifecycle_process_open_failure';schema='edr.test.lifecycle-process-open-failure.v1';file='process-open-failure.json'},
@@ -983,7 +1067,9 @@ try {
       }
     }
   } catch {Write-Warning ('Lifecycle process evidence unavailable: '+$_.Exception.GetType().FullName)}
-  Copy-InstallerDiagnostics -Stage $script:LastLifecycleStage -SetupLog $script:LastSetupLog
+  if (-not $formalMaintenance) {
+    Copy-InstallerDiagnostics -Stage $script:LastLifecycleStage -SetupLog $script:LastSetupLog
+  }
   Add-Evidence "lifecycle" "failed" $lifecycleFailure.Exception.Message
   throw $lifecycleFailure
 } finally {
@@ -1000,6 +1086,9 @@ try {
     baseline_version = $BaselineVersion
     target_version = $TargetVersion
     signed_publisher_validation = [bool]$SignedPublisherValidation
+    formal_maintenance_validation = $formalMaintenance
+    last_stage = $script:LastLifecycleStage
+    failure_line = $failureLine
     legacy_migration_version = $LegacyVersion
     setup_rollback_skipped = [bool]$SkipSetupRollback
     installer_timeout_requested = [bool]$ExerciseInstallerTimeout

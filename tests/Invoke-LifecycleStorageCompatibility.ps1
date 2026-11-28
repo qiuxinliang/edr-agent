@@ -109,11 +109,18 @@ function Invoke-LifecycleStoragePython($Context,[string[]]$Arguments,[string]$La
   $encoded=[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes((Get-LifecycleStoragePython)))
   return Invoke-LifecycleStorageProcess $Context $Context.tools.python_path (@('-I','-B','-c',("import base64;exec(base64.b64decode('"+$encoded+"'))"))+$Arguments) $Label
 }
-function Import-LifecycleStorageTools([string]$InputPath,[string]$Architecture,[string]$PeVerifier) {
+function Import-LifecycleStorageTools([string]$InputPath,[string]$Architecture,[string]$PeVerifier,[switch]$FormalMaintenance) {
   $path=Assert-LifecycleStorageRegular $InputPath 65536;$tools=[IO.File]::ReadAllText($path)|ConvertFrom-Json
   if($tools.schema -cne 'edr.windows.storage-compat-tools.v1' -or $tools.architecture -cne $Architecture){throw 'storage tools identity mismatch'}
   $pins=@{legacy='b51bc3d825e6d5666535463b34eb708201e6fda7';candidate='d4e837790c53861c99d31ee127c55a5ef1f06f4a'}
-  foreach($role in @('legacy','candidate')) {
+  if($FormalMaintenance) {
+    $pins=@{
+      legacy='97064865522c6aebd050fab9675c7eb34697ece6'
+      baseline='408f5c5f2a325d08e3eb09d6b50eac87bf6694e3'
+      candidate='a175b978f98fce2936bda44636ab48a7d40da547'
+    }
+  }
+  foreach($role in $pins.Keys) {
     if($tools.$role.source_commit -cne $pins[$role]){throw 'storage consumer source differs from immutable product source'}
     foreach($kind in @('cache','queue')) {
       $exe=Assert-LifecycleStorageRegular $tools.$role.($kind+'_path')
@@ -261,7 +268,7 @@ function Write-LifecycleStorageFixture($Context,[ValidateSet('seed','append')][s
     finally {$native.process.Dispose()}
   }
 }
-function Test-LifecycleStorageReadback($Context,[string]$Stage) {
+function Test-LifecycleStorageReadback($Context,[string]$Stage,[string[]]$ReaderRoles=@('legacy','candidate')) {
   Assert-LifecycleStorageBinding $Context
   if($Stage -cnotmatch '^[a-z0-9-]+$' -or $Context.generation -notin @(1,2)){throw 'invalid storage readback stage'}
   $directory=Join-Path $Context.root $Stage
@@ -274,7 +281,10 @@ function Test-LifecycleStorageReadback($Context,[string]$Stage) {
     if($proof.schema -cne 'edr.test.storage-snapshot.v1' -or $proof.sqlite_backup -ne $true -or $proof.source_readonly -ne $true -or
         $proof.source -ine $Context.binding.$kind.path -or $proof.config_sha256 -cne $Context.binding.config_sha256 -or
         $proof.sha256 -cne (Get-FileHash -LiteralPath $snapshot -Algorithm SHA256).Hash.ToLowerInvariant()){throw 'actual storage snapshot binding failed'}
-    foreach($role in @('legacy','candidate')) {
+    foreach($role in $ReaderRoles) {
+      if($role -cnotin @('legacy','baseline','candidate') -or -not $Context.tools.PSObject.Properties[$role]){
+        throw 'storage reader role has not been admitted'
+      }
       $copy=Join-Path $directory ($kind+'.'+$role+'.db')
       Copy-Item -LiteralPath $snapshot -Destination $copy -ErrorAction Stop
       if((Get-FileHash -LiteralPath $copy -Algorithm SHA256).Hash.ToLowerInvariant() -cne $proof.sha256){throw 'consumer copy differs from sealed snapshot'}
@@ -301,6 +311,6 @@ function Test-LifecycleStorageReadback($Context,[string]$Stage) {
   }
   if($native.process.HasExited){throw 'bound runtime exited during storage readback'}
   Assert-LifecycleStorageBinding $Context
-  Add-Evidence $Stage 'verified' ('actual_configured_databases=true owner_api_readback=legacy,candidate generations='+$Context.generation+' input_origin=synthetic_owner_api queue_retry_clock=disposable_copy_only')
+  Add-Evidence $Stage 'verified' ('actual_configured_databases=true owner_api_readback='+($ReaderRoles -join ',')+' generations='+$Context.generation+' input_origin=synthetic_owner_api queue_retry_clock=disposable_copy_only')
   } finally {$native.process.Dispose()}
 }

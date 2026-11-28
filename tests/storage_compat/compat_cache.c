@@ -1,7 +1,14 @@
 /* Test adapter: all storage/query implementation is the pinned version's owner. */
 #define main compat_unused_original_main
+#ifdef COMPAT_ORIGINAL_687
+#define edr_monotonic_ns compat_original_test_clock
+#endif
 #include COMPAT_TEST_SOURCE
 #undef main
+#ifdef COMPAT_ORIGINAL_687
+#undef edr_monotonic_ns
+#include "edr/time_util.h"
+#endif
 #include "compat_common.h"
 
 enum { COMPAT_CACHE_QUERY_LIMIT=1000, COMPAT_CACHE_SCAN_BOUND=20100,
@@ -76,8 +83,28 @@ static cJSON *compat_cache_facts(const EdrBehaviorRecord *r) {
   cJSON_AddStringToObject(o,"process_generation_source",r->process_generation_source);
   cJSON_AddStringToObject(o,"source_completeness",r->source_completeness);return o;
 }
+
+static void compat_cache_write(const EdrBehaviorRecord *record,const char *cause) {
+#ifdef COMPAT_ORIGINAL_687
+  /* This release persisted candidates through record_behavior, which returns
+   * void. Require a new durable candidate plus independent snapshot readback. */
+  EdrEvidenceCacheStatus before,after;
+  edr_local_evidence_cache_get_status(&before);
+  compat_need(edr_local_evidence_cache_is_candidate(record),"legacy_candidate_admission");
+  edr_local_evidence_cache_record_behavior(record);
+  edr_local_evidence_cache_get_status(&after);
+  compat_need(after.p0_candidates_written==before.p0_candidates_written+1u,cause);
+#else
+  EdrCommandFacts commands={record->cmdline,NULL};
+  compat_need(edr_local_evidence_cache_record_alert_context(record,&commands)==0,cause);
+#endif
+}
+
 int main(int argc,char **argv) {
-  compat_args(argc,argv);s_test_real_monotonic=1;
+  compat_args(argc,argv);
+#ifndef COMPAT_ORIGINAL_687
+  s_test_real_monotonic=1;
+#endif
   compat_cache_phase("starting",0,0);
   /* No fixture clock, identity override or legacy schema switch is enabled. */
   compat_cache_phase("open_begin",0,0);
@@ -100,8 +127,7 @@ int main(int argc,char **argv) {
     }
     for(unsigned item=0;item<2u;item++) {
       EdrBehaviorRecord *r=pending[item];
-      EdrCommandFacts commands={r->cmdline,NULL};
-      compat_need(edr_local_evidence_cache_record_alert_context(r,&commands)==0,"cache_owner_write");
+      compat_cache_write(r,"cache_owner_write");
       cJSON_AddItemToArray(records,compat_cache_facts(r));free(r);
     }
     if(!strcmp(compat_stage,"create")) {
@@ -111,8 +137,7 @@ int main(int argc,char **argv) {
         EdrBehaviorRecord *r=calloc(1,sizeof(*r));compat_need(r!=NULL,"noise_record_alloc");compat_record(r,1u,item);
         r->pid=100000u+item;r->event_time_ns=compat_epoch*INT64_C(1000000000)+1000+(int64_t)item;
         snprintf(r->event_id,sizeof(r->event_id),"storage-noise-%u",item);
-        EdrCommandFacts commands={r->cmdline,NULL};
-        compat_need(edr_local_evidence_cache_record_alert_context(r,&commands)==0,"noise_owner_write");
+        compat_cache_write(r,"noise_owner_write");
         noise_records_written++;free(r);
       }
       compat_cache_phase("reopen_begin",0,0);

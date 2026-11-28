@@ -394,6 +394,18 @@ class WindowsLifecycleWorkflowTests(unittest.TestCase):
         invoke = step(signed, 'Execute signed migration upgrade timeout rollback and uninstall')
         self.assertIn("StorageToolsInput=(Join-Path $PWD 'storage-tools-input.json')", invoke)
 
+    def test_formal_native_storage_verifier_and_checkout_share_the_same_input_pin(self):
+        formal = self.text.split('  formal-maintenance-lifecycle:\n', 1)[1]
+        env = formal.split('    env:\n', 1)[1].split('    steps:\n', 1)[0]
+        self.assertIn("P0_TEST_INPUTS_REF: '1190a89c39c0fcf675626afe040ed11b93670f09'", env)
+        checkout = step(formal, 'Read the existing frozen private P0 checkout')
+        self.assertIn('-Directory .p0-formal-inputs -Ref $env:P0_TEST_INPUTS_REF', checkout)
+        verifier = step(formal, 'Verify the frozen P0 inputs and identity')
+        self.assertIn('verify-p0-inputs --directory .p0-formal-inputs', verifier)
+        self.assertNotIn('P0_TEST_INPUTS_REF:', verifier)
+        self.assertLess(formal.index('- name: Verify the frozen P0 inputs'),
+                        formal.index('- name: Compile and verify all three'))
+
 
 if __name__ == '__main__':
     unittest.main()
